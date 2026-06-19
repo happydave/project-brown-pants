@@ -16,7 +16,8 @@ Required: the Bevy Remote Protocol is compiled only under the app's `dev` featur
 ## Component Index
 
 - **sounding_sim** `/crates/sim/` — the headless simulation core (library).
-  - `/crates/sim/src/orbit.rs` — `Orbit`: analytic 2D Kepler propagation. Inputs: μ, state vectors, time. Outputs: position/velocity, derived orbit, maneuver result.
+  - `/crates/sim/src/orbit.rs` — `Orbit`: analytic 2D Kepler propagation (the **on-rails** gear). Inputs: μ, state vectors, time. Outputs: position/velocity, derived orbit, maneuver result.
+  - `/crates/sim/src/active.rs` — the **active** gear (WI 515): `ActiveBody` numerically integrated under point-mass gravity (velocity Verlet, symplectic) at a fixed `dt`, with torque-free rotation driven by stored world-frame angular momentum (consumes the WI 505 inertia tensor). `advance` caps sub-steps per frame (the active-vehicle warp cap); `ActivePlugin`/`Gravity` drive it from `SimClock`. Pure energy/angular-momentum drift functions (WI 499 style). Standalone — the on-rails↔active hand-off is WI 508. Validated against the analytic `Orbit`. Headless.
   - `/crates/sim/src/sim.rs` — `SimClock` (time + warp + paused), `CentralBody`, `Craft`, `OrbitPlugin`. Inputs: real frame time. Outputs: advancing simulated time; the spawned craft entity.
   - `/crates/sim/src/command.rs` — `Command` (serde message envelope), `apply_command`, `FlightControlPlugin`. Inputs: `Command` messages. Outputs: the only writes to `SimClock`/`Craft`.
   - `/crates/sim/src/diagnostics.rs` — `SimDiagnosticsPlugin`, conservation-drift metrics. Inputs: clock + craft. Outputs: Bevy diagnostics (`sim/energy_drift`, `sim/angular_momentum_drift`).
@@ -58,7 +59,7 @@ Render placement (Toy 4, retained): entities carry an f64 `WorldPlacement`; `tra
 
 ## Known Gaps (not yet built)
 
-- Only the on-rails (analytic) gear exists. The active/numerical gear and the warp-gearbox hand-off are not built (see the design's Validation Roadmap, Toys 4–9).
+- Both gearbox gears now exist in isolation: the on-rails analytic `Orbit` and the active numerical `ActiveBody` (WI 515). The **hand-off** between them — putting an active craft onto a conic and waking a rails craft into active physics — is **not** built (WI 508), and nothing switches a craft between gears yet. The active gear has no scene hosting it (its live drift diagnostics await WI 506/508); it is validated by tests. Units are normalised (μ = 1); metric reconciliation is deferred.
 - The f64 3D world-coordinate + reference-frame substrate and the data-driven fluid/surface field types exist (WI 497, `frame.rs`/`fluid.rs`/`surface.rs`). Floating-origin rendering now consumes `WorldPos` (WI 504, `app/floating_origin.rs`), but the field *consumers* (aero/hydro, wheels) and the 2D-orbit→3D-world bridge are still not built. The orbit propagator remains 2D and runs headless behind the 3D scene; the rendered planet/craft are a static placement, not orbit-driven.
 - The Toy 4 planet scene (retained) renders a single static sphere with no terrain LOD, collision, or surface micro-precision (Toy 6). Depth uses Bevy's default reverse-Z.
 - The voxel craft (WI 505, `voxel.rs`) derives mass/inertia and the aero cross-section, but its other two roles — connected-component **breakage** and airtight **compartments** — are not built; **devices are inert mass** (no engine/tank behavior); and the area curve is *produced* here but *consumed* (drag/lift/area-ruling) only at Toy 9. The editor saves blueprints/subassemblies to JSON files in the working directory.
