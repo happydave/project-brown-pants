@@ -115,6 +115,14 @@ impl Orbit {
         -self.mu / (2.0 * self.semi_major_axis)
     }
 
+    /// Specific angular momentum (signed; sign follows the motion sense).
+    pub fn specific_angular_momentum(&self) -> f64 {
+        self.sense
+            * (self.mu * self.semi_major_axis * (1.0 - self.eccentricity * self.eccentricity))
+                .max(0.0)
+                .sqrt()
+    }
+
     /// Position and velocity at time `t`, in world coordinates. Closed form: the
     /// same `t` always yields the same result, and arbitrarily large steps are
     /// exact rather than approximate.

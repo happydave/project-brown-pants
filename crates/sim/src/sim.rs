@@ -84,8 +84,10 @@ mod tests {
 
     #[test]
     fn clock_advances_scaled_by_warp() {
-        let mut clock = SimClock::default();
-        clock.warp = 10.0;
+        let mut clock = SimClock {
+            warp: 10.0,
+            ..Default::default()
+        };
         clock.advance(0.5);
         assert_eq!(clock.time, 5.0);
     }

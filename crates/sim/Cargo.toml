@@ -13,6 +13,7 @@ description = "Sounding simulation core — headless, rendering-free."
 bevy_app = { workspace = true }
 bevy_ecs = { workspace = true }
 bevy_time = { workspace = true }
+bevy_diagnostic = { workspace = true }
 # f64 2D vector math (DVec2). Same glam version Bevy uses, so no duplicate build.
 # Rendering-free — does not affect the headless invariant.
 glam = { workspace = true }

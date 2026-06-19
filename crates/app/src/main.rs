@@ -12,6 +12,7 @@
 use bevy::color::palettes::css;
 use bevy::math::{DVec2, Isometry2d};
 use bevy::prelude::*;
+use sounding_sim::diagnostics::SimDiagnosticsPlugin;
 use sounding_sim::orbit::Orbit;
 use sounding_sim::sim::{CentralBody, Craft, OrbitPlugin, SimClock};
 
@@ -41,6 +42,7 @@ fn main() {
             central_body,
             initial_orbit,
         })
+        .add_plugins(SimDiagnosticsPlugin)
         .init_resource::<ManeuverPlan>()
         .add_systems(Startup, setup)
         .add_systems(Update, (time_warp_input, maneuver_input, draw));

@@ -6,6 +6,7 @@
 //! The same `SimPlugin` runs headless or inside the windowed application, because
 //! `bevy::app::App` is a re-export of `bevy_app::App`.
 
+pub mod diagnostics;
 pub mod orbit;
 pub mod sim;
 

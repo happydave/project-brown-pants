@@ -4563,6 +4563,7 @@ name = "sounding_sim"
 version = "0.1.2"
 dependencies = [
  "bevy_app",
+ "bevy_diagnostic",
  "bevy_ecs",
  "bevy_time",
  "glam",
