@@ -17,6 +17,8 @@ use sounding_sim::diagnostics::SimDiagnosticsPlugin;
 use sounding_sim::orbit::Orbit;
 use sounding_sim::sim::{CentralBody, Craft, OrbitPlugin, SimClock};
 
+mod bus;
+
 /// Pixels per world distance unit.
 const SCALE: f32 = 220.0;
 const DV_STEP: f64 = 0.02;
@@ -43,6 +45,7 @@ fn main() {
         })
         .add_plugins(FlightControlPlugin)
         .add_plugins(SimDiagnosticsPlugin)
+        .add_plugins(bus::BusPlugin::default())
         .init_resource::<ManeuverPlan>()
         .add_systems(Startup, setup)
         .add_systems(Update, (time_warp_input, maneuver_input, draw));

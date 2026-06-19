@@ -43,6 +43,26 @@ and an aqua craft propagated analytically (patched-conic, on-rails). Controls:
 - `Up` / `Down` — adjust prograde / retrograde delta-v (preview orbit shown in lime)
 - `Enter` — execute the maneuver
 
+## Runtime bus
+
+While the app runs, a runtime state/command bus listens on
+`http://127.0.0.1:8787` (a synchronous HTTP server on its own thread). It is the
+shared substrate later consumers — the AI companion, second screen, multiplayer
+sync — adapt onto. It is distinct from the dev-only Bevy Remote Protocol.
+
+- `GET /telemetry` — current simulation snapshot as JSON (time, warp, paused,
+  craft orbit and position, energy-drift metric).
+- `POST /command` — inject a JSON command into the same executor the keyboard
+  uses; malformed input returns HTTP 400.
+
+```bash
+curl -s localhost:8787/telemetry
+curl -s -X POST localhost:8787/command -d '{"SetWarp":8.0}'
+curl -s -X POST localhost:8787/command -d '{"SetPaused":true}'
+curl -s -X POST localhost:8787/command \
+  -d '{"ExecuteManeuver":{"node_time":0.0,"delta_v":[0.0,0.1]}}'
+```
+
 ## Notes
 
 - **Headless invariant.** The core's freedom from rendering is verifiable:
