@@ -12,14 +12,13 @@
 use bevy::color::palettes::css;
 use bevy::math::{DVec2, Isometry2d};
 use bevy::prelude::*;
+use sounding_sim::command::{Command, FlightControlPlugin};
 use sounding_sim::diagnostics::SimDiagnosticsPlugin;
 use sounding_sim::orbit::Orbit;
 use sounding_sim::sim::{CentralBody, Craft, OrbitPlugin, SimClock};
 
 /// Pixels per world distance unit.
 const SCALE: f32 = 220.0;
-const MIN_WARP: f64 = 0.25;
-const MAX_WARP: f64 = 256.0;
 const DV_STEP: f64 = 0.02;
 
 fn main() {
@@ -42,6 +41,7 @@ fn main() {
             central_body,
             initial_orbit,
         })
+        .add_plugins(FlightControlPlugin)
         .add_plugins(SimDiagnosticsPlugin)
         .init_resource::<ManeuverPlan>()
         .add_systems(Startup, setup)
@@ -78,18 +78,19 @@ fn prograde_delta_v(orbit: &Orbit, t: f64, mag: f64) -> Option<DVec2> {
     (dir != DVec2::ZERO).then_some(dir * mag)
 }
 
-fn time_warp_input(keys: Res<ButtonInput<KeyCode>>, mut clock: ResMut<SimClock>) {
+fn time_warp_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    clock: Res<SimClock>,
+    mut commands: MessageWriter<Command>,
+) {
     if keys.just_pressed(KeyCode::Space) {
-        clock.paused = !clock.paused;
-        info!("paused: {}", clock.paused);
+        commands.write(Command::SetPaused(!clock.paused));
     }
     if keys.just_pressed(KeyCode::Period) {
-        clock.warp = (clock.warp * 2.0).min(MAX_WARP);
-        info!("warp: {}x", clock.warp);
+        commands.write(Command::SetWarp(clock.warp * 2.0));
     }
     if keys.just_pressed(KeyCode::Comma) {
-        clock.warp = (clock.warp / 2.0).max(MIN_WARP);
-        info!("warp: {}x", clock.warp);
+        commands.write(Command::SetWarp(clock.warp / 2.0));
     }
 }
 
@@ -97,9 +98,10 @@ fn maneuver_input(
     keys: Res<ButtonInput<KeyCode>>,
     clock: Res<SimClock>,
     mut plan: ResMut<ManeuverPlan>,
-    mut craft: Query<&mut Craft>,
+    craft: Query<&Craft>,
+    mut commands: MessageWriter<Command>,
 ) {
-    let Ok(mut craft) = craft.single_mut() else {
+    let Ok(craft) = craft.single() else {
         return;
     };
 
@@ -125,19 +127,13 @@ fn maneuver_input(
         info!("prograde dv: {:+.3}", plan.prograde_dv);
     }
     if keys.just_pressed(KeyCode::Enter) {
-        match prograde_delta_v(&craft.orbit, plan.node_time, plan.prograde_dv)
-            .and_then(|dv| craft.orbit.with_maneuver(plan.node_time, dv))
-        {
-            Some(new_orbit) => {
-                craft.orbit = new_orbit;
-                plan.active = false;
-                info!(
-                    "maneuver executed; periapsis {:.3}, apoapsis {:.3}",
-                    new_orbit.periapsis_radius(),
-                    new_orbit.apoapsis_radius()
-                );
-            }
-            None => warn!("maneuver would make the orbit unbound; ignored"),
+        // Emit a command; the core executor applies it (or rejects an unbound burn).
+        if let Some(delta_v) = prograde_delta_v(&craft.orbit, plan.node_time, plan.prograde_dv) {
+            commands.write(Command::ExecuteManeuver {
+                node_time: plan.node_time,
+                delta_v,
+            });
+            plan.active = false;
         }
     }
 }
