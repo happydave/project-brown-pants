@@ -63,10 +63,7 @@ impl Brain for NavigatorBrain {
         let dv_mag = v_circ - speed;
         let delta_v = DVec2::new(craft.velocity[0], craft.velocity[1]).normalize_or_zero() * dv_mag;
         Decision::Act(
-            Command::ExecuteManeuver {
-                node_time: t.time,
-                delta_v,
-            },
+            Command::ExecuteManeuver { delta_v },
             format!("At apoapsis. Circularizing with a {dv_mag:.4} prograde burn."),
         )
     }
@@ -119,8 +116,8 @@ mod tests {
         let t_apo = orbit.period() / 2.0; // half a period from periapsis
         let mut brain = NavigatorBrain;
         match brain.decide(&telemetry_at(&orbit, t_apo)) {
-            Decision::Act(Command::ExecuteManeuver { node_time, delta_v }, _) => {
-                let after = orbit.with_maneuver(node_time, delta_v).unwrap();
+            Decision::Act(Command::ExecuteManeuver { delta_v }, _) => {
+                let after = orbit.with_maneuver(t_apo, delta_v).unwrap();
                 assert!(
                     after.eccentricity < 1e-3,
                     "burn should circularize, got e={}",

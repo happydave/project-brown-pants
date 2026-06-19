@@ -65,7 +65,6 @@ fn setup(mut commands: Commands) {
 #[derive(Resource, Default)]
 struct ManeuverPlan {
     active: bool,
-    node_time: f64,
     prograde_dv: f64,
 }
 
@@ -111,11 +110,10 @@ fn maneuver_input(
     if keys.just_pressed(KeyCode::KeyM) {
         plan.active = !plan.active;
         if plan.active {
-            plan.node_time = clock.time;
             plan.prograde_dv = 0.0;
-            info!("maneuver node placed at t={:.2}", plan.node_time);
+            info!("maneuver planned (burn now); Up/Down to size, Enter to execute");
         } else {
-            info!("maneuver node cleared");
+            info!("maneuver cleared");
         }
     }
     if !plan.active {
@@ -130,12 +128,9 @@ fn maneuver_input(
         info!("prograde dv: {:+.3}", plan.prograde_dv);
     }
     if keys.just_pressed(KeyCode::Enter) {
-        // Emit a command; the core executor applies it (or rejects an unbound burn).
-        if let Some(delta_v) = prograde_delta_v(&craft.orbit, plan.node_time, plan.prograde_dv) {
-            commands.write(Command::ExecuteManeuver {
-                node_time: plan.node_time,
-                delta_v,
-            });
+        // Emit a command; the core executor applies it now (or rejects an unbound burn).
+        if let Some(delta_v) = prograde_delta_v(&craft.orbit, clock.time, plan.prograde_dv) {
+            commands.write(Command::ExecuteManeuver { delta_v });
             plan.active = false;
         }
     }
@@ -173,12 +168,12 @@ fn draw(
     // Maneuver node and its predicted orbit.
     if plan.active {
         gizmos.circle_2d(
-            Isometry2d::from_translation(world_to_screen(orbit.position(plan.node_time))),
+            Isometry2d::from_translation(world_to_screen(orbit.position(clock.time))),
             5.0,
             css::YELLOW,
         );
-        if let Some(preview) = prograde_delta_v(orbit, plan.node_time, plan.prograde_dv)
-            .and_then(|dv| orbit.with_maneuver(plan.node_time, dv))
+        if let Some(preview) = prograde_delta_v(orbit, clock.time, plan.prograde_dv)
+            .and_then(|dv| orbit.with_maneuver(clock.time, dv))
         {
             gizmos.linestrip_2d(closed_path(&preview), css::LIME);
         }

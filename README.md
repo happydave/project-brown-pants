@@ -60,7 +60,7 @@ curl -s localhost:8787/telemetry
 curl -s -X POST localhost:8787/command -d '{"SetWarp":8.0}'
 curl -s -X POST localhost:8787/command -d '{"SetPaused":true}'
 curl -s -X POST localhost:8787/command \
-  -d '{"ExecuteManeuver":{"node_time":0.0,"delta_v":[0.0,0.1]}}'
+  -d '{"ExecuteManeuver":{"delta_v":[0.0,0.1]}}'
 ```
 
 ## AI companion

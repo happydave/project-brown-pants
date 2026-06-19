@@ -30,8 +30,9 @@ pub enum Command {
     SetWarp(f64),
     /// Pause or resume simulated time.
     SetPaused(bool),
-    /// Execute an impulsive maneuver: a world-frame delta-v at a node time.
-    ExecuteManeuver { node_time: f64, delta_v: DVec2 },
+    /// Execute an impulsive maneuver now: a world-frame delta-v applied at the
+    /// current instant and craft state (changes velocity, not position).
+    ExecuteManeuver { delta_v: DVec2 },
 }
 
 /// Applies a single command to the simulation. Pure and deterministic — the only
@@ -47,8 +48,8 @@ pub fn apply_command(cmd: &Command, clock: &mut SimClock, orbit: Option<&mut Orb
             clock.paused = p;
             true
         }
-        Command::ExecuteManeuver { node_time, delta_v } => {
-            match orbit.and_then(|o| o.with_maneuver(node_time, delta_v).map(|new| (o, new))) {
+        Command::ExecuteManeuver { delta_v } => {
+            match orbit.and_then(|o| o.with_maneuver(clock.time, delta_v).map(|new| (o, new))) {
                 Some((o, new)) => {
                     *o = new;
                     true
@@ -118,7 +119,6 @@ mod tests {
         let apo_before = orbit.apoapsis_radius();
         let ok = apply_command(
             &Command::ExecuteManeuver {
-                node_time: 0.0,
                 delta_v: DVec2::new(0.0, 0.1),
             },
             &mut clock,
@@ -131,7 +131,6 @@ mod tests {
         let snapshot = orbit2;
         let rejected = apply_command(
             &Command::ExecuteManeuver {
-                node_time: 0.0,
                 delta_v: DVec2::new(0.0, 5.0),
             },
             &mut clock,
@@ -145,11 +144,35 @@ mod tests {
     }
 
     #[test]
+    fn maneuver_keeps_position_continuous() {
+        // Applied at the current instant, an impulsive burn changes velocity, not
+        // position — so the craft does not jump.
+        let mut clock = SimClock {
+            time: 2.3,
+            warp: 1.0,
+            paused: false,
+        };
+        let mut orbit = circular();
+        let before = orbit.position(clock.time);
+        apply_command(
+            &Command::ExecuteManeuver {
+                delta_v: DVec2::new(0.05, 0.1),
+            },
+            &mut clock,
+            Some(&mut orbit),
+        );
+        let after = orbit.position(clock.time);
+        assert!(
+            (after - before).length() < 1e-9,
+            "position must be continuous across a burn"
+        );
+    }
+
+    #[test]
     fn maneuver_without_craft_is_noop() {
         let mut clock = SimClock::default();
         let applied = apply_command(
             &Command::ExecuteManeuver {
-                node_time: 0.0,
                 delta_v: DVec2::ZERO,
             },
             &mut clock,
@@ -164,7 +187,6 @@ mod tests {
             Command::SetWarp(4.0),
             Command::SetPaused(true),
             Command::ExecuteManeuver {
-                node_time: 1.5,
                 delta_v: DVec2::new(0.1, -0.2),
             },
         ] {
