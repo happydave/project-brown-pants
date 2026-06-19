@@ -3,11 +3,13 @@ resolver = "2"
 members = ["crates/sim", "crates/app"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 
 [workspace.dependencies]
 bevy = "0.18.1"
 bevy_app = "0.18.1"
 bevy_ecs = "0.18.1"
+bevy_time = "0.18.1"
+glam = "0.30"
 sounding_sim = { path = "crates/sim" }

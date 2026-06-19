@@ -32,6 +32,17 @@ live in the project's `tickets` repository under `docs/projects/sounding/`.
 - Test the headless core (no display required): `cargo test -p sounding_sim`
 - Quality gates: `cargo fmt --all --check` and `cargo clippy --all-targets`
 
+## Toy 1 — orbit playground
+
+`cargo run -p sounding` opens a 2D scene: an orange central body, a grey orbit,
+and an aqua craft propagated analytically (patched-conic, on-rails). Controls:
+
+- `.` / `,` — increase / decrease time warp
+- `Space` — pause / resume
+- `M` — place / clear a maneuver node at the craft
+- `Up` / `Down` — adjust prograde / retrograde delta-v (preview orbit shown in lime)
+- `Enter` — execute the maneuver
+
 ## Notes
 
 - **Headless invariant.** The core's freedom from rendering is verifiable:

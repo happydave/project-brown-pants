@@ -4552,7 +4552,7 @@ dependencies = [
 
 [[package]]
 name = "sounding"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bevy",
  "sounding_sim",
@@ -4560,10 +4560,12 @@ dependencies = [
 
 [[package]]
 name = "sounding_sim"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bevy_app",
  "bevy_ecs",
+ "bevy_time",
+ "glam",
 ]
 
 [[package]]
