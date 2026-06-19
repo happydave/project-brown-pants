@@ -10,7 +10,7 @@ use bevy::diagnostic::DiagnosticsStore;
 use bevy::prelude::*;
 use sounding_sim::command::Command;
 use sounding_sim::diagnostics::ENERGY_DRIFT;
-use sounding_sim::sim::{Craft, SimClock};
+use sounding_sim::sim::{CentralBody, Craft, SimClock};
 use sounding_sim::telemetry::Telemetry;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -99,12 +99,13 @@ fn handle_request(
 fn publish_telemetry(
     bus: Res<BusTelemetry>,
     clock: Res<SimClock>,
+    body: Res<CentralBody>,
     craft: Query<&Craft>,
     diagnostics: Res<DiagnosticsStore>,
 ) {
     let orbit = craft.single().ok().map(|c| c.orbit);
     let energy_drift = diagnostics.get(&ENERGY_DRIFT).and_then(|d| d.value());
-    let snapshot = Telemetry::capture(&clock, orbit.as_ref(), energy_drift);
+    let snapshot = Telemetry::capture(&clock, orbit.as_ref(), body.mu, energy_drift);
     if let (Ok(json), Ok(mut slot)) = (serde_json::to_string(&snapshot), bus.0.lock()) {
         *slot = json;
     }

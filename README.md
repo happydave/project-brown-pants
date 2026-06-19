@@ -63,6 +63,19 @@ curl -s -X POST localhost:8787/command \
   -d '{"ExecuteManeuver":{"node_time":0.0,"delta_v":[0.0,0.1]}}'
 ```
 
+## AI companion
+
+`cargo run -p companion` starts an external agent that flies the craft through
+the bus alone — it only reads `GET /telemetry` and issues `POST /command`,
+reasoning purely from exposed telemetry (no privileged access). The shipped
+deterministic navigator circularizes the orbit (coast to apoapsis, then a
+prograde burn), narrating as it goes. The decision logic sits behind a `Brain`
+trait, so an LLM-backed brain can replace it without changing the bus loop.
+
+Run `cargo run -p sounding` first, then `cargo run -p companion` in a second
+terminal. For a dramatic before/after, make the orbit eccentric in the app
+(`M` → `↑` a few times → `Enter`) before starting the companion.
+
 ## Notes
 
 - **Headless invariant.** The core's freedom from rendering is verifiable:

@@ -1,0 +1,11 @@
+[package]
+name = "companion"
+version.workspace = true
+edition.workspace = true
+description = "Sounding AI companion — an external agent that flies the craft over the bus."
+
+[dependencies]
+sounding_sim = { workspace = true }
+glam = { workspace = true }
+serde_json = { workspace = true }
+ureq = "3"
