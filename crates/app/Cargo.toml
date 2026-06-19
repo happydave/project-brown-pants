@@ -1,0 +1,20 @@
+[package]
+name = "sounding"
+version.workspace = true
+edition.workspace = true
+description = "Sounding application — windowed Bevy app wrapping the simulation core."
+
+[[bin]]
+name = "sounding"
+path = "src/main.rs"
+
+[features]
+# Dev-only Bevy Remote Protocol (BRP) over HTTP. Off by default and in release.
+# INVARIANT (WI 496): BRP is compiled only when this feature is enabled.
+# The HTTP transport (RemoteHttpPlugin) ships inside the `bevy_remote` feature
+# itself; the umbrella `bevy/http` feature is unrelated (a bevy_asset web source).
+dev = ["bevy/bevy_remote"]
+
+[dependencies]
+bevy = { workspace = true }
+sounding_sim = { workspace = true }

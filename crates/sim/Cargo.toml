@@ -1,0 +1,14 @@
+[package]
+name = "sounding_sim"
+version.workspace = true
+edition.workspace = true
+description = "Sounding simulation core — headless, rendering-free."
+
+[dependencies]
+# INVARIANT (WI 496): this crate is rendering-free. It depends on Bevy SUB-CRATES,
+# not the `bevy` umbrella. The umbrella unifies features across the workspace and
+# would drag bevy_winit/bevy_render in from the application crate; depending on the
+# sub-crates keeps this crate's dependency graph provably free of rendering and
+# windowing (verify: `cargo tree -p sounding_sim` shows no bevy_render/bevy_winit).
+bevy_app = { workspace = true }
+bevy_ecs = { workspace = true }
