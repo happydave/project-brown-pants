@@ -32,16 +32,22 @@ live in the project's `tickets` repository under `docs/projects/sounding/`.
 - Test the headless core (no display required): `cargo test -p sounding_sim`
 - Quality gates: `cargo fmt --all --check` and `cargo clippy --all-targets`
 
-## Toy 1 — orbit playground
+## Toy 4 — floating origin + atmosphere
 
-`cargo run -p sounding` opens a 2D scene: an orange central body, a grey orbit,
-and an aqua craft propagated analytically (patched-conic, on-rails). Controls:
+`cargo run -p sounding` opens a 3D scene: a planetary-scale planet, a small craft
+at the surface, and Bevy's physically-based atmosphere. Authoritative positions
+are f64 (world coordinates); a floating origin keeps the focus near the render
+origin so the planet (radius ~6.36×10⁶ m) and a metres-scale craft coexist
+without f32 precision loss. Controls:
 
-- `.` / `,` — increase / decrease time warp
-- `Space` — pause / resume
-- `M` — place / clear a maneuver node at the craft
-- `Up` / `Down` — adjust prograde / retrograde delta-v (preview orbit shown in lime)
-- `Enter` — execute the maneuver
+- `W` / `S`, `A` / `D` — fly forward / back, strafe
+- `R` / `F` — ascend / descend (fly from the surface up to orbit)
+- Arrow keys — look (yaw / pitch)
+- `P` — pause / resume the sun (the terminator sweep)
+
+Fly up (`R`) to orbit and watch the sun sweep an orbital sunrise; fly back down
+(`F`) to confirm the craft renders jitter-free. The on-rails orbit (Toy 1) and
+the runtime bus (Toys 2–3) keep running headless behind the scene.
 
 ## Runtime bus
 
@@ -52,8 +58,8 @@ sync — adapt onto. It is distinct from the dev-only Bevy Remote Protocol.
 
 - `GET /telemetry` — current simulation snapshot as JSON (time, warp, paused,
   craft orbit and position, energy-drift metric).
-- `POST /command` — inject a JSON command into the same executor the keyboard
-  uses; malformed input returns HTTP 400.
+- `POST /command` — inject a JSON command into the flight-control executor;
+  malformed input returns HTTP 400.
 
 ```bash
 curl -s localhost:8787/telemetry
@@ -73,8 +79,9 @@ prograde burn), narrating as it goes. The decision logic sits behind a `Brain`
 trait, so an LLM-backed brain can replace it without changing the bus loop.
 
 Run `cargo run -p sounding` first, then `cargo run -p companion` in a second
-terminal. For a dramatic before/after, make the orbit eccentric in the app
-(`M` → `↑` a few times → `Enter`) before starting the companion.
+terminal. The app starts on a mildly eccentric orbit, so the navigator has a
+visible circularization to perform; watch its narration in the companion's
+terminal (the orbit runs headless behind the 3D scene).
 
 ## Notes
 
