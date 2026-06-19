@@ -15,7 +15,8 @@ bevy_ecs = { workspace = true }
 bevy_time = { workspace = true }
 bevy_diagnostic = { workspace = true }
 bevy_log = { workspace = true }
-# f64 2D vector math (DVec2). Same glam version Bevy uses, so no duplicate build.
+# f64 vector math (DVec2 for orbits, DVec3 for world coordinates). Same glam
+# version Bevy uses, so no duplicate build.
 # Rendering-free — does not affect the headless invariant. `serde` feature is for
 # the command envelope / telemetry serialization (WI 502).
 glam = { workspace = true }

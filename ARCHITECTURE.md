@@ -2,7 +2,7 @@
 
 - Rust: stable via rustup (developed on 1.96), edition 2021.
 - Bevy: 0.18.1. The simulation core uses Bevy **sub-crates** only; the app uses the `bevy` umbrella.
-- Key deps: `glam` 0.30 (f64 math, `serde` feature), `bevy_app`/`bevy_ecs`/`bevy_time`/`bevy_diagnostic`/`bevy_log` 0.18, `serde` 1, `serde_json` 1, `tiny_http` 0.12 (app bus), `ureq` 3 (companion).
+- Key deps: `glam` 0.30 (f64 math — `DVec2` orbits, `DVec3` world coordinates; `serde` feature), `bevy_app`/`bevy_ecs`/`bevy_time`/`bevy_diagnostic`/`bevy_log` 0.18, `serde` 1, `serde_json` 1, `tiny_http` 0.12 (app bus), `ureq` 3 (companion).
 - Workspace: virtual manifest at `/Cargo.toml`; members `/crates/sim`, `/crates/app`, `/crates/companion`. One `[workspace.package]` version, bumped one patch per work item.
 
 ## Architectural Boundaries
@@ -21,6 +21,9 @@ Required: the Bevy Remote Protocol is compiled only under the app's `dev` featur
   - `/crates/sim/src/command.rs` — `Command` (serde message envelope), `apply_command`, `FlightControlPlugin`. Inputs: `Command` messages. Outputs: the only writes to `SimClock`/`Craft`.
   - `/crates/sim/src/diagnostics.rs` — `SimDiagnosticsPlugin`, conservation-drift metrics. Inputs: clock + craft. Outputs: Bevy diagnostics (`sim/energy_drift`, `sim/angular_momentum_drift`).
   - `/crates/sim/src/telemetry.rs` — `Telemetry`/`CraftTelemetry` serde snapshot + `capture`. Inputs: clock, orbit, μ, drift. Outputs: serializable snapshot.
+  - `/crates/sim/src/frame.rs` — `FrameId` (body-centered inertial frame identity), `WorldPos`/`WorldVel` (f64 `DVec3`, frame-tagged). `WorldPos::transform_to` is identity for the single frame today and is the documented seam for multi-body SOI transforms (WI 508) and floating-origin rebasing (WI 504). Foundational coordinate substrate (WI 497).
+  - `/crates/sim/src/fluid.rs` — `FluidMedium` (data-driven atmosphere+ocean profile), `FluidSample`, `MediumKind`. A field sampled by signed altitude (`sample_altitude`) or world position (`sample_at`): one shape, different constants for vacuum/air/ocean. Canonical instances `VACUUM`, `EARTHLIKE`. Consumed later by aero/hydro and flooding (WI 497).
+  - `/crates/sim/src/surface.rs` — `SurfaceMaterial` (friction + rolling-resistance coefficients) with `REGOLITH`/`BEDROCK`/`ICE`. The ground-contact parallel to the fluid field; consumed later by the wheel/contact model (WI 506). Foundational (WI 497).
 - **sounding** `/crates/app/` — the windowed application (binary `sounding`).
   - `/crates/app/src/main.rs` — `DefaultPlugins` + sim plugins; 2D gizmo renderer; keyboard input → `Command` messages. Inputs: keyboard. Outputs: rendered window; `Command` messages.
   - `/crates/app/src/bus.rs` — `BusPlugin`: a `tiny_http` server (default `127.0.0.1:8787`) on its own thread, bridged by channels. Inputs: HTTP GET/POST. Outputs: telemetry JSON; `Command` messages into the executor.
@@ -47,6 +50,7 @@ Command lifecycle (the one to know):
 
 ## Known Gaps (not yet built)
 
-- Only the on-rails (analytic) gear exists. The active/numerical gear, the warp-gearbox hand-off, and floating origin are not built (see the design's Validation Roadmap, Toys 4–9).
+- Only the on-rails (analytic) gear exists. The active/numerical gear and the warp-gearbox hand-off are not built (see the design's Validation Roadmap, Toys 4–9).
+- The f64 3D world-coordinate + reference-frame substrate and the data-driven fluid/surface field types exist (WI 497, `frame.rs`/`fluid.rs`/`surface.rs`), but nothing wires them into the live universe yet: floating-origin *rebasing* (WI 504), the 2D-orbit→3D-world bridge, and the field *consumers* (aero/hydro, wheels) are not built. The orbit propagator remains 2D.
 - The hand-off-discontinuity and contact-jitter diagnostics are documented placeholders awaiting their systems.
 - Conceptual architecture, rationale, and the roadmap live in the **design doc**, not here: `/home/dave/Documents/tickets/docs/projects/sounding/design.md` (scope + backlog in `project.md` alongside it).

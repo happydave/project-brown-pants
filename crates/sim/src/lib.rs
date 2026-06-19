@@ -8,8 +8,11 @@
 
 pub mod command;
 pub mod diagnostics;
+pub mod fluid;
+pub mod frame;
 pub mod orbit;
 pub mod sim;
+pub mod surface;
 pub mod telemetry;
 
 use bevy_app::prelude::*;
