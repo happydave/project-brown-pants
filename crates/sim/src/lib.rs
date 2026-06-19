@@ -15,6 +15,7 @@ pub mod persist;
 pub mod sim;
 pub mod surface;
 pub mod telemetry;
+pub mod voxel;
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;

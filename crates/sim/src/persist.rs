@@ -18,6 +18,7 @@
 //! that later toys fill in (a future format-version change).
 
 use crate::frame::WorldPos;
+use crate::voxel::VoxelCraft;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -36,53 +37,46 @@ pub enum Kind {
     WorldSave,
 }
 
-/// Reserved, extensible contents of a craft subgraph. Empty at format version 1;
-/// later toys replace the opaque element type with the real voxel / device /
-/// resource / crew schema (a future format-version change). Round-trips empty.
-#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
-pub struct SubgraphContents {
-    /// Structural voxel/beam/plate lattice (Toy 5).
-    #[serde(default)]
-    pub lattice: Vec<serde_json::Value>,
-    /// Mounted functional devices (Toy 5+).
-    #[serde(default)]
-    pub devices: Vec<serde_json::Value>,
-    /// Resource reservoirs / converters / conduits (Toy 7).
-    #[serde(default)]
-    pub resources: Vec<serde_json::Value>,
-    /// Assigned crew (later).
-    #[serde(default)]
-    pub crew: Vec<serde_json::Value>,
-}
-
 /// A craft-scope serialized subgraph. A craft, a subassembly, and a blueprint are
 /// the **same shape** at different scopes; the [`Payload`] kind distinguishes them.
+///
+/// At format version 1 the voxel/device contents are real (WI 505), filled in
+/// place over WI 498's previously-opaque placeholders. The `resources` and `crew`
+/// containers remain reserved (opaque `Value`s, empty) until their toys.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CraftSubgraph {
     /// Stable identifier.
     pub id: String,
     /// Human-facing display name.
     pub name: String,
-    /// A real WI 497 world-coordinate value — proves the field types integrate
-    /// with the format and gives a craft a place in space.
+    /// A WI 497 world-coordinate value — the craft's reference placement.
     pub reference_position: WorldPos,
-    /// Reserved, extensible contents (empty at version 1).
+    /// The voxel lattice + devices + attachment interface (WI 505).
     #[serde(default)]
-    pub contents: SubgraphContents,
+    pub craft: VoxelCraft,
+    /// Reserved: resource reservoirs / converters / conduits (Toy 7).
+    #[serde(default)]
+    pub resources: Vec<serde_json::Value>,
+    /// Reserved: assigned crew (later).
+    #[serde(default)]
+    pub crew: Vec<serde_json::Value>,
 }
 
 impl CraftSubgraph {
-    /// Builds a craft subgraph with empty (version-1) contents.
+    /// Builds a craft subgraph carrying `craft`.
     pub fn new(
         id: impl Into<String>,
         name: impl Into<String>,
         reference_position: WorldPos,
+        craft: VoxelCraft,
     ) -> Self {
         Self {
             id: id.into(),
             name: name.into(),
             reference_position,
-            contents: SubgraphContents::default(),
+            craft,
+            resources: Vec::new(),
+            crew: Vec::new(),
         }
     }
 }
@@ -205,16 +199,31 @@ impl std::error::Error for FormatError {}
 mod tests {
     use super::*;
     use crate::frame::FrameId;
-    use glam::DVec3;
+    use crate::voxel::{Material, Voxel};
+    use glam::{DVec3, IVec3};
 
     fn sample_pos() -> WorldPos {
         WorldPos::new(FrameId::CENTRAL_BODY, DVec3::new(1.0, 2.0, 3.0))
     }
 
+    fn sample_craft() -> VoxelCraft {
+        let mut craft = VoxelCraft::new(1.0);
+        craft.voxels.push(Voxel {
+            cell: IVec3::ZERO,
+            material: Material::ALUMINIUM,
+        });
+        craft
+    }
+
     #[test]
     fn craft_round_trips_preserving_version_and_kind() {
         let pos = sample_pos();
-        let doc = SavedDocument::new(Payload::Craft(CraftSubgraph::new("ship-1", "Ranger", pos)));
+        let doc = SavedDocument::new(Payload::Craft(CraftSubgraph::new(
+            "ship-1",
+            "Ranger",
+            pos,
+            sample_craft(),
+        )));
         let json = doc.to_json().unwrap();
         let back = SavedDocument::from_json(&json).unwrap();
         assert_eq!(doc, back);
@@ -226,9 +235,9 @@ mod tests {
     fn all_four_kinds_round_trip_through_one_envelope() {
         let pos = sample_pos();
         let payloads = [
-            Payload::Craft(CraftSubgraph::new("c", "C", pos)),
-            Payload::Subassembly(CraftSubgraph::new("s", "S", pos)),
-            Payload::Blueprint(CraftSubgraph::new("b", "B", pos)),
+            Payload::Craft(CraftSubgraph::new("c", "C", pos, sample_craft())),
+            Payload::Subassembly(CraftSubgraph::new("s", "S", pos, sample_craft())),
+            Payload::Blueprint(CraftSubgraph::new("b", "B", pos, sample_craft())),
             Payload::WorldSave(WorldPayload::default()),
         ];
         for p in payloads {
@@ -243,7 +252,7 @@ mod tests {
     #[test]
     fn craft_subassembly_blueprint_share_the_subgraph_payload() {
         let pos = sample_pos();
-        let cs = CraftSubgraph::new("x", "X", pos);
+        let cs = CraftSubgraph::new("x", "X", pos, sample_craft());
         // Same shape carried by three kinds.
         for payload in [
             Payload::Craft(cs.clone()),
@@ -298,18 +307,23 @@ mod tests {
     }
 
     #[test]
-    fn skeletal_payload_embeds_worldpos_and_empty_containers() {
+    fn payload_embeds_worldpos_voxels_and_reserved_containers() {
         let pos = sample_pos();
-        let doc = SavedDocument::new(Payload::Craft(CraftSubgraph::new("id", "Name", pos)));
+        let doc = SavedDocument::new(Payload::Craft(CraftSubgraph::new(
+            "id",
+            "Name",
+            pos,
+            sample_craft(),
+        )));
         let back = SavedDocument::from_json(&doc.to_json().unwrap()).unwrap();
         let Payload::Craft(c) = &back.payload else {
             panic!("expected craft");
         };
         assert_eq!(c.reference_position, pos);
-        assert!(c.contents.lattice.is_empty());
-        assert!(c.contents.devices.is_empty());
-        assert!(c.contents.resources.is_empty());
-        assert!(c.contents.crew.is_empty());
+        // Real voxel content round-trips; resources/crew stay reserved (empty).
+        assert_eq!(c.craft.voxels.len(), 1);
+        assert!(c.resources.is_empty());
+        assert!(c.crew.is_empty());
     }
 
     #[test]
@@ -318,6 +332,7 @@ mod tests {
             "id",
             "Name",
             sample_pos(),
+            sample_craft(),
         )));
         let json = doc.to_json().unwrap();
         assert!(json.contains("format_version"));

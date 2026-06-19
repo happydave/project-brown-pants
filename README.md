@@ -32,22 +32,24 @@ live in the project's `tickets` repository under `docs/projects/sounding/`.
 - Test the headless core (no display required): `cargo test -p sounding_sim`
 - Quality gates: `cargo fmt --all --check` and `cargo clippy --all-targets`
 
-## Toy 4 — floating origin + atmosphere
+## Toy 5 — voxel ship editor
 
-`cargo run -p sounding` opens a 3D scene: a planetary-scale planet, a small craft
-at the surface, and Bevy's physically-based atmosphere. Authoritative positions
-are f64 (world coordinates); a floating origin keeps the focus near the render
-origin so the planet (radius ~6.36×10⁶ m) and a metres-scale craft coexist
-without f32 precision loss. Controls:
+`cargo run -p sounding` opens the voxel editor: build a craft from voxels and
+devices and watch its centre of mass, principal inertia axes, and aero
+cross-sectional-area curve update live (all derived from the same voxels). A
+craft saves and loads as a blueprint or a reusable subassembly through the
+versioned serialization format. Editor controls:
 
-- `W` / `S`, `A` / `D` — fly forward / back, strafe
-- `R` / `F` — ascend / descend (fly from the surface up to orbit)
-- Arrow keys — look (yaw / pitch)
-- `P` — pause / resume the sun (the terminator sweep)
+- Arrow keys / `PageUp`·`PageDown` — move the build cursor (X/Z, then Y)
+- `Space` add a voxel · `Backspace` remove voxel/device · `Tab` cycle material
+- `G` place a device · `M` log mass properties
+- `B` save blueprint · `N` save subassembly · `L` load subassembly · `V` insert it at the cursor
 
-Fly up (`R`) to orbit and watch the sun sweep an orbital sunrise; fly back down
-(`F`) to confirm the craft renders jitter-free. The on-rails orbit (Toy 1) and
-the runtime bus (Toys 2–3) keep running headless behind the scene.
+Camera: `Q`/`E` orbit · `R`/`F` pitch · `Z`/`C` zoom. The magenta marker is the
+centre of mass, the RGB lines are the principal inertia axes, and the cyan plot
+is the cross-section curve. Earlier toys keep running headless: the on-rails
+orbit (Toy 1) and the runtime bus (Toys 2–3); the Toy 4 floating-origin planet
+scene is retired as the default but its code remains.
 
 ## Runtime bus
 

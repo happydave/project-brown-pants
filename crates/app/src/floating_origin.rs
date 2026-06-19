@@ -10,6 +10,10 @@
 //! viewing altitude from the camera's Y. So the anchor rebases the **horizontal
 //! plane (X, Z) only** and leaves Y as the true altitude — the camera is pinned
 //! to the render origin in X/Z while the world moves around it.
+//!
+//! Retained (Toy 5 shows the editor, not the planet) for when in-world flight
+//! returns; its unit tests still run.
+#![allow(dead_code)]
 
 use bevy::math::DVec3;
 use bevy::prelude::*;
