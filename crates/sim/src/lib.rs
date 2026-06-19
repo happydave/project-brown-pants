@@ -13,6 +13,7 @@ pub mod fluid;
 pub mod frame;
 pub mod orbit;
 pub mod persist;
+pub mod resource;
 pub mod rover;
 pub mod sim;
 pub mod surface;
