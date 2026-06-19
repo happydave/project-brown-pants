@@ -48,8 +48,12 @@ versioned serialization format. Editor controls:
 Camera: `Q`/`E` orbit · `R`/`F` pitch · `Z`/`C` zoom. The magenta marker is the
 centre of mass, the RGB lines are the principal inertia axes, and the cyan plot
 is the cross-section curve. Earlier toys keep running headless: the on-rails
-orbit (Toy 1) and the runtime bus (Toys 2–3); the Toy 4 floating-origin planet
-scene is retired as the default but its code remains.
+orbit (Toy 1) and the runtime bus (Toys 2–3).
+
+The app selects a toy scene at launch:
+
+- `cargo run -p sounding` — the Toy 5 voxel editor (default)
+- `cargo run -p sounding -- planet` — the Toy 4 floating-origin planet + atmosphere
 
 ## Runtime bus
 

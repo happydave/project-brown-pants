@@ -63,7 +63,76 @@ pub struct EditorPlugin;
 impl Plugin for EditorPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<EditorState>()
-            .add_systems(Update, (editor_input, draw_editor));
+            .init_resource::<OrbitCam>()
+            .add_systems(Startup, setup_view)
+            .add_systems(Update, (editor_input, draw_editor, orbit_camera));
+    }
+}
+
+/// Orbit-camera state: yaw, pitch, and distance about the craft.
+#[derive(Resource)]
+struct OrbitCam {
+    yaw: f32,
+    pitch: f32,
+    dist: f32,
+}
+
+impl Default for OrbitCam {
+    fn default() -> Self {
+        Self {
+            yaw: 0.7,
+            pitch: 0.5,
+            dist: 14.0,
+        }
+    }
+}
+
+fn setup_view(mut commands: Commands) {
+    commands.spawn((Camera3d::default(), Transform::default()));
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 6_000.0,
+            ..default()
+        },
+        Transform::from_xyz(6.0, 12.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
+}
+
+/// Keyboard orbit camera, always framing the editor's build volume.
+fn orbit_camera(
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut cam: ResMut<OrbitCam>,
+    mut camera: Query<&mut Transform, With<Camera3d>>,
+) {
+    let dt = time.delta_secs();
+    if keys.pressed(KeyCode::KeyQ) {
+        cam.yaw += dt;
+    }
+    if keys.pressed(KeyCode::KeyE) {
+        cam.yaw -= dt;
+    }
+    if keys.pressed(KeyCode::KeyR) {
+        cam.pitch = (cam.pitch + dt).clamp(0.05, 1.5);
+    }
+    if keys.pressed(KeyCode::KeyF) {
+        cam.pitch = (cam.pitch - dt).clamp(0.05, 1.5);
+    }
+    if keys.pressed(KeyCode::KeyZ) {
+        cam.dist = (cam.dist - dt * 12.0).max(2.0);
+    }
+    if keys.pressed(KeyCode::KeyC) {
+        cam.dist = (cam.dist + dt * 12.0).min(80.0);
+    }
+
+    let target = Vec3::new(1.5, 0.5, 1.0);
+    let dir = Vec3::new(
+        cam.yaw.cos() * cam.pitch.cos(),
+        cam.pitch.sin(),
+        cam.yaw.sin() * cam.pitch.cos(),
+    );
+    if let Ok(mut tf) = camera.single_mut() {
+        *tf = Transform::from_translation(target + dir * cam.dist).looking_at(target, Vec3::Y);
     }
 }
 
