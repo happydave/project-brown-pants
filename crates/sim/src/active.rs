@@ -115,11 +115,31 @@ impl ActiveBody {
 
         // Torque-free rotation: angular momentum is constant; integrate the
         // orientation quaternion with the derived angular velocity.
+        self.integrate_orientation(dt);
+    }
+
+    /// Advances the body by `dt` under an external **force and torque** (world
+    /// frame), using semi-implicit Euler. This is the integrator for dissipative,
+    /// state-dependent contact forces (wheels, WI 506) — distinct from the
+    /// conservative-gravity velocity-Verlet [`ActiveBody::step`]. The caller adds
+    /// gravity into `force`.
+    pub fn integrate_wrench(&mut self, force: DVec3, torque: DVec3, dt: f64) {
+        if self.mass > 0.0 {
+            self.velocity += (force / self.mass) * dt;
+        }
+        self.position += self.velocity * dt;
+        self.angular_momentum += torque * dt;
+        self.integrate_orientation(dt);
+    }
+
+    /// Integrates the orientation quaternion by `dt` from the derived angular
+    /// velocity (`q̇ = ½ ω ⊗ q`), renormalising.
+    fn integrate_orientation(&mut self, dt: f64) {
         let omega = self.angular_velocity();
         if omega != DVec3::ZERO {
             let omega_q = DQuat::from_xyzw(omega.x, omega.y, omega.z, 0.0);
             let q = self.orientation;
-            let q_dot = omega_q * q; // q̇ = ½ ω⊗q (the ½ is applied below)
+            let q_dot = omega_q * q;
             self.orientation = DQuat::from_xyzw(
                 q.x + 0.5 * dt * q_dot.x,
                 q.y + 0.5 * dt * q_dot.y,

@@ -13,9 +13,11 @@ pub mod fluid;
 pub mod frame;
 pub mod orbit;
 pub mod persist;
+pub mod rover;
 pub mod sim;
 pub mod surface;
 pub mod telemetry;
+pub mod terrain;
 pub mod voxel;
 
 use bevy_app::prelude::*;

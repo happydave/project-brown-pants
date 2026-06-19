@@ -54,6 +54,7 @@ The app selects a toy scene at launch:
 
 - `cargo run -p sounding` — the Toy 5 voxel editor (default)
 - `cargo run -p sounding -- planet` — the Toy 4 floating-origin planet + atmosphere
+- `cargo run -p sounding -- rover` — the Toy 6 rover on terrain (`W`/`S` drive, `A`/`D` steer, `Space` brake; HUD shows speed/height)
 
 ## Runtime bus
 

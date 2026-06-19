@@ -5,6 +5,7 @@
 //!
 //! - `cargo run -p sounding` — Toy 5 voxel ship editor (default)
 //! - `cargo run -p sounding -- planet` — Toy 4 floating-origin planet + atmosphere
+//! - `cargo run -p sounding -- rover` — Toy 6 rover on terrain
 //!
 //! The Toy 1–3 simulation and runtime bus run headless behind whichever scene is
 //! shown, so the companion still works. Per-scene controls are documented in
@@ -21,19 +22,23 @@ mod bus;
 mod editor;
 mod floating_origin;
 mod planet;
+mod rover_scene;
 
 use editor::EditorPlugin;
 use planet::PlanetPlugin;
+use rover_scene::RoverScenePlugin;
 
 /// Which toy scene the windowed app shows.
 enum Scene {
     Editor,
     Planet,
+    Rover,
 }
 
 fn selected_scene() -> Scene {
     match std::env::args().nth(1).as_deref() {
         Some("planet") => Scene::Planet,
+        Some("rover") => Scene::Rover,
         _ => Scene::Editor,
     }
 }
@@ -69,6 +74,9 @@ fn main() {
         }
         Scene::Planet => {
             app.add_plugins(PlanetPlugin);
+        }
+        Scene::Rover => {
+            app.add_plugins(RoverScenePlugin);
         }
     }
 
