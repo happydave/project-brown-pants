@@ -24,6 +24,7 @@ Required: the Bevy Remote Protocol is compiled only under the app's `dev` featur
   - `/crates/sim/src/frame.rs` — `FrameId` (body-centered inertial frame identity), `WorldPos`/`WorldVel` (f64 `DVec3`, frame-tagged). `WorldPos::transform_to` is identity for the single frame today and is the documented seam for multi-body SOI transforms (WI 508) and floating-origin rebasing (WI 504). Foundational coordinate substrate (WI 497).
   - `/crates/sim/src/fluid.rs` — `FluidMedium` (data-driven atmosphere+ocean profile), `FluidSample`, `MediumKind`. A field sampled by signed altitude (`sample_altitude`) or world position (`sample_at`): one shape, different constants for vacuum/air/ocean. Canonical instances `VACUUM`, `EARTHLIKE`. Consumed later by aero/hydro and flooding (WI 497).
   - `/crates/sim/src/surface.rs` — `SurfaceMaterial` (friction + rolling-resistance coefficients) with `REGOLITH`/`BEDROCK`/`ICE`. The ground-contact parallel to the fluid field; consumed later by the wheel/contact model (WI 506). Foundational (WI 497).
+  - `/crates/sim/src/persist.rs` — the **durable, versioned** serialization format (WI 498), distinct from the ephemeral bus. `SavedDocument` (envelope: `format_version` + `Payload`), internally-tagged `Payload` (craft/subassembly/blueprint share `CraftSubgraph`; world-save → `WorldPayload`), `Kind`, `FORMAT_VERSION` (= 1, decoupled from the crate version), typed `FormatError`. `from_json` does a two-stage parse (a version-stable `VersionProbe` reads the version before the payload, so a newer file is rejected by version) and carries the migration seam. Inputs: JSON. Outputs: `SavedDocument` or a typed error. Payloads are skeletal at v1; later toys fill them.
 - **sounding** `/crates/app/` — the windowed application (binary `sounding`).
   - `/crates/app/src/main.rs` — `DefaultPlugins` + sim plugins; 2D gizmo renderer; keyboard input → `Command` messages. Inputs: keyboard. Outputs: rendered window; `Command` messages.
   - `/crates/app/src/bus.rs` — `BusPlugin`: a `tiny_http` server (default `127.0.0.1:8787`) on its own thread, bridged by channels. Inputs: HTTP GET/POST. Outputs: telemetry JSON; `Command` messages into the executor.
@@ -35,8 +36,8 @@ Required: the Bevy Remote Protocol is compiled only under the app's `dev` featur
 
 - `/crates/app/` depends on `/crates/sim/` + the `bevy` umbrella + `tiny_http` + `serde_json`.
 - `/crates/companion/` depends on `/crates/sim/` (shared `Command`/`Telemetry` types) + `ureq` + `serde_json` + `glam`. No Bevy.
-- `/crates/sim/` depends on Bevy sub-crates + `glam` + `serde`. No rendering; no `bevy` umbrella.
-- `Command` and `Telemetry` (`/crates/sim/`) are the shared contract every other crate and the bus depend on — treat changes to them as public-contract changes.
+- `/crates/sim/` depends on Bevy sub-crates + `glam` + `serde` + `serde_json` (the latter for the WI 498 persistence format, in library code now — not just tests). No rendering; no `bevy` umbrella.
+- `Command` and `Telemetry` (`/crates/sim/`) are the shared contract every other crate and the bus depend on — treat changes to them as public-contract changes. The `persist` format (`SavedDocument` + `FORMAT_VERSION`) is a second, **durable** versioned contract: it has its own `FORMAT_VERSION` line (independent of the crate version) and must stay backward-loadable via the two-stage `from_json` migration seam. Do not conflate it with the ephemeral bus.
 
 ## Linear Data Flow
 
@@ -52,5 +53,6 @@ Command lifecycle (the one to know):
 
 - Only the on-rails (analytic) gear exists. The active/numerical gear and the warp-gearbox hand-off are not built (see the design's Validation Roadmap, Toys 4–9).
 - The f64 3D world-coordinate + reference-frame substrate and the data-driven fluid/surface field types exist (WI 497, `frame.rs`/`fluid.rs`/`surface.rs`), but nothing wires them into the live universe yet: floating-origin *rebasing* (WI 504), the 2D-orbit→3D-world bridge, and the field *consumers* (aero/hydro, wheels) are not built. The orbit propagator remains 2D.
+- The versioned persistence format exists (WI 498, `persist.rs`) but its payloads are skeletal: the craft-subgraph contents (lattice/devices/resources/crew) and the world-save payload are reserved empty containers, filled by later toys. There is no save/load-to-disk wiring, no UI, and no migration engine yet (nothing to migrate at format version 1).
 - The hand-off-discontinuity and contact-jitter diagnostics are documented placeholders awaiting their systems.
 - Conceptual architecture, rationale, and the roadmap live in the **design doc**, not here: `/home/dave/Documents/tickets/docs/projects/sounding/design.md` (scope + backlog in `project.md` alongside it).

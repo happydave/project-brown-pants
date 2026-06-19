@@ -11,6 +11,7 @@ pub mod diagnostics;
 pub mod fluid;
 pub mod frame;
 pub mod orbit;
+pub mod persist;
 pub mod sim;
 pub mod surface;
 pub mod telemetry;

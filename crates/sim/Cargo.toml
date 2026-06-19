@@ -21,6 +21,7 @@ bevy_log = { workspace = true }
 # the command envelope / telemetry serialization (WI 502).
 glam = { workspace = true }
 serde = { workspace = true }
-
-[dev-dependencies]
+# JSON encoding for the durable, versioned persistence format (WI 498). Used in
+# library code (not just tests), so it is a normal dependency. Rendering-free —
+# does not affect the headless invariant.
 serde_json = { workspace = true }
