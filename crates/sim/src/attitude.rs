@@ -214,14 +214,28 @@ pub struct AttitudePilot {
 }
 
 impl AttitudePilot {
-    /// Advance one step: assemble the SAS + manual demand, actuate it (wheels then
-    /// RCS), and apply the achieved torque to the body through `integrate_wrench`.
-    pub fn step(&mut self, body: &mut ActiveBody, graph: &mut ResourceGraph, dt: f64) {
+    /// Computes the **world-frame** control torque for this step: assembles the
+    /// SAS-plus-manual demand, actuates it (wheels then RCS, updating wheel momentum
+    /// and drawing propellant), and returns the achieved torque **without
+    /// integrating**. This lets a unified flight step (WI 534) sum it with the other
+    /// forces and integrate once. `step` is this plus the integration.
+    pub fn control_torque(
+        &mut self,
+        body: &ActiveBody,
+        graph: &mut ResourceGraph,
+        dt: f64,
+    ) -> DVec3 {
         let omega = body.angular_velocity();
         let desired =
             self.sas.desired_torque(body.orientation, omega) + self.manual * self.authority;
         let applied_body = self.actuators.actuate(desired, graph, dt);
-        let torque_world = body.orientation * applied_body;
+        body.orientation * applied_body
+    }
+
+    /// Advance one step: apply the [`control_torque`](Self::control_torque) to the
+    /// body through `integrate_wrench`.
+    pub fn step(&mut self, body: &mut ActiveBody, graph: &mut ResourceGraph, dt: f64) {
+        let torque_world = self.control_torque(body, graph, dt);
         body.integrate_wrench(DVec3::ZERO, torque_world, dt);
     }
 
