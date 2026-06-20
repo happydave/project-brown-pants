@@ -6,6 +6,7 @@
 //! - `cargo run -p sounding` — Toy 5 voxel ship editor (default)
 //! - `cargo run -p sounding -- planet` — Toy 4 floating-origin planet + atmosphere
 //! - `cargo run -p sounding -- rover` — Toy 6 rover on terrain
+//! - `cargo run -p sounding -- dive` — Toy 9 the dive (orbit → atmosphere → ocean)
 //!
 //! The Toy 1–3 simulation and runtime bus run headless behind whichever scene is
 //! shown, so the companion still works. Per-scene controls are documented in
@@ -19,11 +20,13 @@ use sounding_sim::orbit::Orbit;
 use sounding_sim::sim::{CentralBody, OrbitPlugin};
 
 mod bus;
+mod dive_scene;
 mod editor;
 mod floating_origin;
 mod planet;
 mod rover_scene;
 
+use dive_scene::DiveScenePlugin;
 use editor::EditorPlugin;
 use planet::PlanetPlugin;
 use rover_scene::RoverScenePlugin;
@@ -33,12 +36,14 @@ enum Scene {
     Editor,
     Planet,
     Rover,
+    Dive,
 }
 
 fn selected_scene() -> Scene {
     match std::env::args().nth(1).as_deref() {
         Some("planet") => Scene::Planet,
         Some("rover") => Scene::Rover,
+        Some("dive") => Scene::Dive,
         _ => Scene::Editor,
     }
 }
@@ -77,6 +82,9 @@ fn main() {
         }
         Scene::Rover => {
             app.add_plugins(RoverScenePlugin);
+        }
+        Scene::Dive => {
+            app.add_plugins(DiveScenePlugin);
         }
     }
 
