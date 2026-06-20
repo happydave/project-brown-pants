@@ -10,6 +10,7 @@
 //! - `cargo run -p sounding -- break` — structural breakage (a spinning craft snaps apart)
 //! - `cargo run -p sounding -- compartments` — airtight compartments (hatch + breach)
 //! - `cargo run -p sounding -- flooding` — decompression/flooding (breach a submerged craft)
+//! - `cargo run -p sounding -- windtunnel` — aero: lift curve + transonic area-ruling plots
 //!
 //! The Toy 1–3 simulation and runtime bus run headless behind whichever scene is
 //! shown, so the companion still works. Per-scene controls are documented in
@@ -31,6 +32,7 @@ mod floating_origin;
 mod flooding_scene;
 mod planet;
 mod rover_scene;
+mod wind_tunnel_scene;
 
 use break_scene::BreakScenePlugin;
 use compartments_scene::CompartmentsScenePlugin;
@@ -39,6 +41,7 @@ use editor::EditorPlugin;
 use flooding_scene::FloodingScenePlugin;
 use planet::PlanetPlugin;
 use rover_scene::RoverScenePlugin;
+use wind_tunnel_scene::WindTunnelScenePlugin;
 
 /// Which toy scene the windowed app shows.
 enum Scene {
@@ -49,6 +52,7 @@ enum Scene {
     Break,
     Compartments,
     Flooding,
+    WindTunnel,
 }
 
 fn selected_scene() -> Scene {
@@ -59,6 +63,7 @@ fn selected_scene() -> Scene {
         Some("break") => Scene::Break,
         Some("compartments") => Scene::Compartments,
         Some("flooding") => Scene::Flooding,
+        Some("windtunnel") => Scene::WindTunnel,
         _ => Scene::Editor,
     }
 }
@@ -109,6 +114,9 @@ fn main() {
         }
         Scene::Flooding => {
             app.add_plugins(FloodingScenePlugin);
+        }
+        Scene::WindTunnel => {
+            app.add_plugins(WindTunnelScenePlugin);
         }
     }
 

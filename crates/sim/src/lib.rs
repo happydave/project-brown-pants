@@ -7,6 +7,7 @@
 //! `bevy::app::App` is a re-export of `bevy_app::App`.
 
 pub mod active;
+pub mod aero;
 pub mod breakage;
 pub mod command;
 pub mod compartments;

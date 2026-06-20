@@ -1,0 +1,313 @@
+//! FAR-style aerodynamics: lift, stability, and transonic area-ruling (WI 521).
+//!
+//! Completes the design's cross-section-based aero module. The dive (WI 509)
+//! already takes **drag** from the voxel `area_curve`; this adds **lift** and a
+//! **pitching/stability** moment (thin-airfoil, validated against the 2π
+//! lift-slope) and a **transonic area-ruling** wave drag — all from the *one* area
+//! curve and the *one* [`FluidSample`], the medium parameterising them:
+//!
+//! - vacuum (ρ=0) → no aero;
+//! - any dense fluid → lift (hydrodynamic lift works in water too);
+//! - a **compressible** medium (gas) → Mach and the transonic wave-drag rise;
+//!   water is treated incompressible (the design disables it) so wave drag is
+//!   exactly zero there.
+//!
+//! Parameterized thin-airfoil / area-rule aero — not a panel or CFD solve (those
+//! stay quarantined spikes). Headless; the wind-tunnel scene lives in the app.
+
+use crate::fluid::{FluidSample, MediumKind};
+use glam::DVec3;
+use std::f64::consts::{FRAC_PI_2, PI, TAU};
+
+/// Ratio of specific heats for air (diatomic), for the speed of sound.
+const GAMMA: f64 = 1.4;
+/// Stall angle of attack, radians (~15°).
+const STALL: f64 = 0.26;
+/// Critical Mach below which there is no wave drag.
+const M_CRIT: f64 = 0.8;
+
+/// Thin-airfoil lift coefficient as a function of angle of attack (radians).
+/// Odd in `α`, with slope `2π` near zero (the classic thin-airfoil result) and a
+/// stall rollover past [`STALL`]. Bounded for all `α`.
+pub fn lift_coefficient(alpha: f64) -> f64 {
+    let a = alpha.abs().min(FRAC_PI_2);
+    let peak = TAU * STALL; // 2π·α at the stall angle
+    let cl = if a <= STALL {
+        TAU * a
+    } else {
+        // Post-stall: decline from the peak toward 40% of it by 90°.
+        let t = ((a - STALL) / (FRAC_PI_2 - STALL)).clamp(0.0, 1.0);
+        peak * (1.0 - 0.6 * t)
+    };
+    cl * alpha.signum()
+}
+
+/// Angle of attack (radians, `[0, π/2]`) between the relative velocity and the
+/// body's forward axis — the acute angle, so reversed flow is handled.
+fn angle_of_attack(velocity: DVec3, body_forward: DVec3) -> f64 {
+    let v = velocity.normalize_or_zero();
+    let f = body_forward.normalize_or_zero();
+    if v == DVec3::ZERO || f == DVec3::ZERO {
+        return 0.0;
+    }
+    let ang = f.dot(v).clamp(-1.0, 1.0).acos();
+    if ang > FRAC_PI_2 {
+        PI - ang
+    } else {
+        ang
+    }
+}
+
+/// Aero/hydro **lift**: `½ρv²·Cl(α)·A` perpendicular to the relative velocity, in
+/// the plane of the velocity and the body axis, toward the body's forward side.
+/// Zero in vacuum or at rest; present in any dense fluid (water included).
+pub fn lift_force(sample: &FluidSample, velocity: DVec3, body_forward: DVec3, area: f64) -> DVec3 {
+    let speed = velocity.length();
+    if speed <= 0.0 || sample.density <= 0.0 {
+        return DVec3::ZERO;
+    }
+    let vd = velocity / speed;
+    let f = body_forward.normalize_or_zero();
+    // Component of the body axis perpendicular to the flow = the lift direction.
+    let perp = f - f.dot(vd) * vd;
+    let lift_dir = perp.normalize_or_zero();
+    if lift_dir == DVec3::ZERO {
+        return DVec3::ZERO; // axis aligned with flow: no lift
+    }
+    let alpha = angle_of_attack(velocity, body_forward);
+    let cl = lift_coefficient(alpha);
+    0.5 * sample.density * speed * speed * cl * area * lift_dir
+}
+
+/// Speed of sound in the medium, m/s — `√(γP/ρ)` for a **compressible gas**
+/// (atmosphere). `None` for liquid (incompressible by design) and vacuum, which
+/// is what gates wave drag off there.
+pub fn sound_speed(sample: &FluidSample) -> Option<f64> {
+    match sample.medium {
+        MediumKind::Atmosphere if sample.density > 0.0 && sample.pressure > 0.0 => {
+            Some((GAMMA * sample.pressure / sample.density).sqrt())
+        }
+        _ => None,
+    }
+}
+
+/// Mach number, or `None` in an incompressible/vacuum medium.
+pub fn mach(sample: &FluidSample, speed: f64) -> Option<f64> {
+    sound_speed(sample).map(|a| speed / a)
+}
+
+/// A measure of the area curve's **abruptness** — the normalised squared
+/// variation of the cross-sectional area along the body. Small for a smooth
+/// (area-ruled) taper, large for an abrupt body. Drives the wave-drag magnitude.
+pub fn area_ruling_factor(area_curve: &[(i32, f64)]) -> f64 {
+    if area_curve.len() < 2 {
+        return 0.0;
+    }
+    let amax = area_curve.iter().map(|&(_, a)| a).fold(0.0_f64, f64::max);
+    if amax <= 0.0 {
+        return 0.0;
+    }
+    let var: f64 = area_curve
+        .windows(2)
+        .map(|w| (w[1].1 - w[0].1).powi(2))
+        .sum();
+    var / (amax * amax)
+}
+
+/// Transonic wave-drag coefficient: zero below [`M_CRIT`], a bump peaking near
+/// Mach 1.1, declining supersonically, scaled by the area-ruling factor.
+pub fn wave_drag_coefficient(mach: f64, area_ruling_factor: f64) -> f64 {
+    if mach < M_CRIT {
+        return 0.0;
+    }
+    let bump = (-((mach - 1.1) / 0.3).powi(2)).exp();
+    area_ruling_factor * bump
+}
+
+/// Wave-drag force from transonic area-ruling: opposes the velocity, and is
+/// **exactly zero** in an incompressible (water) or vacuum medium (no Mach).
+pub fn wave_drag_force(
+    sample: &FluidSample,
+    velocity: DVec3,
+    area_ruling_factor: f64,
+    area: f64,
+) -> DVec3 {
+    let speed = velocity.length();
+    if speed <= 0.0 {
+        return DVec3::ZERO;
+    }
+    let Some(m) = mach(sample, speed) else {
+        return DVec3::ZERO; // incompressible/vacuum: no wave drag
+    };
+    let cd = wave_drag_coefficient(m, area_ruling_factor);
+    -0.5 * sample.density * speed * speed * cd * area * (velocity / speed)
+}
+
+/// Centre of pressure along the body axis, m — the area-weighted centroid of the
+/// area curve (`Σ station·area / Σ area`, scaled to metres). The cross-section's
+/// "balance point", where the aero force effectively acts.
+pub fn center_of_pressure(area_curve: &[(i32, f64)], cell_size: f64) -> f64 {
+    let total: f64 = area_curve.iter().map(|&(_, a)| a).sum();
+    if total <= 0.0 {
+        return 0.0;
+    }
+    let weighted: f64 = area_curve.iter().map(|&(s, a)| (s as f64 + 0.5) * a).sum();
+    (weighted / total) * cell_size
+}
+
+/// Pitching moment about the centre of mass from an aero force acting at the
+/// centre of pressure: `(cop − com) × force`. Restoring (weathervaning) when the
+/// centre of pressure is aft of the centre of mass.
+pub fn pitching_moment(cop_offset: DVec3, aero_force: DVec3) -> DVec3 {
+    cop_offset.cross(aero_force)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fluid::FluidMedium;
+
+    fn air() -> FluidSample {
+        FluidMedium::EARTHLIKE.sample_altitude(0.0)
+    }
+    fn water() -> FluidSample {
+        FluidMedium::EARTHLIKE.sample_altitude(-10.0)
+    }
+    fn vacuum() -> FluidSample {
+        FluidMedium::VACUUM.sample_altitude(0.0)
+    }
+
+    // --- I1 lift (thin-airfoil) ---
+
+    #[test]
+    fn lift_slope_is_two_pi_near_zero() {
+        // dCl/dα ≈ 2π per radian (thin-airfoil theory).
+        let slope = (lift_coefficient(0.02) - lift_coefficient(-0.02)) / 0.04;
+        assert!((slope - TAU).abs() < 1e-6, "lift slope {slope} ≠ 2π");
+        // Odd function.
+        assert!((lift_coefficient(0.1) + lift_coefficient(-0.1)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn lift_stalls_past_the_stall_angle() {
+        let peak = lift_coefficient(STALL);
+        assert!(lift_coefficient(0.6) < peak, "post-stall Cl should drop");
+        assert!(lift_coefficient(0.5) < peak);
+        // The peak is near the stall angle.
+        assert!(peak > lift_coefficient(0.1));
+    }
+
+    #[test]
+    fn lift_is_zero_in_vacuum_present_in_air_and_water() {
+        // Body axis +x, flow mostly +x with a little +y → small AoA.
+        let v = DVec3::new(100.0, 8.0, 0.0);
+        let fwd = DVec3::X;
+        assert_eq!(lift_force(&vacuum(), v, fwd, 4.0), DVec3::ZERO);
+        let air_lift = lift_force(&air(), v, fwd, 4.0);
+        let water_lift = lift_force(&water(), v, fwd, 4.0);
+        assert!(air_lift.length() > 0.0, "air produces lift");
+        assert!(
+            water_lift.length() > air_lift.length(),
+            "denser water, more lift"
+        );
+        // Lift is perpendicular to the velocity.
+        assert!(air_lift.dot(v).abs() < 1e-6 * air_lift.length() * v.length() + 1e-6);
+    }
+
+    #[test]
+    fn lift_is_zero_when_axis_aligned_with_flow() {
+        let v = DVec3::new(100.0, 0.0, 0.0);
+        assert_eq!(lift_force(&air(), v, DVec3::X, 4.0), DVec3::ZERO);
+    }
+
+    // --- I3 transonic area-ruling, compressible-only ---
+
+    #[test]
+    fn sound_speed_only_in_a_gas() {
+        let a = sound_speed(&air()).expect("air has a sound speed");
+        assert!(
+            (a - 340.0).abs() < 30.0,
+            "sea-level sound speed ~340 m/s, got {a}"
+        );
+        assert!(
+            sound_speed(&water()).is_none(),
+            "water incompressible (by design)"
+        );
+        assert!(sound_speed(&vacuum()).is_none());
+    }
+
+    #[test]
+    fn wave_drag_peaks_transonic_zero_subsonic() {
+        let f = 0.5;
+        assert_eq!(wave_drag_coefficient(0.5, f), 0.0, "subsonic: no wave drag");
+        let at1 = wave_drag_coefficient(1.0, f);
+        let at2 = wave_drag_coefficient(2.0, f);
+        assert!(at1 > 0.0);
+        assert!(at1 > at2, "declines supersonically: {at1} vs {at2}");
+        assert!(
+            at1 > wave_drag_coefficient(0.85, f),
+            "rises through transonic"
+        );
+    }
+
+    #[test]
+    fn smooth_body_has_less_wave_drag_than_abrupt() {
+        // Smooth taper vs an abrupt step, same peak area.
+        let smooth = [(0, 1.0), (1, 2.0), (2, 3.0), (3, 2.0), (4, 1.0)];
+        let abrupt = [(0, 0.0), (1, 3.0), (2, 3.0), (3, 0.0), (4, 0.0)];
+        let fs = area_ruling_factor(&smooth);
+        let fa = area_ruling_factor(&abrupt);
+        assert!(
+            fa > fs,
+            "abrupt body has a larger area-ruling factor: {fa} vs {fs}"
+        );
+        // → larger wave drag at the same Mach.
+        assert!(wave_drag_coefficient(1.1, fa) > wave_drag_coefficient(1.1, fs));
+    }
+
+    #[test]
+    fn wave_drag_force_zero_in_water_and_vacuum() {
+        // A speed that is supersonic in air.
+        let v = DVec3::new(600.0, 0.0, 0.0);
+        let f = 0.5;
+        assert!(
+            wave_drag_force(&air(), v, f, 4.0).length() > 0.0,
+            "air: wave drag"
+        );
+        assert_eq!(
+            wave_drag_force(&water(), v, f, 4.0),
+            DVec3::ZERO,
+            "water: no wave drag (incompressible)"
+        );
+        assert_eq!(wave_drag_force(&vacuum(), v, f, 4.0), DVec3::ZERO);
+    }
+
+    // --- I2 stability ---
+
+    #[test]
+    fn center_of_pressure_is_the_area_centroid() {
+        // Symmetric area curve → CoP at the middle.
+        let curve = [(0, 1.0), (1, 2.0), (2, 1.0)];
+        // centroid = (0.5·1 + 1.5·2 + 2.5·1)/4 = (0.5+3+2.5)/4 = 1.5
+        assert!((center_of_pressure(&curve, 1.0) - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pitching_moment_is_restoring_when_cop_aft_of_com() {
+        // Body axis +x; CoP aft of CoM means toward −x (behind, for a craft moving
+        // +x). A positive-AoA lift (+y) at the aft CoP makes a moment that pitches
+        // the nose toward the flow (reduces AoA) — weathervaning.
+        let cop_offset = DVec3::new(-2.0, 0.0, 0.0); // aft of CoM
+        let lift = DVec3::new(0.0, 100.0, 0.0); // upward lift
+        let moment = pitching_moment(cop_offset, lift);
+        // Moment about z; an aft upward force pitches the nose down (−z here),
+        // opposing the nose-up that created the +AoA → restoring.
+        assert!(
+            moment.z < 0.0,
+            "aft CoP gives a restoring (nose-down) moment"
+        );
+        // A forward CoP would be destabilising (opposite sign).
+        let fwd_moment = pitching_moment(DVec3::new(2.0, 0.0, 0.0), lift);
+        assert!(fwd_moment.z > 0.0);
+    }
+}
