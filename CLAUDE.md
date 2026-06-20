@@ -12,7 +12,7 @@ This is the **code** repo. The **design and planning** live in the `tickets` rep
 
 ## Load-bearing conventions (also in workflow `skills/rust.md`)
 - **Headless core:** `crates/sim` (`sounding_sim`) depends on Bevy **sub-crates**, never the `bevy` umbrella, so it stays rendering-free. Verify: `cargo tree -p sounding_sim` shows no `bevy_render`/`bevy_winit`/`wgpu`.
-- **One writer:** all simulation-state mutation goes through the `Command` executor (`apply_command`). Sources emit commands; they do not mutate state.
+- **Command-routed state:** every simulation-state change is `Command`-driven through the executor — sources emit commands, they never mutate state directly. Field mutations (warp, pause, maneuver) go through the pure `apply_command`; structural changes (component insert/remove — e.g. the `SetGear` gear swap) go through a dedicated `Command`-triggered system. The invariant is the routing, not one function.
 - **API as contract:** the `Command` envelope and `Telemetry` snapshot are a versioned public surface (humans, autopilots, the bus, a future MCP AI all depend on them). Change them as contract changes (sweep all consumers).
 - **Dev tooling:** Bevy Remote Protocol is behind the app's `dev` feature; the runtime bus is separate and always-on.
 - **Toolchain:** use rustup (`. "$HOME/.cargo/env"`). One patch version bump per work item.
