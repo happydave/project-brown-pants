@@ -12,12 +12,14 @@ use bevy::pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium};
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use sounding_sim::frame::{FrameId, WorldPos};
+use sounding_sim::sim::CentralBody;
 use std::f32::consts::PI;
 
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
 
-/// Planet (and atmosphere ground) radius, metres — matches `Atmosphere::earthlike`.
-const PLANET_RADIUS_M: f64 = 6_360_000.0;
+/// Planet (and atmosphere ground) radius, metres — the shared canonical SI body
+/// (WI 527), matching `Atmosphere::earthlike`.
+const PLANET_RADIUS_M: f64 = CentralBody::EARTHLIKE.radius;
 
 /// The Toy 4 planet scene.
 pub struct PlanetPlugin;

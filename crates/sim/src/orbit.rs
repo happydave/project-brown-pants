@@ -328,4 +328,34 @@ mod tests {
             Orbit::from_state(MU, DVec2::new(1.0, 0.0), DVec2::new(0.0, escape), 0.0).is_none()
         );
     }
+
+    /// WI 527: the propagator is unit-agnostic, so the conservation/periodicity
+    /// invariants hold at **SI / planetary scale** too — verified with *relative*
+    /// tolerances (absolute sub-millimetre equality is meaningless on 6.6e6 m).
+    #[test]
+    fn si_scale_orbit_conserves_energy_and_is_periodic() {
+        const MU_SI: f64 = 3.986e14; // m³/s²
+        let r0 = 6_560_000.0; // ~200 km altitude
+        let orbit =
+            Orbit::from_state(MU_SI, DVec2::new(r0, 0.0), DVec2::new(0.0, 8_200.0), 0.0).unwrap();
+        let e0 = orbit.specific_energy();
+        let period = orbit.period();
+        // Specific energy conserved to a tight relative tolerance around the orbit.
+        for i in 0..200 {
+            let t = i as f64 * period / 200.0;
+            let (p, v) = orbit.position_velocity(t);
+            let e = 0.5 * v.length_squared() - MU_SI / p.length();
+            assert!(
+                (e - e0).abs() <= 1e-9 * e0.abs(),
+                "relative energy drift at t={t}: {e} vs {e0}"
+            );
+        }
+        // No secular drift after many revolutions (relative position tolerance).
+        let start = orbit.position(0.0);
+        let after = orbit.position(1000.0 * period);
+        assert!(
+            (after - start).length() <= 1e-6 * r0,
+            "relative drift over 1000 revolutions"
+        );
+    }
 }

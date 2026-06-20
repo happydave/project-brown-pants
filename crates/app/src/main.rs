@@ -70,15 +70,15 @@ fn selected_scene() -> Scene {
 
 fn main() {
     // Toys 1–3 keep running headless: the on-rails orbit and the runtime bus stay
-    // live so the companion still works, whichever scene is shown.
-    let central_body = CentralBody {
-        mu: 1.0,
-        radius: 0.08,
-    };
+    // live so the companion still works, whichever scene is shown. All SI (WI 527):
+    // the one canonical unit system, shared with the scenes via `CentralBody::EARTHLIKE`.
+    let central_body = CentralBody::EARTHLIKE;
+    // A low, eccentric Earth orbit (periapsis ~200 km, prograde, faster than
+    // circular) so the companion navigator has an orbit to circularize.
     let initial_orbit = Orbit::from_state(
         central_body.mu,
-        DVec2::new(1.0, 0.0),
-        DVec2::new(0.0, 1.15),
+        DVec2::new(central_body.radius + 200_000.0, 0.0),
+        DVec2::new(0.0, 8_200.0),
         0.0,
     )
     .expect("initial orbit is bound");

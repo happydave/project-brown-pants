@@ -23,9 +23,10 @@ use serde::{Deserialize, Serialize};
 /// Which medium a sample fell in, derived from the query position. This is a
 /// medium *identity* discriminant only — scattering and rendering parameters are
 /// out of scope here (they belong to the renderer, WI 504).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MediumKind {
     /// No appreciable medium (zero density).
+    #[default]
     Vacuum,
     /// Compressible gas above the surface.
     Atmosphere,

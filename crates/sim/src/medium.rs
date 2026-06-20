@@ -24,6 +24,7 @@ use crate::sim::{Craft, SimClock};
 use crate::voxel::{Axis, VoxelCraft};
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
+use bevy_time::prelude::*;
 use glam::{DQuat, DVec3};
 
 /// Aero/hydro drag: a force opposing the body's velocity relative to the
@@ -335,8 +336,89 @@ fn auto_drop_to_active(
 ) {
     for craft in &crafts {
         if rails_altitude(&craft.orbit, clock.time, interface.surface_radius) < interface.altitude {
+            // Atmospheric entry forces a drop out of warp (the warp filter): reset
+            // to real time so the active descent is not handed a craft deep inside
+            // dense air, then switch to the active gear.
+            if clock.warp != 1.0 {
+                writer.write(Command::SetWarp(1.0));
+            }
             writer.write(Command::SetGear(GearKind::Active));
         }
+    }
+}
+
+/// The craft's physical descent description, carried on the entity **across both
+/// gears** so the active-gear descent driver can advance it after a wake (WI 527).
+/// Holds the voxel craft, its (constant body-frame) centre of mass, and the glide
+/// parameters precomputed once.
+#[derive(Component, Clone)]
+pub struct DivingCraft {
+    /// The voxel craft (drag/buoyancy/lift geometry source).
+    pub craft: VoxelCraft,
+    /// Centre of mass, body frame (metres).
+    pub com: DVec3,
+    /// Precomputed gliding-descent parameters.
+    pub glide: GlideParams,
+}
+
+/// Drives the **active gear's aero/descent forces** (WI 527). Each frame it
+/// sub-steps [`glide_step`] on every active craft carrying a [`DivingCraft`], so a
+/// craft woken into the active gear inside a fluid experiences gravity + drag +
+/// buoyancy + lift + the pitching moment **in the shared schedule** — the dive runs
+/// on the pipeline instead of a scene hand-driving the integrator. Compose with
+/// `HandoffPlugin`/`DiveTriggerPlugin`, and use it **instead of**
+/// [`crate::active::ActivePlugin`] for diving craft, since `glide_step` already
+/// includes gravity (running both would double-integrate). Fixed sub-step with a
+/// per-frame cap (the active-vehicle stability budget); a bounded accumulator
+/// avoids a spiral of death under load.
+pub struct DescentPlugin {
+    /// Fixed integration sub-step, seconds.
+    pub substep_dt: f64,
+    /// Maximum sub-steps integrated per frame.
+    pub max_substeps: u32,
+}
+
+#[derive(Resource)]
+struct DescentSubstep {
+    dt: f64,
+    max: u32,
+    accumulator: f64,
+}
+
+impl Plugin for DescentPlugin {
+    fn build(&self, app: &mut App) {
+        app.insert_resource(DescentSubstep {
+            dt: self.substep_dt,
+            max: self.max_substeps,
+            accumulator: 0.0,
+        })
+        .add_systems(Update, advance_descent);
+    }
+}
+
+fn advance_descent(
+    time: Res<Time>,
+    clock: Res<SimClock>,
+    mut sub: ResMut<DescentSubstep>,
+    mut bodies: Query<(&mut crate::active::ActiveBody, &DivingCraft)>,
+) {
+    if clock.paused {
+        return;
+    }
+    sub.accumulator += time.delta_secs_f64() * clock.warp;
+    // Bound the backlog to one frame's worth of sub-steps (no spiral of death).
+    let cap = sub.max as f64 * sub.dt;
+    if sub.accumulator > cap {
+        sub.accumulator = cap;
+    }
+    let dt = sub.dt;
+    let mut n = 0;
+    while sub.accumulator >= dt && n < sub.max {
+        for (mut body, dc) in &mut bodies {
+            glide_step(&mut body, &dc.craft, dc.com, &dc.glide, dt);
+        }
+        sub.accumulator -= dt;
+        n += 1;
     }
 }
 
@@ -351,9 +433,9 @@ mod tests {
     use crate::voxel::{Material, Voxel, VoxelCraft};
     use glam::{DVec2, IVec3};
 
-    // Earth-like SI constants for the dive.
-    const SURFACE_R: f64 = 6_360_000.0;
-    const MU: f64 = 3.986e14; // ~ g·R²
+    // Earth-like SI constants for the dive — the shared canonical body (WI 527).
+    const SURFACE_R: f64 = CentralBody::EARTHLIKE.radius;
+    const MU: f64 = CentralBody::EARTHLIKE.mu;
 
     fn test_craft() -> VoxelCraft {
         // A 2×2×2 m composite block: ~8 m³, denser than water (sinks).
@@ -589,6 +671,129 @@ mod tests {
         let (on_rails, active) = q.single(app.world()).unwrap();
         assert!(active.is_some(), "craft should have been woken to active");
         assert!(on_rails.is_none(), "craft should have left rails");
+    }
+
+    /// WI 527 — the headline integration: **one craft**, on an SI Kepler orbit,
+    /// coasts on rails, auto-drops to the active gear at the entry interface, and is
+    /// driven by the active-gear descent forces (`DescentPlugin`) down through the
+    /// atmosphere into the ocean — all in one schedule, one consistent SI system.
+    #[test]
+    fn one_craft_orbits_hands_off_and_descends_in_si() {
+        use crate::active::Gravity;
+        use crate::handoff::LastHandoff;
+        use crate::sim::CentralBody;
+        use std::time::Duration;
+
+        let body = CentralBody::EARTHLIKE;
+        // A steep, low-energy plunge from 120 km: a bound Kepler orbit whose
+        // periapsis is deep below the surface (a re-entry trajectory) and whose
+        // entry speed stays tame (~1–2 km/s), not full orbital velocity.
+        let orbit = Orbit::from_state(
+            body.mu,
+            DVec2::new(body.radius + 120_000.0, 0.0),
+            DVec2::new(0.0, 600.0),
+            0.0,
+        )
+        .unwrap();
+        assert!(
+            orbit.periapsis_radius() < body.radius,
+            "must be a re-entry trajectory"
+        );
+
+        let craft = test_craft(); // a dense composite block (sinks)
+        let mp = craft.mass_properties().unwrap();
+        let descent = DescentParams {
+            medium: FluidMedium::EARTHLIKE,
+            mu: body.mu,
+            surface_radius: body.radius,
+            drag_area: max_cross_section(&craft),
+            drag_coefficient: 1.0,
+        };
+        let glide = GlideParams::for_craft(descent, &craft, Axis::Z);
+
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default()); // drive time manually (deterministic)
+        app.insert_resource(Gravity { mu: body.mu }); // handoff sleep path reads it
+        app.add_plugins(OrbitPlugin {
+            central_body: body,
+            initial_orbit: orbit,
+        });
+        app.add_plugins(FlightControlPlugin);
+        app.add_plugins(HandoffPlugin);
+        app.add_plugins(DiveTriggerPlugin {
+            interface: EntryInterface {
+                surface_radius: body.radius,
+                altitude: 100_000.0,
+            },
+        });
+        app.add_plugins(DescentPlugin {
+            substep_dt: 0.002,
+            max_substeps: 4_000,
+        });
+
+        // Put the real craft on the auto-spawned entity: a real gear (mass/inertia)
+        // and the diving description the descent driver needs after the wake.
+        {
+            let mut q = app.world_mut().query_filtered::<Entity, With<Craft>>();
+            let e = q.single(app.world()).unwrap();
+            app.world_mut().entity_mut(e).insert((
+                GearState::new(mp.mass, mp.inertia),
+                DivingCraft {
+                    craft: craft.clone(),
+                    com: mp.center_of_mass,
+                    glide,
+                },
+            ));
+        }
+        // Coast under warp; the entry trigger drops warp to 1 and switches gears.
+        app.world_mut().resource_mut::<SimClock>().warp = 50.0;
+
+        let mut transitioned = false;
+        let mut reached_ocean = false;
+        for _ in 0..6_000 {
+            app.world_mut()
+                .resource_mut::<Time<()>>()
+                .advance_by(Duration::from_secs_f64(0.5));
+            app.update();
+
+            let mut q = app
+                .world_mut()
+                .query::<(Option<&Craft>, Option<&ActiveBody>)>();
+            let (on_rails, active) = q.single(app.world()).unwrap();
+            if let Some(active_body) = active {
+                transitioned = true;
+                // Once active, the state must stay finite all the way down.
+                let body_state = *active_body;
+                assert!(
+                    body_state.position.is_finite() && body_state.velocity.is_finite(),
+                    "active descent state must stay finite"
+                );
+                let altitude = body_state.position.length() - body.radius;
+                if descent.medium.sample_altitude(altitude).medium == MediumKind::Liquid {
+                    reached_ocean = true;
+                    break;
+                }
+            }
+            let _ = on_rails;
+        }
+
+        assert!(
+            transitioned,
+            "the craft must auto-drop from rails to active in SI"
+        );
+        assert!(
+            reached_ocean,
+            "the craft must descend through the atmosphere into the ocean in SI"
+        );
+        // The SI hand-off was clean (sub-metre / sub-m/s injected jump).
+        let last = app.world().resource::<LastHandoff>();
+        assert!(
+            last.0.is_some_and(|h| h.magnitude() < 1.0),
+            "SI hand-off must be ~clean: {:?}",
+            last.0
+        );
+        // Warp was dropped to real time at entry (the warp filter).
+        assert_eq!(app.world().resource::<SimClock>().warp, 1.0);
     }
 
     #[test]

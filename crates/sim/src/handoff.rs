@@ -354,6 +354,37 @@ mod tests {
         );
     }
 
+    /// WI 527: the hand-off stays clean at **SI / planetary scale** — the wake
+    /// reproduces the orbit state exactly (zero injected jump) and the sleep
+    /// round-trip residual is tiny *relative* to the 6.6e6 m / 8 km/s magnitudes.
+    #[test]
+    fn si_scale_handoff_is_clean() {
+        const MU_SI: f64 = 3.986e14;
+        let r0 = 6_560_000.0;
+        let orbit =
+            Orbit::from_state(MU_SI, DVec2::new(r0, 0.0), DVec2::new(0.0, 8_200.0), 0.0).unwrap();
+        // A real-ish craft mass/inertia (the magnitudes must not matter to the bridge).
+        let gear = GearState::new(50_000.0, DMat3::IDENTITY);
+        let t = 1_234.5;
+        let body = wake(&orbit, t, &gear);
+        let d_wake = discontinuity(orbit_state_3d(&orbit, t), (body.position, body.velocity));
+        assert!(
+            d_wake.magnitude() < 1e-6,
+            "SI wake jump must be ~0: {d_wake:?}"
+        );
+
+        let orbit2 = sleep(&body, MU_SI, t).expect("bound");
+        let d_sleep = discontinuity((body.position, body.velocity), orbit_state_3d(&orbit2, t));
+        assert!(
+            d_sleep.position < 1e-6 * r0,
+            "SI sleep position jump (relative): {d_sleep:?}"
+        );
+        assert!(
+            d_sleep.velocity < 1e-6 * 8_200.0,
+            "SI sleep velocity jump (relative): {d_sleep:?}"
+        );
+    }
+
     // --- ECS gear switch through a Bevy App (I4, the wiring) ---
 
     fn handoff_app() -> App {

@@ -127,4 +127,34 @@ mod tests {
             _ => panic!("expected a circularizing maneuver at apoapsis"),
         }
     }
+
+    /// WI 527: the navigator reasons only from telemetry (`v_circ = √(μ/r)`), so it
+    /// is scale-free — it circularizes an **SI** orbit just as it does a normalised
+    /// one, given SI telemetry (the bus passes the body's real μ at runtime).
+    #[test]
+    fn circularizes_at_si_scale() {
+        const MU_SI: f64 = 3.986e14;
+        let r0 = 6_560_000.0;
+        let orbit =
+            Orbit::from_state(MU_SI, DVec2::new(r0, 0.0), DVec2::new(0.0, 8_200.0), 0.0).unwrap();
+        let t_apo = orbit.period() / 2.0;
+        let clock = SimClock {
+            time: t_apo,
+            warp: 1.0,
+            paused: false,
+        };
+        let tele = Telemetry::capture(&clock, Some(&orbit), MU_SI, None);
+        let mut brain = NavigatorBrain;
+        match brain.decide(&tele) {
+            Decision::Act(Command::ExecuteManeuver { delta_v }, _) => {
+                let after = orbit.with_maneuver(t_apo, delta_v).unwrap();
+                assert!(
+                    after.eccentricity < 1e-3,
+                    "SI burn should circularize, got e={}",
+                    after.eccentricity
+                );
+            }
+            _ => panic!("expected a circularizing maneuver at apoapsis (SI)"),
+        }
+    }
 }

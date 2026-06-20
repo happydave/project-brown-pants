@@ -1,135 +1,100 @@
-//! Toy 9 — the dive (WI 509).
+//! Toy 9 — the dive (WI 509), the full **live chain** in SI (WI 527).
 //!
-//! A craft descends **vacuum → atmosphere → ocean** in one continuous fall, with
-//! aero/hydro drag, buoyancy, and pressure all produced by the single
-//! `FluidMedium` field (`sounding_sim::medium`) — the multi-fluid thesis made
-//! visible. A "sounding" descent: the craft falls vertically from high vacuum,
-//! the thickening atmosphere decelerates it, and it splashes into the ocean.
+//! One craft runs the whole gearbox on screen: it starts on an **SI Kepler orbit**
+//! high above the surface, coasts down on rails under time warp, **auto-drops** to
+//! the active gear at the atmospheric entry interface (`DiveTriggerPlugin` +
+//! `HandoffPlugin`), and is then driven by the active-gear aero forces
+//! (`DescentPlugin` → `glide_step`) — gravity + drag + buoyancy + lift — gliding
+//! and weathervaning through vacuum → atmosphere → ocean to splashdown. All one
+//! consistent SI unit system, shared with the headless app and the planet scene
+//! via `CentralBody::EARTHLIKE` (no per-scene unit convention).
 //!
 //! Rendering uses the floating-origin flat-ground convention (sea level at world
-//! Y = 0, planet centre at `(0, -R, 0)`) so Bevy's atmosphere reads altitude from
-//! the camera Y; the descent runs in the radial sim frame (planet at the origin)
-//! and is converted for display. The on-rails↔active hand-off and its automatic
-//! altitude trigger are validated headless (`sounding_sim::handoff`/`medium`); this
-//! scene drives the active descent directly, like the rover scene.
+//! Y = 0, planet centre at `(0, -R, 0)`); the craft's sim position (its orbit while
+//! on rails, its `ActiveBody` once active) is converted for display each frame.
 
 use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::light::{light_consts::lux, AtmosphereEnvironmentMapLight};
-use bevy::math::{DQuat, DVec3};
+use bevy::math::{DVec2, DVec3};
 use bevy::pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium};
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
-use sounding_sim::active::ActiveBody;
+use sounding_sim::active::{ActiveBody, Gravity};
 use sounding_sim::fluid::{FluidMedium, MediumKind};
 use sounding_sim::frame::{FrameId, WorldPos};
+use sounding_sim::handoff::{orbit_state_3d, GearState, HandoffPlugin};
 use sounding_sim::medium::{
-    dynamic_pressure, glide_step, max_cross_section, DescentParams, GlideParams,
+    dynamic_pressure, max_cross_section, DescentParams, DescentPlugin, DiveTriggerPlugin,
+    DivingCraft, EntryInterface, GlideParams,
 };
+use sounding_sim::orbit::Orbit;
+use sounding_sim::sim::{CentralBody, Craft, SimClock};
 use sounding_sim::voxel::{Axis, Material, Voxel, VoxelCraft};
 
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
 
-/// Planet (sea-level) radius, metres — matches `Atmosphere::earthlike` and the
-/// planet scene.
-const SURFACE_R: f64 = 6_360_000.0;
-/// Central-body gravitational parameter, m³/s² (≈ g·R²).
-const MU: f64 = 3.986e14;
-/// Starting altitude of the drop, metres (high vacuum).
+/// The canonical Earth-like body, in SI (WI 527).
+const BODY: CentralBody = CentralBody::EARTHLIKE;
+/// Starting altitude of the orbit's high point, metres.
 const START_ALT: f64 = 120_000.0;
-/// Dive sub-step, seconds (the stiff splashdown wants a small step).
-const SUBSTEP_DT: f64 = 0.004;
-/// Cap on sub-steps per frame.
-const MAX_SUBSTEPS: u32 = 600;
+/// Atmospheric-entry interface altitude, metres (where warp drops and the craft
+/// wakes into active physics).
+const ENTRY_ALT: f64 = 100_000.0;
+/// Active-descent sub-step, seconds (the stiff entry/splashdown wants a small step).
+const SUBSTEP_DT: f64 = 0.002;
+/// Cap on active descent sub-steps per frame.
+const MAX_SUBSTEPS: u32 = 4_000;
+/// Initial time warp for the on-rails coast down to the interface.
+const INITIAL_WARP: f64 = 30.0;
+/// Depth (negative altitude) at which the sim is paused so the craft rests rather
+/// than tunnelling the (non-collision) seabed.
+const REST_DEPTH: f64 = -3_500.0;
 
-/// The descending craft and its medium constants. Self-contained, like the rover
-/// scene's world.
-#[derive(Resource)]
-struct DiveWorld {
-    body: ActiveBody,
-    craft: VoxelCraft,
-    com: DVec3,
-    glide: GlideParams,
-    accumulator: f64,
-    medium: MediumKind,
-    /// Ambient (outer-hull) pressure at the craft, Pa — sampled from the unified
-    /// medium field each step.
-    pressure: f64,
-    /// Dynamic (ram) pressure q = ½·ρ·v² on the leading face, Pa. Peaks at max-Q.
-    dynamic_pressure: f64,
-}
-
-impl DiveWorld {
-    fn new() -> Self {
-        // A slender re-entry body along +Z (forward): a 3×3×4 composite hull with
-        // a denser, centred nose tip. The taper gives a transonic wave-drag
-        // signature; the dense nose puts the centre of mass forward of the area
-        // centroid (centre of pressure aft → a positive static margin), so the
-        // craft weathervanes into the airflow instead of tumbling.
-        let mut craft = VoxelCraft::new(1.0);
-        for z in 0..4 {
-            for x in 0..3 {
-                for y in 0..3 {
-                    craft.voxels.push(Voxel {
-                        cell: IVec3::new(x, y, z),
-                        material: Material::COMPOSITE,
-                    });
-                }
+/// A slender re-entry body along +Z (forward): a 3×3×4 composite hull with a
+/// denser, centred nose tip — a positive static margin so it weathervanes into the
+/// airflow, and a tapered area curve so it shows transonic wave drag (WI 526).
+fn dive_craft() -> VoxelCraft {
+    let mut c = VoxelCraft::new(1.0);
+    for z in 0..4 {
+        for x in 0..3 {
+            for y in 0..3 {
+                c.voxels.push(Voxel {
+                    cell: IVec3::new(x, y, z),
+                    material: Material::COMPOSITE,
+                });
             }
         }
-        craft.voxels.push(Voxel {
-            cell: IVec3::new(1, 1, 4),
-            material: Material::ALUMINIUM,
-        });
-        let mp = craft.mass_properties().expect("non-empty craft");
-        // Radial sim frame: planet at the origin, craft straight up at start. Enter
-        // pitched ~20° to the (downward) velocity so there is a nonzero angle of
-        // attack to lift against — a gliding entry, not a belly-flop drop.
-        let entry_aoa = 0.35_f64;
-        let forward_down = DVec3::new(entry_aoa.sin(), -entry_aoa.cos(), 0.0);
-        let mut body = ActiveBody::new(
-            DVec3::new(0.0, SURFACE_R + START_ALT, 0.0),
-            DVec3::new(0.0, -100.0, 0.0), // a gentle initial nudge downward
-            mp.mass,
-            mp.inertia,
-        );
-        body.orientation = DQuat::from_rotation_arc(DVec3::Z, forward_down);
-        let descent = DescentParams {
-            medium: FluidMedium::EARTHLIKE,
-            mu: MU,
-            surface_radius: SURFACE_R,
-            drag_area: max_cross_section(&craft),
-            drag_coefficient: 1.0,
-        };
-        let glide = GlideParams::for_craft(descent, &craft, Axis::Z);
-        Self {
-            body,
-            craft,
-            com: mp.center_of_mass,
-            glide,
-            accumulator: 0.0,
-            medium: MediumKind::Vacuum,
-            pressure: 0.0,
-            dynamic_pressure: 0.0,
-        }
     }
+    c.voxels.push(Voxel {
+        cell: IVec3::new(1, 1, 4),
+        material: Material::ALUMINIUM,
+    });
+    c
+}
 
-    /// Altitude above sea level, metres.
-    fn altitude(&self) -> f64 {
-        self.body.position.length() - SURFACE_R
-    }
+/// The craft's flat-ground render position (sea level at Y = 0): the radial sim
+/// frame shifted so the planet centre sits one radius below the origin.
+fn render_world(sim_pos: DVec3) -> DVec3 {
+    sim_pos - DVec3::new(0.0, BODY.radius, 0.0)
+}
 
-    /// The craft's flat-ground render position (sea level at Y = 0).
-    fn render_world(&self) -> DVec3 {
-        self.body.position - DVec3::new(0.0, SURFACE_R, 0.0)
-    }
+/// Live readout of the craft, refreshed each frame for the HUD.
+#[derive(Resource, Default)]
+struct DiveReadout {
+    active: bool,
+    altitude: f64,
+    speed: f64,
+    medium: MediumKind,
+    pressure: f64,
+    ram: f64,
 }
 
 /// Marks the heads-up readout.
 #[derive(Component)]
 struct Hud;
 
-/// Marks the rendered craft so its placement can be updated each frame.
+/// Marks the rendered craft.
 #[derive(Component)]
 struct CraftMarker;
 
@@ -139,12 +104,23 @@ pub struct DiveScenePlugin;
 impl Plugin for DiveScenePlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(FloatingOriginPlugin)
-            .insert_resource(DiveWorld::new())
+            .init_resource::<DiveReadout>()
+            // The handoff sleep path reads Gravity; the descent driver replaces the
+            // pure-gravity ActivePlugin (glide_step already includes gravity).
+            .insert_resource(Gravity { mu: BODY.mu })
+            .add_plugins(HandoffPlugin)
+            .add_plugins(DiveTriggerPlugin {
+                interface: EntryInterface {
+                    surface_radius: BODY.radius,
+                    altitude: ENTRY_ALT,
+                },
+            })
+            .add_plugins(DescentPlugin {
+                substep_dt: SUBSTEP_DT,
+                max_substeps: MAX_SUBSTEPS,
+            })
             .add_systems(Startup, setup_scene)
-            .add_systems(
-                Update,
-                (step_dive, track_craft, follow_camera, update_hud).chain(),
-            );
+            .add_systems(Update, (track_craft, follow_camera, update_hud).chain());
     }
 }
 
@@ -153,12 +129,60 @@ fn setup_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut scattering: ResMut<Assets<ScatteringMedium>>,
-    dive: Res<DiveWorld>,
+    mut clock: ResMut<SimClock>,
+    mut craft_q: Query<(Entity, &mut Craft, &mut GearState)>,
 ) {
+    // A steep, low-energy re-entry plunge from START_ALT: a bound Kepler orbit
+    // (periapsis deep below the surface) whose entry speed stays tame (~1–2 km/s).
+    // Start at the +Y high point with a small +X tangential velocity so "up" ≈ +Y,
+    // matching the flat-ground render convention.
+    let r0 = BODY.radius + START_ALT;
+    let orbit = Orbit::from_state(BODY.mu, DVec2::new(0.0, r0), DVec2::new(600.0, 0.0), 0.0)
+        .expect("bound re-entry orbit");
+
+    let voxels = dive_craft();
+    let mp = voxels.mass_properties().expect("non-empty craft");
+    let descent = DescentParams {
+        medium: FluidMedium::EARTHLIKE,
+        mu: BODY.mu,
+        surface_radius: BODY.radius,
+        drag_area: max_cross_section(&voxels),
+        drag_coefficient: 1.0,
+    };
+    let glide = GlideParams::for_craft(descent, &voxels, Axis::Z);
+    let start_render = render_world(orbit_state_3d(&orbit, 0.0).0);
+
+    // Reconfigure the single craft the OrbitPlugin spawned (main.rs): put it on the
+    // re-entry orbit with a real gear-state, and attach its diving description plus
+    // the render bundle. One craft runs the whole chain.
+    if let Ok((entity, mut craft, mut gear)) = craft_q.single_mut() {
+        craft.orbit = orbit;
+        *gear = GearState::new(mp.mass, mp.inertia);
+        commands.entity(entity).insert((
+            DivingCraft {
+                craft: voxels,
+                com: mp.center_of_mass,
+                glide,
+            },
+            Mesh3d(meshes.add(Mesh::from(Cuboid::new(3.0, 3.0, 5.0)))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::srgb(0.85, 0.84, 0.88),
+                metallic: 0.6,
+                perceptual_roughness: 0.3,
+                ..default()
+            })),
+            Transform::default(),
+            WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, start_render)),
+            CraftMarker,
+        ));
+    }
+    // Coast down under warp; the entry trigger drops it to 1 at the interface.
+    clock.warp = INITIAL_WARP;
+
     // Seabed: an opaque sphere just below sea level, centred one radius down.
     commands.spawn((
         Mesh3d(meshes.add(Mesh::from(Sphere {
-            radius: (SURFACE_R - 4_000.0) as f32,
+            radius: (BODY.radius - 4_000.0) as f32,
         }))),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: Color::srgb(0.20, 0.17, 0.14),
@@ -168,14 +192,14 @@ fn setup_scene(
         Transform::default(),
         WorldPlacement(WorldPos::new(
             FrameId::CENTRAL_BODY,
-            DVec3::new(0.0, -SURFACE_R, 0.0),
+            DVec3::new(0.0, -BODY.radius, 0.0),
         )),
     ));
 
     // Ocean: a translucent blue sphere whose surface is sea level (Y = 0).
     commands.spawn((
         Mesh3d(meshes.add(Mesh::from(Sphere {
-            radius: SURFACE_R as f32,
+            radius: BODY.radius as f32,
         }))),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: Color::srgba(0.05, 0.20, 0.40, 0.55),
@@ -186,22 +210,8 @@ fn setup_scene(
         Transform::default(),
         WorldPlacement(WorldPos::new(
             FrameId::CENTRAL_BODY,
-            DVec3::new(0.0, -SURFACE_R, 0.0),
+            DVec3::new(0.0, -BODY.radius, 0.0),
         )),
-    ));
-
-    // The descending craft (slender along +Z so its pitch/attitude reads).
-    commands.spawn((
-        Mesh3d(meshes.add(Mesh::from(Cuboid::new(3.0, 3.0, 5.0)))),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.85, 0.84, 0.88),
-            metallic: 0.6,
-            perceptual_roughness: 0.3,
-            ..default()
-        })),
-        Transform::default(),
-        WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, dive.render_world())),
-        CraftMarker,
     ));
 
     // The sun: raw sunlight the atmosphere filters.
@@ -214,10 +224,10 @@ fn setup_scene(
         Transform::from_rotation(Quat::from_rotation_x(-0.5) * Quat::from_rotation_y(0.6)),
     ));
 
-    // Heads-up readout: altitude, speed, medium.
+    // Heads-up readout.
     commands.spawn((
         Text::new(
-            "altitude:        0 m\nspeed:       0.0 m/s\nmedium:   vacuum\nhull P:        0.0 kPa\nram P:         0.0 kPa",
+            "gear:       on-rails\naltitude:        0 m\nspeed:       0.0 m/s\nmedium:   vacuum\nhull P:        0.0 kPa\nram P:         0.0 kPa",
         ),
         TextFont {
             font_size: 20.0,
@@ -234,11 +244,10 @@ fn setup_scene(
     ));
 
     // HDR camera with Bevy's physically-based atmosphere, chasing the craft.
-    let cam = dive.render_world() + DVec3::new(18.0, 8.0, 18.0);
+    let cam = start_render + DVec3::new(18.0, 8.0, 18.0);
     commands.spawn((
         Camera3d::default(),
-        Transform::from_translation(cam.as_vec3())
-            .looking_at(dive.render_world().as_vec3(), Vec3::Y),
+        Transform::from_translation(cam.as_vec3()).looking_at(start_render.as_vec3(), Vec3::Y),
         Atmosphere::earthlike(scattering.add(ScatteringMedium::default())),
         AtmosphereSettings::default(),
         Exposure { ev100: 13.0 },
@@ -250,76 +259,97 @@ fn setup_scene(
     ));
 }
 
-/// Sub-steps the descent under gravity + drag + buoyancy from the one medium.
-fn step_dive(time: Res<Time>, mut dive: ResMut<DiveWorld>) {
-    dive.accumulator += time.delta_secs_f64();
-    let mut n = 0;
-    while dive.accumulator >= SUBSTEP_DT && n < MAX_SUBSTEPS {
-        // Stop integrating once well underwater so the capsule rests on the seabed
-        // rather than tunnelling (the seabed is not a collision surface this toy).
-        if dive.altitude() <= -3_500.0 {
-            dive.accumulator = 0.0;
-            break;
-        }
-        let DiveWorld {
-            body,
-            craft,
-            com,
-            glide,
-            ..
-        } = &mut *dive;
-        let sample = glide_step(body, craft, *com, glide, SUBSTEP_DT);
-        dive.medium = sample.medium;
-        dive.pressure = sample.pressure;
-        dive.dynamic_pressure = dynamic_pressure(&sample, dive.body.velocity);
-        dive.accumulator -= SUBSTEP_DT;
-        n += 1;
-    }
-}
-
-/// Updates the craft entity's world placement and attitude from the simulation.
-/// The floating-origin rebase owns translation; rotation is ours to set, so the
-/// craft visibly weathervanes/banks as the aero moment trims it.
+/// Reads the craft's current gear (orbit while on rails, `ActiveBody` once active),
+/// updates its render placement + attitude, and refreshes the HUD readout. Pauses
+/// the sim once the craft is well underwater so it rests rather than tunnelling.
+#[allow(clippy::type_complexity)] // a Bevy gear-agnostic craft query
 fn track_craft(
-    dive: Res<DiveWorld>,
-    mut craft: Query<(&mut WorldPlacement, &mut Transform), With<CraftMarker>>,
+    mut clock: ResMut<SimClock>,
+    mut readout: ResMut<DiveReadout>,
+    mut craft: Query<
+        (
+            Option<&Craft>,
+            Option<&ActiveBody>,
+            &DivingCraft,
+            &mut WorldPlacement,
+            &mut Transform,
+        ),
+        With<CraftMarker>,
+    >,
 ) {
-    if let Ok((mut wp, mut tf)) = craft.single_mut() {
-        wp.0 = WorldPos::new(FrameId::CENTRAL_BODY, dive.render_world());
-        tf.rotation = dive.body.orientation.as_quat();
+    let Ok((rails, active, dc, mut wp, mut tf)) = craft.single_mut() else {
+        return;
+    };
+    let (sim_pos, velocity, rotation, is_active) = if let Some(body) = active {
+        (
+            body.position,
+            body.velocity,
+            body.orientation.as_quat(),
+            true,
+        )
+    } else if let Some(c) = rails {
+        let (p, v) = orbit_state_3d(&c.orbit, clock.time);
+        (p, v, Quat::IDENTITY, false)
+    } else {
+        return;
+    };
+
+    wp.0 = WorldPos::new(FrameId::CENTRAL_BODY, render_world(sim_pos));
+    tf.rotation = rotation;
+
+    let altitude = sim_pos.length() - BODY.radius;
+    let sample = dc.glide.descent.medium.sample_altitude(altitude);
+    readout.active = is_active;
+    readout.altitude = altitude;
+    readout.speed = velocity.length();
+    readout.medium = sample.medium;
+    readout.pressure = sample.pressure;
+    readout.ram = dynamic_pressure(&sample, velocity);
+
+    // Rest on the seabed (not a collision surface this toy): pause once deep.
+    if altitude <= REST_DEPTH {
+        clock.paused = true;
     }
 }
 
-/// Keeps the anchor camera a fixed offset from the descending craft.
+/// Keeps the anchor camera a fixed offset from the craft's render position.
+#[allow(clippy::type_complexity)] // disjoint Bevy queries (craft vs. camera)
 fn follow_camera(
-    dive: Res<DiveWorld>,
-    mut camera: Query<(&mut Transform, &mut WorldPlacement), With<AnchorCamera>>,
+    craft: Query<&WorldPlacement, (With<CraftMarker>, Without<AnchorCamera>)>,
+    mut camera: Query<
+        (&mut Transform, &mut WorldPlacement),
+        (With<AnchorCamera>, Without<CraftMarker>),
+    >,
 ) {
-    if let Ok((mut tf, mut placement)) = camera.single_mut() {
-        let target = dive.render_world();
-        let eye = target + DVec3::new(18.0, 8.0, 18.0);
-        placement.0 = WorldPos::new(FrameId::CENTRAL_BODY, eye);
-        // Aim at the craft (render space; the floating origin keeps both near zero).
-        let look_dir = (target - eye).as_vec3().normalize_or_zero();
-        if look_dir != Vec3::ZERO {
-            tf.rotation = Transform::default().looking_to(look_dir, Vec3::Y).rotation;
-        }
+    let Ok(craft_wp) = craft.single() else {
+        return;
+    };
+    let Ok((mut tf, mut placement)) = camera.single_mut() else {
+        return;
+    };
+    let target = craft_wp.0.pos;
+    let eye = target + DVec3::new(18.0, 8.0, 18.0);
+    placement.0 = WorldPos::new(FrameId::CENTRAL_BODY, eye);
+    let look_dir = (target - eye).as_vec3().normalize_or_zero();
+    if look_dir != Vec3::ZERO {
+        tf.rotation = Transform::default().looking_to(look_dir, Vec3::Y).rotation;
     }
 }
 
-fn update_hud(dive: Res<DiveWorld>, mut hud: Query<&mut Text, With<Hud>>) {
+fn update_hud(readout: Res<DiveReadout>, mut hud: Query<&mut Text, With<Hud>>) {
     if let Ok(mut text) = hud.single_mut() {
-        let medium = match dive.medium {
+        let gear = if readout.active { "active" } else { "on-rails" };
+        let medium = match readout.medium {
             MediumKind::Vacuum => "vacuum",
             MediumKind::Atmosphere => "atmosphere",
             MediumKind::Liquid => "ocean",
         };
-        let alt = dive.altitude();
-        let speed = dive.body.velocity.length();
-        let pressure_kpa = dive.pressure / 1_000.0;
-        let ram_kpa = dive.dynamic_pressure / 1_000.0;
+        let alt = readout.altitude;
+        let speed = readout.speed;
+        let pressure_kpa = readout.pressure / 1_000.0;
+        let ram_kpa = readout.ram / 1_000.0;
         text.0 = format!(
-            "altitude: {alt:8.0} m\nspeed:    {speed:7.1} m/s\nmedium:   {medium}\nhull P:   {pressure_kpa:8.1} kPa\nram P:    {ram_kpa:8.1} kPa"
+            "gear:     {gear}\naltitude: {alt:8.0} m\nspeed:    {speed:7.1} m/s\nmedium:   {medium}\nhull P:   {pressure_kpa:8.1} kPa\nram P:    {ram_kpa:8.1} kPa"
         );
     }
 }

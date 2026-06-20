@@ -42,14 +42,27 @@ impl SimClock {
     }
 }
 
-/// The central attracting body, at the world origin. `radius` is for display
-/// and collision sizing only; gravity comes from `mu`.
+/// The central attracting body, at the world origin. `radius` is the surface
+/// (sea-level) radius — used for display, altitude, and collision sizing; gravity
+/// comes from `mu`. **All SI** (metres, m³/s²): this is the project's canonical
+/// unit system (WI 527), paired with [`crate::fluid::FluidMedium`] for the medium.
 #[derive(Resource, Debug, Clone, Copy)]
 pub struct CentralBody {
-    /// Gravitational parameter (μ = G·M).
+    /// Gravitational parameter (μ = G·M), m³/s².
     pub mu: f64,
-    /// Display radius, world units.
+    /// Surface (sea-level) radius, metres.
     pub radius: f64,
+}
+
+impl CentralBody {
+    /// The canonical Earth-like body in SI units: μ = G·M ≈ 3.986×10¹⁴ m³/s²
+    /// (≈ g·R²) and surface radius ≈ 6.36×10⁶ m. The single source of these
+    /// constants for the app, the scenes, and integration tests — paired with
+    /// [`crate::fluid::FluidMedium::EARTHLIKE`] (WI 527).
+    pub const EARTHLIKE: CentralBody = CentralBody {
+        mu: 3.986e14,
+        radius: 6_360_000.0,
+    };
 }
 
 /// A craft, carried on its current orbit.

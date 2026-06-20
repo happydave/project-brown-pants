@@ -312,6 +312,41 @@ mod tests {
         assert_eq!(a.velocity, b.velocity);
     }
 
+    /// WI 527: the symplectic integrator's conservation invariants hold at **SI /
+    /// planetary scale** too (relative tolerances). A low-Earth-orbit circular state
+    /// integrated for several minutes keeps energy bounded and momentum ~exact.
+    #[test]
+    fn si_scale_active_conserves_energy_and_momentum() {
+        const MU_SI: f64 = 3.986e14;
+        let r0 = 6_560_000.0;
+        let v_circ = (MU_SI / r0).sqrt();
+        let mut body = ActiveBody::new(
+            DVec3::new(r0, 0.0, 0.0),
+            DVec3::new(0.0, v_circ, 0.0),
+            1.0,
+            DMat3::IDENTITY,
+        );
+        let e0 = body.specific_energy(MU_SI);
+        let l0 = body.specific_angular_momentum();
+        let mut max_e_rel = 0.0_f64;
+        let mut max_l_rel = 0.0_f64;
+        // ~5 minutes of flight at the fixed step.
+        for _ in 0..20_000 {
+            body.step(MU_SI, FIXED_DT);
+            max_e_rel = max_e_rel.max((body.specific_energy(MU_SI) - e0).abs() / e0.abs());
+            max_l_rel =
+                max_l_rel.max((body.specific_angular_momentum() - l0).length() / l0.length());
+        }
+        assert!(
+            max_e_rel < 1e-6,
+            "relative energy drift bounded at SI scale: {max_e_rel}"
+        );
+        assert!(
+            max_l_rel < 1e-9,
+            "angular momentum ~conserved at SI scale: {max_l_rel}"
+        );
+    }
+
     #[test]
     fn warp_is_capped() {
         let orbit = test_orbit();
