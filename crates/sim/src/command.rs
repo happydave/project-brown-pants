@@ -40,6 +40,14 @@ pub enum Command {
     /// the swap is structural (component insert/remove), outside this function's
     /// `(clock, orbit)` reach.
     SetGear(GearKind),
+    /// Set the engine throttle (clamped to `[0, 1]`). Applied to propulsion command
+    /// state (`crate::propulsion::Propulsion::apply_command`), not [`apply_command`]
+    /// — it is propulsion state, outside this function's `(clock, orbit)` reach
+    /// (like `SetGear`). WI 531.
+    SetThrottle(f64),
+    /// Set the engine gimbal deflection (radians, clamped per engine). Applied by
+    /// the propulsion system, not [`apply_command`]. WI 531.
+    SetGimbal(DVec2),
 }
 
 /// Applies a single command to the simulation. Pure and deterministic — the only
@@ -64,8 +72,9 @@ pub fn apply_command(cmd: &Command, clock: &mut SimClock, orbit: Option<&mut Orb
                 None => false,
             }
         }
-        // Structural gear switch is applied by the gear-switch system, not here.
-        Command::SetGear(_) => false,
+        // Structural gear switch and propulsion commands are applied by their own
+        // systems, not here (outside the `(clock, orbit)` reach).
+        Command::SetGear(_) | Command::SetThrottle(_) | Command::SetGimbal(_) => false,
     }
 }
 
@@ -93,6 +102,8 @@ fn execute_commands(
             Command::ExecuteManeuver { .. } if applied => info!("maneuver executed"),
             Command::ExecuteManeuver { .. } => warn!("maneuver rejected (unbound or no craft)"),
             Command::SetGear(g) => info!("gear switch requested: {g:?}"),
+            Command::SetThrottle(t) => info!("throttle: {t}"),
+            Command::SetGimbal(g) => info!("gimbal: {g:?}"),
         }
     }
 }

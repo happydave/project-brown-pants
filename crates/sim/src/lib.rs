@@ -19,6 +19,7 @@ pub mod handoff;
 pub mod medium;
 pub mod orbit;
 pub mod persist;
+pub mod propulsion;
 pub mod resource;
 pub mod rover;
 pub mod sim;
