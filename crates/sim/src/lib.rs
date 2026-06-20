@@ -25,6 +25,7 @@ pub mod sim;
 pub mod surface;
 pub mod telemetry;
 pub mod terrain;
+pub mod universe;
 pub mod voxel;
 
 use bevy_app::prelude::*;

@@ -25,8 +25,21 @@ pub struct FrameId(pub u32);
 
 impl FrameId {
     /// The single central body's inertial frame, which is also the canonical
-    /// world frame today.
+    /// world frame today (and the root frame of a multi-body universe).
     pub const CENTRAL_BODY: FrameId = FrameId(0);
+}
+
+/// Supplies the relative state of one body-centered inertial frame's origin with
+/// respect to another at a given time — exactly the data a frame transform needs.
+/// Because the frames are inertial (non-rotating), the transform between them is a
+/// pure translation by this offset. Implemented by the multi-body universe
+/// (`universe::Universe`, WI 528); kept as a trait here so `frame.rs` stays free of
+/// an `Orbit`/universe dependency.
+pub trait FrameTree {
+    /// Position and velocity of `from`'s origin expressed in `reference`'s frame at
+    /// time `t`. `Some((ZERO, ZERO))` when `from == reference`; `None` if either
+    /// frame is unknown.
+    fn relative_state(&self, from: FrameId, reference: FrameId, t: f64) -> Option<(DVec3, DVec3)>;
 }
 
 /// An f64 3D position in a specific body-centered inertial frame.
@@ -53,14 +66,14 @@ impl WorldPos {
         self.pos.length()
     }
 
-    /// Expresses this position in `target`.
-    ///
-    /// Today only one frame exists, so this returns `Some(self.pos)` when
-    /// `target` matches this position's frame (the identity transform) and `None`
-    /// otherwise. This is the extension seam: multi-frame transforms and
-    /// floating-origin rebasing slot in here without changing call sites.
-    pub fn transform_to(&self, target: FrameId) -> Option<DVec3> {
-        (target == self.frame).then_some(self.pos)
+    /// Expresses this position in `target` at time `t`, using `frames` for the
+    /// relative state of the two frame origins. Because body-centered frames are
+    /// inertial (non-rotating), this is a translation: `pos_target = pos_self +
+    /// (origin_self − origin_target)`. Returns the identity for the same frame and
+    /// `None` if a frame is unknown to `frames` (WI 528).
+    pub fn transform_to(&self, target: FrameId, frames: &impl FrameTree, t: f64) -> Option<DVec3> {
+        let (offset, _) = frames.relative_state(self.frame, target, t)?;
+        Some(self.pos + offset)
     }
 }
 
@@ -80,11 +93,41 @@ impl WorldVel {
     pub fn new(frame: FrameId, vel: DVec3) -> Self {
         Self { frame, vel }
     }
+
+    /// Expresses this velocity in `target` at time `t`: `vel_target = vel_self +
+    /// (vel_origin_self − vel_origin_target)` (inertial frames, WI 528).
+    pub fn transform_to(&self, target: FrameId, frames: &impl FrameTree, t: f64) -> Option<DVec3> {
+        let (_, vel_offset) = frames.relative_state(self.frame, target, t)?;
+        Some(self.vel + vel_offset)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A minimal two-frame tree for transform tests: frame 1's origin sits at a
+    /// fixed offset (with a fixed relative velocity) from the root frame 0.
+    struct TwoFrames {
+        offset: DVec3,
+        vel_offset: DVec3,
+    }
+    impl FrameTree for TwoFrames {
+        fn relative_state(
+            &self,
+            from: FrameId,
+            reference: FrameId,
+            _t: f64,
+        ) -> Option<(DVec3, DVec3)> {
+            match (from, reference) {
+                (a, b) if a == b => Some((DVec3::ZERO, DVec3::ZERO)),
+                // frame 1 origin relative to frame 0.
+                (FrameId(1), FrameId(0)) => Some((self.offset, self.vel_offset)),
+                (FrameId(0), FrameId(1)) => Some((-self.offset, -self.vel_offset)),
+                _ => None,
+            }
+        }
+    }
 
     #[test]
     fn position_is_f64_and_frame_tagged() {
@@ -97,13 +140,47 @@ mod tests {
     fn transform_to_same_frame_is_identity() {
         let pos = DVec3::new(1.0, -2.0, 7.5);
         let p = WorldPos::new(FrameId::CENTRAL_BODY, pos);
-        assert_eq!(p.transform_to(FrameId::CENTRAL_BODY), Some(pos));
+        let frames = TwoFrames {
+            offset: DVec3::new(10.0, 0.0, 0.0),
+            vel_offset: DVec3::ZERO,
+        };
+        assert_eq!(
+            p.transform_to(FrameId::CENTRAL_BODY, &frames, 0.0),
+            Some(pos)
+        );
     }
 
     #[test]
-    fn transform_to_other_frame_is_unsupported_today() {
+    fn transform_to_translates_between_frames_and_round_trips() {
+        let frames = TwoFrames {
+            offset: DVec3::new(10.0, -4.0, 0.0),
+            vel_offset: DVec3::new(0.5, 0.0, 0.0),
+        };
+        // A point at frame-1 origin: in frame 1 it is ZERO, in frame 0 it is offset.
+        let p1 = WorldPos::new(FrameId(1), DVec3::ZERO);
+        let in0 = p1.transform_to(FrameId(0), &frames, 0.0).unwrap();
+        assert_eq!(in0, frames.offset);
+        // Round-trip back to frame 1.
+        let back = WorldPos::new(FrameId(0), in0)
+            .transform_to(FrameId(1), &frames, 0.0)
+            .unwrap();
+        assert_eq!(back, DVec3::ZERO);
+        // Velocity transforms by the relative velocity.
+        let v1 = WorldVel::new(FrameId(1), DVec3::new(1.0, 0.0, 0.0));
+        assert_eq!(
+            v1.transform_to(FrameId(0), &frames, 0.0),
+            Some(DVec3::new(1.5, 0.0, 0.0))
+        );
+    }
+
+    #[test]
+    fn transform_to_unknown_frame_is_none() {
+        let frames = TwoFrames {
+            offset: DVec3::ZERO,
+            vel_offset: DVec3::ZERO,
+        };
         let p = WorldPos::new(FrameId::CENTRAL_BODY, DVec3::ZERO);
-        assert_eq!(p.transform_to(FrameId(1)), None);
+        assert_eq!(p.transform_to(FrameId(9), &frames, 0.0), None);
     }
 
     #[test]

@@ -122,7 +122,7 @@ mod tests {
     }
 
     #[test]
-    fn maneuver_applies_and_unbound_is_rejected() {
+    fn maneuver_applies_including_to_a_hyperbolic_escape() {
         let mut clock = SimClock::default();
 
         let mut orbit = circular();
@@ -137,20 +137,19 @@ mod tests {
         assert!(ok);
         assert!(orbit.apoapsis_radius() > apo_before + 1e-3);
 
+        // A large prograde burn now escapes onto a represented hyperbolic conic
+        // (WI 528) — the maneuver applies and the orbit becomes unbound.
         let mut orbit2 = circular();
-        let snapshot = orbit2;
-        let rejected = apply_command(
+        let escaped = apply_command(
             &Command::ExecuteManeuver {
                 delta_v: DVec2::new(0.0, 5.0),
             },
             &mut clock,
             Some(&mut orbit2),
         );
-        assert!(!rejected);
-        assert_eq!(
-            orbit2, snapshot,
-            "rejected maneuver must leave the orbit unchanged"
-        );
+        assert!(escaped, "escape maneuver applies (hyperbolic conic)");
+        assert!(!orbit2.is_bound(), "the resulting orbit is hyperbolic");
+        assert!(orbit2.eccentricity > 1.0);
     }
 
     #[test]

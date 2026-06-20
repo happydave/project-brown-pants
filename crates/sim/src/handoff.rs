@@ -303,15 +303,22 @@ mod tests {
     }
 
     #[test]
-    fn unbound_active_state_cannot_rail() {
+    fn hyperbolic_active_state_rails_as_a_hyperbolic_conic() {
+        // Since WI 528 the on-rails gear represents hyperbolic conics, so a craft
+        // boosted past escape speed sleeps onto a (hyperbolic) conic rather than
+        // being un-railable. The parabolic knife-edge is still rejected.
         let orbit = test_orbit();
         let mut body = wake(&orbit, 0.0, &unit_gear());
-        // Boost well past escape speed at this radius.
         let escape = (2.0 * MU / body.position.length()).sqrt();
-        body.velocity = DVec3::new(0.0, escape + 0.5, 0.0);
+        body.velocity = DVec3::new(0.0, escape + 0.5, 0.0); // hyperbolic
+        let railed = sleep(&body, MU, 0.0).expect("hyperbolic state rails");
+        assert!(!railed.is_bound() && railed.eccentricity > 1.0);
+
+        // Exactly escape speed (parabolic) remains un-railable.
+        body.velocity = DVec3::new(0.0, escape, 0.0);
         assert!(
             sleep(&body, MU, 0.0).is_none(),
-            "escape state cannot rail (I3)"
+            "parabolic edge cannot rail"
         );
     }
 
