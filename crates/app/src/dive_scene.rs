@@ -50,6 +50,9 @@ struct DiveWorld {
     params: DescentParams,
     accumulator: f64,
     medium: MediumKind,
+    /// Ambient (outer-hull) pressure at the craft, Pa — sampled from the unified
+    /// medium field each step.
+    pressure: f64,
 }
 
 impl DiveWorld {
@@ -88,6 +91,7 @@ impl DiveWorld {
             params,
             accumulator: 0.0,
             medium: MediumKind::Vacuum,
+            pressure: 0.0,
         }
     }
 
@@ -193,7 +197,9 @@ fn setup_scene(
 
     // Heads-up readout: altitude, speed, medium.
     commands.spawn((
-        Text::new("altitude:        0 m\nspeed:       0.0 m/s\nmedium:   vacuum"),
+        Text::new(
+            "altitude:        0 m\nspeed:       0.0 m/s\nmedium:   vacuum\nhull P:        0.0 kPa",
+        ),
         TextFont {
             font_size: 20.0,
             ..default()
@@ -245,6 +251,7 @@ fn step_dive(time: Res<Time>, mut dive: ResMut<DiveWorld>) {
         } = &mut *dive;
         let sample = descent_step(body, craft, *com, params, SUBSTEP_DT);
         dive.medium = sample.medium;
+        dive.pressure = sample.pressure;
         dive.accumulator -= SUBSTEP_DT;
         n += 1;
     }
@@ -283,6 +290,9 @@ fn update_hud(dive: Res<DiveWorld>, mut hud: Query<&mut Text, With<Hud>>) {
         };
         let alt = dive.altitude();
         let speed = dive.body.velocity.length();
-        text.0 = format!("altitude: {alt:8.0} m\nspeed:    {speed:7.1} m/s\nmedium:   {medium}");
+        let pressure_kpa = dive.pressure / 1_000.0;
+        text.0 = format!(
+            "altitude: {alt:8.0} m\nspeed:    {speed:7.1} m/s\nmedium:   {medium}\nhull P:   {pressure_kpa:8.1} kPa"
+        );
     }
 }
