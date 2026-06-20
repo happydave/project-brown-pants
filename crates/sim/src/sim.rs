@@ -2,10 +2,12 @@
 //! (with time warp) and the craft carried on its [`Orbit`]. Rendering-free; the
 //! application crate draws from this state.
 
+use crate::handoff::GearState;
 use crate::orbit::Orbit;
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_time::prelude::*;
+use glam::DMat3;
 
 /// The simulated-time clock. `time` advances by real frame time scaled by
 /// `warp` (unless `paused`). This is the on-rails gear: because the craft's
@@ -68,9 +70,14 @@ impl Plugin for OrbitPlugin {
         app.insert_resource(SimClock::default())
             .insert_resource(self.central_body)
             .add_systems(Update, advance_clock);
-        app.world_mut().spawn(Craft {
-            orbit: self.initial_orbit,
-        });
+        // The craft starts on rails, carrying a persistent gear-state (a unit
+        // body by default) so the WI 508 hand-off can wake it into active physics.
+        app.world_mut().spawn((
+            Craft {
+                orbit: self.initial_orbit,
+            },
+            GearState::new(1.0, DMat3::IDENTITY),
+        ));
     }
 }
 

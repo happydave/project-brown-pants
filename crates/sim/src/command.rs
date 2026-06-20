@@ -6,9 +6,11 @@
 //! This is what lets the AI remain "a player": it issues the same commands a human
 //! does. The command type is also WI 502's bus envelope.
 //!
-//! Impulsive/on-rails actions only for now; continuous actuators (thrust, gimbal)
-//! and attitude/SAS control arrive with the active gear (WI 508).
+//! WI 508 adds the gear-switch command (`SetGear`, on-rails ↔ active hand-off).
+//! Continuous actuators (thrust, gimbal) and attitude/SAS control during active
+//! flight remain a later Flight Control concern.
 
+use crate::handoff::GearKind;
 use crate::orbit::Orbit;
 use crate::sim::{Craft, SimClock};
 use bevy_app::prelude::*;
@@ -33,6 +35,11 @@ pub enum Command {
     /// Execute an impulsive maneuver now: a world-frame delta-v applied at the
     /// current instant and craft state (changes velocity, not position).
     ExecuteManeuver { delta_v: DVec2 },
+    /// Switch the craft into the given gear (on-rails ↔ active) at the current
+    /// instant. Handled by the gear-switch system (WI 508), not [`apply_command`]:
+    /// the swap is structural (component insert/remove), outside this function's
+    /// `(clock, orbit)` reach.
+    SetGear(GearKind),
 }
 
 /// Applies a single command to the simulation. Pure and deterministic — the only
@@ -57,6 +64,8 @@ pub fn apply_command(cmd: &Command, clock: &mut SimClock, orbit: Option<&mut Orb
                 None => false,
             }
         }
+        // Structural gear switch is applied by the gear-switch system, not here.
+        Command::SetGear(_) => false,
     }
 }
 
@@ -83,6 +92,7 @@ fn execute_commands(
             Command::SetPaused(_) => info!("paused: {}", clock.paused),
             Command::ExecuteManeuver { .. } if applied => info!("maneuver executed"),
             Command::ExecuteManeuver { .. } => warn!("maneuver rejected (unbound or no craft)"),
+            Command::SetGear(g) => info!("gear switch requested: {g:?}"),
         }
     }
 }

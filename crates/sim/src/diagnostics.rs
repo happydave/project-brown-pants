@@ -15,9 +15,13 @@ pub const ENERGY_DRIFT: DiagnosticPath = DiagnosticPath::const_new("sim/energy_d
 /// |specific angular momentum of the live state − the orbit's analytic value|.
 pub const ANGULAR_MOMENTUM_DRIFT: DiagnosticPath =
     DiagnosticPath::const_new("sim/angular_momentum_drift");
+/// Position/velocity jump injected at an on-rails ↔ active gear transition (WI 508).
+/// Registered and recorded by the hand-off plugin (`handoff.rs`), which produces
+/// the value at a transition rather than per frame.
+pub const HANDOFF_DISCONTINUITY: DiagnosticPath =
+    DiagnosticPath::const_new("sim/handoff_discontinuity");
 
-// Future invariant metrics, deferred to the systems they observe:
-// - hand-off discontinuity (delta-v injected at on-rails <-> active transition): WI 508.
+// Future invariant metric, deferred to the system that observes it:
 // - wheel contact-query jitter (the kraken detector): WI 506.
 
 /// Absolute deviation of a state's specific orbital energy from the orbit's

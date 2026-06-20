@@ -11,6 +11,7 @@ pub mod command;
 pub mod diagnostics;
 pub mod fluid;
 pub mod frame;
+pub mod handoff;
 pub mod orbit;
 pub mod persist;
 pub mod resource;
