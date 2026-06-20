@@ -58,6 +58,7 @@ The app selects a toy scene at launch:
 - `cargo run -p sounding -- dive` — the Toy 9 dive: a craft falls vacuum→atmosphere→ocean, drag/buoyancy/pressure all from one fluid field (HUD shows altitude/speed/medium, static hull pressure, and dynamic ram pressure / max-Q)
 - `cargo run -p sounding -- break` — structural breakage: a voxel bar spins up until the centripetal load snaps it into connected-component fragments that tumble apart
 - `cargo run -p sounding -- compartments` — airtight compartments: a hollow craft's sealed volumes, colour-coded; `H` toggles a hatch (merge/split), `B` breaches the hull (vent)
+- `cargo run -p sounding -- flooding` — decompression/flooding: a submerged craft; `B` breaches a compartment and it floods, tilts, and sinks as floodwater mass shifts the centre of mass
 
 ## Runtime bus
 

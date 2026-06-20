@@ -11,6 +11,7 @@ pub mod breakage;
 pub mod command;
 pub mod compartments;
 pub mod diagnostics;
+pub mod flooding;
 pub mod fluid;
 pub mod frame;
 pub mod handoff;

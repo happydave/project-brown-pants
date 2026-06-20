@@ -9,6 +9,7 @@
 //! - `cargo run -p sounding -- dive` — Toy 9 the dive (orbit → atmosphere → ocean)
 //! - `cargo run -p sounding -- break` — structural breakage (a spinning craft snaps apart)
 //! - `cargo run -p sounding -- compartments` — airtight compartments (hatch + breach)
+//! - `cargo run -p sounding -- flooding` — decompression/flooding (breach a submerged craft)
 //!
 //! The Toy 1–3 simulation and runtime bus run headless behind whichever scene is
 //! shown, so the companion still works. Per-scene controls are documented in
@@ -27,6 +28,7 @@ mod compartments_scene;
 mod dive_scene;
 mod editor;
 mod floating_origin;
+mod flooding_scene;
 mod planet;
 mod rover_scene;
 
@@ -34,6 +36,7 @@ use break_scene::BreakScenePlugin;
 use compartments_scene::CompartmentsScenePlugin;
 use dive_scene::DiveScenePlugin;
 use editor::EditorPlugin;
+use flooding_scene::FloodingScenePlugin;
 use planet::PlanetPlugin;
 use rover_scene::RoverScenePlugin;
 
@@ -45,6 +48,7 @@ enum Scene {
     Dive,
     Break,
     Compartments,
+    Flooding,
 }
 
 fn selected_scene() -> Scene {
@@ -54,6 +58,7 @@ fn selected_scene() -> Scene {
         Some("dive") => Scene::Dive,
         Some("break") => Scene::Break,
         Some("compartments") => Scene::Compartments,
+        Some("flooding") => Scene::Flooding,
         _ => Scene::Editor,
     }
 }
@@ -101,6 +106,9 @@ fn main() {
         }
         Scene::Compartments => {
             app.add_plugins(CompartmentsScenePlugin);
+        }
+        Scene::Flooding => {
+            app.add_plugins(FloodingScenePlugin);
         }
     }
 
