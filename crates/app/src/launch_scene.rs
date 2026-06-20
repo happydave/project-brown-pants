@@ -89,9 +89,15 @@ impl LaunchWorld {
             commands: vec![EngineCommand::default()],
         };
 
-        // Rest the craft's CoM on the pad (altitude 0 → radius = BODY.radius).
+        // Rest the craft's **base** on the pad, not its CoM. The mesh is centred on
+        // the CoM, which sits `base→CoM` (= `dry_com.y`, the lowest voxel base is at
+        // local y = 0) above the base — so hold the CoM that far above the ground,
+        // putting the base at altitude 0 (the pad). The pad's `surface_radius` is the
+        // CoM rest radius; `altitude()` then reads 0 at rest (base on the pad).
+        let base_to_com = dry_com.y;
+        let pad_radius = BODY.radius + base_to_com;
         let body = ActiveBody::new(
-            DVec3::new(0.0, BODY.radius, 0.0),
+            DVec3::new(0.0, pad_radius, 0.0),
             DVec3::ZERO,
             dry_mass + propellant,
             mp.inertia,
@@ -102,7 +108,7 @@ impl LaunchWorld {
             dry_com,
             dry_mass,
             propulsion,
-            pad: LaunchPad::resting(BODY.radius),
+            pad: LaunchPad::resting(pad_radius),
             drag_area,
             elapsed: 0.0,
             accumulator: 0.0,
