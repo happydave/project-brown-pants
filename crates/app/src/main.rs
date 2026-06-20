@@ -11,6 +11,7 @@
 //! - `cargo run -p sounding -- compartments` — airtight compartments (hatch + breach)
 //! - `cargo run -p sounding -- flooding` — decompression/flooding (breach a submerged craft)
 //! - `cargo run -p sounding -- windtunnel` — aero: lift curve + transonic area-ruling plots
+//! - `cargo run -p sounding -- launch` — surface lift-off: a rocket rests on the pad, then ascends under thrust
 //!
 //! The Toy 1–3 simulation and runtime bus run headless behind whichever scene is
 //! shown, so the companion still works. Per-scene controls are documented in
@@ -30,6 +31,7 @@ mod dive_scene;
 mod editor;
 mod floating_origin;
 mod flooding_scene;
+mod launch_scene;
 mod planet;
 mod rover_scene;
 mod wind_tunnel_scene;
@@ -39,6 +41,7 @@ use compartments_scene::CompartmentsScenePlugin;
 use dive_scene::DiveScenePlugin;
 use editor::EditorPlugin;
 use flooding_scene::FloodingScenePlugin;
+use launch_scene::LaunchScenePlugin;
 use planet::PlanetPlugin;
 use rover_scene::RoverScenePlugin;
 use wind_tunnel_scene::WindTunnelScenePlugin;
@@ -53,6 +56,7 @@ enum Scene {
     Compartments,
     Flooding,
     WindTunnel,
+    Launch,
 }
 
 fn selected_scene() -> Scene {
@@ -64,6 +68,7 @@ fn selected_scene() -> Scene {
         Some("compartments") => Scene::Compartments,
         Some("flooding") => Scene::Flooding,
         Some("windtunnel") => Scene::WindTunnel,
+        Some("launch") => Scene::Launch,
         _ => Scene::Editor,
     }
 }
@@ -117,6 +122,9 @@ fn main() {
         }
         Scene::WindTunnel => {
             app.add_plugins(WindTunnelScenePlugin);
+        }
+        Scene::Launch => {
+            app.add_plugins(LaunchScenePlugin);
         }
     }
 
