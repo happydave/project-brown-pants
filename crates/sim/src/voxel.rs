@@ -14,23 +14,47 @@ use glam::{DMat3, DVec3, IVec3};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// A structural material: density only (the data the discipline says to model).
-/// A new material is a new value, not a new code path.
+/// A structural material: the data the discipline says to model — density and
+/// tensile strength. A new material is a new value, not a new code path.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Material {
     /// Density, kg/m³.
     pub density: f64,
+    /// Tensile strength, Pa — the structural stress a bond of this material
+    /// withstands before breaking (consumed by connected-component breakage,
+    /// WI 518). Defaulted on load so pre-strength saves stay backward-loadable.
+    #[serde(default = "Material::default_strength")]
+    pub strength: f64,
 }
 
 impl Material {
     /// Aluminium-like structural material.
-    pub const ALUMINIUM: Material = Material { density: 2_700.0 };
+    pub const ALUMINIUM: Material = Material {
+        density: 2_700.0,
+        strength: 3.1e8,
+    };
     /// Steel-like structural material.
-    pub const STEEL: Material = Material { density: 7_850.0 };
+    pub const STEEL: Material = Material {
+        density: 7_850.0,
+        strength: 5.0e8,
+    };
     /// Titanium-like structural material.
-    pub const TITANIUM: Material = Material { density: 4_500.0 };
+    pub const TITANIUM: Material = Material {
+        density: 4_500.0,
+        strength: 9.0e8,
+    };
     /// Light composite.
-    pub const COMPOSITE: Material = Material { density: 1_600.0 };
+    pub const COMPOSITE: Material = Material {
+        density: 1_600.0,
+        strength: 6.0e8,
+    };
+
+    /// The strength assumed for a material loaded from a pre-strength save: high
+    /// enough to be effectively unbreakable, so old craft do not spontaneously
+    /// shatter.
+    pub fn default_strength() -> f64 {
+        1.0e12
+    }
 }
 
 /// A single occupied cell of the lattice.
@@ -347,7 +371,16 @@ mod tests {
 
     #[test]
     fn single_voxel_mass_and_com() {
-        let craft = block(1, 1, 1, 2.0, Material { density: 1_000.0 });
+        let craft = block(
+            1,
+            1,
+            1,
+            2.0,
+            Material {
+                density: 1_000.0,
+                strength: 1.0e9,
+            },
+        );
         let mp = craft.mass_properties().unwrap();
         // mass = density × cell³ = 1000 × 8 = 8000 kg.
         assert!((mp.mass - 8_000.0).abs() < 1e-6);
@@ -360,7 +393,16 @@ mod tests {
         let (nx, ny, nz) = (4, 2, 6);
         let s = 0.5;
         let density = 1_200.0;
-        let craft = block(nx, ny, nz, s, Material { density });
+        let craft = block(
+            nx,
+            ny,
+            nz,
+            s,
+            Material {
+                density,
+                strength: 1.0e9,
+            },
+        );
         let mp = craft.mass_properties().unwrap();
 
         let (lx, ly, lz) = (nx as f64 * s, ny as f64 * s, nz as f64 * s);
@@ -382,7 +424,16 @@ mod tests {
 
     #[test]
     fn principal_moments_recover_box_diagonal() {
-        let craft = block(4, 2, 6, 0.5, Material { density: 1_200.0 });
+        let craft = block(
+            4,
+            2,
+            6,
+            0.5,
+            Material {
+                density: 1_200.0,
+                strength: 1.0e9,
+            },
+        );
         let mp = craft.mass_properties().unwrap();
         // For an axis-aligned box the principal moments equal the diagonal entries.
         let mut got = [
@@ -408,11 +459,17 @@ mod tests {
         let mut craft = VoxelCraft::new(1.0);
         craft.voxels.push(Voxel {
             cell: IVec3::new(0, 0, 0),
-            material: Material { density: 1_000.0 },
+            material: Material {
+                density: 1_000.0,
+                strength: 1.0e9,
+            },
         });
         craft.voxels.push(Voxel {
             cell: IVec3::new(1, 0, 0),
-            material: Material { density: 3_000.0 },
+            material: Material {
+                density: 3_000.0,
+                strength: 1.0e9,
+            },
         });
         let mp = craft.mass_properties().unwrap();
         // Cell centres at x=0.5 and x=1.5; mass-weighted mean > 1.0 (midpoint).
@@ -464,7 +521,10 @@ mod tests {
     #[test]
     fn material_is_data_driven() {
         // A new material is a value, not a code change.
-        let exotic = Material { density: 19_300.0 }; // tungsten-like
+        let exotic = Material {
+            density: 19_300.0,
+            strength: 1.0e9,
+        }; // tungsten-like
         let mut craft = VoxelCraft::new(1.0);
         craft.voxels.push(Voxel {
             cell: IVec3::ZERO,

@@ -7,6 +7,7 @@
 //! - `cargo run -p sounding -- planet` — Toy 4 floating-origin planet + atmosphere
 //! - `cargo run -p sounding -- rover` — Toy 6 rover on terrain
 //! - `cargo run -p sounding -- dive` — Toy 9 the dive (orbit → atmosphere → ocean)
+//! - `cargo run -p sounding -- break` — structural breakage (a spinning craft snaps apart)
 //!
 //! The Toy 1–3 simulation and runtime bus run headless behind whichever scene is
 //! shown, so the companion still works. Per-scene controls are documented in
@@ -19,6 +20,7 @@ use sounding_sim::diagnostics::SimDiagnosticsPlugin;
 use sounding_sim::orbit::Orbit;
 use sounding_sim::sim::{CentralBody, OrbitPlugin};
 
+mod break_scene;
 mod bus;
 mod dive_scene;
 mod editor;
@@ -26,6 +28,7 @@ mod floating_origin;
 mod planet;
 mod rover_scene;
 
+use break_scene::BreakScenePlugin;
 use dive_scene::DiveScenePlugin;
 use editor::EditorPlugin;
 use planet::PlanetPlugin;
@@ -37,6 +40,7 @@ enum Scene {
     Planet,
     Rover,
     Dive,
+    Break,
 }
 
 fn selected_scene() -> Scene {
@@ -44,6 +48,7 @@ fn selected_scene() -> Scene {
         Some("planet") => Scene::Planet,
         Some("rover") => Scene::Rover,
         Some("dive") => Scene::Dive,
+        Some("break") => Scene::Break,
         _ => Scene::Editor,
     }
 }
@@ -85,6 +90,9 @@ fn main() {
         }
         Scene::Dive => {
             app.add_plugins(DiveScenePlugin);
+        }
+        Scene::Break => {
+            app.add_plugins(BreakScenePlugin);
         }
     }
 

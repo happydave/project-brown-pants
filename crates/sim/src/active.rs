@@ -326,7 +326,10 @@ mod tests {
         let mut craft = VoxelCraft::new(1.0);
         craft.voxels.push(Voxel {
             cell: IVec3::ZERO,
-            material: Material { density: 1_000.0 },
+            material: Material {
+                density: 1_000.0,
+                strength: 1.0e9,
+            },
         });
         let mp = craft.mass_properties().unwrap();
         let body = ActiveBody::from_mass_properties(DVec3::ZERO, DVec3::ZERO, &mp);

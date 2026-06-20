@@ -56,6 +56,7 @@ The app selects a toy scene at launch:
 - `cargo run -p sounding -- planet` — the Toy 4 floating-origin planet + atmosphere
 - `cargo run -p sounding -- rover` — the Toy 6 rover on terrain (`W`/`S` drive, `A`/`D` steer, `Space` brake; HUD shows speed/height)
 - `cargo run -p sounding -- dive` — the Toy 9 dive: a craft falls vacuum→atmosphere→ocean, drag/buoyancy/pressure all from one fluid field (HUD shows altitude/speed/medium, static hull pressure, and dynamic ram pressure / max-Q)
+- `cargo run -p sounding -- break` — structural breakage: a voxel bar spins up until the centripetal load snaps it into connected-component fragments that tumble apart
 
 ## Runtime bus
 
