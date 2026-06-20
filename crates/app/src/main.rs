@@ -13,6 +13,7 @@
 //! - `cargo run -p sounding -- windtunnel` — aero: lift curve + transonic area-ruling plots
 //! - `cargo run -p sounding -- launch` — surface lift-off: a rocket rests on the pad, then ascends under thrust
 //! - `cargo run -p sounding -- autopilot` — a continuous one-craft session flown automatically: Launch → Flight → Recovery (a sounding)
+//! - `cargo run -p sounding -- play` — fly a craft by hand: throttle/attitude/SAS/warp, with a full flight HUD (Δv, apsides, energy)
 //!
 //! The Toy 1–3 simulation and runtime bus run headless behind whichever scene is
 //! shown, so the companion still works. Per-scene controls are documented in
@@ -35,6 +36,7 @@ mod floating_origin;
 mod flooding_scene;
 mod launch_scene;
 mod planet;
+mod play_scene;
 mod rover_scene;
 mod wind_tunnel_scene;
 
@@ -46,6 +48,7 @@ use editor::EditorPlugin;
 use flooding_scene::FloodingScenePlugin;
 use launch_scene::LaunchScenePlugin;
 use planet::PlanetPlugin;
+use play_scene::PlayScenePlugin;
 use rover_scene::RoverScenePlugin;
 use wind_tunnel_scene::WindTunnelScenePlugin;
 
@@ -61,6 +64,7 @@ enum Scene {
     WindTunnel,
     Launch,
     Autopilot,
+    Play,
 }
 
 fn selected_scene() -> Scene {
@@ -74,6 +78,7 @@ fn selected_scene() -> Scene {
         Some("windtunnel") => Scene::WindTunnel,
         Some("launch") => Scene::Launch,
         Some("autopilot") => Scene::Autopilot,
+        Some("play") => Scene::Play,
         _ => Scene::Editor,
     }
 }
@@ -133,6 +138,9 @@ fn main() {
         }
         Scene::Autopilot => {
             app.add_plugins(AutopilotScenePlugin);
+        }
+        Scene::Play => {
+            app.add_plugins(PlayScenePlugin);
         }
     }
 

@@ -176,6 +176,28 @@ impl Propulsion {
         }
     }
 
+    /// Total remaining propellant across all tanks, kg.
+    pub fn propellant(&self) -> f64 {
+        self.graph.reservoirs.iter().map(|r| r.amount).sum()
+    }
+
+    /// The craft's remaining **Δv**, m/s — the rocket equation `v_e · ln(m_wet/m_dry)`
+    /// (WI 535). Uses the first engine's exhaust velocity (single representative
+    /// engine; staged Δv is later) and the total propellant. Zero with no
+    /// propellant, no engine, or no dry mass.
+    pub fn delta_v(&self, dry_mass: f64) -> f64 {
+        let propellant = self.propellant();
+        let v_e = self
+            .engines
+            .first()
+            .map(|e| e.exhaust_velocity)
+            .unwrap_or(0.0);
+        if dry_mass <= EPS_M || propellant <= 0.0 || v_e <= 0.0 {
+            return 0.0;
+        }
+        v_e * ((dry_mass + propellant) / dry_mass).ln()
+    }
+
     /// Applies a propulsion [`Command`] to engine command state. `SetThrottle` sets
     /// every engine's throttle; `SetGimbal` sets every gimbal-capable engine's
     /// gimbal. Other commands are ignored (returns `false`). The structural analogue
@@ -397,6 +419,23 @@ mod tests {
         assert!((p.commands[0].gimbal.length() - 0.05).abs() < 1e-9);
         // A non-propulsion command is ignored.
         assert!(!p.apply_command(&Command::SetPaused(true)));
+    }
+
+    #[test]
+    fn delta_v_matches_the_rocket_equation() {
+        let p = single_engine(1_000.0, 10.0, 3_000.0); // 1000 kg propellant, v_e 3000
+                                                       // Δv = 3000·ln((1000 dry + 1000 prop)/1000) = 3000·ln 2 ≈ 2079 m/s.
+        let expected = 3_000.0 * 2.0_f64.ln();
+        assert!(
+            (p.delta_v(1_000.0) - expected).abs() < 1e-6,
+            "{}",
+            p.delta_v(1_000.0)
+        );
+        // No propellant → no Δv.
+        let mut empty = single_engine(1_000.0, 10.0, 3_000.0);
+        empty.graph.reservoirs[0].amount = 0.0;
+        assert_eq!(empty.delta_v(1_000.0), 0.0);
+        assert!((p.propellant() - 1_000.0).abs() < 1e-9);
     }
 
     #[test]
