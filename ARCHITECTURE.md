@@ -9,7 +9,7 @@
 
 Required: `/crates/sim/` (`sounding_sim`) depends only on Bevy sub-crates (`bevy_app`, `bevy_ecs`, `bevy_time`, `bevy_diagnostic`, `bevy_log`), never the `bevy` umbrella — so it is rendering-free and runs headless.
 Forbidden: `/crates/sim/` pulling in rendering or windowing. Verify: `cargo tree -p sounding_sim` shows no `bevy_render`, `bevy_winit`, or `wgpu`.
-Required: all mutation of simulation state routes through `apply_command` in `/crates/sim/src/command.rs`. No input system, autopilot, or bus client mutates `SimClock` or `Craft` directly — they emit `Command` messages.
+Required: every change to simulation state is `Command`-driven through the executor — no input system, autopilot, or bus client mutates state directly; they emit `Command` messages. Two arms apply them: **field mutations** (warp, pause, maneuver) go through the pure `apply_command` in `/crates/sim/src/command.rs`; **structural changes** (component insert/remove, spawn/despawn — e.g. the gear swap on `Command::SetGear`, WI 508) go through a dedicated `Command`-triggered system, since they are outside `apply_command`'s `(clock, orbit)` reach. The invariant is the routing (a `Command` drives it), not the single function.
 Required: external processes (`/crates/companion/`, future second screen / MCP AI) act on the simulation only via the runtime bus (`GET /telemetry`, `POST /command`). The bus injects `Command`s; it never mutates state.
 Required: the Bevy Remote Protocol is compiled only under the app's `dev` feature, absent from default/release builds, and is distinct from the runtime bus.
 
