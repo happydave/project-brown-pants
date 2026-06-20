@@ -362,7 +362,8 @@ fn draw_attitude_gizmo(
     }
 }
 
-fn throttle_bar(fraction: f64) -> String {
+/// A 10-cell text gauge for a `[0, 1]` fraction, e.g. `[######----]`.
+fn gauge(fraction: f64) -> String {
     let filled = (fraction * 10.0).round().clamp(0.0, 10.0) as usize;
     let mut s = String::from("[");
     s.push_str(&"#".repeat(filled));
@@ -386,10 +387,29 @@ fn update_hud(world: Res<AutopilotWorld>, mut hud: Query<&mut Text, With<Hud>>) 
         let throttle = world.throttle();
         let altitude = world.altitude();
         let speed = world.body.velocity.length();
+        let (fuel_amt, fuel_cap) = world
+            .craft
+            .propulsion
+            .graph
+            .reservoirs
+            .first()
+            .map(|r| (r.amount, r.capacity))
+            .unwrap_or((0.0, 0.0));
+        let fuel_frac = if fuel_cap > 0.0 {
+            fuel_amt / fuel_cap
+        } else {
+            0.0
+        };
+        // Throttle commanded but the tank is empty → flame-out (no thrust).
+        let flameout = throttle > 0.0 && fuel_amt <= 1.0;
+        let throttle_note = if flameout { "  FLAMEOUT" } else { "" };
         text.0 = format!(
-            "phase:    {phase}\nthrottle: {bar} {pct:3.0}%\nG-force:  {g:5.1} g\naltitude: {altitude:8.0} m\nspeed:    {speed:7.1} m/s\ntilt:     {tilt:5.0}°",
-            bar = throttle_bar(throttle),
+            "phase:    {phase}\nthrottle: {tbar} {pct:3.0}%{note}\nfuel:     {fbar} {fuel:6.0} kg\nG-force:  {g:5.1} g\naltitude: {altitude:8.0} m\nspeed:    {speed:7.1} m/s\ntilt:     {tilt:5.0}°",
+            tbar = gauge(throttle),
             pct = throttle * 100.0,
+            note = throttle_note,
+            fbar = gauge(fuel_frac),
+            fuel = fuel_amt,
             g = world.g_force,
             tilt = world.tilt_degrees(),
         );
