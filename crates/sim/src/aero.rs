@@ -162,6 +162,27 @@ pub fn pitching_moment(cop_offset: DVec3, aero_force: DVec3) -> DVec3 {
     cop_offset.cross(aero_force)
 }
 
+/// Aerodynamic **pitch-damping** moment — a torque opposing the body's angular
+/// velocity, scaled by the aero loading (`½ρ·v`), a reference area, a
+/// characteristic length², and a damping coefficient. This is the `Cm_q`-style
+/// damping derivative that makes a statically-stable craft *converge* to trim
+/// rather than oscillate about it undamped. Medium-parameterised like every other
+/// aero force: **zero in vacuum** (ρ=0) and **zero at rest** (v=0). The product
+/// `ρ·v·A·L²` has units of `N·m·s`, so multiplied by `ω` (1/s) it is a torque.
+pub fn pitch_damping_moment(
+    sample: &FluidSample,
+    speed: f64,
+    angular_velocity: DVec3,
+    area: f64,
+    length: f64,
+    coeff: f64,
+) -> DVec3 {
+    if speed <= 0.0 || sample.density <= 0.0 {
+        return DVec3::ZERO;
+    }
+    -coeff * 0.5 * sample.density * speed * area * length * length * angular_velocity
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +330,29 @@ mod tests {
         // A forward CoP would be destabilising (opposite sign).
         let fwd_moment = pitching_moment(DVec3::new(2.0, 0.0, 0.0), lift);
         assert!(fwd_moment.z > 0.0);
+    }
+
+    #[test]
+    fn pitch_damping_opposes_spin_and_vanishes_in_vacuum() {
+        let omega = DVec3::new(0.0, 0.0, 0.5);
+        let air_damp = pitch_damping_moment(&air(), 100.0, omega, 4.0, 2.0, 0.1);
+        // Opposes the spin (anti-parallel) and is nonzero in a dense medium.
+        assert!(
+            air_damp.dot(omega) < 0.0,
+            "damping must oppose angular velocity"
+        );
+        assert!(air_damp.length() > 0.0);
+        // Denser water damps harder at the same spin/speed.
+        let water_damp = pitch_damping_moment(&water(), 100.0, omega, 4.0, 2.0, 0.1);
+        assert!(water_damp.length() > air_damp.length());
+        // Vacuum and rest produce no damping (medium-parameterised).
+        assert_eq!(
+            pitch_damping_moment(&vacuum(), 100.0, omega, 4.0, 2.0, 0.1),
+            DVec3::ZERO
+        );
+        assert_eq!(
+            pitch_damping_moment(&air(), 0.0, omega, 4.0, 2.0, 0.1),
+            DVec3::ZERO
+        );
     }
 }

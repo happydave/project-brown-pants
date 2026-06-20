@@ -16,15 +16,17 @@
 use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::light::{light_consts::lux, AtmosphereEnvironmentMapLight};
-use bevy::math::DVec3;
+use bevy::math::{DQuat, DVec3};
 use bevy::pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium};
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use sounding_sim::active::ActiveBody;
 use sounding_sim::fluid::{FluidMedium, MediumKind};
 use sounding_sim::frame::{FrameId, WorldPos};
-use sounding_sim::medium::{descent_step, dynamic_pressure, max_cross_section, DescentParams};
-use sounding_sim::voxel::{Material, Voxel, VoxelCraft};
+use sounding_sim::medium::{
+    dynamic_pressure, glide_step, max_cross_section, DescentParams, GlideParams,
+};
+use sounding_sim::voxel::{Axis, Material, Voxel, VoxelCraft};
 
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
 
@@ -47,7 +49,7 @@ struct DiveWorld {
     body: ActiveBody,
     craft: VoxelCraft,
     com: DVec3,
-    params: DescentParams,
+    glide: GlideParams,
     accumulator: f64,
     medium: MediumKind,
     /// Ambient (outer-hull) pressure at the craft, Pa — sampled from the unified
@@ -59,11 +61,15 @@ struct DiveWorld {
 
 impl DiveWorld {
     fn new() -> Self {
-        // A small composite capsule: a 2×2×3 m block (denser than water — it sinks).
+        // A slender re-entry body along +Z (forward): a 3×3×4 composite hull with
+        // a denser, centred nose tip. The taper gives a transonic wave-drag
+        // signature; the dense nose puts the centre of mass forward of the area
+        // centroid (centre of pressure aft → a positive static margin), so the
+        // craft weathervanes into the airflow instead of tumbling.
         let mut craft = VoxelCraft::new(1.0);
-        for x in 0..2 {
-            for y in 0..2 {
-                for z in 0..3 {
+        for z in 0..4 {
+            for x in 0..3 {
+                for y in 0..3 {
                     craft.voxels.push(Voxel {
                         cell: IVec3::new(x, y, z),
                         material: Material::COMPOSITE,
@@ -71,26 +77,36 @@ impl DiveWorld {
                 }
             }
         }
+        craft.voxels.push(Voxel {
+            cell: IVec3::new(1, 1, 4),
+            material: Material::ALUMINIUM,
+        });
         let mp = craft.mass_properties().expect("non-empty craft");
-        // Radial sim frame: planet at the origin, craft straight up at start.
-        let body = ActiveBody::new(
+        // Radial sim frame: planet at the origin, craft straight up at start. Enter
+        // pitched ~20° to the (downward) velocity so there is a nonzero angle of
+        // attack to lift against — a gliding entry, not a belly-flop drop.
+        let entry_aoa = 0.35_f64;
+        let forward_down = DVec3::new(entry_aoa.sin(), -entry_aoa.cos(), 0.0);
+        let mut body = ActiveBody::new(
             DVec3::new(0.0, SURFACE_R + START_ALT, 0.0),
             DVec3::new(0.0, -100.0, 0.0), // a gentle initial nudge downward
             mp.mass,
             mp.inertia,
         );
-        let params = DescentParams {
+        body.orientation = DQuat::from_rotation_arc(DVec3::Z, forward_down);
+        let descent = DescentParams {
             medium: FluidMedium::EARTHLIKE,
             mu: MU,
             surface_radius: SURFACE_R,
             drag_area: max_cross_section(&craft),
             drag_coefficient: 1.0,
         };
+        let glide = GlideParams::for_craft(descent, &craft, Axis::Z);
         Self {
             body,
             craft,
             com: mp.center_of_mass,
-            params,
+            glide,
             accumulator: 0.0,
             medium: MediumKind::Vacuum,
             pressure: 0.0,
@@ -174,9 +190,9 @@ fn setup_scene(
         )),
     ));
 
-    // The descending craft.
+    // The descending craft (slender along +Z so its pitch/attitude reads).
     commands.spawn((
-        Mesh3d(meshes.add(Mesh::from(Cuboid::new(2.0, 2.0, 3.0)))),
+        Mesh3d(meshes.add(Mesh::from(Cuboid::new(3.0, 3.0, 5.0)))),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: Color::srgb(0.85, 0.84, 0.88),
             metallic: 0.6,
@@ -249,10 +265,10 @@ fn step_dive(time: Res<Time>, mut dive: ResMut<DiveWorld>) {
             body,
             craft,
             com,
-            params,
+            glide,
             ..
         } = &mut *dive;
-        let sample = descent_step(body, craft, *com, params, SUBSTEP_DT);
+        let sample = glide_step(body, craft, *com, glide, SUBSTEP_DT);
         dive.medium = sample.medium;
         dive.pressure = sample.pressure;
         dive.dynamic_pressure = dynamic_pressure(&sample, dive.body.velocity);
@@ -261,10 +277,16 @@ fn step_dive(time: Res<Time>, mut dive: ResMut<DiveWorld>) {
     }
 }
 
-/// Updates the craft entity's world placement from the simulation.
-fn track_craft(dive: Res<DiveWorld>, mut craft: Query<&mut WorldPlacement, With<CraftMarker>>) {
-    if let Ok(mut wp) = craft.single_mut() {
+/// Updates the craft entity's world placement and attitude from the simulation.
+/// The floating-origin rebase owns translation; rotation is ours to set, so the
+/// craft visibly weathervanes/banks as the aero moment trims it.
+fn track_craft(
+    dive: Res<DiveWorld>,
+    mut craft: Query<(&mut WorldPlacement, &mut Transform), With<CraftMarker>>,
+) {
+    if let Ok((mut wp, mut tf)) = craft.single_mut() {
         wp.0 = WorldPos::new(FrameId::CENTRAL_BODY, dive.render_world());
+        tf.rotation = dive.body.orientation.as_quat();
     }
 }
 

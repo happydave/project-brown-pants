@@ -15,6 +15,7 @@
 //! `Command::SetGear(Active)`, the design's "atmospheric entry forces a drop out
 //! of warp". Headless; the rendered descent scene lives in the app.
 
+use crate::aero;
 use crate::command::Command;
 use crate::fluid::{FluidMedium, FluidSample};
 use crate::handoff::GearKind;
@@ -156,6 +157,141 @@ pub fn descent_step(
     let buoyancy = buoyancy_force(sample.density, sub_vol, g_local, up);
 
     body.integrate_wrench(gravity + drag + buoyancy, DVec3::ZERO, dt);
+    sample
+}
+
+/// A unit vector along an [`Axis`].
+fn axis_unit(axis: Axis) -> DVec3 {
+    match axis {
+        Axis::X => DVec3::X,
+        Axis::Y => DVec3::Y,
+        Axis::Z => DVec3::Z,
+    }
+}
+
+/// The component of `v` along an [`Axis`].
+fn axis_component(v: DVec3, axis: Axis) -> f64 {
+    match axis {
+        Axis::X => v.x,
+        Axis::Y => v.y,
+        Axis::Z => v.z,
+    }
+}
+
+/// The fixed constants of a **gliding** descent: a [`DescentParams`] plus the aero
+/// terms that turn a ballistic fall into a glide — lift, the transonic wave drag,
+/// the static (weathervaning) pitching moment, and aerodynamic pitch damping. All
+/// derived from the **same** voxel `area_curve` the drag uses; medium-agnostic
+/// (the [`FluidSample`] parameterises every term), so lift/wave-drag vanish in
+/// vacuum and wave drag vanishes in liquid, with no branch on medium identity.
+#[derive(Clone, Copy, Debug)]
+pub struct GlideParams {
+    /// The ballistic descent constants (gravity + drag + buoyancy).
+    pub descent: DescentParams,
+    /// Lift / wave-drag reference area, m².
+    pub lift_area: f64,
+    /// Abruptness of the area curve along the forward axis (drives wave drag).
+    pub area_ruling_factor: f64,
+    /// Body-frame longitudinal ("forward") unit axis — the craft's nose direction.
+    pub forward_local: DVec3,
+    /// Body-frame offset from the centre of mass to the centre of pressure, m
+    /// (along `forward_local`). Aft of the CoM ⇒ statically stable.
+    pub cop_offset_local: DVec3,
+    /// Aerodynamic pitch-damping coefficient (dimensionless).
+    pub pitch_damping: f64,
+    /// Characteristic length for the pitch-damping moment, m.
+    pub damping_length: f64,
+}
+
+impl GlideParams {
+    /// Builds glide parameters for a craft, taking `forward` as the longitudinal
+    /// axis. Precomputes the lift reference area (the drag reference area), the
+    /// area-ruling factor and the centre-of-pressure offset from the craft's own
+    /// `area_curve` and centre of mass — so the per-sub-step `glide_step` does no
+    /// geometry work. `pitch_damping` and `damping_length` default to mild,
+    /// stable values the caller may override.
+    pub fn for_craft(descent: DescentParams, craft: &VoxelCraft, forward: Axis) -> Self {
+        let curve = craft.area_curve(forward);
+        let area_ruling_factor = aero::area_ruling_factor(&curve);
+        let cop = aero::center_of_pressure(&curve, craft.cell_size);
+        let com = craft
+            .mass_properties()
+            .map(|mp| axis_component(mp.center_of_mass, forward))
+            .unwrap_or(0.0);
+        let unit = axis_unit(forward);
+        Self {
+            lift_area: descent.drag_area,
+            area_ruling_factor,
+            forward_local: unit,
+            cop_offset_local: (cop - com) * unit,
+            pitch_damping: 0.5,
+            damping_length: 1.0,
+            descent,
+        }
+    }
+}
+
+/// Advance the active body one step under **gravity + drag + buoyancy + lift +
+/// transonic wave drag**, with a static (weathervaning) pitching moment and
+/// aerodynamic pitch damping — the gliding counterpart to [`descent_step`]. At a
+/// nonzero angle of attack the lift bends the path away from a pure fall (a glide)
+/// and the restoring moment + damping trim the craft toward the flow. Every aero
+/// term is drawn from the one medium sample, so all vanish appropriately in
+/// vacuum/liquid with no medium-identity branch. Returns the medium sample.
+pub fn glide_step(
+    body: &mut crate::active::ActiveBody,
+    craft: &VoxelCraft,
+    com: DVec3,
+    params: &GlideParams,
+    dt: f64,
+) -> FluidSample {
+    let p = &params.descent;
+    let r = body.position.length();
+    let up = if r > 0.0 { body.position / r } else { DVec3::Y };
+    let altitude = r - p.surface_radius;
+    let sample = p.medium.sample_altitude(altitude);
+    let g_local = if r > 0.0 { p.mu / (r * r) } else { 0.0 };
+
+    // Central forces (no moment arm): gravity, drag, buoyancy.
+    let gravity = gravity_force(body.mass, body.position, p.mu);
+    let drag = drag_force(&sample, body.velocity, p.drag_area, p.drag_coefficient);
+    let sub_vol = submerged_volume(
+        craft,
+        com,
+        body.position,
+        body.orientation,
+        p.surface_radius,
+    );
+    let buoyancy = buoyancy_force(sample.density, sub_vol, g_local, up);
+
+    // Aero forces from the one area curve: lift ⊥ to the flow, transonic wave drag.
+    let forward_world = body.orientation * params.forward_local;
+    let lift = aero::lift_force(&sample, body.velocity, forward_world, params.lift_area);
+    let wave = aero::wave_drag_force(
+        &sample,
+        body.velocity,
+        params.area_ruling_factor,
+        params.lift_area,
+    );
+
+    // Moment: lift acting at the centre of pressure (static stability) + damping.
+    let cop_world = body.orientation * params.cop_offset_local;
+    let restoring = aero::pitching_moment(cop_world, lift);
+    let omega = body.angular_velocity();
+    let damping = aero::pitch_damping_moment(
+        &sample,
+        body.velocity.length(),
+        omega,
+        params.lift_area,
+        params.damping_length,
+        params.pitch_damping,
+    );
+
+    body.integrate_wrench(
+        gravity + drag + buoyancy + lift + wave,
+        restoring + damping,
+        dt,
+    );
     sample
 }
 
@@ -472,5 +608,211 @@ mod tests {
         // A 2×2×2 block of 1 m cells: each axis slice is 2×2 = 4 m².
         let craft = test_craft();
         assert!((max_cross_section(&craft) - 4.0).abs() < 1e-9);
+    }
+
+    // --- WI 526: gliding re-entry (lift + moment + wave drag applied) ---
+
+    /// A symmetric, **tapered, heavy-nose** craft: a 3×3 base + body along +Z with
+    /// a single centred steel nose cell at the tip. The taper gives a nonzero
+    /// area-ruling factor (so wave drag exists) and, with the dense nose moving the
+    /// centre of mass forward of the geometric (area) centroid, a positive static
+    /// margin (centre of pressure aft of the centre of mass → weathervaning).
+    /// Forward axis is +Z.
+    fn glide_craft() -> VoxelCraft {
+        let mut c = VoxelCraft::new(1.0);
+        for z in 0..4 {
+            for x in 0..3 {
+                for y in 0..3 {
+                    c.voxels.push(Voxel {
+                        cell: IVec3::new(x, y, z),
+                        material: Material::COMPOSITE,
+                    });
+                }
+            }
+        }
+        // A denser, centred nose tip at the +Z end — a small positive static
+        // margin (gentle weathervaning, controllable; not a hard snap-to-flow).
+        c.voxels.push(Voxel {
+            cell: IVec3::new(1, 1, 4),
+            material: Material::ALUMINIUM,
+        });
+        c
+    }
+
+    fn glide_params(craft: &VoxelCraft) -> (DescentParams, GlideParams) {
+        let descent = DescentParams {
+            medium: FluidMedium::EARTHLIKE,
+            mu: MU,
+            surface_radius: SURFACE_R,
+            drag_area: max_cross_section(craft),
+            drag_coefficient: 1.0,
+        };
+        let glide = GlideParams::for_craft(descent, craft, Axis::Z);
+        (descent, glide)
+    }
+
+    /// Acute angle of attack between the body forward axis and the velocity.
+    fn aoa(orientation: DQuat, forward_local: DVec3, velocity: DVec3) -> f64 {
+        use std::f64::consts::{FRAC_PI_2, PI};
+        let f = (orientation * forward_local).normalize();
+        let v = velocity.normalize_or_zero();
+        if v == DVec3::ZERO {
+            return 0.0;
+        }
+        let a = f.dot(v).clamp(-1.0, 1.0).acos();
+        if a > FRAC_PI_2 {
+            PI - a
+        } else {
+            a
+        }
+    }
+
+    /// An orientation putting the forward axis at angle `alpha` to a straight-down
+    /// (−Y) velocity, tilted toward +X (so lift acts in +X).
+    fn entry_orientation(forward_local: DVec3, alpha: f64) -> DQuat {
+        let desired = DVec3::new(alpha.sin(), -alpha.cos(), 0.0);
+        DQuat::from_rotation_arc(forward_local, desired)
+    }
+
+    #[test]
+    fn the_static_margin_is_positive() {
+        // Sanity on the fixture: the centre of pressure is aft of the centre of
+        // mass along +Z (a stable craft), and the taper gives wave-drag headroom.
+        let craft = glide_craft();
+        let (_d, glide) = glide_params(&craft);
+        assert!(
+            glide.cop_offset_local.z < 0.0,
+            "CoP should be aft (−Z) of CoM: {:?}",
+            glide.cop_offset_local
+        );
+        assert!(
+            glide.area_ruling_factor > 0.0,
+            "tapered body has a nonzero area-ruling factor"
+        );
+    }
+
+    #[test]
+    fn lift_produces_a_glide_vs_ballistic() {
+        let craft = glide_craft();
+        let mp = craft.mass_properties().unwrap();
+        let com = mp.center_of_mass;
+        let (descent, glide) = glide_params(&craft);
+
+        let start = DVec3::new(0.0, SURFACE_R + 3_000.0, 0.0);
+        let v0 = DVec3::new(0.0, -300.0, 0.0);
+        let mut body = ActiveBody::new(start, v0, mp.mass, mp.inertia);
+        body.orientation = entry_orientation(glide.forward_local, 0.35); // ~20° AoA
+        let mut ballistic = body; // identical start, no lift
+
+        let dt = 0.004;
+        for _ in 0..2_000 {
+            glide_step(&mut body, &craft, com, &glide, dt);
+            descent_step(&mut ballistic, &craft, com, &descent, dt);
+        }
+
+        // The glider converted descent into downrange (+X) motion; the ballistic
+        // reference fell straight down.
+        assert!(
+            body.velocity.x > 5.0,
+            "glide should gain horizontal velocity: {}",
+            body.velocity.x
+        );
+        assert!(
+            ballistic.velocity.x.abs() < 1e-6,
+            "ballistic stays vertical: {}",
+            ballistic.velocity.x
+        );
+        assert!(
+            body.position.x > ballistic.position.x + 5.0,
+            "glide path deflects downrange"
+        );
+        assert!(body.position.is_finite() && body.velocity.is_finite());
+    }
+
+    #[test]
+    fn statically_stable_craft_trims_and_does_not_tumble() {
+        let craft = glide_craft();
+        let mp = craft.mass_properties().unwrap();
+        let com = mp.center_of_mass;
+        let (_d, glide) = glide_params(&craft);
+
+        let mut body = ActiveBody::new(
+            DVec3::new(0.0, SURFACE_R + 3_000.0, 0.0),
+            DVec3::new(0.0, -300.0, 0.0),
+            mp.mass,
+            mp.inertia,
+        );
+        body.orientation = entry_orientation(glide.forward_local, 0.6); // ~34° AoA
+
+        let dt = 0.004;
+        let mut early_max = 0.0_f64;
+        let mut late_max = 0.0_f64;
+        let mut max_omega = 0.0_f64;
+        for i in 0..4_000 {
+            glide_step(&mut body, &craft, com, &glide, dt);
+            let a = aoa(body.orientation, glide.forward_local, body.velocity);
+            if i < 1_000 {
+                early_max = early_max.max(a);
+            } else if i >= 3_000 {
+                late_max = late_max.max(a);
+            }
+            max_omega = max_omega.max(body.angular_velocity().length());
+        }
+        // The pitch oscillation decays toward trim (damping), and the craft never
+        // tumbles (angular velocity stays bounded).
+        assert!(
+            late_max < early_max,
+            "AoA oscillation should decay toward trim: early {early_max} late {late_max}"
+        );
+        assert!(max_omega < 5.0, "no tumble (bounded ω): {max_omega}");
+        assert!(body.orientation.is_finite());
+    }
+
+    #[test]
+    fn wave_drag_included_in_air_absent_in_water() {
+        let craft = glide_craft();
+        let mp = craft.mass_properties().unwrap();
+        let com = mp.center_of_mass;
+        let (descent, glide) = glide_params(&craft);
+
+        // Forward aligned with the velocity → zero AoA → zero lift/moment, so the
+        // only glide/ballistic difference is wave drag.
+        let aligned = DQuat::from_rotation_arc(glide.forward_local, DVec3::NEG_Y);
+        let v = DVec3::new(0.0, -400.0, 0.0); // transonic in dense air
+
+        // Atmosphere (transonic, ~1 km up): wave drag adds deceleration.
+        let mut g_air = ActiveBody::new(
+            DVec3::new(0.0, SURFACE_R + 1_000.0, 0.0),
+            v,
+            mp.mass,
+            mp.inertia,
+        );
+        g_air.orientation = aligned;
+        let mut d_air = g_air;
+        let s = glide_step(&mut g_air, &craft, com, &glide, 0.004);
+        descent_step(&mut d_air, &craft, com, &descent, 0.004);
+        assert_eq!(s.medium, MediumKind::Atmosphere);
+        assert!(
+            g_air.velocity.length() < d_air.velocity.length(),
+            "transonic air: wave drag decelerates the glider more than plain drag"
+        );
+
+        // Ocean (submerged): wave drag is exactly zero (incompressible) and AoA is
+        // zero, so the glide step is linearly identical to the ballistic step.
+        let mut g_w = ActiveBody::new(
+            DVec3::new(0.0, SURFACE_R - 10.0, 0.0),
+            v,
+            mp.mass,
+            mp.inertia,
+        );
+        g_w.orientation = aligned;
+        let mut d_w = g_w;
+        let sw = glide_step(&mut g_w, &craft, com, &glide, 0.004);
+        descent_step(&mut d_w, &craft, com, &descent, 0.004);
+        assert_eq!(sw.medium, MediumKind::Liquid);
+        assert!(
+            (g_w.velocity - d_w.velocity).length() < 1e-9,
+            "ocean: no wave drag and no lift → identical to ballistic"
+        );
     }
 }
