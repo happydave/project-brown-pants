@@ -9,6 +9,7 @@
 pub mod active;
 pub mod breakage;
 pub mod command;
+pub mod compartments;
 pub mod diagnostics;
 pub mod fluid;
 pub mod frame;

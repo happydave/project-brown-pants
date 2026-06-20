@@ -107,6 +107,18 @@ pub struct AttachmentPoint {
     pub face: Face,
 }
 
+/// A door / hatch occupying an (empty) cell in the structure. When `open` the cell
+/// is passable air; when closed it is an air barrier (solid for the compartment
+/// flood-fill, WI 519). Doors affect air topology only — not mass, aero, or
+/// breakage (a thin door is structurally negligible here).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Door {
+    /// The empty cell the door occupies (a gap in a wall).
+    pub cell: IVec3,
+    /// Open (passable air) or closed (a barrier).
+    pub open: bool,
+}
+
 /// An axis along which the cross-sectional-area curve is sliced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Axis {
@@ -141,6 +153,10 @@ pub struct VoxelCraft {
     pub devices: Vec<Device>,
     /// Subassembly attachment points (empty for a standalone craft).
     pub attachments: Vec<AttachmentPoint>,
+    /// Doors / hatches occupying gaps in the structure (compartment flood-fill,
+    /// WI 519). Defaulted on load so pre-doors saves stay backward-loadable.
+    #[serde(default)]
+    pub doors: Vec<Door>,
 }
 
 impl Default for VoxelCraft {
@@ -150,6 +166,7 @@ impl Default for VoxelCraft {
             voxels: Vec::new(),
             devices: Vec::new(),
             attachments: Vec::new(),
+            doors: Vec::new(),
         }
     }
 }
