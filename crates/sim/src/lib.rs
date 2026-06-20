@@ -8,6 +8,7 @@
 
 pub mod active;
 pub mod aero;
+pub mod attitude;
 pub mod breakage;
 pub mod command;
 pub mod compartments;

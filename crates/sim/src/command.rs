@@ -16,8 +16,24 @@ use crate::sim::{Craft, SimClock};
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_log::{info, warn};
-use glam::DVec2;
+use glam::{DVec2, DVec3};
 use serde::{Deserialize, Serialize};
+
+/// A stability-assist (SAS) mode — the attitude-hold autopilot's intent (WI 533).
+/// Defined here (with [`Command`]) so the attitude controller can depend on the
+/// command envelope without a cycle.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SasMode {
+    /// No assist — only manual attitude intent acts.
+    Off,
+    /// Damp all rotation toward zero angular rate.
+    KillRotation,
+    /// Hold the attitude captured when this mode was engaged.
+    Hold,
+    /// Point the craft's nose axis along a world-frame target direction.
+    Point(DVec3),
+}
 
 /// Safe time-warp bounds enforced by the executor — a command source cannot set
 /// a warp outside this range.
@@ -48,6 +64,12 @@ pub enum Command {
     /// Set the engine gimbal deflection (radians, clamped per engine). Applied by
     /// the propulsion system, not [`apply_command`]. WI 531.
     SetGimbal(DVec2),
+    /// Manual attitude intent: pitch/yaw/roll about the body axes, each in
+    /// `[-1, 1]` (scaled by actuator authority). Applied by the attitude system. WI 533.
+    SetAttitude(DVec3),
+    /// Set the stability-assist mode. Applied by the attitude system (it captures
+    /// the current attitude when entering `Hold`). WI 533.
+    SetSas(SasMode),
 }
 
 /// Applies a single command to the simulation. Pure and deterministic — the only
@@ -74,7 +96,11 @@ pub fn apply_command(cmd: &Command, clock: &mut SimClock, orbit: Option<&mut Orb
         }
         // Structural gear switch and propulsion commands are applied by their own
         // systems, not here (outside the `(clock, orbit)` reach).
-        Command::SetGear(_) | Command::SetThrottle(_) | Command::SetGimbal(_) => false,
+        Command::SetGear(_)
+        | Command::SetThrottle(_)
+        | Command::SetGimbal(_)
+        | Command::SetAttitude(_)
+        | Command::SetSas(_) => false,
     }
 }
 
@@ -104,6 +130,8 @@ fn execute_commands(
             Command::SetGear(g) => info!("gear switch requested: {g:?}"),
             Command::SetThrottle(t) => info!("throttle: {t}"),
             Command::SetGimbal(g) => info!("gimbal: {g:?}"),
+            Command::SetAttitude(a) => info!("attitude intent: {a:?}"),
+            Command::SetSas(m) => info!("sas: {m:?}"),
         }
     }
 }
