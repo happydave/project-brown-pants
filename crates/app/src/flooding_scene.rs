@@ -22,6 +22,10 @@ const START_DEPTH: f64 = 80.0;
 const SURFACE_R: f64 = 6_360_000.0;
 const SUBSTEP_DT: f64 = 0.01;
 const MAX_SUBSTEPS: u32 = 40;
+/// Water rotational drag — damps the righting oscillation to rest (N·m·s).
+const ANG_DAMP: f64 = 5.0e6;
+/// Water linear drag — gives the sink a bounded (terminal) rate (N·s/m).
+const LIN_DAMP: f64 = 1.0e5;
 
 /// The submerged craft, its per-compartment flood state, and the rigid body.
 #[derive(Resource)]
@@ -156,12 +160,16 @@ fn step_flood(time: Res<Time>, mut world: ResMut<FloodWorld>) {
         // Buoyancy calibrated to neutral when dry; floodwater is net ballast.
         let buoyancy = world.dry_mass * G;
         let weight = fm.mass * G;
-        let force = DVec3::new(0.0, buoyancy - weight, 0.0);
-        // Tilt: weight acts at the (shifted) CoM, buoyancy at the geometric
-        // centre — their horizontal offset is a righting/tipping torque.
         let mp = world.craft.mass_properties().unwrap();
-        let offset = fm.center_of_mass - mp.center_of_mass; // toward the flooded side
-        let torque = offset.cross(DVec3::new(0.0, -weight, 0.0));
+        // Lever from the centre of buoyancy (≈ the dry geometric centre) to the
+        // shifted CoM, **rotated into the world frame** so it tracks the craft's
+        // attitude. Buoyancy acts up at the CoB and weight down at the CoM: their
+        // couple is a *restoring* torque (it vanishes when the heavy flooded side
+        // is straight down), not a constant spin. Water drag damps it to rest.
+        let lever = world.body.orientation * (fm.center_of_mass - mp.center_of_mass);
+        let righting = (-lever).cross(DVec3::new(0.0, buoyancy, 0.0));
+        let torque = righting - ANG_DAMP * world.body.angular_velocity();
+        let force = DVec3::new(0.0, buoyancy - weight, 0.0) - LIN_DAMP * world.body.velocity;
         world.body.integrate_wrench(force, torque, SUBSTEP_DT);
         world.accumulator -= SUBSTEP_DT;
         n += 1;
