@@ -1,12 +1,14 @@
-//! Play — a continuous one-craft session (WI 534): the first-playable shell.
+//! Autopilot — a continuous one-craft session, flown automatically (WI 534; renamed
+//! from `play` in SideQuest 539 since there is no player interaction yet — that
+//! arrives with the controls, WI 535).
 //!
 //! One craft runs Build → Launch → Flight → Recovery on the **unified flight
 //! pipeline** (`sounding_sim::flight`), its phase driven by simulation state
 //! (`sounding_sim::session`). The demo is a **sounding**: the craft rests on the pad
 //! (`launch`), auto-throttles up with SAS holding it vertical (`propulsion` +
 //! `attitude`), ascends, burns out, coasts to apoapsis, falls back through the
-//! atmosphere, and touches down — Recovery. The auto-throttle/SAS stand in for
-//! player controls (WI 535). Rendering reuses the dive/launch flat-ground convention.
+//! atmosphere, and touches down — Recovery. The HUD shows the phase, a throttle bar,
+//! G-force, altitude/speed, and tilt; an attitude gizmo draws the nose and velocity.
 
 use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::Tonemapping;
@@ -37,10 +39,12 @@ const MAX_SUBSTEPS: u32 = 250;
 const PROPELLANT: ResourceType = ResourceType(0);
 const HOLD_TIME: f64 = 2.0;
 const RAMP_TIME: f64 = 1.5;
+/// Standard gravity for the G-force readout, m/s².
+const G0: f64 = 9.80665;
 
-/// The played craft + session.
+/// The auto-flown craft + session.
 #[derive(Resource)]
-struct PlayWorld {
+struct AutopilotWorld {
     body: ActiveBody,
     craft: FlightCraft,
     params: FlightParams,
@@ -48,9 +52,11 @@ struct PlayWorld {
     session: GameSession,
     elapsed: f64,
     accumulator: f64,
+    /// Felt (proper) acceleration in g — what an onboard accelerometer reads.
+    g_force: f64,
 }
 
-impl PlayWorld {
+impl AutopilotWorld {
     fn new() -> Self {
         // A slim rocket along +Y, with an engine, propellant, and reaction wheels.
         let mut voxels = VoxelCraft::new(1.0);
@@ -121,6 +127,7 @@ impl PlayWorld {
             session,
             elapsed: 0.0,
             accumulator: 0.0,
+            g_force: 1.0,
         }
     }
 
@@ -135,6 +142,17 @@ impl PlayWorld {
     fn throttle(&self) -> f64 {
         ((self.elapsed - HOLD_TIME) / RAMP_TIME).clamp(0.0, 1.0)
     }
+
+    /// Tilt of the nose (+Y body axis) from the local vertical, degrees.
+    fn tilt_degrees(&self) -> f64 {
+        let r = self.body.position.length();
+        if r <= 0.0 {
+            return 0.0;
+        }
+        let up = self.body.position / r;
+        let nose = (self.body.orientation * DVec3::Y).normalize_or_zero();
+        nose.dot(up).clamp(-1.0, 1.0).acos().to_degrees()
+    }
 }
 
 #[derive(Component)]
@@ -142,17 +160,24 @@ struct CraftMarker;
 #[derive(Component)]
 struct Hud;
 
-/// The play scene.
-pub struct PlayScenePlugin;
+/// The autopilot scene.
+pub struct AutopilotScenePlugin;
 
-impl Plugin for PlayScenePlugin {
+impl Plugin for AutopilotScenePlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(FloatingOriginPlugin)
-            .insert_resource(PlayWorld::new())
+            .insert_resource(AutopilotWorld::new())
             .add_systems(Startup, setup_scene)
             .add_systems(
                 Update,
-                (step_play, track_craft, follow_camera, update_hud).chain(),
+                (
+                    step_autopilot,
+                    track_craft,
+                    follow_camera,
+                    update_hud,
+                    draw_attitude_gizmo,
+                )
+                    .chain(),
             );
     }
 }
@@ -162,7 +187,7 @@ fn setup_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut scattering: ResMut<Assets<ScatteringMedium>>,
-    world: Res<PlayWorld>,
+    world: Res<AutopilotWorld>,
 ) {
     commands.spawn((
         Mesh3d(meshes.add(Mesh::from(Sphere {
@@ -203,7 +228,7 @@ fn setup_scene(
     ));
 
     commands.spawn((
-        Text::new("phase:    LAUNCH\nthrottle:   0%\naltitude:        0 m\nspeed:       0.0 m/s"),
+        Text::new("phase:    LAUNCH"),
         TextFont {
             font_size: 20.0,
             ..default()
@@ -234,8 +259,8 @@ fn setup_scene(
 }
 
 /// Sub-steps the session on the unified flight pipeline, driving the auto-throttle
-/// + SAS hold and advancing the phase from sim state.
-fn step_play(time: Res<Time>, mut world: ResMut<PlayWorld>) {
+/// + SAS hold, tracking felt G-force, and advancing the phase from sim state.
+fn step_autopilot(time: Res<Time>, mut world: ResMut<AutopilotWorld>) {
     if world.session.is_terminal() {
         return; // rest after recovery
     }
@@ -248,7 +273,6 @@ fn step_play(time: Res<Time>, mut world: ResMut<PlayWorld>) {
             .craft
             .propulsion
             .apply_command(&Command::SetThrottle(throttle));
-        // Engage SAS hold (vertical) once we start throttling up.
         if throttle > 0.0 && world.craft.attitude.sas.mode == SasMode::Off {
             let orientation = world.body.orientation;
             world
@@ -257,7 +281,16 @@ fn step_play(time: Res<Time>, mut world: ResMut<PlayWorld>) {
                 .apply_command(&Command::SetSas(SasMode::Hold), orientation);
         }
 
-        let PlayWorld {
+        // Capture state for the felt-acceleration (G-force) readout.
+        let v0 = world.body.velocity;
+        let r0 = world.body.position.length();
+        let up0 = if r0 > 0.0 {
+            world.body.position / r0
+        } else {
+            DVec3::Y
+        };
+
+        let AutopilotWorld {
             body,
             craft,
             params,
@@ -266,15 +299,15 @@ fn step_play(time: Res<Time>, mut world: ResMut<PlayWorld>) {
         } = &mut *world;
         flight_step(body, craft, params, pad, SUBSTEP_DT);
 
+        // Felt (proper) acceleration = actual − gravitational (an accelerometer
+        // reads 1 g on the pad, >1 g under thrust, 0 g in free fall).
+        let gravity_accel = -BODY.mu / (r0 * r0) * up0;
+        let felt = (world.body.velocity - v0) / SUBSTEP_DT - gravity_accel;
+        world.g_force = felt.length() / G0;
+
         // Advance the session phase from sim state.
-        let r = world.body.position.length();
-        let up = if r > 0.0 {
-            world.body.position / r
-        } else {
-            DVec3::Y
-        };
-        let altitude = r - BODY.radius;
-        let vertical_speed = world.body.velocity.dot(up);
+        let altitude = world.body.position.length() - BODY.radius;
+        let vertical_speed = world.body.velocity.dot(up0);
         let speed = world.body.velocity.length();
         let released = world.pad.released;
         world
@@ -286,14 +319,18 @@ fn step_play(time: Res<Time>, mut world: ResMut<PlayWorld>) {
     }
 }
 
-fn track_craft(world: Res<PlayWorld>, mut craft: Query<&mut WorldPlacement, With<CraftMarker>>) {
-    if let Ok(mut wp) = craft.single_mut() {
+fn track_craft(
+    world: Res<AutopilotWorld>,
+    mut craft: Query<(&mut WorldPlacement, &mut Transform), With<CraftMarker>>,
+) {
+    if let Ok((mut wp, mut tf)) = craft.single_mut() {
         wp.0 = WorldPos::new(FrameId::CENTRAL_BODY, world.render_world());
+        tf.rotation = world.body.orientation.as_quat(); // show the craft's attitude
     }
 }
 
 fn follow_camera(
-    world: Res<PlayWorld>,
+    world: Res<AutopilotWorld>,
     mut camera: Query<(&mut Transform, &mut WorldPlacement), With<AnchorCamera>>,
 ) {
     if let Ok((mut tf, mut placement)) = camera.single_mut() {
@@ -307,7 +344,34 @@ fn follow_camera(
     }
 }
 
-fn update_hud(world: Res<PlayWorld>, mut hud: Query<&mut Text, With<Hud>>) {
+/// Draws an attitude gizmo at the craft: its nose axis (green) and velocity (orange).
+#[allow(clippy::type_complexity)]
+fn draw_attitude_gizmo(
+    world: Res<AutopilotWorld>,
+    mut gizmos: Gizmos,
+    craft: Query<&Transform, With<CraftMarker>>,
+) {
+    if let Ok(tf) = craft.single() {
+        let pos = tf.translation;
+        let nose = (world.body.orientation.as_quat() * Vec3::Y).normalize_or_zero();
+        gizmos.line(pos, pos + nose * 6.0, Color::srgb(0.3, 1.0, 0.3));
+        let vel = world.body.velocity.as_vec3();
+        if vel.length() > 1.0 {
+            gizmos.line(pos, pos + vel.normalize() * 5.0, Color::srgb(1.0, 0.6, 0.2));
+        }
+    }
+}
+
+fn throttle_bar(fraction: f64) -> String {
+    let filled = (fraction * 10.0).round().clamp(0.0, 10.0) as usize;
+    let mut s = String::from("[");
+    s.push_str(&"#".repeat(filled));
+    s.push_str(&"-".repeat(10 - filled));
+    s.push(']');
+    s
+}
+
+fn update_hud(world: Res<AutopilotWorld>, mut hud: Query<&mut Text, With<Hud>>) {
     if let Ok(mut text) = hud.single_mut() {
         let phase = match world.session.phase {
             Phase::Build => "BUILD",
@@ -319,11 +383,15 @@ fn update_hud(world: Res<PlayWorld>, mut hud: Query<&mut Text, With<Hud>>) {
                 Outcome::None => "RECOVERY",
             },
         };
-        let throttle = world.throttle() * 100.0;
+        let throttle = world.throttle();
         let altitude = world.altitude();
         let speed = world.body.velocity.length();
         text.0 = format!(
-            "phase:    {phase}\nthrottle: {throttle:3.0}%\naltitude: {altitude:8.0} m\nspeed:    {speed:7.1} m/s"
+            "phase:    {phase}\nthrottle: {bar} {pct:3.0}%\nG-force:  {g:5.1} g\naltitude: {altitude:8.0} m\nspeed:    {speed:7.1} m/s\ntilt:     {tilt:5.0}°",
+            bar = throttle_bar(throttle),
+            pct = throttle * 100.0,
+            g = world.g_force,
+            tilt = world.tilt_degrees(),
         );
     }
 }
