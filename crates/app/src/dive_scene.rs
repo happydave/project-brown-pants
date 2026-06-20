@@ -23,7 +23,7 @@ use bevy::prelude::*;
 use sounding_sim::active::ActiveBody;
 use sounding_sim::fluid::{FluidMedium, MediumKind};
 use sounding_sim::frame::{FrameId, WorldPos};
-use sounding_sim::medium::{descent_step, max_cross_section, DescentParams};
+use sounding_sim::medium::{descent_step, dynamic_pressure, max_cross_section, DescentParams};
 use sounding_sim::voxel::{Material, Voxel, VoxelCraft};
 
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
@@ -53,6 +53,8 @@ struct DiveWorld {
     /// Ambient (outer-hull) pressure at the craft, Pa — sampled from the unified
     /// medium field each step.
     pressure: f64,
+    /// Dynamic (ram) pressure q = ½·ρ·v² on the leading face, Pa. Peaks at max-Q.
+    dynamic_pressure: f64,
 }
 
 impl DiveWorld {
@@ -92,6 +94,7 @@ impl DiveWorld {
             accumulator: 0.0,
             medium: MediumKind::Vacuum,
             pressure: 0.0,
+            dynamic_pressure: 0.0,
         }
     }
 
@@ -198,7 +201,7 @@ fn setup_scene(
     // Heads-up readout: altitude, speed, medium.
     commands.spawn((
         Text::new(
-            "altitude:        0 m\nspeed:       0.0 m/s\nmedium:   vacuum\nhull P:        0.0 kPa",
+            "altitude:        0 m\nspeed:       0.0 m/s\nmedium:   vacuum\nhull P:        0.0 kPa\nram P:         0.0 kPa",
         ),
         TextFont {
             font_size: 20.0,
@@ -252,6 +255,7 @@ fn step_dive(time: Res<Time>, mut dive: ResMut<DiveWorld>) {
         let sample = descent_step(body, craft, *com, params, SUBSTEP_DT);
         dive.medium = sample.medium;
         dive.pressure = sample.pressure;
+        dive.dynamic_pressure = dynamic_pressure(&sample, dive.body.velocity);
         dive.accumulator -= SUBSTEP_DT;
         n += 1;
     }
@@ -291,8 +295,9 @@ fn update_hud(dive: Res<DiveWorld>, mut hud: Query<&mut Text, With<Hud>>) {
         let alt = dive.altitude();
         let speed = dive.body.velocity.length();
         let pressure_kpa = dive.pressure / 1_000.0;
+        let ram_kpa = dive.dynamic_pressure / 1_000.0;
         text.0 = format!(
-            "altitude: {alt:8.0} m\nspeed:    {speed:7.1} m/s\nmedium:   {medium}\nhull P:   {pressure_kpa:8.1} kPa"
+            "altitude: {alt:8.0} m\nspeed:    {speed:7.1} m/s\nmedium:   {medium}\nhull P:   {pressure_kpa:8.1} kPa\nram P:    {ram_kpa:8.1} kPa"
         );
     }
 }

@@ -43,6 +43,17 @@ pub fn drag_force(
     -0.5 * sample.density * speed * speed * drag_coefficient * area * dir
 }
 
+/// Dynamic (ram) pressure of the flow over the craft: `q = ½·ρ·v²` — the
+/// aerodynamic pressure increment at the windward/stagnation (leading) face,
+/// where the leading-face total is ambient + q (incompressible Bernoulli).
+/// Medium-agnostic and zero in vacuum or at rest. Its peak over a descent is
+/// "max-Q", the canonical re-entry stress milestone. (A resolved per-face
+/// pressure *distribution* — windward high, leeward low — is the deferred
+/// FAR-style aero; this is the single scalar.)
+pub fn dynamic_pressure(sample: &FluidSample, velocity: DVec3) -> f64 {
+    0.5 * sample.density * velocity.length_squared()
+}
+
 /// Buoyancy: the weight of displaced medium, directed `up` (radially outward).
 /// Equal to `density · submerged_volume · gravity`. Medium-agnostic — the same
 /// formula gives a negligible force in air and a large one in water, purely from
@@ -252,6 +263,25 @@ mod tests {
         assert!(water.length() > 100.0 * air.length());
         // All oppose the velocity (point +y, against the -y motion).
         assert!(air.y > 0.0 && water.y > 0.0);
+    }
+
+    #[test]
+    fn dynamic_pressure_is_ram_pressure_and_zero_without_flow() {
+        let air = FluidMedium::EARTHLIKE.sample_altitude(0.0);
+        // At rest: no ram pressure.
+        assert_eq!(dynamic_pressure(&air, DVec3::ZERO), 0.0);
+        // Vacuum: zero regardless of speed.
+        let vac = FluidMedium::VACUUM.sample_altitude(0.0);
+        assert_eq!(dynamic_pressure(&vac, DVec3::new(0.0, -2_000.0, 0.0)), 0.0);
+        // Sea-level air at 100 m/s: q = ½·1.225·100² = 6125 Pa.
+        let q = dynamic_pressure(&air, DVec3::new(0.0, -100.0, 0.0));
+        assert!((q - 6_125.0).abs() < 1.0, "q = {q}");
+        // Scales with density: water at the same speed is far larger.
+        let water = FluidMedium::EARTHLIKE.sample_altitude(-10.0);
+        assert!(dynamic_pressure(&water, DVec3::new(0.0, -100.0, 0.0)) > 100.0 * q);
+        // Scales with v²: doubling speed quadruples q.
+        let q2 = dynamic_pressure(&air, DVec3::new(0.0, -200.0, 0.0));
+        assert!((q2 - 4.0 * q).abs() < 1.0);
     }
 
     #[test]
