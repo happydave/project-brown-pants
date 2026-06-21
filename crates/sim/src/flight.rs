@@ -55,17 +55,21 @@ impl FlightCraft {
     /// attitude/SAS to the attitude pilot. `current` is the craft orientation,
     /// captured as the SAS hold target. Returns whether the command was applied.
     ///
-    /// Note: the *gate* only governs whether a command is accepted. Whether SAS
-    /// actually produces stabilizing torque at the resolved tier is enforced in
-    /// [`flight_step`] (Direct ⇒ no stabilization).
+    /// Note: the *gate* governs whether a command is accepted. Engaging an active SAS
+    /// mode additionally requires `Stabilized` (a powered command core, WI 564) — at
+    /// Direct it is refused, not silently accepted-then-suppressed; `SetSas(Off)` is
+    /// always allowed. Whether SAS produces torque is still enforced in [`flight_step`].
     pub fn apply_command(&mut self, cmd: &crate::command::Command, current: DQuat) -> bool {
-        use crate::command::Command;
-        if !self.resolve_control().allows_manual() {
+        use crate::command::{Command, SasMode};
+        let tier = self.resolve_control();
+        if !tier.allows_manual() {
             return false;
         }
         match cmd {
             Command::SetThrottle(_) | Command::SetGimbal(_) => self.propulsion.apply_command(cmd),
-            Command::SetAttitude(_) | Command::SetSas(_) => {
+            // Engaging an active SAS mode needs a powered command core (WI 564).
+            Command::SetSas(mode) if *mode != SasMode::Off && !tier.allows_stabilization() => false,
+            Command::SetAttitude(_) | Command::SetSas(_) | Command::SetSasRecapture(_) => {
                 self.attitude.apply_command(cmd, current)
             }
             _ => false,
@@ -239,6 +243,7 @@ mod tests {
             sas: Sas::default(),
             manual: DVec3::ZERO,
             authority: 1_000.0,
+            recapture_on_release: true,
             actuators: AttitudeControl {
                 wheels: Some(ReactionWheels::new(5_000.0, 1e9)),
                 rcs: None,
@@ -278,6 +283,80 @@ mod tests {
         let ok = craft.apply_command(&Command::SetThrottle(0.5), DQuat::IDENTITY);
         assert!(ok, "direct craft accepts throttle");
         assert!((craft.propulsion.commands[0].throttle - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn engaging_sas_requires_command_core() {
+        use crate::command::Command;
+        let (mut craft, _) = rocket(); // crewed_stabilized → Stabilized
+        assert!(
+            craft.apply_command(&Command::SetSas(SasMode::Hold), DQuat::IDENTITY),
+            "stabilized craft engages SAS"
+        );
+        // Drop to Direct (crewed manual, no command core).
+        craft.attitude.sas.set_mode(SasMode::Off, DQuat::IDENTITY);
+        craft.control = crate::control::ControlSystem::crewed_manual();
+        assert_eq!(craft.resolve_control(), ControlTier::Direct);
+        assert!(
+            !craft.apply_command(&Command::SetSas(SasMode::Hold), DQuat::IDENTITY),
+            "Direct refuses engaging SAS"
+        );
+        assert!(
+            craft.apply_command(&Command::SetSas(SasMode::Off), DQuat::IDENTITY),
+            "SetSas(Off) always allowed"
+        );
+    }
+
+    #[test]
+    fn sas_lost_when_command_core_battery_drains() {
+        use crate::control::{ControlComputer, ControlPoint, ControlSystem, ELECTRICITY};
+        let (mut craft, wet0) = rocket();
+        // A crewed control point + a powered command core on a tiny battery.
+        let bi = craft.propulsion.graph.reservoirs.len();
+        craft
+            .propulsion
+            .graph
+            .reservoirs
+            .push(Reservoir::new(ELECTRICITY, 0.02, 100.0));
+        let sys = ControlSystem {
+            points: vec![ControlPoint::crewed()],
+            computers: vec![ControlComputer::command_core(10.0)], // 10/s draw
+            battery: Some(ReservoirId(bi)),
+        };
+        craft
+            .propulsion
+            .graph
+            .consumers
+            .push(sys.power_consumer().unwrap());
+        craft.control = sys;
+        assert_eq!(
+            craft.resolve_control(),
+            ControlTier::Stabilized,
+            "powered: stabilized"
+        );
+
+        let p = params(crate::medium::max_cross_section(&craft.voxels));
+        let pad_radius = BODY.radius + craft.dry_com.y;
+        let mut pad = LaunchPad::resting(pad_radius);
+        let mut body = ActiveBody::new(
+            DVec3::new(0.0, pad_radius, 0.0),
+            DVec3::ZERO,
+            wet0,
+            craft.voxels.mass_properties().unwrap().inertia,
+        );
+        // 0.02 units at 10/s drains in 0.002 s — a couple of 4 ms steps.
+        for _ in 0..5 {
+            flight_step(&mut body, &mut craft, &p, &mut pad, 0.004);
+        }
+        assert!(
+            craft.propulsion.graph.reservoirs[bi].amount <= 1e-9,
+            "battery drained"
+        );
+        assert_eq!(
+            craft.resolve_control(),
+            ControlTier::Direct,
+            "unpowered: SAS lost, falls to Direct"
+        );
     }
 
     fn params(drag_area: f64) -> FlightParams {

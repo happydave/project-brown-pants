@@ -91,6 +91,7 @@ impl PlayWorld {
             sas: Sas::default(),
             manual: DVec3::ZERO,
             authority: 5_000.0,
+            recapture_on_release: true,
             actuators: AttitudeControl {
                 wheels: Some(ReactionWheels::new(8_000.0, 1e9)),
                 rcs: None,
@@ -371,6 +372,13 @@ fn player_input(time: Res<Time>, keys: Res<ButtonInput<KeyCode>>, mut world: Res
             .craft
             .apply_command(&Command::SetSas(SasMode::Off), orientation);
     }
+    // Toggle the SAS hold-target re-capture policy (WI 564): nudge-sticks vs return-to-target.
+    if keys.just_pressed(KeyCode::KeyG) {
+        let next = !world.craft.attitude.recapture_on_release;
+        world
+            .craft
+            .apply_command(&Command::SetSasRecapture(next), orientation);
+    }
 
     // Time-warp.
     if keys.just_pressed(KeyCode::Period) {
@@ -526,19 +534,30 @@ fn update_hud(world: Res<PlayWorld>, mut hud: Query<&mut Text, With<Hud>>) {
             Some((apo, _)) => format!("orbit:    suborbital  apoapsis {}", fmt_alt(apo)),
             None => "orbit:    escape".to_string(),
         };
-        let sas = match world.craft.attitude.sas.mode {
-            SasMode::Off => "off",
-            SasMode::KillRotation => "kill-rot",
-            SasMode::Hold => "hold",
-            SasMode::Point(_) => "point",
+        let tier = world.craft.resolve_control();
+        // SAS shows "unavail" when the tier can't stabilize (no powered command core).
+        let sas = if !tier.allows_stabilization() {
+            "unavail"
+        } else {
+            match world.craft.attitude.sas.mode {
+                SasMode::Off => "off",
+                SasMode::KillRotation => "kill-rot",
+                SasMode::Hold => "hold",
+                SasMode::Point(_) => "point",
+            }
         };
-        let ctrl = match world.craft.resolve_control() {
+        let recap = if world.craft.attitude.recapture_on_release {
+            "recap"
+        } else {
+            "return"
+        };
+        let ctrl = match tier {
             ControlTier::Uncontrolled => "UNCONTROLLED",
             ControlTier::Direct => "direct",
             ControlTier::Stabilized => "stabilized",
         };
         text.0 = format!(
-            "phase:    {phase}\nthrottle: {tbar} {pct:3.0}%{note}\nfuel:     {fbar} {fuel:6.0} kg\n\u{0394}v:       {dv:6.0} m/s\nG-force:  {g:5.1} g\naltitude: {alt}\nv-speed:  {v_speed:+7.0} m/s\nspeed:    {speed:7.1} m/s\n{orbit_line}\nenergy:   {energy:8.2} MJ/kg\nmedium:   {medium}   tilt {tilt:.0}\u{00b0}   SAS {sas}\ncontrol:  {ctrl}",
+            "phase:    {phase}\nthrottle: {tbar} {pct:3.0}%{note}\nfuel:     {fbar} {fuel:6.0} kg\n\u{0394}v:       {dv:6.0} m/s\nG-force:  {g:5.1} g\naltitude: {alt}\nv-speed:  {v_speed:+7.0} m/s\nspeed:    {speed:7.1} m/s\n{orbit_line}\nenergy:   {energy:8.2} MJ/kg\nmedium:   {medium}   tilt {tilt:.0}\u{00b0}   SAS {sas} ({recap})\ncontrol:  {ctrl}",
             tbar = gauge(throttle),
             pct = throttle * 100.0,
             note = if flameout { "  FLAMEOUT" } else { "" },

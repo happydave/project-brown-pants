@@ -91,6 +91,7 @@ impl AutopilotWorld {
             sas: Sas::default(),
             manual: DVec3::ZERO,
             authority: 5_000.0,
+            recapture_on_release: true,
             actuators: AttitudeControl {
                 wheels: Some(ReactionWheels::new(8_000.0, 1e9)),
                 rcs: None,

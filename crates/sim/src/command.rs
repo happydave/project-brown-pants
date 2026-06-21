@@ -70,6 +70,10 @@ pub enum Command {
     /// Set the stability-assist mode. Applied by the attitude system (it captures
     /// the current attitude when entering `Hold`). WI 533.
     SetSas(SasMode),
+    /// Set the SAS hold-target re-capture policy (WI 564): `true` re-captures the
+    /// attitude when a manual nudge releases (the nudge sticks); `false` returns to
+    /// the prior hold target. Applied by the attitude system.
+    SetSasRecapture(bool),
 }
 
 /// Applies a single command to the simulation. Pure and deterministic — the only
@@ -100,7 +104,8 @@ pub fn apply_command(cmd: &Command, clock: &mut SimClock, orbit: Option<&mut Orb
         | Command::SetThrottle(_)
         | Command::SetGimbal(_)
         | Command::SetAttitude(_)
-        | Command::SetSas(_) => false,
+        | Command::SetSas(_)
+        | Command::SetSasRecapture(_) => false,
     }
 }
 
@@ -132,6 +137,7 @@ fn execute_commands(
             Command::SetGimbal(g) => info!("gimbal: {g:?}"),
             Command::SetAttitude(a) => info!("attitude intent: {a:?}"),
             Command::SetSas(m) => info!("sas: {m:?}"),
+            Command::SetSasRecapture(b) => info!("sas recapture-on-release: {b}"),
         }
     }
 }

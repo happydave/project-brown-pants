@@ -237,6 +237,16 @@ pub struct AttitudePilot {
     pub authority: f64,
     /// The actuators.
     pub actuators: AttitudeControl,
+    /// SAS hold-target re-capture policy (WI 564): when `true`, releasing a manual
+    /// nudge re-captures the current attitude as the new `Hold` target (the nudge
+    /// sticks); when `false`, SAS returns to the prior target. Defaults to `true`.
+    #[serde(default = "default_recapture")]
+    pub recapture_on_release: bool,
+}
+
+/// Default for [`AttitudePilot::recapture_on_release`] (so pre-564 saves load).
+fn default_recapture() -> bool {
+    true
 }
 
 impl AttitudePilot {
@@ -298,17 +308,34 @@ impl AttitudePilot {
         body.integrate_wrench(DVec3::ZERO, torque_world, dt);
     }
 
-    /// Applies an attitude [`Command`] (`SetAttitude`/`SetSas`); other commands are
-    /// ignored (returns `false`). `current` is the craft's orientation, captured as
-    /// the hold target when engaging `Hold`.
+    /// Applies an attitude [`Command`] (`SetAttitude`/`SetSas`/`SetSasRecapture`);
+    /// other commands are ignored (returns `false`). `current` is the craft's
+    /// orientation, captured as the hold target when engaging `Hold` and (per the
+    /// re-capture policy, WI 564) when a manual nudge releases.
     pub fn apply_command(&mut self, cmd: &Command, current: DQuat) -> bool {
         match *cmd {
             Command::SetAttitude(intent) => {
-                self.manual = intent.clamp(DVec3::splat(-1.0), DVec3::splat(1.0));
+                let clamped = intent.clamp(DVec3::splat(-1.0), DVec3::splat(1.0));
+                let was_active = self.manual != DVec3::ZERO;
+                self.manual = clamped;
+                // Re-capture the hold target when a manual nudge fully releases, so the
+                // nudge sticks instead of snapping back to the old target (WI 564). Only
+                // meaningful for `Hold`.
+                if self.recapture_on_release
+                    && was_active
+                    && clamped == DVec3::ZERO
+                    && self.sas.mode == SasMode::Hold
+                {
+                    self.sas.target = current;
+                }
                 true
             }
             Command::SetSas(mode) => {
                 self.sas.set_mode(mode, current);
+                true
+            }
+            Command::SetSasRecapture(b) => {
+                self.recapture_on_release = b;
                 true
             }
             _ => false,
@@ -353,6 +380,7 @@ mod tests {
                 wheels: Some(ReactionWheels::new(max_torque, max_momentum)),
                 rcs: None,
             },
+            recapture_on_release: true,
         }
     }
 
@@ -451,6 +479,67 @@ mod tests {
             (both.x - (man_only.x + sas_only.x)).abs() > 1e-9,
             "arbitration, not summation"
         );
+    }
+
+    // --- SAS hold-target re-capture (WI 564) ---
+
+    #[test]
+    fn recapture_on_release_moves_hold_target_to_release_attitude() {
+        let mut pilot = wheels_only(100.0, 1e9);
+        pilot.recapture_on_release = true;
+        let t0 = DQuat::IDENTITY;
+        pilot.apply_command(&Command::SetSas(SasMode::Hold), t0);
+        assert_eq!(pilot.sas.target, t0);
+        // Nudge (manual active), then release at a new attitude t1.
+        pilot.apply_command(&Command::SetAttitude(DVec3::new(1.0, 0.0, 0.0)), t0);
+        let t1 = DQuat::from_rotation_x(0.5);
+        pilot.apply_command(&Command::SetAttitude(DVec3::ZERO), t1);
+        assert_eq!(pilot.sas.target, t1, "re-capture: the nudge sticks");
+    }
+
+    #[test]
+    fn return_to_target_keeps_hold_target_on_release() {
+        let mut pilot = wheels_only(100.0, 1e9);
+        pilot.recapture_on_release = false;
+        let t0 = DQuat::IDENTITY;
+        pilot.apply_command(&Command::SetSas(SasMode::Hold), t0);
+        pilot.apply_command(&Command::SetAttitude(DVec3::new(1.0, 0.0, 0.0)), t0);
+        pilot.apply_command(
+            &Command::SetAttitude(DVec3::ZERO),
+            DQuat::from_rotation_x(0.5),
+        );
+        assert_eq!(
+            pilot.sas.target, t0,
+            "return-to-target: original target kept"
+        );
+    }
+
+    #[test]
+    fn recapture_only_applies_to_hold() {
+        let mut pilot = wheels_only(100.0, 1e9);
+        pilot.recapture_on_release = true;
+        pilot.apply_command(&Command::SetSas(SasMode::KillRotation), DQuat::IDENTITY);
+        let before = pilot.sas.target;
+        pilot.apply_command(
+            &Command::SetAttitude(DVec3::new(1.0, 0.0, 0.0)),
+            DQuat::IDENTITY,
+        );
+        pilot.apply_command(
+            &Command::SetAttitude(DVec3::ZERO),
+            DQuat::from_rotation_x(0.5),
+        );
+        assert_eq!(
+            pilot.sas.target, before,
+            "KillRotation has no hold-target re-capture"
+        );
+    }
+
+    #[test]
+    fn set_sas_recapture_command_toggles_policy() {
+        let mut pilot = wheels_only(100.0, 1e9);
+        pilot.recapture_on_release = true;
+        assert!(pilot.apply_command(&Command::SetSasRecapture(false), DQuat::IDENTITY));
+        assert!(!pilot.recapture_on_release);
     }
 
     // --- Actuators ---

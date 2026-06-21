@@ -62,7 +62,7 @@ The app selects a toy scene at launch:
 - `cargo run -p sounding -- windtunnel` — aero: live lift curve (Cl vs angle of attack) and wave-drag curve (Cd vs speed); `M` cycles the medium so the transonic spike appears in air and vanishes in water/vacuum
 - `cargo run -p sounding -- launch` — surface lift-off (first-playable): a rocket rests on the pad, then auto-throttles up and ascends under thrust against gravity and drag (WI 531 propulsion + WI 532 launch-pad rest)
 - `cargo run -p sounding -- autopilot` — a continuous one-craft session flown automatically (first-playable shell): Launch → Flight → Recovery (a sounding) on the unified flight pipeline; HUD shows phase, throttle, G-force, altitude/speed, and tilt, with an attitude gizmo (WI 534)
-- `cargo run -p sounding -- play` — fly a craft by hand (WI 535): Shift/Ctrl throttle · Z/X full/cut · WSAD/QE attitude · T hold / R kill-rot / F SAS off · `,`/`.` warp; full flight HUD with Δv, apoapsis/periapsis, specific energy, and the **control tier** (direct/stabilized/uncontrolled — WI 562)
+- `cargo run -p sounding -- play` — fly a craft by hand (WI 535): Shift/Ctrl throttle · Z/X full/cut · WSAD/QE attitude · T hold / R kill-rot / F SAS off / G re-capture-toggle · `,`/`.` warp; full flight HUD with Δv, apoapsis/periapsis, specific energy, the **control tier** (direct/stabilized/uncontrolled — WI 562), and SAS availability/re-capture policy (WI 564)
 
 ## Runtime bus
 
