@@ -77,6 +77,9 @@ impl FlightCraft {
             Command::SetAttitude(_) | Command::SetSas(_) | Command::SetSasRecapture(_) => {
                 self.attitude.apply_command(cmd, current)
             }
+            // Live controller tuning needs a powered Tier-2 computer (WI 566).
+            Command::SetSasGains(..) if !tier.allows_tuning() => false,
+            Command::SetSasGains(..) => self.attitude.apply_command(cmd, current),
             // Engaging a canned autopilot needs a powered Tier-1 computer (WI 565);
             // disengaging (None) is always allowed.
             Command::SetAutopilot(ap) => {
@@ -472,6 +475,21 @@ mod tests {
             "raised apoapsis (ascending toward orbit)"
         );
         assert!(body.position.is_finite() && body.velocity.is_finite());
+    }
+
+    #[test]
+    fn gain_tuning_requires_tunable_tier() {
+        use crate::command::Command;
+        let (mut craft, _) = rocket();
+        craft.control = crate::control::ControlSystem::crewed_canned(); // Canned < Tunable
+        assert!(
+            !craft.apply_command(&Command::SetSasGains(20.0, 10.0), DQuat::IDENTITY),
+            "Canned tier refuses gain tuning"
+        );
+        craft.control = crate::control::ControlSystem::crewed_tunable();
+        assert_eq!(craft.resolve_control(), ControlTier::Tunable);
+        assert!(craft.apply_command(&Command::SetSasGains(20.0, 10.0), DQuat::IDENTITY));
+        assert_eq!((craft.attitude.sas.kp, craft.attitude.sas.kd), (20.0, 10.0));
     }
 
     fn params(drag_area: f64) -> FlightParams {

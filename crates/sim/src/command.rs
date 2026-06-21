@@ -79,6 +79,9 @@ pub enum Command {
     /// Engaging requires a powered Tier-1 (`Canned`) computer; applied by the flight
     /// layer (`FlightCraft::apply_command`), not [`apply_command`].
     SetAutopilot(Option<Autopilot>),
+    /// Live-tune the SAS PD gains `(kp, kd)` (WI 566). Requires a powered Tier-2
+    /// (`Tunable`) computer; applied by the attitude system.
+    SetSasGains(f64, f64),
 }
 
 /// Applies a single command to the simulation. Pure and deterministic — the only
@@ -111,7 +114,8 @@ pub fn apply_command(cmd: &Command, clock: &mut SimClock, orbit: Option<&mut Orb
         | Command::SetAttitude(_)
         | Command::SetSas(_)
         | Command::SetSasRecapture(_)
-        | Command::SetAutopilot(_) => false,
+        | Command::SetAutopilot(_)
+        | Command::SetSasGains(..) => false,
     }
 }
 
@@ -145,6 +149,7 @@ fn execute_commands(
             Command::SetSas(m) => info!("sas: {m:?}"),
             Command::SetSasRecapture(b) => info!("sas recapture-on-release: {b}"),
             Command::SetAutopilot(a) => info!("autopilot: {a:?}"),
+            Command::SetSasGains(kp, kd) => info!("sas gains: kp={kp} kd={kd}"),
         }
     }
 }

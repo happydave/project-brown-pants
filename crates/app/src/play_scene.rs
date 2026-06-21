@@ -125,7 +125,7 @@ impl PlayWorld {
                 voxels,
                 propulsion,
                 attitude,
-                control: ControlSystem::crewed_canned(),
+                control: ControlSystem::crewed_tunable(),
                 autopilot: None,
             },
             pad: LaunchPad::resting(pad_radius),
@@ -405,6 +405,30 @@ fn player_input(time: Res<Time>, keys: Res<ButtonInput<KeyCode>>, mut world: Res
             .craft
             .apply_command(&Command::SetAutopilot(None), orientation);
     }
+    // Live PID-gain tuning (WI 566, Tier 2): [ ] tune kp, - = tune kd.
+    {
+        let (kp, kd) = (world.craft.attitude.sas.kp, world.craft.attitude.sas.kd);
+        let mut nkp = kp;
+        let mut nkd = kd;
+        if keys.just_pressed(KeyCode::BracketRight) {
+            nkp += 1.0;
+        }
+        if keys.just_pressed(KeyCode::BracketLeft) {
+            nkp -= 1.0;
+        }
+        if keys.just_pressed(KeyCode::Equal) {
+            nkd += 1.0;
+        }
+        if keys.just_pressed(KeyCode::Minus) {
+            nkd -= 1.0;
+        }
+        if (nkp, nkd) != (kp, kd) {
+            world.craft.apply_command(
+                &Command::SetSasGains(nkp.max(0.0), nkd.max(0.0)),
+                orientation,
+            );
+        }
+    }
 
     // Time-warp.
     if keys.just_pressed(KeyCode::Period) {
@@ -582,14 +606,16 @@ fn update_hud(world: Res<PlayWorld>, mut hud: Query<&mut Text, With<Hud>>) {
             ControlTier::Direct => "direct",
             ControlTier::Stabilized => "stabilized",
             ControlTier::Canned => "canned",
+            ControlTier::Tunable => "tunable",
         };
+        let (kp, kd) = (world.craft.attitude.sas.kp, world.craft.attitude.sas.kd);
         let ap = match world.craft.autopilot {
             None => "off".to_string(),
             Some(Autopilot::GravityTurn(_)) => "grav-turn".to_string(),
             Some(a) => format!("{a:?}").to_lowercase(),
         };
         text.0 = format!(
-            "phase:    {phase}\nthrottle: {tbar} {pct:3.0}%{note}\nfuel:     {fbar} {fuel:6.0} kg\n\u{0394}v:       {dv:6.0} m/s\nG-force:  {g:5.1} g\naltitude: {alt}\nv-speed:  {v_speed:+7.0} m/s\nspeed:    {speed:7.1} m/s\n{orbit_line}\nenergy:   {energy:8.2} MJ/kg\nmedium:   {medium}   tilt {tilt:.0}\u{00b0}   SAS {sas} ({recap})\ncontrol:  {ctrl}   autopilot {ap}",
+            "phase:    {phase}\nthrottle: {tbar} {pct:3.0}%{note}\nfuel:     {fbar} {fuel:6.0} kg\n\u{0394}v:       {dv:6.0} m/s\nG-force:  {g:5.1} g\naltitude: {alt}\nv-speed:  {v_speed:+7.0} m/s\nspeed:    {speed:7.1} m/s\n{orbit_line}\nenergy:   {energy:8.2} MJ/kg\nmedium:   {medium}   tilt {tilt:.0}\u{00b0}   SAS {sas} ({recap})\ncontrol:  {ctrl}   autopilot {ap}   gains kp={kp:.0}/kd={kd:.0}",
             tbar = gauge(throttle),
             pct = throttle * 100.0,
             note = if flameout { "  FLAMEOUT" } else { "" },

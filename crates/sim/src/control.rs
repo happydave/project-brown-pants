@@ -53,6 +53,9 @@ pub enum ControlTier {
     /// Tier 1: a powered autopilot computer offers **canned autopilots** (orbital-frame
     /// attitude holds, gravity-turn ascent, …) on top of stabilization (WI 565).
     Canned,
+    /// Tier 2: a powered tuning computer additionally allows **live tuning** of a
+    /// controller's parameters (e.g. SAS PD gains) on top of canned autopilots (WI 566).
+    Tunable,
 }
 
 impl ControlTier {
@@ -69,6 +72,11 @@ impl ControlTier {
     /// Whether canned autopilots (Tier 1) are available at this tier.
     pub fn allows_canned(self) -> bool {
         self >= ControlTier::Canned
+    }
+
+    /// Whether live controller tuning (Tier 2) is available at this tier.
+    pub fn allows_tuning(self) -> bool {
+        self >= ControlTier::Tunable
     }
 }
 
@@ -122,6 +130,14 @@ impl ControlComputer {
             power_draw,
         }
     }
+
+    /// A Tier-2 (live-tuning-capable) computer with the given draw.
+    pub fn tuning_computer(power_draw: f64) -> Self {
+        Self {
+            grants: ControlTier::Tunable,
+            power_draw,
+        }
+    }
 }
 
 /// A craft's control loadout: its control points, control computers, and which
@@ -165,6 +181,17 @@ impl ControlSystem {
         Self {
             points: vec![ControlPoint::crewed()],
             computers: vec![ControlComputer::autopilot_computer(0.0)],
+            battery: None,
+        }
+    }
+
+    /// A crewed craft with a **self-powered** Tier-2 tuning computer → resolves to
+    /// [`ControlTier::Tunable`] (live controller tuning available). Convenience for
+    /// craft where power is not modelled.
+    pub fn crewed_tunable() -> Self {
+        Self {
+            points: vec![ControlPoint::crewed()],
+            computers: vec![ControlComputer::tuning_computer(0.0)],
             battery: None,
         }
     }
@@ -300,6 +327,16 @@ mod tests {
         assert!(!ControlSystem::crewed_stabilized()
             .resolve(&g)
             .allows_canned());
+    }
+
+    #[test]
+    fn tuning_computer_grants_tunable_tier() {
+        let g = ResourceGraph::default();
+        let tier = ControlSystem::crewed_tunable().resolve(&g);
+        assert_eq!(tier, ControlTier::Tunable);
+        assert!(tier.allows_tuning() && tier.allows_canned() && tier.allows_stabilization());
+        // A Tier-1 autopilot computer does not grant tuning.
+        assert!(!ControlSystem::crewed_canned().resolve(&g).allows_tuning());
     }
 
     #[test]

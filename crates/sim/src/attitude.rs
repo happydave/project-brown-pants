@@ -341,6 +341,13 @@ impl AttitudePilot {
                 self.recapture_on_release = b;
                 true
             }
+            Command::SetSasGains(kp, kd) => {
+                // Clamp to a sane non-negative range so a tuned controller cannot
+                // produce divergent/NaN torque (WI 566).
+                self.sas.kp = kp.clamp(0.0, 1_000.0);
+                self.sas.kd = kd.clamp(0.0, 1_000.0);
+                true
+            }
             _ => false,
         }
     }
@@ -534,6 +541,43 @@ mod tests {
         assert_eq!(
             pilot.sas.target, before,
             "KillRotation has no hold-target re-capture"
+        );
+    }
+
+    #[test]
+    fn sas_gains_tune_and_clamp() {
+        let mut pilot = wheels_only(1e6, 1e9);
+        assert!(pilot.apply_command(&Command::SetSasGains(50.0, 30.0), DQuat::IDENTITY));
+        assert_eq!((pilot.sas.kp, pilot.sas.kd), (50.0, 30.0));
+        // Negative / huge inputs clamp to a sane non-negative range.
+        pilot.apply_command(&Command::SetSasGains(-5.0, 1e9), DQuat::IDENTITY);
+        assert_eq!(pilot.sas.kp, 0.0);
+        assert!(pilot.sas.kd <= 1_000.0);
+    }
+
+    #[test]
+    fn higher_kp_gives_stronger_correction() {
+        // Same attitude error, two kp values → proportionally different SAS torque
+        // (the tuning is real, not cosmetic). Unit inertia, kd=0.
+        let mut b = body(1.0);
+        b.orientation = DQuat::from_rotation_x(0.2);
+        let mut g = empty_graph();
+        let mut soft = wheels_only(1e6, 1e9);
+        soft.sas
+            .set_mode(crate::command::SasMode::Hold, DQuat::IDENTITY);
+        soft.sas.kp = 5.0;
+        soft.sas.kd = 0.0;
+        let mut stiff = soft;
+        stiff.sas.kp = 50.0;
+        let t_soft = soft
+            .control_torque_gated(&b, &mut g, 0.01, false, true)
+            .length();
+        let t_stiff = stiff
+            .control_torque_gated(&b, &mut g, 0.01, false, true)
+            .length();
+        assert!(
+            t_stiff > t_soft * 5.0,
+            "higher kp → proportionally stronger correction"
         );
     }
 
