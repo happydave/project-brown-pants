@@ -23,6 +23,32 @@ use crate::resource::{ReservoirId, ResourceGraph};
 use glam::{DQuat, DVec3};
 use serde::{Deserialize, Serialize};
 
+/// Manual intent magnitude (per axis, in `[-1, 1]`) above which manual is treated
+/// as *claiming* that axis for command arbitration (WI 563).
+const MANUAL_DEADZONE: f64 = 1e-6;
+
+/// Command arbitration (WI 563): resolve a per-body-axis attitude torque from
+/// competing control sources, each `(torque, per-axis claim)`, listed
+/// **highest-priority first**. The first source claiming an axis **owns** it; lower
+/// sources are ignored on that axis. Demands are never summed across sources, so two
+/// controllers cannot fight over the same axis. A future controller (canned
+/// autopilot, player program, per-limb gait) is just another source at its priority
+/// — the resolver is unchanged. Pure and order-deterministic.
+fn arbitrate_axes(sources: &[(DVec3, [bool; 3])]) -> DVec3 {
+    let mut out = [0.0_f64; 3];
+    let mut owned = [false; 3];
+    for (torque, claims) in sources {
+        let t = [torque.x, torque.y, torque.z];
+        for axis in 0..3 {
+            if !owned[axis] && claims[axis] {
+                out[axis] = t[axis];
+                owned[axis] = true;
+            }
+        }
+    }
+    DVec3::new(out[0], out[1], out[2])
+}
+
 /// Reaction-wheel assembly: per-body-axis torque, saturating at a stored-momentum
 /// limit. Storing the opposite momentum is how the body is torqued without an
 /// external jet — until the wheels are full.
@@ -242,17 +268,26 @@ impl AttitudePilot {
         stabilization: bool,
     ) -> DVec3 {
         let omega = body.angular_velocity();
-        let sas = if stabilization {
-            self.sas.desired_torque(body.orientation, omega)
+
+        // Command arbitration (WI 563): each attitude axis is owned by a single
+        // controller per tick, highest priority first — manual overrides SAS on the
+        // axes it claims; SAS owns the rest. Demands are *not* summed.
+        let man_torque = self.manual * self.authority;
+        let man_claims = if manual {
+            [
+                self.manual.x.abs() > MANUAL_DEADZONE,
+                self.manual.y.abs() > MANUAL_DEADZONE,
+                self.manual.z.abs() > MANUAL_DEADZONE,
+            ]
         } else {
-            DVec3::ZERO
+            [false; 3]
         };
-        let man = if manual {
-            self.manual * self.authority
-        } else {
-            DVec3::ZERO
-        };
-        let applied_body = self.actuators.actuate(sas + man, graph, dt);
+        let sas_torque = self.sas.desired_torque(body.orientation, omega);
+        let sas_claims = [stabilization; 3];
+
+        // Sources in priority order (manual over SAS).
+        let desired = arbitrate_axes(&[(man_torque, man_claims), (sas_torque, sas_claims)]);
+        let applied_body = self.actuators.actuate(desired, graph, dt);
         body.orientation * applied_body
     }
 
@@ -358,6 +393,63 @@ mod tests {
         assert!(
             no_sas.length() < 1e-9,
             "Direct tier: no stabilization torque"
+        );
+    }
+
+    // --- Command arbitration (WI 563) ---
+
+    #[test]
+    fn arbitrate_axes_single_owner_by_priority() {
+        // Manual (priority 1) claims x; SAS (priority 2) claims all. Result: manual
+        // owns x (5, not SAS's 1, not the sum 6); SAS owns y, z.
+        let manual = (DVec3::new(5.0, 0.0, 0.0), [true, false, false]);
+        let sas = (DVec3::new(1.0, 2.0, 3.0), [true, true, true]);
+        let out = arbitrate_axes(&[manual, sas]);
+        assert_eq!(out, DVec3::new(5.0, 2.0, 3.0));
+    }
+
+    #[test]
+    fn arbitrate_axes_priority_is_positional_and_deterministic() {
+        let a = (DVec3::new(5.0, 0.0, 0.0), [true, false, false]);
+        let b = (DVec3::new(1.0, 2.0, 3.0), [true, true, true]);
+        // Order defines priority: first claimant wins x.
+        assert_eq!(arbitrate_axes(&[a, b]).x, 5.0);
+        assert_eq!(arbitrate_axes(&[b, a]).x, 1.0);
+        // Same inputs → same output (determinism).
+        assert_eq!(arbitrate_axes(&[a, b]), arbitrate_axes(&[a, b]));
+        // No claimant on an axis → zero (no actuation).
+        let none = (DVec3::new(9.0, 9.0, 9.0), [false, false, false]);
+        assert_eq!(arbitrate_axes(&[none]), DVec3::ZERO);
+    }
+
+    #[test]
+    fn manual_overrides_sas_per_axis_through_control_torque() {
+        // KillRotation SAS on a body spinning about all axes demands torque on each;
+        // a manual pitch (x) demand overrides SAS on x while SAS keeps yaw/roll.
+        let mut pilot = wheels_only(1e6, 1e9); // huge limits → applied ≈ desired
+        pilot
+            .sas
+            .set_mode(crate::command::SasMode::KillRotation, DQuat::IDENTITY);
+        let b = body(1.0).with_angular_velocity(DVec3::new(0.5, 0.5, 0.5)); // identity orientation
+        let mut g = empty_graph();
+
+        let mut p_sas = pilot;
+        let sas_only = p_sas.control_torque_gated(&b, &mut g, 0.01, false, true);
+        let mut p_man = pilot;
+        p_man.manual = DVec3::new(1.0, 0.0, 0.0);
+        let man_only = p_man.control_torque_gated(&b, &mut g, 0.01, true, false);
+        let mut p_both = pilot;
+        p_both.manual = DVec3::new(1.0, 0.0, 0.0);
+        let both = p_both.control_torque_gated(&b, &mut g, 0.01, true, true);
+
+        assert!((both.x - man_only.x).abs() < 1e-9, "manual owns pitch");
+        assert!(
+            (both.y - sas_only.y).abs() < 1e-9 && (both.z - sas_only.z).abs() < 1e-9,
+            "SAS owns yaw/roll"
+        );
+        assert!(
+            (both.x - (man_only.x + sas_only.x)).abs() > 1e-9,
+            "arbitration, not summation"
         );
     }
 
