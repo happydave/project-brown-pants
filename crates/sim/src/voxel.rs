@@ -190,6 +190,14 @@ impl VoxelCraft {
         self.voxels.len() as f64 * self.cell_volume()
     }
 
+    /// Whether this craft (or breakage fragment) carries a control point — a
+    /// `DeviceKind::Command` device through which commands can enter it. A fragment
+    /// without one is uncontrolled (inert debris); the flight-level autonomy tier of
+    /// one that has it is resolved by `crate::control::ControlSystem` (WI 562).
+    pub fn has_control_point(&self) -> bool {
+        self.devices.iter().any(|d| d.kind == DeviceKind::Command)
+    }
+
     /// World-frame centre of cell `c` (the cell's geometric centre), metres.
     fn cell_center(&self, c: IVec3) -> DVec3 {
         (c.as_dvec3() + DVec3::splat(0.5)) * self.cell_size
@@ -521,6 +529,29 @@ mod tests {
         });
         let mp = craft.mass_properties().unwrap();
         assert!((mp.mass - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn control_point_presence_tracks_command_device() {
+        // A bare lattice has no control point; adding a Command device gives it one
+        // (the lattice-level controllability breakage reads, WI 562).
+        let mut craft = block(1, 1, 1, 1.0, Material::STEEL);
+        assert!(!craft.has_control_point());
+        craft.devices.push(Device {
+            cell: IVec3::ZERO,
+            mass: 5.0,
+            kind: DeviceKind::Engine,
+        });
+        assert!(
+            !craft.has_control_point(),
+            "an engine is not a control point"
+        );
+        craft.devices.push(Device {
+            cell: IVec3::ZERO,
+            mass: 10.0,
+            kind: DeviceKind::Command,
+        });
+        assert!(craft.has_control_point());
     }
 
     #[test]

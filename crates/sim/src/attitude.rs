@@ -225,10 +225,34 @@ impl AttitudePilot {
         graph: &mut ResourceGraph,
         dt: f64,
     ) -> DVec3 {
+        self.control_torque_gated(body, graph, dt, true, true)
+    }
+
+    /// As [`control_torque`](Self::control_torque), but with the control authority
+    /// **gated by the craft's resolved tier** (WI 562): `manual` enables the manual
+    /// pitch/yaw/roll demand, `stabilization` enables the SAS demand. An uncontrolled
+    /// craft passes `(false, false)` → zero demand → no actuation; a Direct craft
+    /// passes `(true, false)` → manual only, no stabilization.
+    pub fn control_torque_gated(
+        &mut self,
+        body: &ActiveBody,
+        graph: &mut ResourceGraph,
+        dt: f64,
+        manual: bool,
+        stabilization: bool,
+    ) -> DVec3 {
         let omega = body.angular_velocity();
-        let desired =
-            self.sas.desired_torque(body.orientation, omega) + self.manual * self.authority;
-        let applied_body = self.actuators.actuate(desired, graph, dt);
+        let sas = if stabilization {
+            self.sas.desired_torque(body.orientation, omega)
+        } else {
+            DVec3::ZERO
+        };
+        let man = if manual {
+            self.manual * self.authority
+        } else {
+            DVec3::ZERO
+        };
+        let applied_body = self.actuators.actuate(sas + man, graph, dt);
         body.orientation * applied_body
     }
 
@@ -299,6 +323,42 @@ mod tests {
 
     fn empty_graph() -> ResourceGraph {
         ResourceGraph::default()
+    }
+
+    // --- Tier-gated control authority (WI 562) ---
+
+    #[test]
+    fn gated_torque_suppresses_manual_when_disallowed() {
+        let mut pilot = wheels_only(100.0, 1e9);
+        pilot.manual = DVec3::new(1.0, 0.0, 0.0); // full pitch demand
+        let b = body(1.0);
+        let mut g = empty_graph();
+        let allowed = pilot.control_torque_gated(&b, &mut g, 0.1, true, false);
+        let denied = pilot.control_torque_gated(&b, &mut g, 0.1, false, false);
+        assert!(allowed.length() > 1e-6, "manual allowed produces torque");
+        assert!(
+            denied.length() < 1e-9,
+            "manual disallowed produces no torque"
+        );
+    }
+
+    #[test]
+    fn gated_torque_suppresses_sas_when_disallowed() {
+        // Direct (no stabilization): SAS demand is suppressed even when engaged.
+        let mut pilot = wheels_only(100.0, 1e9);
+        pilot
+            .sas
+            .set_mode(crate::command::SasMode::Hold, DQuat::IDENTITY);
+        let mut b = body(1.0);
+        b.orientation = DQuat::from_rotation_x(0.3); // error vs the hold target
+        let mut g = empty_graph();
+        let with_sas = pilot.control_torque_gated(&b, &mut g, 0.1, false, true);
+        let no_sas = pilot.control_torque_gated(&b, &mut g, 0.1, false, false);
+        assert!(with_sas.length() > 1e-6, "SAS allowed corrects the error");
+        assert!(
+            no_sas.length() < 1e-9,
+            "Direct tier: no stabilization torque"
+        );
     }
 
     // --- Actuators ---

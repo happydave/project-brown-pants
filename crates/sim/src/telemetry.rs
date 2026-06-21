@@ -4,6 +4,7 @@
 //! not a separate model). WI 502's bus serves this over a transport; the AI
 //! companion, second-screen, and replay read the same shape. Rendering-free.
 
+use crate::control::ControlTier;
 use crate::orbit::Orbit;
 use crate::sim::SimClock;
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,11 @@ pub struct CraftTelemetry {
     pub position: [f64; 2],
     /// Current world velocity `[x, y]` at the snapshot time.
     pub velocity: [f64; 2],
+    /// The craft's resolved control tier (WI 562), when known. The orbit-gear bus
+    /// `capture` leaves this `None` (it has no `FlightCraft`); a flight-aware path
+    /// (e.g. the flight HUD reading `FlightCraft::resolve_control`) supplies it.
+    #[serde(default)]
+    pub control_tier: Option<ControlTier>,
 }
 
 impl Telemetry {
@@ -54,6 +60,7 @@ impl Telemetry {
                 apoapsis_radius: o.apoapsis_radius(),
                 position: [p.x, p.y],
                 velocity: [v.x, v.y],
+                control_tier: None,
             }
         });
         Telemetry {

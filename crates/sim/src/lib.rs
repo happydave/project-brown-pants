@@ -12,6 +12,7 @@ pub mod attitude;
 pub mod breakage;
 pub mod command;
 pub mod compartments;
+pub mod control;
 pub mod diagnostics;
 pub mod flight;
 pub mod flooding;

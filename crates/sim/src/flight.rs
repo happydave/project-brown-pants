@@ -14,12 +14,13 @@
 use crate::active::ActiveBody;
 use crate::aero;
 use crate::attitude::AttitudePilot;
+use crate::control::{ControlSystem, ControlTier};
 use crate::fluid::{FluidMedium, FluidSample};
 use crate::launch::LaunchPad;
 use crate::medium::{buoyancy_force, drag_force, submerged_volume, GlideParams};
 use crate::propulsion::Propulsion;
 use crate::voxel::VoxelCraft;
-use glam::DVec3;
+use glam::{DQuat, DVec3};
 use serde::{Deserialize, Serialize};
 
 /// A flyable craft: geometry + propulsion + attitude, sharing one resource graph
@@ -36,6 +37,40 @@ pub struct FlightCraft {
     pub propulsion: Propulsion,
     /// Attitude actuators + SAS (RCS draws from `propulsion.graph`).
     pub attitude: AttitudePilot,
+    /// Control devices + the autonomy-tier gate (WI 562). The battery, if any, is a
+    /// reservoir in `propulsion.graph`.
+    pub control: ControlSystem,
+}
+
+impl FlightCraft {
+    /// The craft's current control tier, resolved from its control devices and the
+    /// power in its (shared) resource graph (WI 562).
+    pub fn resolve_control(&self) -> ControlTier {
+        self.control.resolve(&self.propulsion.graph)
+    }
+
+    /// Apply a manual command, **gated by the resolved control tier** (WI 562). An
+    /// uncontrolled craft rejects every manual command (returns `false`, no state
+    /// change); a controllable craft routes throttle/gimbal to propulsion and
+    /// attitude/SAS to the attitude pilot. `current` is the craft orientation,
+    /// captured as the SAS hold target. Returns whether the command was applied.
+    ///
+    /// Note: the *gate* only governs whether a command is accepted. Whether SAS
+    /// actually produces stabilizing torque at the resolved tier is enforced in
+    /// [`flight_step`] (Direct ⇒ no stabilization).
+    pub fn apply_command(&mut self, cmd: &crate::command::Command, current: DQuat) -> bool {
+        use crate::command::Command;
+        if !self.resolve_control().allows_manual() {
+            return false;
+        }
+        match cmd {
+            Command::SetThrottle(_) | Command::SetGimbal(_) => self.propulsion.apply_command(cmd),
+            Command::SetAttitude(_) | Command::SetSas(_) => {
+                self.attitude.apply_command(cmd, current)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// The fixed environment of an active flight. (Not serialized — reconstructed from
@@ -66,12 +101,16 @@ pub fn flight_step(
     pad: &mut LaunchPad,
     dt: f64,
 ) -> FluidSample {
+    // Resolve the control tier before borrowing the fields mutably: it gates how
+    // much of the attitude demand is applied (WI 562).
+    let tier = craft.resolve_control();
     let FlightCraft {
         voxels,
         dry_mass,
         dry_com,
         propulsion,
         attitude,
+        control: _,
     } = craft;
 
     // Wet mass + CoM (propellant folds into mass/CoM in real time, WI 531).
@@ -132,8 +171,23 @@ pub fn flight_step(
         None => (DVec3::ZERO, DVec3::ZERO),
     };
 
-    // Attitude control torque (RCS draws from the shared propellant graph).
-    let att_torque = attitude.control_torque(body, &mut propulsion.graph, dt);
+    // Attitude control torque (RCS draws from the shared propellant graph), gated by
+    // the resolved tier: an uncontrolled craft actuates nothing; a Direct craft
+    // applies manual only (no stabilization); Stabilized applies SAS too (WI 562).
+    let att_torque = attitude.control_torque_gated(
+        body,
+        &mut propulsion.graph,
+        dt,
+        tier.allows_manual(),
+        tier.allows_stabilization(),
+    );
+
+    // Drain the control computer's electrical battery over the step (the standing
+    // electricity consumer in the shared graph). Analytic catch-up; the only standing
+    // graph consumer (thrust/RCS deduct propellant directly), so this touches only
+    // the battery reservoir (WI 562).
+    let g = &mut propulsion.graph;
+    g.integrate(g.time + dt);
 
     let force = gravity + drag + buoyancy + thrust + lift;
     let torque = thrust_torque + lift_torque + att_torque;
@@ -196,8 +250,34 @@ mod tests {
             voxels,
             propulsion,
             attitude,
+            control: crate::control::ControlSystem::crewed_stabilized(),
         };
         (craft, mp.mass + propellant)
+    }
+
+    #[test]
+    fn uncontrolled_craft_rejects_manual_commands() {
+        use crate::command::Command;
+        let (mut craft, _) = rocket();
+        craft.control = ControlSystem::default(); // no control point → Uncontrolled
+        assert_eq!(craft.resolve_control(), ControlTier::Uncontrolled);
+        let ok = craft.apply_command(&Command::SetThrottle(1.0), DQuat::IDENTITY);
+        assert!(!ok, "uncontrolled craft rejects throttle");
+        assert_eq!(
+            craft.propulsion.commands[0].throttle, 0.0,
+            "throttle unchanged on rejection"
+        );
+    }
+
+    #[test]
+    fn direct_craft_accepts_manual_throttle() {
+        use crate::command::Command;
+        let (mut craft, _) = rocket();
+        craft.control = ControlSystem::crewed_manual(); // Direct
+        assert_eq!(craft.resolve_control(), ControlTier::Direct);
+        let ok = craft.apply_command(&Command::SetThrottle(0.5), DQuat::IDENTITY);
+        assert!(ok, "direct craft accepts throttle");
+        assert!((craft.propulsion.commands[0].throttle - 0.5).abs() < 1e-9);
     }
 
     fn params(drag_area: f64) -> FlightParams {

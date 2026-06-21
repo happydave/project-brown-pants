@@ -20,6 +20,7 @@ use bevy::prelude::*;
 use sounding_sim::active::ActiveBody;
 use sounding_sim::attitude::{AttitudeControl, AttitudePilot, ReactionWheels, Sas};
 use sounding_sim::command::{Command, SasMode};
+use sounding_sim::control::ControlSystem;
 use sounding_sim::flight::{flight_step, FlightCraft, FlightParams};
 use sounding_sim::fluid::FluidMedium;
 use sounding_sim::frame::{FrameId, WorldPos};
@@ -122,6 +123,7 @@ impl AutopilotWorld {
                 voxels,
                 propulsion,
                 attitude,
+                control: ControlSystem::crewed_stabilized(),
             },
             pad: LaunchPad::resting(pad_radius),
             session,
@@ -269,15 +271,14 @@ fn step_autopilot(time: Res<Time>, mut world: ResMut<AutopilotWorld>) {
     while world.accumulator >= SUBSTEP_DT && n < MAX_SUBSTEPS && !world.session.is_terminal() {
         world.elapsed += SUBSTEP_DT;
         let throttle = world.throttle();
+        let orientation = world.body.orientation;
+        // Route through the tier-gated applicator (WI 562); this craft is Stabilized.
         world
             .craft
-            .propulsion
-            .apply_command(&Command::SetThrottle(throttle));
+            .apply_command(&Command::SetThrottle(throttle), orientation);
         if throttle > 0.0 && world.craft.attitude.sas.mode == SasMode::Off {
-            let orientation = world.body.orientation;
             world
                 .craft
-                .attitude
                 .apply_command(&Command::SetSas(SasMode::Hold), orientation);
         }
 

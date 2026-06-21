@@ -324,6 +324,39 @@ mod tests {
     }
 
     #[test]
+    fn fragment_without_control_point_is_uncontrolled() {
+        // A bar with a Command device at x=0. Cut it in two: the fragment holding
+        // the command device retains control; the other is uncontrolled debris (WI 562).
+        use crate::voxel::{Device, DeviceKind};
+        let mut c = bar(4, Material::ALUMINIUM);
+        c.devices.push(Device {
+            cell: IVec3::new(0, 0, 0),
+            mass: 10.0,
+            kind: DeviceKind::Command,
+        });
+        let mut severed = Severed::new();
+        severed.insert(bond(IVec3::new(1, 0, 0), IVec3::new(2, 0, 0)));
+        let frags = connected_components(&c, &severed);
+        assert_eq!(frags.len(), 2);
+        let controllable = frags.iter().filter(|f| f.has_control_point()).count();
+        assert_eq!(
+            controllable, 1,
+            "exactly one fragment keeps the control point"
+        );
+        // The fragment containing x=0 is the controllable one; the other is inert.
+        let with = frags
+            .iter()
+            .find(|f| f.voxels.iter().any(|v| v.cell.x == 0))
+            .unwrap();
+        let without = frags
+            .iter()
+            .find(|f| f.voxels.iter().all(|v| v.cell.x != 0))
+            .unwrap();
+        assert!(with.has_control_point());
+        assert!(!without.has_control_point());
+    }
+
+    #[test]
     fn non_separating_cut_stays_connected() {
         // An L: (0,0,0)-(1,0,0)-(1,1,0). Severing the x bond at y=0 leaves the
         // path around through (1,1,0)? No — (0,0,0) only connects via (1,0,0).

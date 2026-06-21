@@ -21,6 +21,7 @@ use bevy::prelude::*;
 use sounding_sim::active::ActiveBody;
 use sounding_sim::attitude::{AttitudeControl, AttitudePilot, ReactionWheels, Sas};
 use sounding_sim::command::{Command, SasMode};
+use sounding_sim::control::{ControlSystem, ControlTier};
 use sounding_sim::flight::{flight_step, FlightCraft, FlightParams};
 use sounding_sim::fluid::{FluidMedium, MediumKind};
 use sounding_sim::frame::{FrameId, WorldPos};
@@ -122,6 +123,7 @@ impl PlayWorld {
                 voxels,
                 propulsion,
                 attitude,
+                control: ControlSystem::crewed_stabilized(),
             },
             pad: LaunchPad::resting(pad_radius),
             session,
@@ -316,13 +318,13 @@ fn player_input(time: Res<Time>, keys: Res<ButtonInput<KeyCode>>, mut world: Res
     if keys.just_pressed(KeyCode::KeyX) {
         world.throttle = 0.0;
     }
+    let orientation = world.body.orientation;
     let throttle = world.throttle;
+    // Route all manual input through the tier-gated FlightCraft applicator (WI 562):
+    // an uncontrolled craft would ignore these; here the craft is Stabilized.
     world
         .craft
-        .propulsion
-        .apply_command(&Command::SetThrottle(throttle));
-
-    let orientation = world.body.orientation;
+        .apply_command(&Command::SetThrottle(throttle), orientation);
 
     // Manual attitude intent (pitch/yaw/roll about the body axes).
     let mut manual = DVec3::ZERO;
@@ -346,7 +348,6 @@ fn player_input(time: Res<Time>, keys: Res<ButtonInput<KeyCode>>, mut world: Res
     }
     world
         .craft
-        .attitude
         .apply_command(&Command::SetAttitude(manual), orientation);
 
     // SAS mode.
@@ -358,19 +359,16 @@ fn player_input(time: Res<Time>, keys: Res<ButtonInput<KeyCode>>, mut world: Res
         };
         world
             .craft
-            .attitude
             .apply_command(&Command::SetSas(mode), orientation);
     }
     if keys.just_pressed(KeyCode::KeyR) {
         world
             .craft
-            .attitude
             .apply_command(&Command::SetSas(SasMode::KillRotation), orientation);
     }
     if keys.just_pressed(KeyCode::KeyF) {
         world
             .craft
-            .attitude
             .apply_command(&Command::SetSas(SasMode::Off), orientation);
     }
 
@@ -534,8 +532,13 @@ fn update_hud(world: Res<PlayWorld>, mut hud: Query<&mut Text, With<Hud>>) {
             SasMode::Hold => "hold",
             SasMode::Point(_) => "point",
         };
+        let ctrl = match world.craft.resolve_control() {
+            ControlTier::Uncontrolled => "UNCONTROLLED",
+            ControlTier::Direct => "direct",
+            ControlTier::Stabilized => "stabilized",
+        };
         text.0 = format!(
-            "phase:    {phase}\nthrottle: {tbar} {pct:3.0}%{note}\nfuel:     {fbar} {fuel:6.0} kg\n\u{0394}v:       {dv:6.0} m/s\nG-force:  {g:5.1} g\naltitude: {alt}\nv-speed:  {v_speed:+7.0} m/s\nspeed:    {speed:7.1} m/s\n{orbit_line}\nenergy:   {energy:8.2} MJ/kg\nmedium:   {medium}   tilt {tilt:.0}\u{00b0}   SAS {sas}",
+            "phase:    {phase}\nthrottle: {tbar} {pct:3.0}%{note}\nfuel:     {fbar} {fuel:6.0} kg\n\u{0394}v:       {dv:6.0} m/s\nG-force:  {g:5.1} g\naltitude: {alt}\nv-speed:  {v_speed:+7.0} m/s\nspeed:    {speed:7.1} m/s\n{orbit_line}\nenergy:   {energy:8.2} MJ/kg\nmedium:   {medium}   tilt {tilt:.0}\u{00b0}   SAS {sas}\ncontrol:  {ctrl}",
             tbar = gauge(throttle),
             pct = throttle * 100.0,
             note = if flameout { "  FLAMEOUT" } else { "" },
