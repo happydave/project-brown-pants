@@ -20,6 +20,7 @@ use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use sounding_sim::active::ActiveBody;
 use sounding_sim::attitude::{AttitudeControl, AttitudePilot, ReactionWheels, Sas};
+use sounding_sim::autopilot::{Autopilot, GravityTurn};
 use sounding_sim::command::{Command, SasMode};
 use sounding_sim::control::{ControlSystem, ControlTier};
 use sounding_sim::flight::{flight_step, FlightCraft, FlightParams};
@@ -124,7 +125,8 @@ impl PlayWorld {
                 voxels,
                 propulsion,
                 attitude,
-                control: ControlSystem::crewed_stabilized(),
+                control: ControlSystem::crewed_canned(),
+                autopilot: None,
             },
             pad: LaunchPad::resting(pad_radius),
             session,
@@ -379,6 +381,30 @@ fn player_input(time: Res<Time>, keys: Res<ButtonInput<KeyCode>>, mut world: Res
             .craft
             .apply_command(&Command::SetSasRecapture(next), orientation);
     }
+    // Canned autopilots (WI 565): 1 prograde · 2 retrograde · 3 gravity-turn · 0 off.
+    if keys.just_pressed(KeyCode::Digit1) {
+        world.craft.apply_command(
+            &Command::SetAutopilot(Some(Autopilot::Prograde)),
+            orientation,
+        );
+    }
+    if keys.just_pressed(KeyCode::Digit2) {
+        world.craft.apply_command(
+            &Command::SetAutopilot(Some(Autopilot::Retrograde)),
+            orientation,
+        );
+    }
+    if keys.just_pressed(KeyCode::Digit3) {
+        let gt = Autopilot::GravityTurn(GravityTurn::to_apoapsis(120_000.0));
+        world
+            .craft
+            .apply_command(&Command::SetAutopilot(Some(gt)), orientation);
+    }
+    if keys.just_pressed(KeyCode::Digit0) {
+        world
+            .craft
+            .apply_command(&Command::SetAutopilot(None), orientation);
+    }
 
     // Time-warp.
     if keys.just_pressed(KeyCode::Period) {
@@ -555,9 +581,15 @@ fn update_hud(world: Res<PlayWorld>, mut hud: Query<&mut Text, With<Hud>>) {
             ControlTier::Uncontrolled => "UNCONTROLLED",
             ControlTier::Direct => "direct",
             ControlTier::Stabilized => "stabilized",
+            ControlTier::Canned => "canned",
+        };
+        let ap = match world.craft.autopilot {
+            None => "off".to_string(),
+            Some(Autopilot::GravityTurn(_)) => "grav-turn".to_string(),
+            Some(a) => format!("{a:?}").to_lowercase(),
         };
         text.0 = format!(
-            "phase:    {phase}\nthrottle: {tbar} {pct:3.0}%{note}\nfuel:     {fbar} {fuel:6.0} kg\n\u{0394}v:       {dv:6.0} m/s\nG-force:  {g:5.1} g\naltitude: {alt}\nv-speed:  {v_speed:+7.0} m/s\nspeed:    {speed:7.1} m/s\n{orbit_line}\nenergy:   {energy:8.2} MJ/kg\nmedium:   {medium}   tilt {tilt:.0}\u{00b0}   SAS {sas} ({recap})\ncontrol:  {ctrl}",
+            "phase:    {phase}\nthrottle: {tbar} {pct:3.0}%{note}\nfuel:     {fbar} {fuel:6.0} kg\n\u{0394}v:       {dv:6.0} m/s\nG-force:  {g:5.1} g\naltitude: {alt}\nv-speed:  {v_speed:+7.0} m/s\nspeed:    {speed:7.1} m/s\n{orbit_line}\nenergy:   {energy:8.2} MJ/kg\nmedium:   {medium}   tilt {tilt:.0}\u{00b0}   SAS {sas} ({recap})\ncontrol:  {ctrl}   autopilot {ap}",
             tbar = gauge(throttle),
             pct = throttle * 100.0,
             note = if flameout { "  FLAMEOUT" } else { "" },

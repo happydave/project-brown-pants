@@ -10,6 +10,7 @@
 //! Continuous actuators (thrust, gimbal) and attitude/SAS control during active
 //! flight remain a later Flight Control concern.
 
+use crate::autopilot::Autopilot;
 use crate::handoff::GearKind;
 use crate::orbit::Orbit;
 use crate::sim::{Craft, SimClock};
@@ -74,6 +75,10 @@ pub enum Command {
     /// attitude when a manual nudge releases (the nudge sticks); `false` returns to
     /// the prior hold target. Applied by the attitude system.
     SetSasRecapture(bool),
+    /// Engage (`Some`) or disengage (`None`) a Tier-1 canned autopilot (WI 565).
+    /// Engaging requires a powered Tier-1 (`Canned`) computer; applied by the flight
+    /// layer (`FlightCraft::apply_command`), not [`apply_command`].
+    SetAutopilot(Option<Autopilot>),
 }
 
 /// Applies a single command to the simulation. Pure and deterministic — the only
@@ -105,7 +110,8 @@ pub fn apply_command(cmd: &Command, clock: &mut SimClock, orbit: Option<&mut Orb
         | Command::SetGimbal(_)
         | Command::SetAttitude(_)
         | Command::SetSas(_)
-        | Command::SetSasRecapture(_) => false,
+        | Command::SetSasRecapture(_)
+        | Command::SetAutopilot(_) => false,
     }
 }
 
@@ -138,6 +144,7 @@ fn execute_commands(
             Command::SetAttitude(a) => info!("attitude intent: {a:?}"),
             Command::SetSas(m) => info!("sas: {m:?}"),
             Command::SetSasRecapture(b) => info!("sas recapture-on-release: {b}"),
+            Command::SetAutopilot(a) => info!("autopilot: {a:?}"),
         }
     }
 }

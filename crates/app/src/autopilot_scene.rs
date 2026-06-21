@@ -125,6 +125,7 @@ impl AutopilotWorld {
                 propulsion,
                 attitude,
                 control: ControlSystem::crewed_stabilized(),
+                autopilot: None,
             },
             pad: LaunchPad::resting(pad_radius),
             session,

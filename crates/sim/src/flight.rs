@@ -14,6 +14,7 @@
 use crate::active::ActiveBody;
 use crate::aero;
 use crate::attitude::AttitudePilot;
+use crate::autopilot::Autopilot;
 use crate::control::{ControlSystem, ControlTier};
 use crate::fluid::{FluidMedium, FluidSample};
 use crate::launch::LaunchPad;
@@ -40,6 +41,10 @@ pub struct FlightCraft {
     /// Control devices + the autonomy-tier gate (WI 562). The battery, if any, is a
     /// reservoir in `propulsion.graph`.
     pub control: ControlSystem,
+    /// Engaged Tier-1 canned autopilot, if any (WI 565). Requires a powered `Canned`
+    /// computer to engage and to act; drives SAS target + throttle each step.
+    #[serde(default)]
+    pub autopilot: Option<Autopilot>,
 }
 
 impl FlightCraft {
@@ -71,6 +76,16 @@ impl FlightCraft {
             Command::SetSas(mode) if *mode != SasMode::Off && !tier.allows_stabilization() => false,
             Command::SetAttitude(_) | Command::SetSas(_) | Command::SetSasRecapture(_) => {
                 self.attitude.apply_command(cmd, current)
+            }
+            // Engaging a canned autopilot needs a powered Tier-1 computer (WI 565);
+            // disengaging (None) is always allowed.
+            Command::SetAutopilot(ap) => {
+                if ap.is_some() && !tier.allows_canned() {
+                    false
+                } else {
+                    self.autopilot = *ap;
+                    true
+                }
             }
             _ => false,
         }
@@ -108,6 +123,33 @@ pub fn flight_step(
     // Resolve the control tier before borrowing the fields mutably: it gates how
     // much of the attitude demand is applied (WI 562).
     let tier = craft.resolve_control();
+
+    // Canned autopilot (WI 565): if engaged and the tier permits, drive the SAS
+    // target (and throttle, for an ascent autopilot) the same way a player would —
+    // command arbitration (563) then lets manual input override it per axis.
+    if tier.allows_canned() {
+        if let Some(out) = craft.autopilot.map(|ap| {
+            ap.evaluate(
+                body.position,
+                body.velocity,
+                params.surface_radius,
+                params.mu,
+            )
+        }) {
+            if let Some(dir) = out.attitude_target {
+                craft
+                    .attitude
+                    .sas
+                    .set_mode(crate::command::SasMode::Point(dir), body.orientation);
+            }
+            if let Some(th) = out.throttle {
+                craft
+                    .propulsion
+                    .apply_command(&crate::command::Command::SetThrottle(th));
+            }
+        }
+    }
+
     let FlightCraft {
         voxels,
         dry_mass,
@@ -115,6 +157,7 @@ pub fn flight_step(
         propulsion,
         attitude,
         control: _,
+        autopilot: _,
     } = craft;
 
     // Wet mass + CoM (propellant folds into mass/CoM in real time, WI 531).
@@ -256,6 +299,7 @@ mod tests {
             propulsion,
             attitude,
             control: crate::control::ControlSystem::crewed_stabilized(),
+            autopilot: None,
         };
         (craft, mp.mass + propellant)
     }
@@ -357,6 +401,77 @@ mod tests {
             ControlTier::Direct,
             "unpowered: SAS lost, falls to Direct"
         );
+    }
+
+    #[test]
+    fn autopilot_engagement_requires_canned_tier() {
+        use crate::autopilot::Autopilot;
+        use crate::command::Command;
+        let (mut craft, _) = rocket(); // crewed_stabilized → Stabilized (no Tier 1)
+        assert!(
+            !craft.apply_command(
+                &Command::SetAutopilot(Some(Autopilot::Prograde)),
+                DQuat::IDENTITY
+            ),
+            "Stabilized refuses engaging an autopilot"
+        );
+        assert!(craft.autopilot.is_none());
+        // Disengage (None) is always allowed.
+        assert!(craft.apply_command(&Command::SetAutopilot(None), DQuat::IDENTITY));
+        // Upgrade to a Tier-1 computer → engaging is accepted.
+        craft.control = crate::control::ControlSystem::crewed_canned();
+        assert_eq!(craft.resolve_control(), ControlTier::Canned);
+        assert!(craft.apply_command(
+            &Command::SetAutopilot(Some(Autopilot::Prograde)),
+            DQuat::IDENTITY
+        ));
+        assert_eq!(craft.autopilot, Some(Autopilot::Prograde));
+    }
+
+    #[test]
+    fn gravity_turn_autopilot_ascends_and_gains_horizontal_velocity() {
+        use crate::autopilot::{Autopilot, GravityTurn};
+        let (mut craft, wet0) = rocket();
+        craft.control = crate::control::ControlSystem::crewed_canned();
+        // A capable engine + ample propellant so the demo has TWR to climb and time to
+        // thrust through the turn (the stock rocket is deliberately marginal).
+        craft.propulsion.engines[0].max_mass_flow = 200.0;
+        craft.propulsion.graph.reservoirs[0] = Reservoir::new(PROP, 8_000.0, 8_000.0);
+        craft.autopilot = Some(Autopilot::GravityTurn(GravityTurn {
+            pitchover_altitude: 800.0,
+            turn_end_altitude: 2_500.0,
+            target_apoapsis: 120_000.0,
+        }));
+
+        let p = params(crate::medium::max_cross_section(&craft.voxels));
+        let pad_radius = BODY.radius + craft.dry_com.y;
+        let mut pad = LaunchPad::resting(pad_radius);
+        let mut body = ActiveBody::new(
+            DVec3::new(0.0, pad_radius, 0.0), // up = +Y; downrange = +X
+            DVec3::ZERO,
+            wet0,
+            craft.voxels.mass_properties().unwrap().inertia,
+        );
+        let apo0 = crate::autopilot::apoapsis_radius(body.position, body.velocity, p.mu);
+        // The autopilot owns throttle (gravity turn); no manual input. Climb + turn.
+        for _ in 0..12_000 {
+            flight_step(&mut body, &mut craft, &p, &mut pad, 0.004);
+        }
+        assert!(pad.released, "lifted off");
+        assert!(
+            body.position.length() - BODY.radius > 1_000.0,
+            "climbed past pitchover"
+        );
+        assert!(
+            body.velocity.x.abs() > 50.0,
+            "gained horizontal (downrange) velocity"
+        );
+        let apo1 = crate::autopilot::apoapsis_radius(body.position, body.velocity, p.mu);
+        assert!(
+            apo1.unwrap_or(0.0) > apo0.unwrap_or(0.0).max(body.position.length()),
+            "raised apoapsis (ascending toward orbit)"
+        );
+        assert!(body.position.is_finite() && body.velocity.is_finite());
     }
 
     fn params(drag_area: f64) -> FlightParams {

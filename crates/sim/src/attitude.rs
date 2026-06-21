@@ -292,7 +292,10 @@ impl AttitudePilot {
         } else {
             [false; 3]
         };
-        let sas_torque = self.sas.desired_torque(body.orientation, omega);
+        // The SAS PD law yields a desired angular *acceleration*; scale by the body
+        // inertia so authority is inertia-aware (a heavy craft gets proportionally
+        // more torque, so the same gains slew any mass). Unit-inertia → unchanged.
+        let sas_torque = body.inertia * self.sas.desired_torque(body.orientation, omega);
         let sas_claims = [stabilization; 3];
 
         // Sources in priority order (manual over SAS).

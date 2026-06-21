@@ -50,6 +50,9 @@ pub enum ControlTier {
     /// Tier 0: a powered command computer enables SAS-style stabilization on top of
     /// manual control. (SAS hardware/engagement specifics are WI 564.)
     Stabilized,
+    /// Tier 1: a powered autopilot computer offers **canned autopilots** (orbital-frame
+    /// attitude holds, gravity-turn ascent, …) on top of stabilization (WI 565).
+    Canned,
 }
 
 impl ControlTier {
@@ -61,6 +64,11 @@ impl ControlTier {
     /// Whether stabilization (SAS) is available at this tier.
     pub fn allows_stabilization(self) -> bool {
         self >= ControlTier::Stabilized
+    }
+
+    /// Whether canned autopilots (Tier 1) are available at this tier.
+    pub fn allows_canned(self) -> bool {
+        self >= ControlTier::Canned
     }
 }
 
@@ -106,6 +114,14 @@ impl ControlComputer {
             power_draw,
         }
     }
+
+    /// A Tier-1 (canned-autopilot-capable) computer with the given draw.
+    pub fn autopilot_computer(power_draw: f64) -> Self {
+        Self {
+            grants: ControlTier::Canned,
+            power_draw,
+        }
+    }
 }
 
 /// A craft's control loadout: its control points, control computers, and which
@@ -138,6 +154,17 @@ impl ControlSystem {
         Self {
             points: vec![ControlPoint::crewed()],
             computers: vec![ControlComputer::command_core(0.0)],
+            battery: None,
+        }
+    }
+
+    /// A crewed craft with a **self-powered** Tier-1 autopilot computer → resolves to
+    /// [`ControlTier::Canned`] (canned autopilots available). Convenience for craft
+    /// where power is not modelled.
+    pub fn crewed_canned() -> Self {
+        Self {
+            points: vec![ControlPoint::crewed()],
+            computers: vec![ControlComputer::autopilot_computer(0.0)],
             battery: None,
         }
     }
@@ -260,6 +287,19 @@ mod tests {
             battery: Some(bat),
         };
         assert_eq!(sys.resolve(&g_full), ControlTier::Stabilized);
+    }
+
+    #[test]
+    fn autopilot_computer_grants_canned_tier() {
+        let sys = ControlSystem::crewed_canned();
+        let g = ResourceGraph::default();
+        let tier = sys.resolve(&g);
+        assert_eq!(tier, ControlTier::Canned);
+        assert!(tier.allows_canned() && tier.allows_stabilization() && tier.allows_manual());
+        // A Tier-0 command core does not grant canned autopilots.
+        assert!(!ControlSystem::crewed_stabilized()
+            .resolve(&g)
+            .allows_canned());
     }
 
     #[test]

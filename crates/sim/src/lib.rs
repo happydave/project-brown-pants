@@ -9,6 +9,7 @@
 pub mod active;
 pub mod aero;
 pub mod attitude;
+pub mod autopilot;
 pub mod breakage;
 pub mod command;
 pub mod compartments;
