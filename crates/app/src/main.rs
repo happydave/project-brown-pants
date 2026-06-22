@@ -16,6 +16,7 @@
 //! - `cargo run -p sounding -- play` — fly a craft by hand: throttle/attitude/SAS/warp, with a full flight HUD (Δv, apsides, energy)
 //! - `cargo run -p sounding -- skins` — voxel-skin comparison: the same craft flown side by side, blocky vs greedy-meshed hull
 //! - `cargo run -p sounding -- materials` — preview a generated PBR material set on lit geometry
+//! - `cargo run -p sounding -- terrainmesh` — preview a generated MoGe terrain relief (glTF)
 //!
 //! The Toy 1–3 simulation and runtime bus run headless behind whichever scene is
 //! shown, so the companion still works. Per-scene controls are documented in
@@ -43,6 +44,7 @@ mod planet;
 mod play_scene;
 mod rover_scene;
 mod skins_scene;
+mod terrain_mesh_scene;
 mod voxel_skin;
 mod wind_tunnel_scene;
 
@@ -58,6 +60,7 @@ use planet::PlanetPlugin;
 use play_scene::PlayScenePlugin;
 use rover_scene::RoverScenePlugin;
 use skins_scene::SkinsScenePlugin;
+use terrain_mesh_scene::TerrainMeshScenePlugin;
 use wind_tunnel_scene::WindTunnelScenePlugin;
 
 /// Which toy scene the windowed app shows.
@@ -75,6 +78,7 @@ enum Scene {
     Play,
     Materials,
     Skins,
+    TerrainMesh,
 }
 
 fn selected_scene() -> Scene {
@@ -91,6 +95,7 @@ fn selected_scene() -> Scene {
         Some("play") => Scene::Play,
         Some("materials") => Scene::Materials,
         Some("skins") => Scene::Skins,
+        Some("terrainmesh") => Scene::TerrainMesh,
         _ => Scene::Editor,
     }
 }
@@ -159,6 +164,9 @@ fn main() {
         }
         Scene::Skins => {
             app.add_plugins(SkinsScenePlugin);
+        }
+        Scene::TerrainMesh => {
+            app.add_plugins(TerrainMeshScenePlugin);
         }
     }
 
