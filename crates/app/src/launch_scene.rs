@@ -151,11 +151,13 @@ impl Plugin for LaunchScenePlugin {
 
 fn setup_scene(
     mut commands: Commands,
+    asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut scattering: ResMut<Assets<ScatteringMedium>>,
     world: Res<LaunchWorld>,
 ) {
+    crate::ground::spawn_ground(&mut commands, &mut meshes, &mut materials, &asset_server);
     // Ground: an opaque sphere whose surface is sea level (Y = 0).
     commands.spawn((
         Mesh3d(meshes.add(Mesh::from(Sphere {

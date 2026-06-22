@@ -238,11 +238,13 @@ impl Plugin for PlayScenePlugin {
 
 fn setup_scene(
     mut commands: Commands,
+    asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut scattering: ResMut<Assets<ScatteringMedium>>,
     world: Res<PlayWorld>,
 ) {
+    crate::ground::spawn_ground(&mut commands, &mut meshes, &mut materials, &asset_server);
     commands.spawn((
         Mesh3d(meshes.add(Mesh::from(Sphere {
             radius: BODY.radius as f32,

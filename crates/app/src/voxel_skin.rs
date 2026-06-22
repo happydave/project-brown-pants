@@ -52,36 +52,49 @@ pub fn material_set_for(_material: Material) -> &'static str {
     "hull_panel"
 }
 
-/// Build the `StandardMaterial` for a named PBR set: albedo sRGB; normal /
-/// metallic-roughness / occlusion are non-colour data and load linear (the `-- materials`
-/// convention). All maps use **repeat** wrap so the greedy hull's tiled UVs (which span
-/// `[0,w]×[0,h]` across a merged panel) repeat the texture per cell instead of clamping —
-/// otherwise the surface shows one image at a corner with the edges smeared (WI 587).
-/// Linear filtering is preserved. Textures supply the variation, so multipliers stay
-/// neutral-high.
+/// Load a texture with a **repeat-wrapped**, linear-filtered sampler so tiled UVs (UVs that
+/// exceed `1.0`) repeat the texture instead of clamping/smearing the edge texel (WI 587).
+/// `srgb` true for colour (albedo), false for non-colour data (normal / metallic-roughness
+/// / occlusion). Shared by the craft skins and the textured ground (WI 588).
+pub fn load_repeat(asset_server: &AssetServer, path: String, srgb: bool) -> Handle<Image> {
+    asset_server.load_with_settings(path, move |s: &mut ImageLoaderSettings| {
+        s.is_srgb = srgb;
+        let mut desc = ImageSamplerDescriptor::linear();
+        desc.address_mode_u = ImageAddressMode::Repeat;
+        desc.address_mode_v = ImageAddressMode::Repeat;
+        s.sampler = ImageSampler::Descriptor(desc);
+    })
+}
+
+/// Build the `StandardMaterial` for a named PBR set (albedo sRGB; normal /
+/// metallic-roughness / occlusion linear), repeat-wrapped so the greedy hull's tiled UVs
+/// repeat per cell. Textures supply the variation, so multipliers stay neutral-high.
 pub fn pbr_material(
     set: &str,
     asset_server: &AssetServer,
     materials: &mut Assets<StandardMaterial>,
 ) -> Handle<StandardMaterial> {
-    // A linear-filtered, repeat-wrapped sampler (so tiled UVs repeat, not clamp).
-    let tiled = move |path: String, srgb: bool| {
-        asset_server.load_with_settings(path, move |s: &mut ImageLoaderSettings| {
-            s.is_srgb = srgb;
-            let mut desc = ImageSamplerDescriptor::linear();
-            desc.address_mode_u = ImageAddressMode::Repeat;
-            desc.address_mode_v = ImageAddressMode::Repeat;
-            s.sampler = ImageSampler::Descriptor(desc);
-        })
-    };
     materials.add(StandardMaterial {
-        base_color_texture: Some(tiled(format!("materials/{set}_albedo.png"), true)),
-        normal_map_texture: Some(tiled(format!("materials/{set}_normal.png"), false)),
-        metallic_roughness_texture: Some(tiled(
+        base_color_texture: Some(load_repeat(
+            asset_server,
+            format!("materials/{set}_albedo.png"),
+            true,
+        )),
+        normal_map_texture: Some(load_repeat(
+            asset_server,
+            format!("materials/{set}_normal.png"),
+            false,
+        )),
+        metallic_roughness_texture: Some(load_repeat(
+            asset_server,
             format!("materials/{set}_metallic_roughness.png"),
             false,
         )),
-        occlusion_texture: Some(tiled(format!("materials/{set}_occlusion.png"), false)),
+        occlusion_texture: Some(load_repeat(
+            asset_server,
+            format!("materials/{set}_occlusion.png"),
+            false,
+        )),
         perceptual_roughness: 1.0,
         metallic: 1.0,
         ..default()

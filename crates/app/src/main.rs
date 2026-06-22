@@ -36,6 +36,7 @@ mod dive_scene;
 mod editor;
 mod floating_origin;
 mod flooding_scene;
+mod ground;
 mod launch_scene;
 mod materials_scene;
 mod planet;

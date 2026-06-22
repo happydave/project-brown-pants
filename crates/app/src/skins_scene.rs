@@ -198,7 +198,7 @@ fn setup_scene(
         ));
     }
 
-    // Ground sphere.
+    // Ground sphere (planet body / horizon).
     commands.spawn((
         Mesh3d(meshes.add(Mesh::from(Sphere {
             radius: BODY.radius as f32,
@@ -214,6 +214,8 @@ fn setup_scene(
             DVec3::new(0.0, -BODY.radius, 0.0),
         )),
     ));
+    // Textured rocky ground patch under the craft (WI 588).
+    crate::ground::spawn_ground(&mut commands, &mut meshes, &mut materials, &asset_server);
 
     commands.spawn((
         DirectionalLight {
