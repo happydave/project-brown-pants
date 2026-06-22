@@ -14,6 +14,7 @@
 //! - `cargo run -p sounding -- launch` — surface lift-off: a rocket rests on the pad, then ascends under thrust
 //! - `cargo run -p sounding -- autopilot` — a continuous one-craft session flown automatically: Launch → Flight → Recovery (a sounding)
 //! - `cargo run -p sounding -- play` — fly a craft by hand: throttle/attitude/SAS/warp, with a full flight HUD (Δv, apsides, energy)
+//! - `cargo run -p sounding -- skins` — voxel-skin comparison: the same craft flown side by side, blocky vs greedy-meshed hull
 //! - `cargo run -p sounding -- materials` — preview a generated PBR material set on lit geometry
 //!
 //! The Toy 1–3 simulation and runtime bus run headless behind whichever scene is
@@ -40,6 +41,8 @@ mod materials_scene;
 mod planet;
 mod play_scene;
 mod rover_scene;
+mod skins_scene;
+mod voxel_skin;
 mod wind_tunnel_scene;
 
 use autopilot_scene::AutopilotScenePlugin;
@@ -53,6 +56,7 @@ use materials_scene::MaterialsScenePlugin;
 use planet::PlanetPlugin;
 use play_scene::PlayScenePlugin;
 use rover_scene::RoverScenePlugin;
+use skins_scene::SkinsScenePlugin;
 use wind_tunnel_scene::WindTunnelScenePlugin;
 
 /// Which toy scene the windowed app shows.
@@ -69,6 +73,7 @@ enum Scene {
     Autopilot,
     Play,
     Materials,
+    Skins,
 }
 
 fn selected_scene() -> Scene {
@@ -84,6 +89,7 @@ fn selected_scene() -> Scene {
         Some("autopilot") => Scene::Autopilot,
         Some("play") => Scene::Play,
         Some("materials") => Scene::Materials,
+        Some("skins") => Scene::Skins,
         _ => Scene::Editor,
     }
 }
@@ -149,6 +155,9 @@ fn main() {
         }
         Scene::Materials => {
             app.add_plugins(MaterialsScenePlugin);
+        }
+        Scene::Skins => {
+            app.add_plugins(SkinsScenePlugin);
         }
     }
 

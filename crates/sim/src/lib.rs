@@ -34,6 +34,7 @@ pub mod telemetry;
 pub mod terrain;
 pub mod universe;
 pub mod voxel;
+pub mod voxel_mesh;
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
