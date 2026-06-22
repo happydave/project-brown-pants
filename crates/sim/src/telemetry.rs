@@ -65,11 +65,6 @@ pub struct CraftTelemetry {
     pub position: [f64; 2],
     /// Current world velocity `[x, y]` at the snapshot time.
     pub velocity: [f64; 2],
-    /// The craft's resolved control tier (WI 562), when known. The orbit-gear bus
-    /// `capture` leaves this `None` (it has no `FlightCraft`); a flight-aware path
-    /// (e.g. the flight HUD reading `FlightCraft::resolve_control`) supplies it.
-    #[serde(default)]
-    pub control_tier: Option<ControlTier>,
 }
 
 impl Telemetry {
@@ -91,7 +86,6 @@ impl Telemetry {
                 apoapsis_radius: o.apoapsis_radius(),
                 position: [p.x, p.y],
                 velocity: [v.x, v.y],
-                control_tier: None,
             }
         });
         Telemetry {
@@ -105,15 +99,12 @@ impl Telemetry {
         }
     }
 
-    /// Attach active-gear autonomy state to this snapshot (WI 569). Also mirrors the
-    /// effective tier into the orbit-derived `craft` block's `control_tier` (WI 562)
-    /// when such a block is present, so that field becomes live where an orbit exists.
-    /// Builder-style so the publisher can layer it onto `capture` without changing the
-    /// orbit-only `capture` signature.
+    /// Attach active-gear autonomy state to this snapshot (WI 569). The active block is
+    /// the single home for the control tier; clients read `active.control_tier`. (The
+    /// `craft` block describes the orbit-gear propagator — a distinct craft — so the
+    /// tier is deliberately not mirrored onto it. WI 579.) Builder-style so the publisher
+    /// can layer it onto `capture` without changing the orbit-only `capture` signature.
     pub fn with_active_flight(mut self, active: ActiveFlightTelemetry) -> Self {
-        if let Some(c) = self.craft.as_mut() {
-            c.control_tier = Some(active.control_tier);
-        }
         self.active = Some(active);
         self
     }
@@ -209,16 +200,13 @@ mod tests {
         assert_eq!(active.available_tier, ControlTier::Tunable);
         assert!(!active.assist_offline);
 
-        // Attaching to an orbit-bearing snapshot mirrors the effective tier into the
-        // nested craft block AND fills the top-level active block.
+        // Attaching to an orbit-bearing snapshot fills the top-level active block; the
+        // orbit `craft` block is a distinct craft and carries no tier (WI 579).
         let clock = SimClock::default();
         let orbit =
             Orbit::from_state(1.0, DVec2::new(1.0, 0.0), DVec2::new(0.0, 1.0), 0.0).unwrap();
         let snap = Telemetry::capture(&clock, Some(&orbit), 1.0, None).with_active_flight(active);
-        assert_eq!(
-            snap.craft.as_ref().unwrap().control_tier,
-            Some(ControlTier::Tunable)
-        );
+        assert!(snap.craft.is_some());
         assert_eq!(snap.active.unwrap().control_tier, ControlTier::Tunable);
     }
 
