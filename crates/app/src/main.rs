@@ -14,6 +14,7 @@
 //! - `cargo run -p sounding -- launch` — surface lift-off: a rocket rests on the pad, then ascends under thrust
 //! - `cargo run -p sounding -- autopilot` — a continuous one-craft session flown automatically: Launch → Flight → Recovery (a sounding)
 //! - `cargo run -p sounding -- play` — fly a craft by hand: throttle/attitude/SAS/warp, with a full flight HUD (Δv, apsides, energy)
+//! - `cargo run -p sounding -- materials` — preview a generated PBR material set on lit geometry
 //!
 //! The Toy 1–3 simulation and runtime bus run headless behind whichever scene is
 //! shown, so the companion still works. Per-scene controls are documented in
@@ -35,6 +36,7 @@ mod editor;
 mod floating_origin;
 mod flooding_scene;
 mod launch_scene;
+mod materials_scene;
 mod planet;
 mod play_scene;
 mod rover_scene;
@@ -47,6 +49,7 @@ use dive_scene::DiveScenePlugin;
 use editor::EditorPlugin;
 use flooding_scene::FloodingScenePlugin;
 use launch_scene::LaunchScenePlugin;
+use materials_scene::MaterialsScenePlugin;
 use planet::PlanetPlugin;
 use play_scene::PlayScenePlugin;
 use rover_scene::RoverScenePlugin;
@@ -65,6 +68,7 @@ enum Scene {
     Launch,
     Autopilot,
     Play,
+    Materials,
 }
 
 fn selected_scene() -> Scene {
@@ -79,6 +83,7 @@ fn selected_scene() -> Scene {
         Some("launch") => Scene::Launch,
         Some("autopilot") => Scene::Autopilot,
         Some("play") => Scene::Play,
+        Some("materials") => Scene::Materials,
         _ => Scene::Editor,
     }
 }
@@ -141,6 +146,9 @@ fn main() {
         }
         Scene::Play => {
             app.add_plugins(PlayScenePlugin);
+        }
+        Scene::Materials => {
+            app.add_plugins(MaterialsScenePlugin);
         }
     }
 
