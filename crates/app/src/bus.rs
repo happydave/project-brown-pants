@@ -11,7 +11,7 @@ use bevy::prelude::*;
 use sounding_sim::command::Command;
 use sounding_sim::diagnostics::ENERGY_DRIFT;
 use sounding_sim::sim::{CentralBody, Craft, SimClock};
-use sounding_sim::telemetry::Telemetry;
+use sounding_sim::telemetry::{ActiveFlightTelemetry, Telemetry};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -27,6 +27,12 @@ struct BusTelemetry(Arc<Mutex<String>>);
 /// Commands received by the server thread, drained into the executor by Bevy.
 #[derive(Resource)]
 struct BusCommandRx(Mutex<Receiver<Command>>);
+
+/// Bridge from an active scene to the bus publisher (WI 569): the latest active-craft
+/// autonomy snapshot. A scene that owns a `FlightCraft` (e.g. `-- play`, `-- autopilot`)
+/// writes it each frame; `publish_telemetry` attaches it. `None` ⇒ orbit-only telemetry.
+#[derive(Resource, Default)]
+pub struct ActiveFlight(pub Option<ActiveFlightTelemetry>);
 
 /// Serves the runtime bus on `port`.
 pub struct BusPlugin {
@@ -58,6 +64,7 @@ impl Plugin for BusPlugin {
 
         app.insert_resource(BusTelemetry(telemetry))
             .insert_resource(BusCommandRx(Mutex::new(rx)))
+            .init_resource::<ActiveFlight>()
             .add_systems(Update, (publish_telemetry, drain_commands));
     }
 }
@@ -102,10 +109,15 @@ fn publish_telemetry(
     body: Res<CentralBody>,
     craft: Query<&Craft>,
     diagnostics: Res<DiagnosticsStore>,
+    active: Res<ActiveFlight>,
 ) {
     let orbit = craft.single().ok().map(|c| c.orbit);
     let energy_drift = diagnostics.get(&ENERGY_DRIFT).and_then(|d| d.value());
-    let snapshot = Telemetry::capture(&clock, orbit.as_ref(), body.mu, energy_drift);
+    let mut snapshot = Telemetry::capture(&clock, orbit.as_ref(), body.mu, energy_drift);
+    // Attach the active craft's autonomy state when a scene has published one (WI 569).
+    if let Some(a) = active.0 {
+        snapshot = snapshot.with_active_flight(a);
+    }
     if let (Ok(json), Ok(mut slot)) = (serde_json::to_string(&snapshot), bus.0.lock()) {
         *slot = json;
     }

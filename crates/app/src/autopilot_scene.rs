@@ -32,7 +32,9 @@ use sounding_sim::session::{GameSession, Outcome, Phase};
 use sounding_sim::sim::CentralBody;
 use sounding_sim::voxel::{Material, Voxel, VoxelCraft};
 
+use crate::bus::ActiveFlight;
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
+use sounding_sim::telemetry::ActiveFlightTelemetry;
 
 const BODY: CentralBody = CentralBody::EARTHLIKE;
 const SUBSTEP_DT: f64 = 0.004;
@@ -176,6 +178,7 @@ impl Plugin for AutopilotScenePlugin {
                 Update,
                 (
                     step_autopilot,
+                    publish_active_flight,
                     track_craft,
                     follow_camera,
                     update_hud,
@@ -320,6 +323,11 @@ fn step_autopilot(time: Res<Time>, mut world: ResMut<AutopilotWorld>) {
         world.accumulator -= SUBSTEP_DT;
         n += 1;
     }
+}
+
+/// Publishes the auto-flown craft's autonomy state onto the bus bridge each frame (WI 569).
+fn publish_active_flight(world: Res<AutopilotWorld>, mut active: ResMut<ActiveFlight>) {
+    active.0 = Some(ActiveFlightTelemetry::from_flight(&world.craft));
 }
 
 fn track_craft(
