@@ -1,19 +1,16 @@
-//! Terrain-mesh preview scene (`-- terrainmesh`): loads a generated MoGe terrain relief (from the
-//! asset-harness `3d-static-props` track, Blender-decimated) as a glTF `SceneRoot` and shows it,
-//! to validate glb loading, scale, and orientation in Sounding's real Bevy pipeline.
+//! Terrain-mesh preview scene (`-- terrainmesh`): loads a generated terrain chunk (asset-harness
+//! `3d-static-props`, **heightmap-displacement** pipeline) as a glTF `SceneRoot` and shows it, to
+//! validate glb loading + materials in Sounding's real Bevy pipeline.
 //!
-//! The MoGe mesh is **camera-space 2.5D** (~544×572×385 units, reconstructed looking down −Z), so
-//! it is recentered + scaled down and slow-spun about its centre (a parent pivot) so the whole
-//! relief is visible. Touches no `sounding_sim` state; assets in `crates/app/assets/models/`.
+//! The mesh is a clean displaced grid — ~10×10 units in the XZ plane, Y-up, low relief, already
+//! centered at the origin — so it loads near-identity and slow-spins in place under sun + fill
+//! light. (Superseded the earlier MoGe relief, which stretched on deep scenes.) Touches no
+//! `sounding_sim` state; assets in `crates/app/assets/models/`.
 
 use bevy::gltf::GltfAssetLabel;
 use bevy::prelude::*;
 
-const TERRAIN: &str = "models/moge_terrain.glb";
-/// Mesh centre in its own (camera-space) coordinates — from the glb POSITION min/max.
-const CENTER: Vec3 = Vec3::new(112.9, -98.5, -192.4);
-/// Scale the ~550-unit mesh down to ~11 units across.
-const SCALE: f32 = 0.02;
+const TERRAIN: &str = "models/terrain.glb";
 
 #[derive(Component)]
 struct Spin(f32);
@@ -29,15 +26,8 @@ impl Plugin for TerrainMeshScenePlugin {
 
 fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     let scene = asset_server.load(GltfAssetLabel::Scene(0).from_asset(TERRAIN));
-    // Parent pivot at the origin spins in place; child carries the recenter + scale.
-    commands
-        .spawn((Transform::default(), Visibility::default(), Spin(0.3)))
-        .with_children(|p| {
-            p.spawn((
-                SceneRoot(scene),
-                Transform::from_translation(-CENTER * SCALE).with_scale(Vec3::splat(SCALE)),
-            ));
-        });
+    // Already centered + Y-up (~10u, low relief): load near-identity and spin in place.
+    commands.spawn((SceneRoot(scene), Transform::default(), Spin(0.25)));
 
     commands.spawn((
         DirectionalLight {
@@ -45,20 +35,20 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
             shadows_enabled: true,
             ..default()
         },
-        Transform::from_xyz(8.0, 14.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(6.0, 10.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     commands.spawn((
         Camera3d::default(),
-        Transform::from_xyz(0.0, 6.0, 16.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(0.0, 8.0, 12.0).looking_at(Vec3::ZERO, Vec3::Y),
         AmbientLight {
-            brightness: 300.0,
+            brightness: 280.0,
             ..default()
         },
     ));
     commands.spawn((
         Text::new(
-            "MoGe terrain relief (asset-harness, MIT) — decimated ~102k tris, textured\n\
-             camera-space 2.5D; scale/center constants live in terrain_mesh_scene.rs",
+            "terrain (asset-harness heightmap-displacement) — clean grid, Z-Image albedo\n\
+             ~40k tris; slow-spin",
         ),
         TextFont {
             font_size: 16.0,
