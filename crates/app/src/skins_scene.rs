@@ -3,9 +3,8 @@
 //! One craft is stepped on the unified flight pipeline (a short auto-flown ascent) and
 //! rendered **twice from the same sim state** at offset transforms, so two skinnings of
 //! the identical lattice fly in formation under identical lighting and the same
-//! `hull_panel` PBR material. WI 582 fills the left slot with the **blocky** skin (and a
-//! blocky placeholder on the right); WI 583 swaps the right slot to the **greedy hull**
-//! skin — the primary look — so blocky and hull are visible side by side.
+//! `hull_panel` PBR material: the **blocky** skin (left, per-cell cubes, WI 582) and the
+//! **greedy-meshed hull** (right, the primary look, WI 583), side by side.
 
 use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::Tonemapping;
@@ -181,12 +180,15 @@ fn setup_scene(
         &mut materials,
     );
 
-    // Two slots from one sim state. WI 582: both blocky (the right is the hull placeholder
-    // until WI 583 swaps it). Left/right separated laterally so they read side by side.
-    let blocky = meshes.add(build_skin_mesh(&craft_voxels, VoxelSkin::Blocky));
-    for offset_z in [-SLOT_OFFSET, SLOT_OFFSET] {
+    // Two slots from one sim state, separated laterally so they read side by side: the
+    // blocky skin (left) and the greedy-meshed hull (right, WI 583) of the same lattice.
+    for (offset_z, skin) in [
+        (-SLOT_OFFSET, VoxelSkin::Blocky),
+        (SLOT_OFFSET, VoxelSkin::Hull),
+    ] {
+        let mesh = meshes.add(build_skin_mesh(&craft_voxels, skin));
         commands.spawn((
-            Mesh3d(blocky.clone()),
+            Mesh3d(mesh),
             MeshMaterial3d(material.clone()),
             Transform::default(),
             WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, world.render_world())),
@@ -223,7 +225,7 @@ fn setup_scene(
     ));
 
     commands.spawn((
-        Text::new("skins: left blocky  |  right blocky (hull \u{2192} 583)"),
+        Text::new("skins: left blocky (per-cell cubes)  |  right hull (greedy-meshed)"),
         TextFont {
             font_size: 18.0,
             ..default()

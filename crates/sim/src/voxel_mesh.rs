@@ -13,9 +13,9 @@
 //! The shared rule: a cell face is **exposed** only when the neighbouring cell along its
 //! normal is empty; interior faces (between two occupied cells) are never emitted.
 
-use crate::voxel::VoxelCraft;
+use crate::voxel::{Material, VoxelCraft};
 use glam::IVec3;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Engine-agnostic triangle-mesh data for one skin of a craft. Parallel
 /// `positions`/`normals`/`uvs` (one entry per vertex) plus a triangle-`indices` list.
@@ -100,6 +100,170 @@ pub fn blocky_mesh(craft: &VoxelCraft) -> SkinMesh {
         }
     }
     mesh
+}
+
+/// Integer cell component along axis `i` (0=x, 1=y, 2=z).
+fn comp(c: IVec3, i: usize) -> i32 {
+    [c.x, c.y, c.z][i]
+}
+
+/// In-plane axes `(u, v)` for face-normal axis `a`, chosen so `û × v̂ = â` (used to keep
+/// merged-quad winding outward).
+const INPLANE: [(usize, usize); 3] = [(1, 2), (2, 0), (0, 1)];
+
+/// One face direction's geometry context: the normal axis `a`, its in-plane axes
+/// `(ua, va)`, the face `sign` (±1), and the cell size `s`. Threaded through the greedy
+/// merge so the inner functions stay within argument limits.
+struct FaceAxis {
+    a: usize,
+    ua: usize,
+    va: usize,
+    sign: i32,
+    s: f32,
+}
+
+/// Build the **greedy hull** skin (WI 583): the same exposed faces as [`blocky_mesh`],
+/// but coplanar faces of like material are merged into maximal rectangles (per
+/// face-direction and slab), with texture coordinates that **tile** across each rectangle
+/// (a w×h-cell quad spans `[0,w]×[0,h]`). Far fewer vertices than blocky for large flat
+/// surfaces; pure and deterministic.
+pub fn greedy_mesh(craft: &VoxelCraft) -> SkinMesh {
+    let occ: HashMap<IVec3, Material> = craft.voxels.iter().map(|v| (v.cell, v.material)).collect();
+    let s = craft.cell_size as f32;
+    let mut mesh = SkinMesh::default();
+
+    for a in 0..3usize {
+        let (ua, va) = INPLANE[a];
+        for sign in [1i32, -1] {
+            let mut off = [0i32; 3];
+            off[a] = sign;
+            let nrm = IVec3::new(off[0], off[1], off[2]);
+
+            // Group exposed faces of this direction by slab (the cell's `a`-coordinate),
+            // each slab a sparse (u,v) → material mask.
+            let mut layers: HashMap<i32, HashMap<(i32, i32), Material>> = HashMap::new();
+            for (cell, mat) in &occ {
+                if !occ.contains_key(&(*cell + nrm)) {
+                    layers
+                        .entry(comp(*cell, a))
+                        .or_default()
+                        .insert((comp(*cell, ua), comp(*cell, va)), *mat);
+                }
+            }
+
+            let fa = FaceAxis { a, ua, va, sign, s };
+            for (k, mask) in &layers {
+                greedy_merge_layer(*k, mask, &fa, &mut mesh);
+            }
+        }
+    }
+    mesh
+}
+
+/// Greedily merge one slab's (u,v) → material mask into maximal rectangles and emit a
+/// quad per rectangle.
+fn greedy_merge_layer(
+    k: i32,
+    mask: &HashMap<(i32, i32), Material>,
+    fa: &FaceAxis,
+    mesh: &mut SkinMesh,
+) {
+    let umin = mask.keys().map(|&(u, _)| u).min().unwrap_or(0);
+    let umax = mask.keys().map(|&(u, _)| u).max().unwrap_or(0);
+    let vmin = mask.keys().map(|&(_, v)| v).min().unwrap_or(0);
+    let vmax = mask.keys().map(|&(_, v)| v).max().unwrap_or(0);
+    let mut visited: HashSet<(i32, i32)> = HashSet::new();
+
+    for v0 in vmin..=vmax {
+        for u0 in umin..=umax {
+            let Some(&mat) = mask.get(&(u0, v0)) else {
+                continue;
+            };
+            if visited.contains(&(u0, v0)) {
+                continue;
+            }
+            // Extend width along +u while same material, present, unvisited.
+            let mut w = 1;
+            while mask.get(&(u0 + w, v0)) == Some(&mat) && !visited.contains(&(u0 + w, v0)) {
+                w += 1;
+            }
+            // Extend height along +v while the whole row [u0, u0+w) matches.
+            let mut h = 1;
+            'rows: loop {
+                for du in 0..w {
+                    let key = (u0 + du, v0 + h);
+                    if mask.get(&key) != Some(&mat) || visited.contains(&key) {
+                        break 'rows;
+                    }
+                }
+                h += 1;
+            }
+            for dv in 0..h {
+                for du in 0..w {
+                    visited.insert((u0 + du, v0 + dv));
+                }
+            }
+            emit_quad(k, u0, v0, w, h, fa, mesh);
+        }
+    }
+}
+
+/// Emit one merged rectangle as a quad (four vertices, two triangles) with an outward
+/// normal, CCW-outward winding, and tiled texture coordinates spanning `[0,w]×[0,h]`.
+fn emit_quad(k: i32, u0: i32, v0: i32, w: i32, h: i32, fa: &FaceAxis, mesh: &mut SkinMesh) {
+    // The face plane: +faces sit on the high boundary of the cell layer, −faces on the low.
+    let ap = if fa.sign > 0 { k + 1 } else { k };
+    let xyz = |uv: i32, vv: i32| -> [f32; 3] {
+        let mut c = [0i32; 3];
+        c[fa.a] = ap;
+        c[fa.ua] = uv;
+        c[fa.va] = vv;
+        [c[0] as f32 * fa.s, c[1] as f32 * fa.s, c[2] as f32 * fa.s]
+    };
+    let mut n = [0.0f32; 3];
+    n[fa.a] = fa.sign as f32;
+
+    // Corner + UV order differs by sign so the winding stays outward (û × v̂ = â).
+    let (corners, uvs): ([[f32; 3]; 4], [[f32; 2]; 4]) = if fa.sign > 0 {
+        (
+            [
+                xyz(u0, v0),
+                xyz(u0 + w, v0),
+                xyz(u0 + w, v0 + h),
+                xyz(u0, v0 + h),
+            ],
+            [
+                [0.0, 0.0],
+                [w as f32, 0.0],
+                [w as f32, h as f32],
+                [0.0, h as f32],
+            ],
+        )
+    } else {
+        (
+            [
+                xyz(u0, v0),
+                xyz(u0, v0 + h),
+                xyz(u0 + w, v0 + h),
+                xyz(u0 + w, v0),
+            ],
+            [
+                [0.0, 0.0],
+                [0.0, h as f32],
+                [w as f32, h as f32],
+                [w as f32, 0.0],
+            ],
+        )
+    };
+
+    let base = mesh.positions.len() as u32;
+    for (corner, uv) in corners.iter().zip(uvs.iter()) {
+        mesh.positions.push(*corner);
+        mesh.normals.push(n);
+        mesh.uvs.push(*uv);
+    }
+    mesh.indices
+        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
 #[cfg(test)]
@@ -198,5 +362,113 @@ mod tests {
                 "winding normal {face_n:?} agrees with stored {stored:?}"
             );
         }
+    }
+
+    // --- WI 583: greedy hull skin ---
+
+    /// Total surface area of an axis-aligned-rectangle quad mesh: Σ |(p1−p0)×(p3−p0)|.
+    fn quad_area_sum(m: &SkinMesh) -> f32 {
+        (0..m.positions.len())
+            .step_by(4)
+            .map(|b| {
+                let p0 = glam::Vec3::from(m.positions[b]);
+                let p1 = glam::Vec3::from(m.positions[b + 1]);
+                let p3 = glam::Vec3::from(m.positions[b + 3]);
+                (p1 - p0).cross(p3 - p0).length()
+            })
+            .sum()
+    }
+
+    fn block(nx: i32, ny: i32, nz: i32) -> VoxelCraft {
+        let mut cells = Vec::new();
+        for x in 0..nx {
+            for y in 0..ny {
+                for z in 0..nz {
+                    cells.push(IVec3::new(x, y, z));
+                }
+            }
+        }
+        craft_from(&cells)
+    }
+
+    #[test]
+    fn greedy_solid_block_is_six_quads() {
+        // Each side of a solid block merges to a single rectangle.
+        let m = greedy_mesh(&block(2, 3, 4));
+        assert_eq!(m.face_count(), 6, "one merged rectangle per side");
+    }
+
+    #[test]
+    fn greedy_column_merges_long_sides() {
+        // 1×1×2: 4 long sides each merge two cells (4 quads) + 2 end caps = 6 (blocky: 10).
+        let c = craft_from(&[IVec3::new(0, 0, 0), IVec3::new(0, 0, 1)]);
+        assert_eq!(greedy_mesh(&c).face_count(), 6);
+        assert_eq!(blocky_mesh(&c).face_count(), 10);
+    }
+
+    #[test]
+    fn greedy_single_voxel_matches_blocky() {
+        // Nothing to merge: 6 quads, same as blocky.
+        let c = craft_from(&[IVec3::ZERO]);
+        assert_eq!(greedy_mesh(&c).face_count(), 6);
+    }
+
+    #[test]
+    fn greedy_conserves_exposed_area() {
+        // The merged rectangles cover exactly the exposed surface: greedy area == the
+        // naive per-cube exposed area (blocky face count, cell_size 1) — for a block, a
+        // column, and a non-rectangular L silhouette.
+        let l = craft_from(&[
+            IVec3::new(0, 0, 0),
+            IVec3::new(1, 0, 0),
+            IVec3::new(0, 1, 0),
+        ]);
+        for c in [block(2, 2, 2), block(1, 1, 3), l] {
+            let blocky_area = blocky_mesh(&c).face_count() as f32; // cell_size 1 → area = faces
+            assert!(
+                (quad_area_sum(&greedy_mesh(&c)) - blocky_area).abs() < 1e-4,
+                "greedy area conserved vs blocky"
+            );
+        }
+    }
+
+    #[test]
+    fn greedy_has_fewer_vertices_than_blocky() {
+        // The 2×2×5 hull the -- skins scene flies: greedy merges the broad faces.
+        let hull = block(2, 2, 5);
+        let g = greedy_mesh(&hull);
+        let b = blocky_mesh(&hull);
+        assert!(
+            g.positions.len() < b.positions.len(),
+            "greedy {} < blocky {} vertices",
+            g.positions.len(),
+            b.positions.len()
+        );
+    }
+
+    #[test]
+    fn greedy_winding_matches_outward_normal() {
+        // Both face signs: geometric winding agrees with the stored normal.
+        let m = greedy_mesh(&block(2, 2, 2));
+        for tri in m.indices.chunks(3).step_by(2) {
+            let p0 = glam::Vec3::from(m.positions[tri[0] as usize]);
+            let p1 = glam::Vec3::from(m.positions[tri[1] as usize]);
+            let p2 = glam::Vec3::from(m.positions[tri[2] as usize]);
+            let face_n = (p1 - p0).cross(p2 - p0).normalize();
+            let stored = glam::Vec3::from(m.normals[tri[0] as usize]);
+            assert!(face_n.dot(stored) > 0.99, "outward winding");
+        }
+    }
+
+    #[test]
+    fn greedy_tiles_uvs_across_merged_rectangle() {
+        // A solid block's merged side spans multiple cells; its UVs must reach the cell
+        // dimensions (tiling), not stay within [0,1] (stretched).
+        let m = greedy_mesh(&block(2, 2, 2));
+        let max_u = m.uvs.iter().map(|uv| uv[0]).fold(0.0_f32, f32::max);
+        assert!(
+            max_u >= 2.0,
+            "UVs tile across the merged rectangle (got {max_u})"
+        );
     }
 }

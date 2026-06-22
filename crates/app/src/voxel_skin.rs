@@ -8,13 +8,15 @@ use bevy::image::ImageLoaderSettings;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use sounding_sim::voxel::{Material, VoxelCraft};
-use sounding_sim::voxel_mesh::{blocky_mesh, SkinMesh};
+use sounding_sim::voxel_mesh::{blocky_mesh, greedy_mesh, SkinMesh};
 
 /// How a craft's render mesh is built from its voxel lattice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VoxelSkin {
     /// One textured cube per occupied cell — the Stormworks-style blocky skin (WI 582).
     Blocky,
+    /// Coplanar faces merged into panels — the Starbase-style hull, the primary look (WI 583).
+    Hull,
 }
 
 impl VoxelSkin {
@@ -22,6 +24,7 @@ impl VoxelSkin {
     fn mesh_data(self, craft: &VoxelCraft) -> SkinMesh {
         match self {
             VoxelSkin::Blocky => blocky_mesh(craft),
+            VoxelSkin::Hull => greedy_mesh(craft),
         }
     }
 }
