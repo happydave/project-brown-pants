@@ -25,3 +25,4 @@ serde = { workspace = true }
 # library code (not just tests), so it is a normal dependency. Rendering-free —
 # does not affect the headless invariant.
 serde_json = { workspace = true }
+parry3d-f64 = "0.28.0"
