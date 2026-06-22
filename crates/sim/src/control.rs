@@ -203,6 +203,14 @@ pub struct ControlSystem {
     /// non-negative and bounded by the battery's capacity at evaluation.
     #[serde(default)]
     pub low_power_reserve: f64,
+    /// Player-selected control-tier cap (WI 571): the craft may be operated **below**
+    /// its available tier (e.g. fly Direct with assist off to conserve power or for
+    /// skill). `resolve` returns `min(effective_tier, selected)`. `None` ⇒ no cap (full
+    /// available). Downshift is always permitted; a selection above capability is
+    /// harmless (the `min` ignores it). Does **not** affect `available_tier` or
+    /// `assist_offline` (the latter stays a low-power indicator, not a downshift one).
+    #[serde(default)]
+    pub selected: Option<ControlTier>,
 }
 
 impl ControlSystem {
@@ -312,11 +320,16 @@ impl ControlSystem {
         tier
     }
 
-    /// Resolve the craft's control tier the inner-loop executor gates on — the
-    /// **effective** tier (alias of [`Self::effective_tier`]; name retained from
-    /// WI 562).
+    /// Resolve the craft's **operating** control tier the inner-loop executor gates on:
+    /// the power-resolved [`Self::effective_tier`] capped by the player-selected tier
+    /// (WI 571) — `min(effective_tier, selected)`. With no selection this is exactly the
+    /// effective tier (name retained from WI 562).
     pub fn resolve(&self, graph: &ResourceGraph) -> ControlTier {
-        self.effective_tier(graph)
+        let eff = self.effective_tier(graph);
+        match self.selected {
+            Some(sel) => eff.min(sel),
+            None => eff,
+        }
     }
 
     /// Whether powered assistance is **offline because of low power** (WI 570): the
@@ -622,6 +635,7 @@ mod tests {
             computers: vec![ControlComputer::command_core(1.0)],
             battery: Some(bat),
             low_power_reserve: reserve,
+            ..Default::default()
         };
         // Just above the reserve → powered.
         g.reservoirs[bat.0].amount = reserve + 0.5;
@@ -631,5 +645,76 @@ mod tests {
         assert_eq!(sys.effective_tier(&g), ControlTier::Direct);
         assert!(g.reservoirs[bat.0].amount > 0.0, "fails before empty");
         assert!(sys.assist_offline(&g));
+    }
+
+    // --- WI 571: player-selectable tier (downshift cap) ---
+
+    #[test]
+    fn selected_tier_caps_the_operating_tier() {
+        // A powered, crewed Stabilized craft. Selecting Direct caps the operating tier;
+        // selecting above capability is a no-op; clearing restores full available.
+        let (g, bat) = graph_with_battery(50.0);
+        let mut sys = ControlSystem {
+            points: vec![ControlPoint::crewed()],
+            computers: vec![ControlComputer::command_core(1.0)],
+            battery: Some(bat),
+            ..Default::default()
+        };
+        assert_eq!(sys.available_tier(), ControlTier::Stabilized);
+        assert_eq!(
+            sys.resolve(&g),
+            ControlTier::Stabilized,
+            "no selection ⇒ full"
+        );
+
+        sys.selected = Some(ControlTier::Direct);
+        assert_eq!(
+            sys.resolve(&g),
+            ControlTier::Direct,
+            "downshift caps to Direct"
+        );
+        assert_eq!(
+            sys.available_tier(),
+            ControlTier::Stabilized,
+            "available unchanged by selection"
+        );
+        assert!(
+            !sys.assist_offline(&g),
+            "a deliberate downshift is not low-power assist-offline"
+        );
+
+        sys.selected = Some(ControlTier::Tunable);
+        assert_eq!(
+            sys.resolve(&g),
+            ControlTier::Stabilized,
+            "selection cannot exceed capability"
+        );
+
+        sys.selected = None;
+        assert_eq!(
+            sys.resolve(&g),
+            ControlTier::Stabilized,
+            "cleared ⇒ full again"
+        );
+    }
+
+    #[test]
+    fn selection_composes_with_low_power_floor() {
+        // Both caps apply: when power has already floored the tier, a higher selection
+        // cannot lift it; a lower selection still caps further.
+        let (mut g, bat) = graph_with_battery(50.0);
+        let mut sys = ControlSystem {
+            points: vec![ControlPoint::crewed()],
+            computers: vec![ControlComputer::command_core(1.0)],
+            battery: Some(bat),
+            ..Default::default()
+        };
+        g.reservoirs[bat.0].amount = 0.0; // unpowered → effective floor Direct (crewed)
+        sys.selected = Some(ControlTier::Tunable);
+        assert_eq!(
+            sys.resolve(&g),
+            ControlTier::Direct,
+            "selecting high cannot lift the power floor"
+        );
     }
 }

@@ -105,6 +105,13 @@ impl FlightCraft {
                     true
                 }
             }
+            // Select a control-tier cap (WI 571). Always permitted on a controllable
+            // craft (the `allows_manual` gate above already rejected uncontrolled): the
+            // cap can only lower the operating tier, never exceed capability.
+            Command::SetControlTier(sel) => {
+                self.control.selected = *sel;
+                true
+            }
             _ => false,
         }
     }
@@ -562,6 +569,52 @@ mod tests {
         assert_eq!(craft.resolve_control(), ControlTier::Tunable);
         assert!(craft.apply_command(&Command::SetSasGains(20.0, 10.0), DQuat::IDENTITY));
         assert_eq!((craft.attitude.sas.kp, craft.attitude.sas.kd), (20.0, 10.0));
+    }
+
+    #[test]
+    fn selecting_direct_disables_assist_then_restores() {
+        // WI 571: a Stabilized craft downshifted to Direct refuses SAS engagement; the
+        // available tier is unchanged; clearing the selection restores assist.
+        use crate::command::Command;
+        let (mut craft, _) = rocket(); // crewed_stabilized → Stabilized
+        assert_eq!(craft.resolve_control(), ControlTier::Stabilized);
+
+        assert!(
+            craft.apply_command(
+                &Command::SetControlTier(Some(ControlTier::Direct)),
+                DQuat::IDENTITY
+            ),
+            "downshift is always permitted"
+        );
+        assert_eq!(
+            craft.resolve_control(),
+            ControlTier::Direct,
+            "operating at Direct"
+        );
+        assert_eq!(
+            craft.available_control(),
+            ControlTier::Stabilized,
+            "installed tier unchanged"
+        );
+        assert!(
+            !craft.apply_command(&Command::SetSas(SasMode::Hold), DQuat::IDENTITY),
+            "Direct refuses engaging SAS (assist off)"
+        );
+
+        // A selection above capability cannot lift the operating tier.
+        craft.apply_command(
+            &Command::SetControlTier(Some(ControlTier::Tunable)),
+            DQuat::IDENTITY,
+        );
+        assert_eq!(craft.resolve_control(), ControlTier::Stabilized);
+
+        // Clear the cap → assist available again.
+        assert!(craft.apply_command(&Command::SetControlTier(None), DQuat::IDENTITY));
+        assert_eq!(craft.resolve_control(), ControlTier::Stabilized);
+        assert!(
+            craft.apply_command(&Command::SetSas(SasMode::Hold), DQuat::IDENTITY),
+            "assist restored after clearing the downshift"
+        );
     }
 
     fn params(drag_area: f64) -> FlightParams {

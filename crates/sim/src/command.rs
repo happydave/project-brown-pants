@@ -11,6 +11,7 @@
 //! flight remain a later Flight Control concern.
 
 use crate::autopilot::Autopilot;
+use crate::control::ControlTier;
 use crate::handoff::GearKind;
 use crate::orbit::Orbit;
 use crate::sim::{Craft, SimClock};
@@ -82,6 +83,12 @@ pub enum Command {
     /// Live-tune the SAS PD gains `(kp, kd)` (WI 566). Requires a powered Tier-2
     /// (`Tunable`) computer; applied by the attitude system.
     SetSasGains(f64, f64),
+    /// Select a control-tier cap (WI 571): `Some(tier)` operates the craft at
+    /// `min(available-given-power, tier)` (a downshift); `None` clears the cap (full
+    /// available). Applied by the flight layer (`FlightCraft::apply_command`), not
+    /// [`apply_command`] — it is control-system state, outside this function's
+    /// `(clock, orbit)` reach.
+    SetControlTier(Option<ControlTier>),
 }
 
 /// Applies a single command to the simulation. Pure and deterministic — the only
@@ -115,7 +122,8 @@ pub fn apply_command(cmd: &Command, clock: &mut SimClock, orbit: Option<&mut Orb
         | Command::SetSas(_)
         | Command::SetSasRecapture(_)
         | Command::SetAutopilot(_)
-        | Command::SetSasGains(..) => false,
+        | Command::SetSasGains(..)
+        | Command::SetControlTier(_) => false,
     }
 }
 
@@ -150,6 +158,7 @@ fn execute_commands(
             Command::SetSasRecapture(b) => info!("sas recapture-on-release: {b}"),
             Command::SetAutopilot(a) => info!("autopilot: {a:?}"),
             Command::SetSasGains(kp, kd) => info!("sas gains: kp={kp} kd={kd}"),
+            Command::SetControlTier(t) => info!("control-tier selection: {t:?}"),
         }
     }
 }

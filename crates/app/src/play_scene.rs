@@ -299,7 +299,7 @@ fn setup_scene(
 
     commands.spawn((
         Text::new(
-            "Shift/Ctrl throttle · Z/X full/cut · WSAD QE attitude · T hold  R kill  F off · ,/. warp",
+            "Shift/Ctrl throttle · Z/X full/cut · WSAD QE attitude · T hold  R kill  F off · C/V tier down/auto · ,/. warp",
         ),
         TextFont {
             font_size: 14.0,
@@ -456,6 +456,28 @@ fn player_input(time: Res<Time>, keys: Res<ButtonInput<KeyCode>>, mut world: Res
         }
     }
 
+    // Player-selectable control tier (WI 571): C downshifts one rung (toward Direct),
+    // V clears the downshift (back to full available). Cycling never selects below
+    // Direct, so the player cannot lock control out.
+    if keys.just_pressed(KeyCode::KeyC) {
+        let avail = world.craft.available_control();
+        let current = world.craft.control.selected.unwrap_or(avail);
+        let lower = match current {
+            ControlTier::Tunable => ControlTier::Canned,
+            ControlTier::Canned => ControlTier::Stabilized,
+            ControlTier::Stabilized => ControlTier::Direct,
+            ControlTier::Direct | ControlTier::Uncontrolled => ControlTier::Direct,
+        };
+        world
+            .craft
+            .apply_command(&Command::SetControlTier(Some(lower)), orientation);
+    }
+    if keys.just_pressed(KeyCode::KeyV) {
+        world
+            .craft
+            .apply_command(&Command::SetControlTier(None), orientation);
+    }
+
     // Time-warp.
     if keys.just_pressed(KeyCode::Period) {
         world.warp = (world.warp * 2.0).min(MAX_WARP);
@@ -555,6 +577,17 @@ fn draw_attitude_gizmo(
     }
 }
 
+/// Short HUD label for a control tier (WI 571).
+fn tier_name(tier: ControlTier) -> &'static str {
+    match tier {
+        ControlTier::Uncontrolled => "UNCONTROLLED",
+        ControlTier::Direct => "direct",
+        ControlTier::Stabilized => "stabilized",
+        ControlTier::Canned => "canned",
+        ControlTier::Tunable => "tunable",
+    }
+}
+
 fn gauge(fraction: f64) -> String {
     let filled = (fraction * 10.0).round().clamp(0.0, 10.0) as usize;
     format!("[{}{}]", "#".repeat(filled), "-".repeat(10 - filled))
@@ -635,15 +668,14 @@ fn update_hud(world: Res<PlayWorld>, mut hud: Query<&mut Text, With<Hud>>) {
             "return"
         };
         // The control label shows the *installed* (available) tier — charge-independent
-        // (WI 570); low power shows as an "assist offline" note, not a relabel.
-        let avail = world.craft.available_control();
-        let ctrl = match avail {
-            ControlTier::Uncontrolled => "UNCONTROLLED",
-            ControlTier::Direct => "direct",
-            ControlTier::Stabilized => "stabilized",
-            ControlTier::Canned => "canned",
-            ControlTier::Tunable => "tunable",
+        // (WI 570) — plus the player-selected cap and the resulting *effective* operating
+        // tier (WI 571). Low power shows as an "assist offline" note, not a relabel.
+        let ctrl = tier_name(world.craft.available_control());
+        let sel = match world.craft.control.selected {
+            None => "auto",
+            Some(t) => tier_name(t),
         };
+        let eff = tier_name(tier);
         let assist = if world.craft.assist_offline() {
             "  ASSIST OFFLINE (low power)"
         } else {
@@ -664,7 +696,7 @@ fn update_hud(world: Res<PlayWorld>, mut hud: Query<&mut Text, With<Hud>>) {
             Some(a) => format!("{a:?}").to_lowercase(),
         };
         text.0 = format!(
-            "phase:    {phase}\nthrottle: {tbar} {pct:3.0}%{note}\nfuel:     {fbar} {fuel:6.0} kg\npower:    {pbar} {elec:5.0} / {elec_cap:.0}\n\u{0394}v:       {dv:6.0} m/s\nG-force:  {g:5.1} g\naltitude: {alt}\nv-speed:  {v_speed:+7.0} m/s\nspeed:    {speed:7.1} m/s\n{orbit_line}\nenergy:   {energy:8.2} MJ/kg\nmedium:   {medium}   tilt {tilt:.0}\u{00b0}   SAS {sas} ({recap})\ncontrol:  {ctrl}   autopilot {ap}   gains kp={kp:.0}/kd={kd:.0}{assist}",
+            "phase:    {phase}\nthrottle: {tbar} {pct:3.0}%{note}\nfuel:     {fbar} {fuel:6.0} kg\npower:    {pbar} {elec:5.0} / {elec_cap:.0}\n\u{0394}v:       {dv:6.0} m/s\nG-force:  {g:5.1} g\naltitude: {alt}\nv-speed:  {v_speed:+7.0} m/s\nspeed:    {speed:7.1} m/s\n{orbit_line}\nenergy:   {energy:8.2} MJ/kg\nmedium:   {medium}   tilt {tilt:.0}\u{00b0}   SAS {sas} ({recap})\ncontrol:  avail {ctrl}  sel {sel}  eff {eff}   autopilot {ap}   gains kp={kp:.0}/kd={kd:.0}{assist}",
             tbar = gauge(throttle),
             pct = throttle * 100.0,
             note = if flameout { "  FLAMEOUT" } else { "" },
