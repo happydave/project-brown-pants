@@ -184,11 +184,10 @@ fn editor_input(keys: Res<ButtonInput<KeyCode>>, mut state: ResMut<EditorState>)
     if keys.just_pressed(KeyCode::KeyG) {
         let cell = state.cursor;
         state.craft.devices.retain(|d| d.cell != cell);
-        state.craft.devices.push(Device {
-            cell,
-            mass: 100.0,
-            kind: DeviceKind::Engine,
-        });
+        state
+            .craft
+            .devices
+            .push(Device::structural(cell, 100.0, DeviceKind::Engine));
     }
 
     // Save as a blueprint / a reusable subassembly.

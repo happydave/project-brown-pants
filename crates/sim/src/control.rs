@@ -6,7 +6,8 @@
 //! ladder (the Starbase chassis / MechJeb-as-a-part pattern, generalised; see
 //! `tickets/docs/projects/sounding/design.md` → *Control Computers*).
 //!
-//! Two devices:
+//! Three device functions (WI 570 — placed devices carry these as data, assembled by
+//! [`assemble_control`]):
 //! - A **control point** (command seat / cockpit / probe receiver) admits commands
 //!   into the craft and enables the **Direct (manual, no computer)** floor. A
 //!   *crewed* control point needs no electrical power; an *uncrewed* one does. A
@@ -14,17 +15,25 @@
 //! - A **control computer** carries its granted tier as data and a power draw; when
 //!   powered it raises the craft to its tier (Tier 0 / `Stabilized` here; Tiers 1–2
 //!   are WI 565/566).
+//! - A **battery** ([`BatterySpec`]) supplies the [`ELECTRICITY`] [`Reservoir`] the
+//!   computers run on.
 //!
-//! Power is a real resource-graph element: a battery [`Reservoir`] of [`ELECTRICITY`]
-//! drained by a [`Consumer`]. Losing power **degrades** a craft down the ladder
-//! (a crewed craft to Direct, an uncrewed one to Uncontrolled); it never raises it.
+//! Available vs. effective (WI 570). The **available** tier ([`ControlSystem::
+//! available_tier`]) is the installed capability — a function of mounted devices only,
+//! **independent of battery charge**. The **effective** tier ([`ControlSystem::
+//! effective_tier`], what the executor gates on) is the available tier while powered
+//! above a small **low-power reserve**, and otherwise falls hard to the unpowered floor
+//! (Direct if crewed, Uncontrolled if uncrewed) — recovering when power returns. Power
+//! is thus a hard cutoff, never a gradient on the tier; [`ControlSystem::assist_offline`]
+//! reports when effective is below available because of it.
 //!
 //! Lattice vs. flight: lattice-level controllability (used by breakage) is the
 //! presence of a `DeviceKind::Command` device on the `VoxelCraft`
 //! (`VoxelCraft::has_control_point`); this module's [`ControlSystem`] is the
 //! richer flight-level loadout (crewed flags, computers, battery).
 
-use crate::resource::{Consumer, ReservoirId, ResourceGraph, ResourceType};
+use crate::resource::{Consumer, Reservoir, ReservoirId, ResourceGraph, ResourceType};
+use crate::voxel::VoxelCraft;
 use serde::{Deserialize, Serialize};
 
 /// Conventional resource tag for electrical power (content, like every
@@ -140,6 +149,41 @@ impl ControlComputer {
     }
 }
 
+/// The electrical store a battery device provides: an [`ELECTRICITY`] reservoir
+/// (charge / capacity) injected into the craft's resource graph at assembly.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BatterySpec {
+    /// Stored charge at assembly, units of [`ELECTRICITY`].
+    pub charge: f64,
+    /// Reservoir capacity, units of [`ELECTRICITY`].
+    pub capacity: f64,
+}
+
+impl BatterySpec {
+    /// A battery filled to capacity.
+    pub fn full(capacity: f64) -> Self {
+        Self {
+            charge: capacity,
+            capacity,
+        }
+    }
+}
+
+/// The flight function a placed device performs (WI 570). This is the data-shaped,
+/// catalog-ready bridge between a lattice [`crate::voxel::Device`] and its control
+/// behaviour: assembly ([`assemble_control`]) reads these to build a [`ControlSystem`].
+/// A device without a function is structural / inert mass only (the pre-570 default).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceFunction {
+    /// A control point (cockpit / probe core) — admits commands; the Direct floor.
+    ControlPoint(ControlPoint),
+    /// A control computer — grants its tier while powered.
+    Computer(ControlComputer),
+    /// A battery — an electricity reservoir powering the computers.
+    Battery(BatterySpec),
+}
+
 /// A craft's control loadout: its control points, control computers, and which
 /// resource-graph reservoir is its electrical battery. The single source of the
 /// craft's available [`ControlTier`].
@@ -151,6 +195,14 @@ pub struct ControlSystem {
     pub computers: Vec<ControlComputer>,
     /// The electrical battery reservoir in the craft's resource graph, if any.
     pub battery: Option<ReservoirId>,
+    /// Critically-low charge reserve (units of [`ELECTRICITY`]): powered assistance
+    /// **fails hard** when battery charge drops to or below this reserve, not only at
+    /// exactly zero (WI 570). Charge-independent capability (the *available* tier) is
+    /// unaffected. Defaulted to 0 (legacy ≈empty cutoff) so pre-570 systems are
+    /// unchanged; a positive value models a real operating reserve. Clamped
+    /// non-negative and bounded by the battery's capacity at evaluation.
+    #[serde(default)]
+    pub low_power_reserve: f64,
 }
 
 impl ControlSystem {
@@ -170,7 +222,7 @@ impl ControlSystem {
         Self {
             points: vec![ControlPoint::crewed()],
             computers: vec![ControlComputer::command_core(0.0)],
-            battery: None,
+            ..Default::default()
         }
     }
 
@@ -181,7 +233,7 @@ impl ControlSystem {
         Self {
             points: vec![ControlPoint::crewed()],
             computers: vec![ControlComputer::autopilot_computer(0.0)],
-            battery: None,
+            ..Default::default()
         }
     }
 
@@ -192,26 +244,50 @@ impl ControlSystem {
         Self {
             points: vec![ControlPoint::crewed()],
             computers: vec![ControlComputer::tuning_computer(0.0)],
-            battery: None,
+            ..Default::default()
         }
     }
 
-    /// Whether the craft currently has electrical power (battery present and
-    /// non-empty). Crewed control points do not depend on this.
+    /// Whether the craft currently has electrical power **above its low-power
+    /// reserve** (WI 570): battery present and charge strictly above the effective
+    /// cutoff. The cutoff is `low_power_reserve`, clamped non-negative and bounded by
+    /// the reservoir capacity, and never below `EPS_POWER` (so an unconfigured reserve
+    /// keeps the pre-570 ≈empty behaviour). Crewed control points do not depend on this.
     pub fn is_powered(&self, graph: &ResourceGraph) -> bool {
         match self.battery {
-            Some(id) => graph
-                .reservoirs
-                .get(id.0)
-                .is_some_and(|r| r.amount > EPS_POWER),
+            Some(id) => graph.reservoirs.get(id.0).is_some_and(|r| {
+                let cutoff = self.low_power_reserve.clamp(0.0, r.capacity).max(EPS_POWER);
+                r.amount > cutoff
+            }),
             None => false,
         }
     }
 
-    /// Resolve the craft's available control tier from its mounted devices and
-    /// current power. Pure and deterministic; degradation is the same function over
-    /// reduced state, so power/structural loss can only lower the result.
-    pub fn resolve(&self, graph: &ResourceGraph) -> ControlTier {
+    /// The craft's **available** (installed) control tier — a function of mounted
+    /// devices only, **independent of battery charge** (WI 570). A Stabilized craft
+    /// stays Stabilized whatever the charge; power gates only whether that capability
+    /// is currently *running* (see [`Self::effective_tier`]). `Uncontrolled` only when
+    /// there is no control point at all (no installed control hardware).
+    pub fn available_tier(&self) -> ControlTier {
+        if self.points.is_empty() {
+            return ControlTier::Uncontrolled;
+        }
+        let mut tier = ControlTier::Direct;
+        for c in &self.computers {
+            if c.grants > tier {
+                tier = c.grants;
+            }
+        }
+        tier
+    }
+
+    /// The craft's **effective** control tier — what is currently operating given
+    /// power (WI 570). Equals [`Self::available_tier`] when powered above the reserve;
+    /// otherwise it falls hard to the unpowered floor: Direct for a crewed craft (the
+    /// crew still flies), Uncontrolled for an uncrewed one. Pure and deterministic;
+    /// degradation is the same function over reduced state, so power/structural loss
+    /// can only lower the result.
+    pub fn effective_tier(&self, graph: &ResourceGraph) -> ControlTier {
         if self.points.is_empty() {
             return ControlTier::Uncontrolled;
         }
@@ -236,6 +312,21 @@ impl ControlSystem {
         tier
     }
 
+    /// Resolve the craft's control tier the inner-loop executor gates on — the
+    /// **effective** tier (alias of [`Self::effective_tier`]; name retained from
+    /// WI 562).
+    pub fn resolve(&self, graph: &ResourceGraph) -> ControlTier {
+        self.effective_tier(graph)
+    }
+
+    /// Whether powered assistance is **offline because of low power** (WI 570): the
+    /// effective tier is below the installed/available tier due to the power gate.
+    /// Lets a HUD show "assist offline (low power)" against the unchanged available
+    /// tier rather than relabelling it.
+    pub fn assist_offline(&self, graph: &ResourceGraph) -> bool {
+        self.effective_tier(graph) < self.available_tier()
+    }
+
     /// The standing electricity [`Consumer`] for this control system's computers —
     /// added to the craft's [`ResourceGraph`] at assembly so power drains over time.
     /// `None` if there is no battery or no draw.
@@ -247,6 +338,41 @@ impl ControlSystem {
             rate,
         })
     }
+}
+
+/// Assemble a [`ControlSystem`] from a craft's **placed devices** (WI 570): the
+/// data-shaped bridge that replaces per-scene hand-assembly. Walks the craft's
+/// devices, and for each carrying a [`DeviceFunction`]:
+/// - **Battery** → push an [`ELECTRICITY`] [`Reservoir`] into `graph` and wire it as
+///   the system battery (the first battery is the electrical source; multi-bank power
+///   is out of scope, WI 570).
+/// - **ControlPoint** / **Computer** → collect into the system's points / computers.
+///
+/// Finally pushes the standing electricity [`Consumer`] for the computers' draw into
+/// `graph`, so power drains over time exactly as a hand-built system would. A device
+/// with no [`DeviceFunction`] is ignored here (structural / inert mass only).
+pub fn assemble_control(craft: &VoxelCraft, graph: &mut ResourceGraph) -> ControlSystem {
+    let mut sys = ControlSystem::default();
+    for d in &craft.devices {
+        match d.function {
+            Some(DeviceFunction::ControlPoint(p)) => sys.points.push(p),
+            Some(DeviceFunction::Computer(c)) => sys.computers.push(c),
+            Some(DeviceFunction::Battery(b)) => {
+                let id = ReservoirId(graph.reservoirs.len());
+                graph
+                    .reservoirs
+                    .push(Reservoir::new(ELECTRICITY, b.charge, b.capacity));
+                if sys.battery.is_none() {
+                    sys.battery = Some(id);
+                }
+            }
+            None => {}
+        }
+    }
+    if let Some(c) = sys.power_consumer() {
+        graph.consumers.push(c);
+    }
+    sys
 }
 
 #[cfg(test)]
@@ -312,6 +438,7 @@ mod tests {
             points: vec![ControlPoint::uncrewed()],
             computers: vec![ControlComputer::command_core(1.0)],
             battery: Some(bat),
+            ..Default::default()
         };
         assert_eq!(sys.resolve(&g_full), ControlTier::Stabilized);
     }
@@ -348,6 +475,7 @@ mod tests {
             points: vec![ControlPoint::crewed()],
             computers: vec![ControlComputer::command_core(1.0)],
             battery: Some(bat),
+            ..Default::default()
         };
         let powered = sys.resolve(&g_full);
         let (g_empty, _) = graph_with_battery(0.0);
@@ -363,6 +491,7 @@ mod tests {
             points: vec![ControlPoint::uncrewed()],
             computers: vec![ControlComputer::command_core(1.0)],
             battery: Some(ReservoirId(0)),
+            ..Default::default()
         };
         let (g_empty, _) = graph_with_battery(0.0);
         assert_eq!(sys.resolve(&g_empty), ControlTier::Uncontrolled);
@@ -377,6 +506,7 @@ mod tests {
             points: vec![ControlPoint::uncrewed()],
             computers: vec![ControlComputer::command_core(2.0)],
             battery: Some(bat),
+            ..Default::default()
         };
         g.consumers.push(sys.power_consumer().expect("consumer"));
         assert_eq!(sys.resolve(&g), ControlTier::Stabilized);
@@ -387,5 +517,119 @@ mod tests {
             "battery should be empty"
         );
         assert_eq!(sys.resolve(&g), ControlTier::Uncontrolled);
+    }
+
+    // --- WI 570: assembly + available-vs-effective power model ---
+
+    #[test]
+    fn assemble_builds_control_system_from_placed_devices() {
+        use crate::voxel::{Device, VoxelCraft};
+        use glam::IVec3;
+        let mut craft = VoxelCraft::new(1.0);
+        craft
+            .devices
+            .push(Device::control_point(IVec3::ZERO, 80.0, true));
+        craft.devices.push(Device::computer(
+            IVec3::new(0, 1, 0),
+            20.0,
+            ControlComputer::command_core(0.5),
+        ));
+        craft.devices.push(Device::battery(
+            IVec3::new(0, 2, 0),
+            40.0,
+            BatterySpec::full(100.0),
+        ));
+        // A structural-only device is ignored by assembly (mass only).
+        craft.devices.push(Device::structural(
+            IVec3::new(0, 3, 0),
+            5.0,
+            crate::voxel::DeviceKind::Engine,
+        ));
+
+        let mut graph = ResourceGraph::default();
+        let sys = assemble_control(&craft, &mut graph);
+
+        assert_eq!(sys.points.len(), 1);
+        assert_eq!(sys.computers.len(), 1);
+        assert!(sys.battery.is_some(), "battery wired");
+        assert_eq!(
+            graph.reservoirs.len(),
+            1,
+            "battery injected as an electricity reservoir"
+        );
+        assert_eq!(graph.reservoirs[0].resource, ELECTRICITY);
+        assert_eq!(graph.consumers.len(), 1, "standing power consumer added");
+        assert_eq!(sys.available_tier(), ControlTier::Stabilized);
+        assert_eq!(sys.effective_tier(&graph), ControlTier::Stabilized);
+        assert!(!sys.assist_offline(&graph));
+    }
+
+    #[test]
+    fn assemble_with_no_functional_devices_is_uncontrolled() {
+        use crate::voxel::{Device, DeviceKind, VoxelCraft};
+        use glam::IVec3;
+        let mut craft = VoxelCraft::new(1.0);
+        craft
+            .devices
+            .push(Device::structural(IVec3::ZERO, 10.0, DeviceKind::Tank));
+        let mut graph = ResourceGraph::default();
+        let sys = assemble_control(&craft, &mut graph);
+        assert!(sys.points.is_empty() && sys.computers.is_empty());
+        assert!(sys.battery.is_none());
+        assert!(graph.reservoirs.is_empty() && graph.consumers.is_empty());
+        assert_eq!(sys.available_tier(), ControlTier::Uncontrolled);
+        assert_eq!(sys.effective_tier(&graph), ControlTier::Uncontrolled);
+    }
+
+    #[test]
+    fn available_tier_is_charge_independent_while_effective_drops() {
+        // A crewed, stabilized craft on a battery: available stays Stabilized as the
+        // battery drains; effective falls to Direct (crew still flies). Then recovers.
+        let (mut g, bat) = graph_with_battery(50.0);
+        let sys = ControlSystem {
+            points: vec![ControlPoint::crewed()],
+            computers: vec![ControlComputer::command_core(1.0)],
+            battery: Some(bat),
+            ..Default::default()
+        };
+        assert_eq!(sys.available_tier(), ControlTier::Stabilized);
+        assert_eq!(sys.effective_tier(&g), ControlTier::Stabilized);
+        assert!(!sys.assist_offline(&g));
+
+        // Drain below the cutoff: available unchanged, effective drops, assist offline.
+        g.reservoirs[bat.0].amount = 0.0;
+        assert_eq!(
+            sys.available_tier(),
+            ControlTier::Stabilized,
+            "installed capability is charge-independent"
+        );
+        assert_eq!(sys.effective_tier(&g), ControlTier::Direct);
+        assert!(sys.assist_offline(&g), "assist offline due to low power");
+
+        // Recharge: effective recovers to available.
+        g.reservoirs[bat.0].amount = 50.0;
+        assert_eq!(sys.effective_tier(&g), ControlTier::Stabilized);
+        assert!(!sys.assist_offline(&g));
+    }
+
+    #[test]
+    fn low_power_reserve_cuts_assist_before_zero() {
+        // A configured reserve makes assist fail at a small reserve, not only at zero.
+        let (mut g, bat) = graph_with_battery(100.0);
+        let reserve = 5.0;
+        let sys = ControlSystem {
+            points: vec![ControlPoint::crewed()],
+            computers: vec![ControlComputer::command_core(1.0)],
+            battery: Some(bat),
+            low_power_reserve: reserve,
+        };
+        // Just above the reserve → powered.
+        g.reservoirs[bat.0].amount = reserve + 0.5;
+        assert_eq!(sys.effective_tier(&g), ControlTier::Stabilized);
+        // At the reserve → not powered (strict cutoff), assist offline, but charge > 0.
+        g.reservoirs[bat.0].amount = reserve;
+        assert_eq!(sys.effective_tier(&g), ControlTier::Direct);
+        assert!(g.reservoirs[bat.0].amount > 0.0, "fails before empty");
+        assert!(sys.assist_offline(&g));
     }
 }

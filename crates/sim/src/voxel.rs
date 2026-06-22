@@ -66,26 +66,96 @@ pub struct Voxel {
     pub material: Material,
 }
 
-/// What a device is (a type tag only — devices are inert mass in Toy 5).
+/// The coarse lattice tag for a device — what kind of part it is. Used by the
+/// lattice/breakage path (e.g. `has_control_point` keys on `Command`) and by
+/// serialization. A device's *flight behaviour* is the separate, optional
+/// [`crate::control::DeviceFunction`] it carries (WI 570); `kind` and `function` are
+/// kept consistent by the constructors below.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceKind {
+    /// A control point (cockpit / command pod / probe core) — the lattice's command
+    /// device; the only kind `has_control_point` recognises.
     Command,
     Engine,
     Tank,
     Rcs,
+    /// A control computer (SAS / autopilot / tuning) — distinct from a control point,
+    /// so a computer-only fragment is not controllable on its own (WI 570).
+    Computer,
+    /// An electrical battery — an electricity reservoir powering the computers (WI 570).
+    Battery,
 }
 
 /// A mounted functional device: a mass at a cell. Contributes to mass and inertia
-/// only; it does not add to the voxel-occupancy area curve (Toy 5).
+/// (never to the voxel-occupancy area curve). Beyond mass, a device may carry a
+/// [`crate::control::DeviceFunction`] giving it real flight behaviour assembled into
+/// the craft's control system (WI 570); a device without one is structural mass only.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Device {
     /// Mounting cell.
     pub cell: IVec3,
     /// Device mass, kg.
     pub mass: f64,
-    /// Device type.
+    /// Device type (coarse lattice tag).
     pub kind: DeviceKind,
+    /// Optional flight function (WI 570). Defaulted absent so pre-570 saves load.
+    #[serde(default)]
+    pub function: Option<crate::control::DeviceFunction>,
+}
+
+impl Device {
+    /// A structural / inert-mass device of `kind` (no flight function) — the pre-570
+    /// shape.
+    pub fn structural(cell: IVec3, mass: f64, kind: DeviceKind) -> Self {
+        Self {
+            cell,
+            mass,
+            kind,
+            function: None,
+        }
+    }
+
+    /// A control point device (kind `Command` + a control-point function), crewed or
+    /// uncrewed (WI 570).
+    pub fn control_point(cell: IVec3, mass: f64, crewed: bool) -> Self {
+        use crate::control::{ControlPoint, DeviceFunction};
+        let point = if crewed {
+            ControlPoint::crewed()
+        } else {
+            ControlPoint::uncrewed()
+        };
+        Self {
+            cell,
+            mass,
+            kind: DeviceKind::Command,
+            function: Some(DeviceFunction::ControlPoint(point)),
+        }
+    }
+
+    /// A control-computer device (kind `Computer` + a computer function) granting
+    /// `computer`'s tier while powered (WI 570).
+    pub fn computer(cell: IVec3, mass: f64, computer: crate::control::ControlComputer) -> Self {
+        use crate::control::DeviceFunction;
+        Self {
+            cell,
+            mass,
+            kind: DeviceKind::Computer,
+            function: Some(DeviceFunction::Computer(computer)),
+        }
+    }
+
+    /// A battery device (kind `Battery` + a battery function) providing an electricity
+    /// reservoir (WI 570).
+    pub fn battery(cell: IVec3, mass: f64, spec: crate::control::BatterySpec) -> Self {
+        use crate::control::DeviceFunction;
+        Self {
+            cell,
+            mass,
+            kind: DeviceKind::Battery,
+            function: Some(DeviceFunction::Battery(spec)),
+        }
+    }
 }
 
 /// A face direction, used by subassembly attachment points.
@@ -522,11 +592,9 @@ mod tests {
     #[test]
     fn device_only_craft_has_mass() {
         let mut craft = VoxelCraft::new(1.0);
-        craft.devices.push(Device {
-            cell: IVec3::ZERO,
-            mass: 50.0,
-            kind: DeviceKind::Command,
-        });
+        craft
+            .devices
+            .push(Device::structural(IVec3::ZERO, 50.0, DeviceKind::Command));
         let mp = craft.mass_properties().unwrap();
         assert!((mp.mass - 50.0).abs() < 1e-9);
     }
@@ -537,20 +605,42 @@ mod tests {
         // (the lattice-level controllability breakage reads, WI 562).
         let mut craft = block(1, 1, 1, 1.0, Material::STEEL);
         assert!(!craft.has_control_point());
-        craft.devices.push(Device {
-            cell: IVec3::ZERO,
-            mass: 5.0,
-            kind: DeviceKind::Engine,
-        });
+        craft
+            .devices
+            .push(Device::structural(IVec3::ZERO, 5.0, DeviceKind::Engine));
         assert!(
             !craft.has_control_point(),
             "an engine is not a control point"
         );
-        craft.devices.push(Device {
-            cell: IVec3::ZERO,
-            mass: 10.0,
-            kind: DeviceKind::Command,
-        });
+        craft
+            .devices
+            .push(Device::structural(IVec3::ZERO, 10.0, DeviceKind::Command));
+        assert!(craft.has_control_point());
+    }
+
+    #[test]
+    fn computer_or_battery_alone_is_not_a_control_point() {
+        // A fragment carrying only a computer/battery (no control point) is
+        // uncontrolled debris — `has_control_point` keys on `Command` only (WI 570).
+        let mut craft = block(1, 1, 1, 1.0, Material::STEEL);
+        craft.devices.push(Device::computer(
+            IVec3::ZERO,
+            10.0,
+            crate::control::ControlComputer::command_core(0.5),
+        ));
+        craft.devices.push(Device::battery(
+            IVec3::ZERO,
+            20.0,
+            crate::control::BatterySpec::full(100.0),
+        ));
+        assert!(
+            !craft.has_control_point(),
+            "computer + battery without a control point is not controllable"
+        );
+        // Adding a control point makes it controllable.
+        craft
+            .devices
+            .push(Device::control_point(IVec3::ZERO, 50.0, true));
         assert!(craft.has_control_point());
     }
 

@@ -22,7 +22,7 @@ use sounding_sim::active::ActiveBody;
 use sounding_sim::attitude::{AttitudeControl, AttitudePilot, ReactionWheels, Sas};
 use sounding_sim::autopilot::{Autopilot, GravityTurn};
 use sounding_sim::command::{Command, SasMode};
-use sounding_sim::control::{ControlSystem, ControlTier};
+use sounding_sim::control::{assemble_control, BatterySpec, ControlComputer, ControlTier};
 use sounding_sim::flight::{flight_step, FlightCraft, FlightParams};
 use sounding_sim::fluid::{FluidMedium, MediumKind};
 use sounding_sim::frame::{FrameId, WorldPos};
@@ -32,7 +32,7 @@ use sounding_sim::propulsion::{Engine, EngineCommand, Propulsion};
 use sounding_sim::resource::{Reservoir, ReservoirId, ResourceGraph, ResourceType};
 use sounding_sim::session::{GameSession, Outcome, Phase};
 use sounding_sim::sim::CentralBody;
-use sounding_sim::voxel::{Material, Voxel, VoxelCraft};
+use sounding_sim::voxel::{Device, Material, Voxel, VoxelCraft};
 
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
 
@@ -68,11 +68,28 @@ impl PlayWorld {
                 material: Material::COMPOSITE,
             });
         }
+        // Functional devices (WI 570): a crewed control point, a Tier-2 computer, and a
+        // real battery — the craft's control system is assembled from these placed
+        // components below, not hand-built. The battery drains in flight, so assistance
+        // goes offline on depletion while the installed (available) tier stays Tunable.
+        voxels
+            .devices
+            .push(Device::control_point(IVec3::new(0, 0, 0), 120.0, true));
+        voxels.devices.push(Device::computer(
+            IVec3::new(0, 2, 0),
+            40.0,
+            ControlComputer::tuning_computer(0.4), // 0.4 units/s
+        ));
+        voxels.devices.push(Device::battery(
+            IVec3::new(0, 3, 0),
+            60.0,
+            BatterySpec::full(120.0), // ~5 min of assisted flight before the reserve
+        ));
         let mp = voxels.mass_properties().expect("non-empty craft");
         let drag_area = max_cross_section(&voxels);
         let propellant = 5_000.0;
 
-        let propulsion = Propulsion {
+        let mut propulsion = Propulsion {
             graph: ResourceGraph {
                 reservoirs: vec![Reservoir::new(PROPELLANT, propellant, propellant)],
                 ..Default::default()
@@ -88,6 +105,12 @@ impl PlayWorld {
             }],
             commands: vec![EngineCommand::default()],
         };
+        // Assemble the control system from the placed devices (WI 570): the battery
+        // becomes an electricity reservoir in the shared propulsion graph and a standing
+        // power consumer is added, so it drains as the computer runs. A ~5% operating
+        // reserve makes assistance fail before the battery is bone dry.
+        let mut control = assemble_control(&voxels, &mut propulsion.graph);
+        control.low_power_reserve = 6.0;
         let attitude = AttitudePilot {
             sas: Sas::default(),
             manual: DVec3::ZERO,
@@ -125,7 +148,7 @@ impl PlayWorld {
                 voxels,
                 propulsion,
                 attitude,
-                control: ControlSystem::crewed_tunable(),
+                control,
                 autopilot: None,
             },
             pad: LaunchPad::resting(pad_radius),
@@ -585,7 +608,8 @@ fn update_hud(world: Res<PlayWorld>, mut hud: Query<&mut Text, With<Hud>>) {
             None => "orbit:    escape".to_string(),
         };
         let tier = world.craft.resolve_control();
-        // SAS shows "unavail" when the tier can't stabilize (no powered command core).
+        // SAS shows "unavail" when the effective tier can't stabilize (e.g. assist
+        // offline on low power).
         let sas = if !tier.allows_stabilization() {
             "unavail"
         } else {
@@ -601,13 +625,29 @@ fn update_hud(world: Res<PlayWorld>, mut hud: Query<&mut Text, With<Hud>>) {
         } else {
             "return"
         };
-        let ctrl = match tier {
+        // The control label shows the *installed* (available) tier — charge-independent
+        // (WI 570); low power shows as an "assist offline" note, not a relabel.
+        let avail = world.craft.available_control();
+        let ctrl = match avail {
             ControlTier::Uncontrolled => "UNCONTROLLED",
             ControlTier::Direct => "direct",
             ControlTier::Stabilized => "stabilized",
             ControlTier::Canned => "canned",
             ControlTier::Tunable => "tunable",
         };
+        let assist = if world.craft.assist_offline() {
+            "  ASSIST OFFLINE (low power)"
+        } else {
+            ""
+        };
+        // Battery charge gauge (the electricity reservoir wired by assembly).
+        let (elec, elec_cap) = world
+            .craft
+            .control
+            .battery
+            .and_then(|id| world.craft.propulsion.graph.reservoirs.get(id.0))
+            .map(|r| (r.amount, r.capacity))
+            .unwrap_or((0.0, 0.0));
         let (kp, kd) = (world.craft.attitude.sas.kp, world.craft.attitude.sas.kd);
         let ap = match world.craft.autopilot {
             None => "off".to_string(),
@@ -615,11 +655,12 @@ fn update_hud(world: Res<PlayWorld>, mut hud: Query<&mut Text, With<Hud>>) {
             Some(a) => format!("{a:?}").to_lowercase(),
         };
         text.0 = format!(
-            "phase:    {phase}\nthrottle: {tbar} {pct:3.0}%{note}\nfuel:     {fbar} {fuel:6.0} kg\n\u{0394}v:       {dv:6.0} m/s\nG-force:  {g:5.1} g\naltitude: {alt}\nv-speed:  {v_speed:+7.0} m/s\nspeed:    {speed:7.1} m/s\n{orbit_line}\nenergy:   {energy:8.2} MJ/kg\nmedium:   {medium}   tilt {tilt:.0}\u{00b0}   SAS {sas} ({recap})\ncontrol:  {ctrl}   autopilot {ap}   gains kp={kp:.0}/kd={kd:.0}",
+            "phase:    {phase}\nthrottle: {tbar} {pct:3.0}%{note}\nfuel:     {fbar} {fuel:6.0} kg\npower:    {pbar} {elec:5.0} / {elec_cap:.0}\n\u{0394}v:       {dv:6.0} m/s\nG-force:  {g:5.1} g\naltitude: {alt}\nv-speed:  {v_speed:+7.0} m/s\nspeed:    {speed:7.1} m/s\n{orbit_line}\nenergy:   {energy:8.2} MJ/kg\nmedium:   {medium}   tilt {tilt:.0}\u{00b0}   SAS {sas} ({recap})\ncontrol:  {ctrl}   autopilot {ap}   gains kp={kp:.0}/kd={kd:.0}{assist}",
             tbar = gauge(throttle),
             pct = throttle * 100.0,
             note = if flameout { "  FLAMEOUT" } else { "" },
             fbar = gauge(fuel / fuel_cap),
+            pbar = gauge(if elec_cap > 0.0 { elec / elec_cap } else { 0.0 }),
             g = world.g_force,
             alt = fmt_alt(world.altitude()),
             speed = world.body.velocity.length(),

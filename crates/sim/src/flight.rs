@@ -48,10 +48,25 @@ pub struct FlightCraft {
 }
 
 impl FlightCraft {
-    /// The craft's current control tier, resolved from its control devices and the
-    /// power in its (shared) resource graph (WI 562).
+    /// The craft's current **effective** control tier — what is operating given power,
+    /// resolved from its control devices and the power in its (shared) resource graph
+    /// (WI 562). This is the tier the executor gates on.
     pub fn resolve_control(&self) -> ControlTier {
         self.control.resolve(&self.propulsion.graph)
+    }
+
+    /// The craft's **available** (installed) control tier — charge-independent (WI 570).
+    /// A HUD shows this as the craft's capability; it does not change when the battery
+    /// drains (only [`Self::resolve_control`] does).
+    pub fn available_control(&self) -> ControlTier {
+        self.control.available_tier()
+    }
+
+    /// Whether powered assistance is currently offline because of low power (WI 570):
+    /// the effective tier has fallen below the available tier due to the battery
+    /// reaching its low-power reserve.
+    pub fn assist_offline(&self) -> bool {
+        self.control.assist_offline(&self.propulsion.graph)
     }
 
     /// Apply a manual command, **gated by the resolved control tier** (WI 562). An
@@ -369,6 +384,7 @@ mod tests {
             points: vec![ControlPoint::crewed()],
             computers: vec![ControlComputer::command_core(10.0)], // 10/s draw
             battery: Some(ReservoirId(bi)),
+            ..Default::default()
         };
         craft
             .propulsion
@@ -404,6 +420,62 @@ mod tests {
             ControlTier::Direct,
             "unpowered: SAS lost, falls to Direct"
         );
+    }
+
+    #[test]
+    fn assembled_battery_drains_to_assist_offline_in_flight() {
+        // WI 570: assemble the control system from placed devices (control point +
+        // computer + battery), then drain it through flight_step. The available tier
+        // stays Stabilized; the effective tier falls to Direct (crewed floor) and
+        // `assist_offline` reports the low-power cause.
+        use crate::control::{assemble_control, BatterySpec, ControlComputer};
+        use crate::voxel::Device;
+        use glam::IVec3;
+        let (mut craft, wet0) = rocket();
+        // Place real functional devices on the lattice.
+        craft
+            .voxels
+            .devices
+            .push(Device::control_point(IVec3::new(0, 0, 0), 50.0, true));
+        craft.voxels.devices.push(Device::computer(
+            IVec3::new(0, 1, 0),
+            20.0,
+            ControlComputer::command_core(10.0), // 10/s draw
+        ));
+        craft.voxels.devices.push(Device::battery(
+            IVec3::new(0, 2, 0),
+            30.0,
+            BatterySpec::full(0.02), // tiny: drains in ~2 ms
+        ));
+        // Assemble control from the devices into the shared propulsion graph.
+        craft.control = assemble_control(&craft.voxels, &mut craft.propulsion.graph);
+        assert_eq!(craft.available_control(), ControlTier::Stabilized);
+        assert_eq!(craft.resolve_control(), ControlTier::Stabilized);
+        assert!(!craft.assist_offline());
+
+        let p = params(crate::medium::max_cross_section(&craft.voxels));
+        let pad_radius = BODY.radius + craft.dry_com.y;
+        let mut pad = LaunchPad::resting(pad_radius);
+        let mut body = ActiveBody::new(
+            DVec3::new(0.0, pad_radius, 0.0),
+            DVec3::ZERO,
+            wet0,
+            craft.voxels.mass_properties().unwrap().inertia,
+        );
+        for _ in 0..5 {
+            flight_step(&mut body, &mut craft, &p, &mut pad, 0.004);
+        }
+        assert_eq!(
+            craft.available_control(),
+            ControlTier::Stabilized,
+            "installed tier unchanged by depletion"
+        );
+        assert_eq!(
+            craft.resolve_control(),
+            ControlTier::Direct,
+            "effective tier falls to the crewed floor"
+        );
+        assert!(craft.assist_offline(), "assist offline due to low power");
     }
 
     #[test]

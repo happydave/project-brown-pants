@@ -329,11 +329,11 @@ mod tests {
         // the command device retains control; the other is uncontrolled debris (WI 562).
         use crate::voxel::{Device, DeviceKind};
         let mut c = bar(4, Material::ALUMINIUM);
-        c.devices.push(Device {
-            cell: IVec3::new(0, 0, 0),
-            mass: 10.0,
-            kind: DeviceKind::Command,
-        });
+        c.devices.push(Device::structural(
+            IVec3::new(0, 0, 0),
+            10.0,
+            DeviceKind::Command,
+        ));
         let mut severed = Severed::new();
         severed.insert(bond(IVec3::new(1, 0, 0), IVec3::new(2, 0, 0)));
         let frags = connected_components(&c, &severed);
@@ -383,16 +383,16 @@ mod tests {
     fn devices_follow_their_component() {
         use crate::voxel::{Device, DeviceKind};
         let mut c = bar(4, Material::ALUMINIUM);
-        c.devices.push(Device {
-            cell: IVec3::new(0, 0, 0),
-            mass: 50.0,
-            kind: DeviceKind::Tank,
-        });
-        c.devices.push(Device {
-            cell: IVec3::new(3, 0, 0),
-            mass: 50.0,
-            kind: DeviceKind::Engine,
-        });
+        c.devices.push(Device::structural(
+            IVec3::new(0, 0, 0),
+            50.0,
+            DeviceKind::Tank,
+        ));
+        c.devices.push(Device::structural(
+            IVec3::new(3, 0, 0),
+            50.0,
+            DeviceKind::Engine,
+        ));
         let mut severed = Severed::new();
         severed.insert(bond(IVec3::new(1, 0, 0), IVec3::new(2, 0, 0)));
         let frags = connected_components(&c, &severed);
