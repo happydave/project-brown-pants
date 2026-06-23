@@ -17,12 +17,15 @@ game-light (decimated + 512 px JPEG texture) output.
 
 ## Licenses
 
-- **MoGe** ([github.com/microsoft/MoGe](https://github.com/microsoft/MoGe)) — code MIT, except the
-  bundled **DINOv2** (`moge/model/dinov2`) which is **Apache-2.0** (Meta AI).
-- **Z-Image** — Apache-2.0 (per the asset-harness track docs).
+- **MoGe-2** — **MIT** for both the **weights and codebase**
+  ([`Ruicheng/moge-2-vitl-normal`](https://huggingface.co/Ruicheng/moge-2-vitl-normal) /
+  [github.com/microsoft/MoGe](https://github.com/microsoft/MoGe)), **except** the bundled
+  **DINOv2** backbone (`moge/model/dinov2`) which is **Apache-2.0** (Meta AI). Both are compatible
+  with this project's `MIT OR Apache-2.0`. (Confirmed against the model card / repo.)
 - **DINOv2** — Apache-2.0 (Meta AI).
+- **Z-Image** — Apache-2.0 (per the asset-harness track docs).
 
-> **Verify before redistributing** this asset: confirm the **model-card / weights** license for
-> `Ruicheng/moge-2-vitl-normal` — a code license (MIT) does not automatically cover the published
-> weights or their outputs — and the Z-Image output terms. The asset-harness repo is authoritative
-> for the exact models/seeds used.
+> Since MoGe is a permissive (MIT) tool, this asset's terms are governed mainly by the **Z-Image
+> concept image** it was generated from (the geometry and texture source). The asset-harness repo
+> is authoritative for the exact model/seed/prompt; confirm the Z-Image output terms before any
+> public redistribution.
