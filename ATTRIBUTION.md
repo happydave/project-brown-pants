@@ -27,7 +27,7 @@ repo is the source of truth; the files here are the cached, versioned output):
 | Asset | Location | Notes |
 | ----- | -------- | ----- |
 | PBR material sets (`hull_panel`, `rocky_ground`) | `crates/app/assets/materials/` | see [materials/ATTRIBUTION.md](crates/app/assets/materials/ATTRIBUTION.md) |
-| Terrain mesh (`terrain.glb`) | `crates/app/assets/models/` | see [models/ATTRIBUTION.md](crates/app/assets/models/ATTRIBUTION.md) |
+| Terrain mesh (`terrain.glb`) | `crates/app/assets/models/` | Z-Image concept → MoGe-2 depth (`Ruicheng/moge-2-vitl-normal`, MIT; DINOv2 Apache-2.0) → Blender displacement; see [models/ATTRIBUTION.md](crates/app/assets/models/ATTRIBUTION.md) |
 
 > Note: the generated assets' licensing follows the terms of the generating models/tools, which
 > are recorded in the asset-harness track docs. Confirm those terms before redistributing the
