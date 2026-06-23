@@ -2,8 +2,9 @@
 //!
 //! A craft is dropped above the textured ground with no thrust; gravity pulls it down and the
 //! penalty contact response (`sounding_sim::contact`, via the WI 591 detection adapter) brings
-//! it to rest on the surface — the first end-to-end collision slice. No player input; the HUD
-//! shows altitude, speed, and a RESTING flag.
+//! it to rest on the surface — the first end-to-end collision slice. `R` re-drops the craft
+//! and `1`/`2` select a low/high drop; the HUD shows the drop height, altitude, speed, and a
+//! RESTING flag.
 
 use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::Tonemapping;
@@ -32,7 +33,9 @@ use crate::voxel_skin::{build_skin_mesh, material_set_for, pbr_material, VoxelSk
 const BODY: CentralBody = CentralBody::EARTHLIKE;
 const SUBSTEP_DT: f64 = 0.004;
 const MAX_SUBSTEPS: u32 = 250;
-const DROP_HEIGHT: f64 = 12.0;
+/// Low and high drop heights, metres (selectable; `1`/`2`).
+const LOW_DROP: f64 = 6.0;
+const HIGH_DROP: f64 = 40.0;
 
 /// The dropped craft.
 #[derive(Resource)]
@@ -42,6 +45,8 @@ struct LandWorld {
     params: FlightParams,
     pad: LaunchPad,
     accumulator: f64,
+    /// Current drop height (m); the height the next reset re-drops from.
+    drop_height: f64,
 }
 
 impl LandWorld {
@@ -84,13 +89,14 @@ impl LandWorld {
         let mut pad = LaunchPad::resting(surface);
         pad.released = true;
         let body = ActiveBody::new(
-            DVec3::new(0.0, surface + DROP_HEIGHT, 0.0),
+            DVec3::new(0.0, surface + LOW_DROP, 0.0),
             DVec3::ZERO,
             mp.mass,
             mp.inertia,
         );
 
         Self {
+            drop_height: LOW_DROP,
             body,
             params: FlightParams {
                 mu: BODY.mu,
@@ -126,6 +132,26 @@ impl LandWorld {
     fn altitude(&self) -> f64 {
         self.body.position.length() - BODY.radius
     }
+
+    /// Re-drop the craft from the current `drop_height` at rest (the reset button).
+    fn reset(&mut self) {
+        let mp = self
+            .craft
+            .voxels
+            .mass_properties()
+            .expect("non-empty craft");
+        let surface = BODY.radius;
+        self.body = ActiveBody::new(
+            DVec3::new(0.0, surface + self.drop_height, 0.0),
+            DVec3::ZERO,
+            mp.mass,
+            mp.inertia,
+        );
+        let mut pad = LaunchPad::resting(surface);
+        pad.released = true;
+        self.pad = pad;
+        self.accumulator = 0.0;
+    }
 }
 
 #[derive(Component)]
@@ -143,7 +169,14 @@ impl Plugin for LandScenePlugin {
             .add_systems(Startup, setup_scene)
             .add_systems(
                 Update,
-                (step_land, track_craft, follow_camera, update_hud).chain(),
+                (
+                    land_input,
+                    step_land,
+                    track_craft,
+                    follow_camera,
+                    update_hud,
+                )
+                    .chain(),
             );
     }
 }
@@ -197,6 +230,21 @@ fn setup_scene(
         Hud,
     ));
 
+    commands.spawn((
+        Text::new("R reset (re-drop) · 1 low drop · 2 high drop"),
+        TextFont {
+            font_size: 14.0,
+            ..default()
+        },
+        TextColor(Color::srgb(0.7, 0.75, 0.8)),
+        Node {
+            position_type: PositionType::Absolute,
+            bottom: Val::Px(10.0),
+            left: Val::Px(12.0),
+            ..default()
+        },
+    ));
+
     let cam = world.render_world() + DVec3::new(14.0, 6.0, 14.0);
     commands.spawn((
         Camera3d::default(),
@@ -210,6 +258,21 @@ fn setup_scene(
         WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, cam)),
         AnchorCamera,
     ));
+}
+
+/// R re-drops the craft; 1 / 2 select a low / high drop (and re-drop).
+fn land_input(keys: Res<ButtonInput<KeyCode>>, mut world: ResMut<LandWorld>) {
+    if keys.just_pressed(KeyCode::Digit1) {
+        world.drop_height = LOW_DROP;
+        world.reset();
+    }
+    if keys.just_pressed(KeyCode::Digit2) {
+        world.drop_height = HIGH_DROP;
+        world.reset();
+    }
+    if keys.just_pressed(KeyCode::KeyR) {
+        world.reset();
+    }
 }
 
 fn step_land(time: Res<Time>, mut world: ResMut<LandWorld>) {
@@ -258,8 +321,14 @@ fn update_hud(world: Res<LandWorld>, mut hud: Query<&mut Text, With<Hud>>) {
     if let Ok(mut text) = hud.single_mut() {
         let speed = world.body.velocity.length();
         let state = if speed < 0.1 { "RESTING" } else { "falling" };
+        let drop = if world.drop_height >= HIGH_DROP {
+            "high"
+        } else {
+            "low"
+        };
         text.0 = format!(
-            "land: {state}\naltitude: {alt:6.2} m\nspeed:    {speed:6.2} m/s",
+            "land: {state}\ndrop:     {drop} ({h:.0} m)\naltitude: {alt:6.2} m\nspeed:    {speed:6.2} m/s",
+            h = world.drop_height,
             alt = world.altitude(),
         );
     }
