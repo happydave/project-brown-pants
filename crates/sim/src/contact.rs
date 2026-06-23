@@ -25,8 +25,8 @@ pub struct ContactParams {
 impl Default for ContactParams {
     fn default() -> Self {
         Self {
-            normal_stiffness: 4.0e5,
-            normal_damping: 4.0e4,
+            normal_stiffness: 2.0e6,
+            normal_damping: 8.0e4,
             friction: 0.8,
         }
     }
