@@ -4,23 +4,23 @@ A KSP-inspired space-flight sandbox, built as an academic exercise in Rust + the
 Bevy engine. This repository is the implementation; the architecture and design
 live in the project's `tickets` repository under `docs/projects/sounding/`.
 
-> Status: bootstrap (WI 496). A two-crate workspace skeleton Ã¢ÂÂ a headless
-> simulation core and a windowed application Ã¢ÂÂ with dev-only remote tooling.
+> Status: bootstrap (WI 496). A two-crate workspace skeleton — a headless
+> simulation core and a windowed application — with dev-only remote tooling.
 
 ## Workspace layout
 
-- [crates/sim/](crates/sim/) Ã¢ÂÂ `sounding_sim`, the **headless, rendering-free**
+- [crates/sim/](crates/sim/) — `sounding_sim`, the **headless, rendering-free**
   simulation core. Depends on Bevy *sub-crates* (`bevy_app`, `bevy_ecs`), never
   the `bevy` umbrella, so it builds and runs with no display, GPU, or windowing
   libraries. The simulation logic lives here.
-- [crates/app/](crates/app/) Ã¢ÂÂ `sounding`, the windowed Bevy application. Pulls in
+- [crates/app/](crates/app/) — `sounding`, the windowed Bevy application. Pulls in
   rendering (the `bevy` umbrella) and wraps the core.
 
 ## Prerequisites
 
 - A modern Rust toolchain via [rustup](https://rustup.rs) (stable; developed on
   1.96). A distro `rustc` may be too old for Bevy 0.18.
-- For the **windowed app** on Linux, Bevy's system libraries Ã¢ÂÂ at minimum
+- For the **windowed app** on Linux, Bevy's system libraries — at minimum
   `libwayland-dev` and `libxkbcommon-dev`; audio/gamepad support may also need
   `libasound2-dev` and `libudev-dev`. The headless core needs none of these.
 
@@ -32,7 +32,7 @@ live in the project's `tickets` repository under `docs/projects/sounding/`.
 - Test the headless core (no display required): `cargo test -p sounding_sim`
 - Quality gates: `cargo fmt --all --check` and `cargo clippy --all-targets`
 
-## Toy 5 Ã¢ÂÂ voxel ship editor
+## Toy 5 — voxel ship editor
 
 `cargo run -p sounding` opens the voxel editor: build a craft from voxels and
 devices and watch its centre of mass, principal inertia axes, and aero
@@ -40,42 +40,42 @@ cross-sectional-area curve update live (all derived from the same voxels). A
 craft saves and loads as a blueprint or a reusable subassembly through the
 versioned serialization format. Editor controls:
 
-- Arrow keys / `PageUp`ÃÂ·`PageDown` Ã¢ÂÂ move the build cursor (X/Z, then Y)
-- `Space` add a voxel ÃÂ· `Backspace` remove voxel/device ÃÂ· `Tab` cycle material
-- `G` place a device ÃÂ· `M` log mass properties
-- `B` save blueprint ÃÂ· `N` save subassembly ÃÂ· `L` load subassembly ÃÂ· `V` insert it at the cursor
+- Arrow keys / `PageUp`·`PageDown` — move the build cursor (X/Z, then Y)
+- `Space` add a voxel · `Backspace` remove voxel/device · `Tab` cycle material
+- `G` place a device · `M` log mass properties
+- `B` save blueprint · `N` save subassembly · `L` load subassembly · `V` insert it at the cursor
 
-Camera: `Q`/`E` orbit ÃÂ· `R`/`F` pitch ÃÂ· `Z`/`C` zoom. The magenta marker is the
+Camera: `Q`/`E` orbit · `R`/`F` pitch · `Z`/`C` zoom. The magenta marker is the
 centre of mass, the RGB lines are the principal inertia axes, and the cyan plot
 is the cross-section curve. Earlier toys keep running headless: the on-rails
-orbit (Toy 1) and the runtime bus (Toys 2Ã¢ÂÂ3).
+orbit (Toy 1) and the runtime bus (Toys 2–3).
 
 The app selects a toy scene at launch:
 
-- `cargo run -p sounding` Ã¢ÂÂ the Toy 5 voxel editor (default)
-- `cargo run -p sounding -- planet` Ã¢ÂÂ the Toy 4 floating-origin planet + atmosphere
-- `cargo run -p sounding -- rover` Ã¢ÂÂ the Toy 6 rover on terrain (`W`/`S` drive, `A`/`D` steer, `Space` brake; HUD shows speed/height)
-- `cargo run -p sounding -- dive` Ã¢ÂÂ the Toy 9 dive, the **full live chain in SI** (WI 527): one craft starts on a Kepler orbit, coasts down under time warp, **auto-drops** to active physics at the atmospheric entry interface, then **glides** (lift + transonic wave drag, weathervaning to trim Ã¢ÂÂ WI 526) vacuumÃ¢ÂÂatmosphereÃ¢ÂÂocean to splashdown Ã¢ÂÂ drag/buoyancy/pressure all from one fluid field (HUD shows gear, altitude/speed/medium, static hull pressure, and dynamic ram pressure / max-Q)
-- `cargo run -p sounding -- break` Ã¢ÂÂ structural breakage: a voxel bar spins up until the centripetal load snaps it into connected-component fragments that tumble apart
-- `cargo run -p sounding -- compartments` Ã¢ÂÂ airtight compartments: a hollow craft's sealed volumes, colour-coded; `H` toggles a hatch (merge/split), `B` breaches the hull (vent)
-- `cargo run -p sounding -- flooding` Ã¢ÂÂ decompression/flooding: a submerged craft; `B` breaches a compartment and it floods, tilts, and sinks as floodwater mass shifts the centre of mass
-- `cargo run -p sounding -- windtunnel` Ã¢ÂÂ aero: live lift curve (Cl vs angle of attack) and wave-drag curve (Cd vs speed); `M` cycles the medium so the transonic spike appears in air and vanishes in water/vacuum
-- `cargo run -p sounding -- launch` Ã¢ÂÂ surface lift-off (first-playable): a rocket rests on the pad, then auto-throttles up and ascends under thrust against gravity and drag (WI 531 propulsion + WI 532 launch-pad rest)
-- `cargo run -p sounding -- autopilot` Ã¢ÂÂ a continuous one-craft session flown automatically (first-playable shell): Launch Ã¢ÂÂ Flight Ã¢ÂÂ Recovery (a sounding) on the unified flight pipeline; HUD shows phase, throttle, G-force, altitude/speed, and tilt, with an attitude gizmo (WI 534)
-- `cargo run -p sounding -- play` Ã¢ÂÂ fly a craft by hand (WI 535): Shift/Ctrl throttle ÃÂ· Z/X full/cut ÃÂ· WSAD/QE attitude ÃÂ· T hold / R kill-rot / F SAS off / G re-capture-toggle ÃÂ· **1 prograde / 2 retrograde / 3 gravity-turn / 0 autopilot-off** (WI 565) ÃÂ· **`[`/`]` tune kp, `-`/`=` tune kd** (WI 566) ÃÂ· `,`/`.` warp; full flight HUD with ÃÂv, apoapsis/periapsis, specific energy, the **control tier** (direct/stabilized/canned/tunable/uncontrolled Ã¢ÂÂ WI 562/565/566), SAS availability/re-capture (WI 564), the engaged autopilot, live SAS gains, and (WI 570) a **battery charge gauge** for a craft assembled from placed devices (control point + computer + battery) Ã¢ÂÂ on depletion the installed tier label is unchanged but an **ASSIST OFFLINE (low power)** marker appears and assistance drops to the unpowered floor. **C/V** (WI 571) downshift / restore the **player-selected control tier** (fly below capability for skill or to conserve power); the HUD shows **avail / sel / eff** tiers
-- `cargo run -p sounding -- skins` Ã¢ÂÂ voxel-skin comparison (WI 582/583): the same craft rendered two ways and flown side by side from one sim state under the `hull_panel` PBR Ã¢ÂÂ **blocky** (per-cell cubes, Stormworks-style) vs the **greedy-meshed hull** (Starbase-style, the primary look), over a tiled **rocky-ground** surface (WI 588). WI 582 lands the blocky skin + the scene; WI 583 adds the hull
-- `cargo run -p sounding -- land` â craftâterrain collision demo (WI 590â592): a craft is dropped onto the tiled ground and the penalty contact response (detection via `parry3d-f64`) brings it to rest — `R` re-drop, `1`/`2` low/high drop
+- `cargo run -p sounding` — the Toy 5 voxel editor (default)
+- `cargo run -p sounding -- planet` — the Toy 4 floating-origin planet + atmosphere
+- `cargo run -p sounding -- rover` — the Toy 6 rover on terrain (`W`/`S` drive, `A`/`D` steer, `Space` brake; HUD shows speed/height)
+- `cargo run -p sounding -- dive` — the Toy 9 dive, the **full live chain in SI** (WI 527): one craft starts on a Kepler orbit, coasts down under time warp, **auto-drops** to active physics at the atmospheric entry interface, then **glides** (lift + transonic wave drag, weathervaning to trim — WI 526) vacuum→atmosphere→ocean to splashdown — drag/buoyancy/pressure all from one fluid field (HUD shows gear, altitude/speed/medium, static hull pressure, and dynamic ram pressure / max-Q)
+- `cargo run -p sounding -- break` — structural breakage: a voxel bar spins up until the centripetal load snaps it into connected-component fragments that tumble apart
+- `cargo run -p sounding -- compartments` — airtight compartments: a hollow craft's sealed volumes, colour-coded; `H` toggles a hatch (merge/split), `B` breaches the hull (vent)
+- `cargo run -p sounding -- flooding` — decompression/flooding: a submerged craft; `B` breaches a compartment and it floods, tilts, and sinks as floodwater mass shifts the centre of mass
+- `cargo run -p sounding -- windtunnel` — aero: live lift curve (Cl vs angle of attack) and wave-drag curve (Cd vs speed); `M` cycles the medium so the transonic spike appears in air and vanishes in water/vacuum
+- `cargo run -p sounding -- launch` — surface lift-off (first-playable): a rocket rests on the pad, then auto-throttles up and ascends under thrust against gravity and drag (WI 531 propulsion + WI 532 launch-pad rest)
+- `cargo run -p sounding -- autopilot` — a continuous one-craft session flown automatically (first-playable shell): Launch → Flight → Recovery (a sounding) on the unified flight pipeline; HUD shows phase, throttle, G-force, altitude/speed, and tilt, with an attitude gizmo (WI 534)
+- `cargo run -p sounding -- play` — fly a craft by hand (WI 535): Shift/Ctrl throttle · Z/X full/cut · WSAD/QE attitude · T hold / R kill-rot / F SAS off / G re-capture-toggle · **1 prograde / 2 retrograde / 3 gravity-turn / 0 autopilot-off** (WI 565) · **`[`/`]` tune kp, `-`/`=` tune kd** (WI 566) · `,`/`.` warp; full flight HUD with Δv, apoapsis/periapsis, specific energy, the **control tier** (direct/stabilized/canned/tunable/uncontrolled — WI 562/565/566), SAS availability/re-capture (WI 564), the engaged autopilot, live SAS gains, and (WI 570) a **battery charge gauge** for a craft assembled from placed devices (control point + computer + battery) — on depletion the installed tier label is unchanged but an **ASSIST OFFLINE (low power)** marker appears and assistance drops to the unpowered floor. **C/V** (WI 571) downshift / restore the **player-selected control tier** (fly below capability for skill or to conserve power); the HUD shows **avail / sel / eff** tiers
+- `cargo run -p sounding -- skins` — voxel-skin comparison (WI 582/583): the same craft rendered two ways and flown side by side from one sim state under the `hull_panel` PBR — **blocky** (per-cell cubes, Stormworks-style) vs the **greedy-meshed hull** (Starbase-style, the primary look), over a tiled **rocky-ground** surface (WI 588). WI 582 lands the blocky skin + the scene; WI 583 adds the hull
+- `cargo run -p sounding -- land` — craft↔terrain collision demo (WI 590–592): a craft is dropped onto the tiled ground and the penalty contact response (detection via `parry3d-f64`) brings it to rest — `R` re-drop, `1`/`2` low/high drop
 
 ## Runtime bus
 
 While the app runs, a runtime state/command bus listens on
 `http://127.0.0.1:8787` (a synchronous HTTP server on its own thread). It is the
-shared substrate later consumers Ã¢ÂÂ the AI companion, second screen, multiplayer
-sync Ã¢ÂÂ adapt onto. It is distinct from the dev-only Bevy Remote Protocol.
+shared substrate later consumers — the AI companion, second screen, multiplayer
+sync — adapt onto. It is distinct from the dev-only Bevy Remote Protocol.
 
-- `GET /telemetry` Ã¢ÂÂ current simulation snapshot as JSON (time, warp, paused,
+- `GET /telemetry` — current simulation snapshot as JSON (time, warp, paused,
   craft orbit and position, energy-drift metric).
-- `POST /command` Ã¢ÂÂ inject a JSON command into the flight-control executor;
+- `POST /command` — inject a JSON command into the flight-control executor;
   malformed input returns HTTP 400.
 
 ```bash
@@ -89,7 +89,7 @@ curl -s -X POST localhost:8787/command \
 ## AI companion
 
 `cargo run -p companion` starts an external agent that flies the craft through
-the bus alone Ã¢ÂÂ it only reads `GET /telemetry` and issues `POST /command`,
+the bus alone — it only reads `GET /telemetry` and issues `POST /command`,
 reasoning purely from exposed telemetry (no privileged access). The shipped
 deterministic navigator circularizes the orbit (coast to apoapsis, then a
 prograde burn), narrating as it goes. The decision logic sits behind a `Brain`

@@ -3,23 +3,23 @@
 //!
 //! The app hosts one of several **toy scenes**, selected at launch (WI 514):
 //!
-//! - `cargo run -p sounding` â Toy 5 voxel ship editor (default)
-//! - `cargo run -p sounding -- planet` â Toy 4 floating-origin planet + atmosphere
-//! - `cargo run -p sounding -- rover` â Toy 6 rover on terrain
-//! - `cargo run -p sounding -- dive` â Toy 9 the dive (orbit â atmosphere â ocean)
-//! - `cargo run -p sounding -- break` â structural breakage (a spinning craft snaps apart)
-//! - `cargo run -p sounding -- compartments` â airtight compartments (hatch + breach)
-//! - `cargo run -p sounding -- flooding` â decompression/flooding (breach a submerged craft)
-//! - `cargo run -p sounding -- windtunnel` â aero: lift curve + transonic area-ruling plots
-//! - `cargo run -p sounding -- launch` â surface lift-off: a rocket rests on the pad, then ascends under thrust
-//! - `cargo run -p sounding -- autopilot` â a continuous one-craft session flown automatically: Launch â Flight â Recovery (a sounding)
-//! - `cargo run -p sounding -- play` â fly a craft by hand: throttle/attitude/SAS/warp, with a full flight HUD (Îv, apsides, energy)
-//! - `cargo run -p sounding -- skins` â voxel-skin comparison: the same craft flown side by side, blocky vs greedy-meshed hull
+//! - `cargo run -p sounding` — Toy 5 voxel ship editor (default)
+//! - `cargo run -p sounding -- planet` — Toy 4 floating-origin planet + atmosphere
+//! - `cargo run -p sounding -- rover` — Toy 6 rover on terrain
+//! - `cargo run -p sounding -- dive` — Toy 9 the dive (orbit → atmosphere → ocean)
+//! - `cargo run -p sounding -- break` — structural breakage (a spinning craft snaps apart)
+//! - `cargo run -p sounding -- compartments` — airtight compartments (hatch + breach)
+//! - `cargo run -p sounding -- flooding` — decompression/flooding (breach a submerged craft)
+//! - `cargo run -p sounding -- windtunnel` — aero: lift curve + transonic area-ruling plots
+//! - `cargo run -p sounding -- launch` — surface lift-off: a rocket rests on the pad, then ascends under thrust
+//! - `cargo run -p sounding -- autopilot` — a continuous one-craft session flown automatically: Launch → Flight → Recovery (a sounding)
+//! - `cargo run -p sounding -- play` — fly a craft by hand: throttle/attitude/SAS/warp, with a full flight HUD (Δv, apsides, energy)
+//! - `cargo run -p sounding -- skins` — voxel-skin comparison: the same craft flown side by side, blocky vs greedy-meshed hull
 //! - `cargo run -p sounding -- land` — drop a craft and watch the collision response bring it to rest
-//! - `cargo run -p sounding -- materials` â preview a generated PBR material set on lit geometry
-//! - `cargo run -p sounding -- terrainmesh` â preview a generated MoGe terrain relief (glTF)
+//! - `cargo run -p sounding -- materials` — preview a generated PBR material set on lit geometry
+//! - `cargo run -p sounding -- terrainmesh` — preview a generated MoGe terrain relief (glTF)
 //!
-//! The Toy 1â3 simulation and runtime bus run headless behind whichever scene is
+//! The Toy 1–3 simulation and runtime bus run headless behind whichever scene is
 //! shown, so the companion still works. Per-scene controls are documented in
 //! `editor.rs` and `planet.rs`.
 
@@ -106,7 +106,7 @@ fn selected_scene() -> Scene {
 }
 
 fn main() {
-    // Toys 1â3 keep running headless: the on-rails orbit and the runtime bus stay
+    // Toys 1–3 keep running headless: the on-rails orbit and the runtime bus stay
     // live so the companion still works, whichever scene is shown. All SI (WI 527):
     // the one canonical unit system, shared with the scenes via `CentralBody::EARTHLIKE`.
     let central_body = CentralBody::EARTHLIKE;
