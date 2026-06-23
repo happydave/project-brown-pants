@@ -1936,7 +1936,7 @@ dependencies = [
 
 [[package]]
 name = "companion"
-version = "0.1.50"
+version = "0.1.51"
 dependencies = [
  "glam 0.30.10",
  "serde_json",
@@ -4759,7 +4759,7 @@ dependencies = [
 
 [[package]]
 name = "sounding"
-version = "0.1.50"
+version = "0.1.51"
 dependencies = [
  "bevy",
  "serde_json",
@@ -4769,7 +4769,7 @@ dependencies = [
 
 [[package]]
 name = "sounding_sim"
-version = "0.1.50"
+version = "0.1.51"
 dependencies = [
  "bevy_app",
  "bevy_diagnostic",

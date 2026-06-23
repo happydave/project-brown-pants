@@ -277,6 +277,15 @@ impl WorkshopWorld {
         pos - DVec3::new(0.0, BODY.radius, 0.0)
     }
 
+    /// Render position for a skin mesh: the mesh is built in **raw lattice coordinates** (cells,
+    /// not centred on the CoM), while `body.position` is the **CoM**. Place the mesh's lattice
+    /// origin at the physical lattice origin (`body.position − orientation·com`) — exactly where
+    /// `flight_step`'s collision shape sits — so the rendered hull coincides with the physics
+    /// (no float/sink), then rebase to render space.
+    fn mesh_origin(&self, body: &ActiveBody, com: DVec3) -> DVec3 {
+        self.render_of(body.position - body.orientation * com)
+    }
+
     fn focus(&self) -> DVec3 {
         match self.state {
             CraftState::Intact => self.render_of(self.body.position),
@@ -749,7 +758,7 @@ fn reconcile_meshes(
     match world.state {
         CraftState::Intact => {
             let mesh = meshes.add(build_skin_mesh(&world.craft.voxels, VoxelSkin::Hull));
-            let render = world.render_of(world.body.position);
+            let render = world.mesh_origin(&world.body, world.craft.dry_com);
             commands.spawn((
                 Mesh3d(mesh),
                 MeshMaterial3d(material),
@@ -762,7 +771,11 @@ fn reconcile_meshes(
         CraftState::Fractured => {
             for (i, (voxels, body)) in world.fragments.iter().enumerate() {
                 let mesh = meshes.add(build_skin_mesh(voxels, VoxelSkin::Hull));
-                let render = world.render_of(body.position);
+                let com = voxels
+                    .mass_properties()
+                    .map(|mp| mp.center_of_mass)
+                    .unwrap_or(DVec3::ZERO);
+                let render = world.mesh_origin(body, com);
                 commands.spawn((
                     Mesh3d(mesh),
                     MeshMaterial3d(material.clone()),
@@ -788,14 +801,21 @@ fn track_meshes(
     match world.state {
         CraftState::Intact => {
             if let Ok((mut wp, mut tf)) = sets.p0().single_mut() {
-                wp.0 = WorldPos::new(FrameId::CENTRAL_BODY, world.render_of(world.body.position));
+                wp.0 = WorldPos::new(
+                    FrameId::CENTRAL_BODY,
+                    world.mesh_origin(&world.body, world.craft.dry_com),
+                );
                 tf.rotation = world.body.orientation.as_quat();
             }
         }
         CraftState::Fractured => {
             for (tag, mut wp, mut tf) in &mut sets.p1() {
-                if let Some((_, body)) = world.fragments.get(tag.0) {
-                    wp.0 = WorldPos::new(FrameId::CENTRAL_BODY, world.render_of(body.position));
+                if let Some((voxels, body)) = world.fragments.get(tag.0) {
+                    let com = voxels
+                        .mass_properties()
+                        .map(|mp| mp.center_of_mass)
+                        .unwrap_or(DVec3::ZERO);
+                    wp.0 = WorldPos::new(FrameId::CENTRAL_BODY, world.mesh_origin(body, com));
                     tf.rotation = body.orientation.as_quat();
                 }
             }
@@ -864,13 +884,20 @@ mod tests {
             craft.resolve_control().allows_manual(),
             "a control point makes it controllable"
         );
-        assert_eq!(craft.propulsion.engines.len(), 1, "one engine device → one engine");
+        assert_eq!(
+            craft.propulsion.engines.len(),
+            1,
+            "one engine device → one engine"
+        );
         assert!(
             craft.propulsion.propellant() > 0.0,
             "a tank device gives it propellant"
         );
         let mp = default_lattice().mass_properties().unwrap();
-        assert!((craft.dry_mass - mp.mass).abs() < 1e-9, "mass from the lattice");
+        assert!(
+            (craft.dry_mass - mp.mass).abs() < 1e-9,
+            "mass from the lattice"
+        );
     }
 
     /// A bare lattice (no devices) assembles into an **uncontrolled**, engineless craft — control
@@ -891,7 +918,10 @@ mod tests {
             !craft.resolve_control().allows_manual(),
             "no control point → uncontrolled"
         );
-        assert!(craft.propulsion.engines.is_empty(), "no engine device → no engine");
+        assert!(
+            craft.propulsion.engines.is_empty(),
+            "no engine device → no engine"
+        );
     }
 
     /// An empty lattice has no mass, so it can't be assembled (the scene falls back to default).
