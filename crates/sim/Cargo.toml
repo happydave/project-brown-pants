@@ -2,6 +2,8 @@
 name = "sounding_sim"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+authors.workspace = true
 description = "Sounding simulation core — headless, rendering-free."
 
 [dependencies]

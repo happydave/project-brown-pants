@@ -2,6 +2,8 @@
 name = "sounding"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+authors.workspace = true
 description = "Sounding application — windowed Bevy app wrapping the simulation core."
 
 [[bin]]
