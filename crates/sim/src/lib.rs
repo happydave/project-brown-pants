@@ -11,6 +11,7 @@ pub mod aero;
 pub mod attitude;
 pub mod autopilot;
 pub mod breakage;
+pub mod collision;
 pub mod command;
 pub mod compartments;
 pub mod control;
