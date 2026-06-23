@@ -12,8 +12,10 @@
 //!
 //! Build and Test are different coordinate worlds (the editor works near the origin; Test runs in
 //! planetary coordinates with floating origin), so each mode spawns and despawns its own entities
-//! on transition — they never coexist. (Until WI 604, Test flies a fixed preset craft, not the
-//! Build lattice.)
+//! on transition — they never coexist. **Test flies what you built** (WI 604): entering Test
+//! assembles the Build lattice into a `FlightCraft` (mass/inertia/skin from the voxels, engines
+//! from `Engine` devices, control from `assemble_control`) and drops it on the pad; a build with
+//! no control point is uncontrolled.
 //!
 //! Test controls: Shift/Ctrl throttle · Z/X full/cut · W/S/A/D/Q/E attitude · T SAS · F off ·
 //! `,`/`.` warp · Backspace reset. Build controls: arrows/PageUp-Dn cursor · Space add ·
@@ -45,7 +47,7 @@ use sounding_sim::medium::max_cross_section;
 use sounding_sim::propulsion::{Engine, EngineCommand, Propulsion};
 use sounding_sim::resource::{Reservoir, ReservoirId, ResourceGraph, ResourceType};
 use sounding_sim::sim::CentralBody;
-use sounding_sim::voxel::{Device, Material, Voxel, VoxelCraft};
+use sounding_sim::voxel::{Device, DeviceKind, Material, Voxel, VoxelCraft};
 use sounding_sim::warp::safe_substep_dt;
 
 use crate::editor::{draw_editor, editor_input, orbit_camera, EditorState, OrbitCam};
@@ -96,54 +98,96 @@ struct WorkshopWorld {
     dirty: bool,
 }
 
-/// A 2×2×2 test craft: a stable base that rests without toppling, with a control point, a
-/// computer, a battery, and a downward engine — assembled into a `FlightCraft`.
-fn build_craft() -> (FlightCraft, ActiveBody, LaunchPad) {
-    let mut voxels = VoxelCraft::new(1.0);
+/// The default workshop craft as an **editable lattice**: a 2×2×2 "test frame" with a control
+/// point, a computer, a battery, an engine, and a tank — so it assembles into a flyable craft and
+/// the player can edit it in Build mode. Seeds the workshop's `EditorState`.
+fn default_lattice() -> VoxelCraft {
+    let mut v = VoxelCraft::new(1.0);
     for x in 0..2 {
         for y in 0..2 {
             for z in 0..2 {
-                voxels.voxels.push(Voxel {
+                v.voxels.push(Voxel {
                     cell: IVec3::new(x, y, z),
                     material: FRAME,
                 });
             }
         }
     }
-    voxels
-        .devices
+    v.devices
         .push(Device::control_point(IVec3::new(0, 0, 0), 120.0, true));
-    voxels.devices.push(Device::computer(
+    v.devices.push(Device::computer(
         IVec3::new(1, 1, 1),
         40.0,
         ControlComputer::tuning_computer(0.4),
     ));
-    voxels.devices.push(Device::battery(
-        IVec3::new(1, 0, 1),
+    v.devices.push(Device::battery(
+        IVec3::new(0, 1, 0),
         60.0,
         BatterySpec::full(120.0),
     ));
+    v.devices.push(Device::structural(
+        IVec3::new(1, 0, 1),
+        100.0,
+        DeviceKind::Engine,
+    ));
+    v.devices.push(Device::structural(
+        IVec3::new(0, 0, 1),
+        80.0,
+        DeviceKind::Tank,
+    ));
+    v
+}
 
-    let mp = voxels.mass_properties().expect("non-empty craft");
-    let propellant = 3_000.0;
+/// Assemble a flyable `FlightCraft` (+ its resting body and a released pad) **from a built
+/// lattice** (WI 604). Mass/inertia/CoM and the skin come from the voxels; **engines** are
+/// derived from the placed `Engine` devices (thrust through the CoM, +Y), with propellant from
+/// the `Tank` devices (or a default if engines but no tanks); **control** comes from
+/// `assemble_control` (so a build with no control point is uncontrolled). `None` for an empty
+/// lattice (no mass).
+fn assemble_from_lattice(voxels: &VoxelCraft) -> Option<(FlightCraft, ActiveBody, LaunchPad)> {
+    let mp = voxels.mass_properties()?;
+    let s = voxels.cell_size;
+    let com = mp.center_of_mass;
+
+    let engine_cells: Vec<IVec3> = voxels
+        .devices
+        .iter()
+        .filter(|d| d.kind == DeviceKind::Engine)
+        .map(|d| d.cell)
+        .collect();
+    let tanks = voxels
+        .devices
+        .iter()
+        .filter(|d| d.kind == DeviceKind::Tank)
+        .count();
+    let propellant = if engine_cells.is_empty() {
+        0.0
+    } else {
+        tanks.max(1) as f64 * 1_500.0
+    };
 
     let mut propulsion = Propulsion {
         graph: ResourceGraph {
             reservoirs: vec![Reservoir::new(PROPELLANT, propellant, propellant)],
             ..Default::default()
         },
-        tank_mounts: vec![DVec3::new(mp.center_of_mass.x, 1.0, mp.center_of_mass.z)],
-        engines: vec![Engine {
-            tank: ReservoirId(0),
-            exhaust_velocity: 3_000.0,
-            max_mass_flow: 90.0, // ~270 kN; wet weight ≈ 156 kN → TWR ≈ 1.7
-            mount: DVec3::new(mp.center_of_mass.x, 0.0, mp.center_of_mass.z),
-            axis: DVec3::Y,
-            max_gimbal: 0.0,
-        }],
-        commands: vec![EngineCommand::default()],
+        tank_mounts: vec![com],
+        // Thrust along +Y, passed through the CoM in X/Z (the engine sits at the bottom of its
+        // cell) so a built craft flies straight without a surprise spin.
+        engines: engine_cells
+            .iter()
+            .map(|c| Engine {
+                tank: ReservoirId(0),
+                exhaust_velocity: 3_000.0,
+                max_mass_flow: 90.0,
+                mount: DVec3::new(com.x, c.y as f64 * s, com.z),
+                axis: DVec3::Y,
+                max_gimbal: 0.0,
+            })
+            .collect(),
+        commands: vec![EngineCommand::default(); engine_cells.len()],
     };
-    let mut control = assemble_control(&voxels, &mut propulsion.graph);
+    let mut control = assemble_control(voxels, &mut propulsion.graph);
     control.low_power_reserve = 6.0;
     let attitude = AttitudePilot {
         sas: Sas::default(),
@@ -156,7 +200,7 @@ fn build_craft() -> (FlightCraft, ActiveBody, LaunchPad) {
         },
     };
 
-    let rest_radius = BODY.radius + mp.center_of_mass.y;
+    let rest_radius = BODY.radius + com.y;
     let body = ActiveBody::new(
         DVec3::new(0.0, rest_radius, 0.0),
         DVec3::ZERO,
@@ -168,21 +212,20 @@ fn build_craft() -> (FlightCraft, ActiveBody, LaunchPad) {
 
     let craft = FlightCraft {
         dry_mass: mp.mass,
-        dry_com: mp.center_of_mass,
-        voxels,
+        dry_com: com,
+        voxels: voxels.clone(),
         propulsion,
         attitude,
         control,
         autopilot: None,
     };
-    (craft, body, pad)
+    Some((craft, body, pad))
 }
 
 impl WorkshopWorld {
-    fn new() -> Self {
-        let (craft, body, pad) = build_craft();
+    /// Wrap an assembled craft + body + pad into a fresh Test world (on the pad, intact).
+    fn wrap(craft: FlightCraft, body: ActiveBody, pad: LaunchPad) -> Self {
         Self {
-            body,
             params: FlightParams {
                 mu: BODY.mu,
                 surface_radius: BODY.radius,
@@ -196,6 +239,7 @@ impl WorkshopWorld {
                     contact: ContactParams::default(),
                 }),
             },
+            body,
             craft,
             pad,
             accumulator: 0.0,
@@ -207,8 +251,26 @@ impl WorkshopWorld {
         }
     }
 
+    /// A Test world flying the given built lattice (falling back to the default craft for an
+    /// empty/unassemblable lattice).
+    fn from_lattice(voxels: &VoxelCraft) -> Self {
+        match assemble_from_lattice(voxels) {
+            Some((craft, body, pad)) => Self::wrap(craft, body, pad),
+            None => Self::new(),
+        }
+    }
+
+    fn new() -> Self {
+        let (craft, body, pad) =
+            assemble_from_lattice(&default_lattice()).expect("default lattice is non-empty");
+        Self::wrap(craft, body, pad)
+    }
+
+    /// Rebuild the *current* test craft on the pad (the Backspace reset), re-assembling from the
+    /// same lattice it was flying.
     fn reset(&mut self) {
-        *self = Self::new();
+        let voxels = self.craft.voxels.clone();
+        *self = Self::from_lattice(&voxels);
     }
 
     fn render_of(&self, pos: DVec3) -> DVec3 {
@@ -361,7 +423,14 @@ impl Plugin for WorkshopScenePlugin {
         app.add_plugins(FloatingOriginPlugin)
             .init_state::<WorkshopMode>()
             .insert_resource(WorkshopWorld::new())
-            .init_resource::<EditorState>()
+            // Seed Build with the default flyable lattice (a control point + engine + battery +
+            // tank), so it can be edited and immediately Tested.
+            .insert_resource(EditorState {
+                craft: default_lattice(),
+                cursor: IVec3::new(0, 2, 0),
+                material: 0,
+                subassembly: None,
+            })
             .init_resource::<OrbitCam>()
             .add_systems(OnEnter(WorkshopMode::Build), enter_build)
             .add_systems(OnExit(WorkshopMode::Build), exit_build)
@@ -426,7 +495,7 @@ fn enter_build(mut commands: Commands) {
     ));
     commands.spawn((
         Text::new(
-            "arrows/PgUp-Dn cursor · Space add · Backspace remove · Tab material · G engine · QE/RF/ZC camera · Enter → TEST",
+            "arrows/PgUp-Dn cursor · Space add · Backspace remove · Tab material · 1-5 devices (ctrl/cpu/batt/engine/tank) · QE/RF/ZC camera · Enter → TEST (fly it)",
         ),
         TextFont {
             font_size: 14.0,
@@ -476,8 +545,11 @@ fn enter_test(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut scattering: ResMut<Assets<ScatteringMedium>>,
     mut world: ResMut<WorkshopWorld>,
+    editor: Res<EditorState>,
 ) {
-    world.reset(); // fresh test craft on the pad each time we enter Test
+    // Fly **what was built**: assemble the editor's lattice into a fresh craft on the pad
+    // (WI 604). An empty/unassemblable build falls back to the default craft.
+    *world = WorkshopWorld::from_lattice(&editor.craft);
 
     let ground =
         crate::ground::spawn_ground(&mut commands, &mut meshes, &mut materials, &asset_server);
@@ -775,5 +847,56 @@ fn update_test_hud(world: Res<WorkshopWorld>, mut hud: Query<&mut Text, With<Tes
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The default lattice assembles into a flyable craft: controllable, with an engine and
+    /// propellant, mass/inertia from the voxels.
+    #[test]
+    fn default_lattice_assembles_a_flyable_craft() {
+        let (craft, _body, _pad) =
+            assemble_from_lattice(&default_lattice()).expect("default lattice is non-empty");
+        assert!(
+            craft.resolve_control().allows_manual(),
+            "a control point makes it controllable"
+        );
+        assert_eq!(craft.propulsion.engines.len(), 1, "one engine device → one engine");
+        assert!(
+            craft.propulsion.propellant() > 0.0,
+            "a tank device gives it propellant"
+        );
+        let mp = default_lattice().mass_properties().unwrap();
+        assert!((craft.dry_mass - mp.mass).abs() < 1e-9, "mass from the lattice");
+    }
+
+    /// A bare lattice (no devices) assembles into an **uncontrolled**, engineless craft — control
+    /// reflects what was built (the WI 604 acceptance case).
+    #[test]
+    fn deviceless_build_is_uncontrolled() {
+        let mut v = VoxelCraft::new(1.0);
+        for x in 0..2 {
+            for z in 0..2 {
+                v.voxels.push(Voxel {
+                    cell: IVec3::new(x, 0, z),
+                    material: Material::ALUMINIUM,
+                });
+            }
+        }
+        let (craft, _, _) = assemble_from_lattice(&v).expect("non-empty");
+        assert!(
+            !craft.resolve_control().allows_manual(),
+            "no control point → uncontrolled"
+        );
+        assert!(craft.propulsion.engines.is_empty(), "no engine device → no engine");
+    }
+
+    /// An empty lattice has no mass, so it can't be assembled (the scene falls back to default).
+    #[test]
+    fn empty_lattice_does_not_assemble() {
+        assert!(assemble_from_lattice(&VoxelCraft::new(1.0)).is_none());
     }
 }

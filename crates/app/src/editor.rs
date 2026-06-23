@@ -9,6 +9,7 @@
 
 use bevy::math::DVec3;
 use bevy::prelude::*;
+use sounding_sim::control::{BatterySpec, ControlComputer};
 use sounding_sim::frame::{FrameId, WorldPos};
 use sounding_sim::persist::{CraftSubgraph, Kind, Payload, SavedDocument};
 use sounding_sim::voxel::{
@@ -184,14 +185,30 @@ pub(crate) fn editor_input(keys: Res<ButtonInput<KeyCode>>, mut state: ResMut<Ed
         state.material = (state.material + 1) % PALETTE.len();
         info!("material: {}", PALETTE[state.material].0);
     }
-    // Place a device at the cursor.
-    if keys.just_pressed(KeyCode::KeyG) {
-        let cell = state.cursor;
-        state.craft.devices.retain(|d| d.cell != cell);
-        state
-            .craft
-            .devices
-            .push(Device::structural(cell, 100.0, DeviceKind::Engine));
+    // Place a device at the cursor. `G` is a shortcut for an engine; the digit keys place the
+    // full functional set (WI 604) so a build can be a flyable craft: 1 control point ·
+    // 2 computer · 3 battery · 4 engine · 5 tank. Any places one device per cell (replacing one).
+    let cell = state.cursor;
+    let device = if keys.just_pressed(KeyCode::KeyG) || keys.just_pressed(KeyCode::Digit4) {
+        Some(Device::structural(cell, 100.0, DeviceKind::Engine))
+    } else if keys.just_pressed(KeyCode::Digit1) {
+        Some(Device::control_point(cell, 120.0, true))
+    } else if keys.just_pressed(KeyCode::Digit2) {
+        Some(Device::computer(
+            cell,
+            40.0,
+            ControlComputer::tuning_computer(0.4),
+        ))
+    } else if keys.just_pressed(KeyCode::Digit3) {
+        Some(Device::battery(cell, 60.0, BatterySpec::full(120.0)))
+    } else if keys.just_pressed(KeyCode::Digit5) {
+        Some(Device::structural(cell, 80.0, DeviceKind::Tank))
+    } else {
+        None
+    };
+    if let Some(d) = device {
+        state.craft.devices.retain(|x| x.cell != cell);
+        state.craft.devices.push(d);
     }
 
     // Save as a blueprint / a reusable subassembly.
