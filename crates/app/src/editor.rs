@@ -46,6 +46,10 @@ pub(crate) enum Brush {
         drive: bool,
         steer: bool,
     },
+    Seat,
+    Antenna,
+    SolarPanel,
+    Bumper,
 }
 
 impl Brush {
@@ -60,6 +64,10 @@ impl Brush {
             Brush::Tank => "tank",
             Brush::Wheel { steer: false, .. } => "wheel (drive)",
             Brush::Wheel { steer: true, .. } => "wheel (drive+steer)",
+            Brush::Seat => "seat",
+            Brush::Antenna => "antenna",
+            Brush::SolarPanel => "solar panel",
+            Brush::Bumper => "bumper",
         }
     }
 }
@@ -130,8 +138,26 @@ fn place_brush(
                 kind: PartKind::Wheel(WheelPart::for_cell_size(s, drive, steer)),
             });
         }
-        device => {
-            let d = match device {
+        Brush::Seat | Brush::Antenna | Brush::SolarPanel | Brush::Bumper => {
+            let kind = match brush {
+                Brush::Seat => PartKind::Seat,
+                Brush::Antenna => PartKind::Antenna,
+                Brush::SolarPanel => PartKind::SolarPanel,
+                Brush::Bumper => PartKind::Bumper,
+                _ => unreachable!(),
+            };
+            // Cosmetic parts mount on a face like wheels, at a small build-scaled mass.
+            craft
+                .parts
+                .retain(|p| (p.mount - wheel_mount).length() > 1e-6);
+            craft.parts.push(Part {
+                mount: wheel_mount,
+                mass: (10.0 * craft.cell_size).max(1.0),
+                kind,
+            });
+        }
+        Brush::ControlPoint | Brush::Computer | Brush::Battery | Brush::Engine | Brush::Tank => {
+            let d = match brush {
                 Brush::ControlPoint => Device::control_point(device_cell, 120.0, true),
                 Brush::Computer => {
                     Device::computer(device_cell, 40.0, ControlComputer::tuning_computer(0.4))
@@ -139,7 +165,7 @@ fn place_brush(
                 Brush::Battery => Device::battery(device_cell, 60.0, BatterySpec::full(120.0)),
                 Brush::Engine => Device::structural(device_cell, 100.0, DeviceKind::Engine),
                 Brush::Tank => Device::structural(device_cell, 80.0, DeviceKind::Tank),
-                Brush::Voxel | Brush::Wheel { .. } => unreachable!(),
+                _ => unreachable!(),
             };
             craft.devices.retain(|x| x.cell != device_cell);
             craft.devices.push(d);
@@ -293,6 +319,14 @@ pub(crate) fn editor_input(keys: Res<ButtonInput<KeyCode>>, mut state: ResMut<Ed
             drive: true,
             steer: true,
         };
+    } else if keys.just_pressed(KeyCode::Digit8) {
+        state.brush = Brush::Seat;
+    } else if keys.just_pressed(KeyCode::Digit9) {
+        state.brush = Brush::Antenna;
+    } else if keys.just_pressed(KeyCode::Digit0) {
+        state.brush = Brush::SolarPanel;
+    } else if keys.just_pressed(KeyCode::Minus) {
+        state.brush = Brush::Bumper;
     }
 
     // Place the active brush at the cursor (keyboard fallback; the mouse is the primary path).

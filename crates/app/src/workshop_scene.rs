@@ -32,7 +32,7 @@
 use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::light::{light_consts::lux, AtmosphereEnvironmentMapLight};
-use bevy::math::{DVec3, Isometry3d};
+use bevy::math::{DQuat, DVec3};
 use bevy::pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium};
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
@@ -124,6 +124,10 @@ struct RoverState {
     track: Vec<DVec3>,
     /// Substep counter for sampling the trail.
     record: u32,
+    /// The lattice centre of mass (body frame) — for placing the chassis skin mesh.
+    com: DVec3,
+    /// Accumulated wheel spin angle (rad) per wheel, for the rolling-wheel render.
+    spin_angle: Vec<f64>,
 }
 
 /// The grounded workshop Test state: one controllable craft, or its debris after a crash.
@@ -323,6 +327,10 @@ impl WorkshopWorld {
             ..Default::default()
         };
         let mut rover = asm.rover;
+        let com = lattice
+            .mass_properties()
+            .map(|mp| mp.center_of_mass)
+            .unwrap_or(DVec3::ZERO);
         // Rest the rover on the pad: place the CoM (`body.position`) high enough that **both** every
         // wheel hub sits at its suspension free length above the surface **and** the chassis bottom
         // clears the ground — so it never spawns partly underground (the "front falls through" bug),
@@ -335,16 +343,12 @@ impl WorkshopWorld {
             .fold(0.0_f64, f64::max);
         // Distance from the CoM down to the lowest chassis voxel (CoM-relative), so the chassis
         // bottom lands at/above the ground.
-        let chassis_drop = lattice
-            .mass_properties()
-            .map(|mp| {
-                let min_cell_y = lattice.voxels.iter().map(|v| v.cell.y).min().unwrap_or(0) as f64
-                    * lattice.cell_size;
-                mp.center_of_mass.y - min_cell_y
-            })
-            .unwrap_or(0.0);
+        let min_cell_y =
+            lattice.voxels.iter().map(|v| v.cell.y).min().unwrap_or(0) as f64 * lattice.cell_size;
+        let chassis_drop = com.y - min_cell_y;
         let drop = wheel_drop.max(chassis_drop) + 0.05;
         rover.body.position = DVec3::new(0.0, ground + drop, 0.0);
+        let spin_angle = vec![0.0; rover.wheels.len()];
         world.rover = Some(RoverState {
             rover,
             terrain,
@@ -355,6 +359,8 @@ impl WorkshopWorld {
             accumulator: 0.0,
             track: Vec::new(),
             record: 0,
+            com,
+            spin_angle,
         });
         world
     }
@@ -526,6 +532,15 @@ struct BuildHud;
 /// Tags a solid mesh entity rendering part of the Build craft (rebuilt on edit).
 #[derive(Component)]
 struct BuildMesh;
+/// The rover Test's solid chassis skin mesh (WI 608).
+#[derive(Component)]
+struct RoverChassisMesh;
+/// A rover Test wheel (tyre) mesh by wheel index (WI 608).
+#[derive(Component)]
+struct RoverWheelMesh(usize);
+/// A rover Test cosmetic part (seat/antenna/solar/bumper) mesh by part index (WI 608).
+#[derive(Component)]
+struct RoverPartMesh(usize);
 
 /// The grounded build-and-test workshop scene.
 pub struct WorkshopScenePlugin;
@@ -573,6 +588,7 @@ impl Plugin for WorkshopScenePlugin {
                     step_workshop,
                     reconcile_meshes,
                     track_meshes,
+                    track_rover_meshes,
                     follow_camera,
                     draw_rover,
                     update_test_hud,
@@ -639,7 +655,7 @@ fn enter_build(mut commands: Commands) {
     ));
     commands.spawn((
         Text::new(
-            "MOUSE: left-click place brush · right-click remove · middle-drag orbit · scroll zoom. Brush: Tab material · 1 ctrl · 2 cpu · 3 batt · 4 engine · 5 tank · 6/7 wheel · Enter → TEST (4 wheels ⇒ drive it)",
+            "MOUSE: left-click place brush · right-click remove · middle-drag orbit · scroll zoom. Brush: Tab material · 1 ctrl · 2 cpu · 3 batt · 4 engine · 5 tank · 6/7 wheel · 8 seat · 9 antenna · 0 solar · - bumper · Enter → TEST (4 wheels ⇒ drive it)",
         ),
         TextFont {
             font_size: 14.0,
@@ -753,6 +769,17 @@ fn sync_build_meshes(
                 Mesh3d(m),
                 MeshMaterial3d(wheel_mat.clone()),
                 tf,
+                BuildMesh,
+                BuildEntity,
+            ));
+        } else {
+            // Cosmetic parts (seat/antenna/solar/bumper): recognisable solids at their mount.
+            let (mesh, mat) =
+                part_mesh(p.kind, editor.craft.cell_size, &mut meshes, &mut materials);
+            commands.spawn((
+                Mesh3d(mesh),
+                MeshMaterial3d(mat),
+                Transform::from_translation(p.mount.as_vec3()),
                 BuildMesh,
                 BuildEntity,
             ));
@@ -875,6 +902,52 @@ fn enter_test(
             },
             TestEntity,
         ));
+
+        // Solid render (WI 608): chassis skin mesh + a tyre mesh per wheel + cosmetic part meshes,
+        // all positioned each frame by `track_rover_meshes`. Replaces the gizmo cuboid + spheres.
+        let chassis_mat = pbr_material(
+            material_set_for(Material::ALUMINIUM),
+            &asset_server,
+            &mut materials,
+        );
+        commands.spawn((
+            Mesh3d(meshes.add(build_skin_mesh(&editor.craft, VoxelSkin::Hull))),
+            MeshMaterial3d(chassis_mat),
+            Transform::default(),
+            RoverChassisMesh,
+            TestEntity,
+        ));
+        let tyre_mat = materials.add(StandardMaterial {
+            base_color: Color::srgb(0.07, 0.07, 0.09),
+            perceptual_roughness: 0.95,
+            ..default()
+        });
+        if let Some(rs) = &world.rover {
+            for (i, w) in rs.rover.wheels.iter().enumerate() {
+                let r = w.radius as f32;
+                commands.spawn((
+                    Mesh3d(meshes.add(Mesh::from(Cylinder::new(r, r * 0.5)))),
+                    MeshMaterial3d(tyre_mat.clone()),
+                    Transform::default(),
+                    RoverWheelMesh(i),
+                    TestEntity,
+                ));
+            }
+            for (j, part) in rs.lattice.parts.iter().enumerate() {
+                if matches!(part.kind, PartKind::Wheel(_)) {
+                    continue; // wheels handled above
+                }
+                let (mesh, mat) =
+                    part_mesh(part.kind, rs.lattice.cell_size, &mut meshes, &mut materials);
+                commands.spawn((
+                    Mesh3d(mesh),
+                    MeshMaterial3d(mat),
+                    Transform::default(),
+                    RoverPartMesh(j),
+                    TestEntity,
+                ));
+            }
+        }
         return;
     }
 
@@ -1081,6 +1154,10 @@ fn step_workshop(time: Res<Time>, mut world: ResMut<WorkshopWorld>) {
             rs.rover.step(&terrain, ROVER_SUBSTEP_DT);
             rs.accumulator -= ROVER_SUBSTEP_DT;
             n += 1;
+            // Accumulate each wheel's spin angle for the rolling-wheel render.
+            for (i, w) in rs.rover.wheels.iter().enumerate() {
+                rs.spin_angle[i] += w.spin * ROVER_SUBSTEP_DT;
+            }
             // Drop a breadcrumb under the rover every so often (motion reference).
             rs.record += 1;
             if rs.record.is_multiple_of(48) {
@@ -1234,6 +1311,109 @@ fn follow_camera(
 /// Draws the rover, its wheels/suspension, and a terrain grid as gizmos, **rover-anchored**
 /// (everything is drawn relative to the rover so the fixed chase camera keeps it framed). Mirrors
 /// the `-- rover` scene; the recognisable wheel/chassis meshes arrive in WI 608.
+/// A procedural mesh + material for a catalog part (WI 608), sized to `cell_size`. Recognisable
+/// primitive shapes (textured asset-harness versions are deferred to WI 614).
+fn part_mesh(
+    kind: PartKind,
+    s: f64,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+) -> (Handle<Mesh>, Handle<StandardMaterial>) {
+    let s = s as f32;
+    let (mesh, color) = match kind {
+        PartKind::Seat => (
+            Mesh::from(Cuboid::new(s * 1.2, s * 0.7, s * 1.2)),
+            Color::srgb(0.15, 0.16, 0.2),
+        ),
+        PartKind::Antenna => (
+            Mesh::from(Cylinder::new(s * 0.12, s * 4.0)),
+            Color::srgb(0.7, 0.72, 0.78),
+        ),
+        PartKind::SolarPanel => (
+            Mesh::from(Cuboid::new(s * 3.0, s * 0.1, s * 2.0)),
+            Color::srgb(0.06, 0.1, 0.35),
+        ),
+        PartKind::Bumper => (
+            Mesh::from(Cuboid::new(s * 3.0, s * 0.5, s * 0.5)),
+            Color::srgb(0.5, 0.5, 0.55),
+        ),
+        PartKind::Wheel(w) => (
+            Mesh::from(Cylinder::new(w.radius as f32, (w.radius * 0.5) as f32)),
+            Color::srgb(0.07, 0.07, 0.09),
+        ),
+    };
+    (
+        meshes.add(mesh),
+        materials.add(StandardMaterial {
+            base_color: color,
+            perceptual_roughness: 0.8,
+            ..default()
+        }),
+    )
+}
+
+/// Positions the rover's solid meshes (WI 608) each frame, rover-anchored: the chassis skin at the
+/// lattice origin, each tyre at its wheel (steered, riding the suspension), each cosmetic part at
+/// its mount — all oriented with the body.
+#[allow(clippy::type_complexity)]
+fn track_rover_meshes(
+    world: Res<WorkshopWorld>,
+    mut chassis_q: Query<
+        &mut Transform,
+        (
+            With<RoverChassisMesh>,
+            Without<RoverWheelMesh>,
+            Without<RoverPartMesh>,
+        ),
+    >,
+    mut wheel_q: Query<
+        (&RoverWheelMesh, &mut Transform),
+        (Without<RoverChassisMesh>, Without<RoverPartMesh>),
+    >,
+    mut part_q: Query<
+        (&RoverPartMesh, &mut Transform),
+        (Without<RoverChassisMesh>, Without<RoverWheelMesh>),
+    >,
+) {
+    let Some(rs) = &world.rover else {
+        return;
+    };
+    let body = &rs.rover.body;
+    let anchor = body.position;
+    let q = body.orientation;
+
+    if let Ok(mut tf) = chassis_q.single_mut() {
+        tf.translation = (-(q * rs.com)).as_vec3();
+        tf.rotation = q.as_quat();
+    }
+
+    let up = q * DVec3::Y;
+    let fwd = q * DVec3::Z;
+    for (tag, mut tf) in &mut wheel_q {
+        if let Some(w) = rs.rover.wheels.get(tag.0) {
+            let hub = body.position + q * w.mount;
+            let ground = rs.terrain.height(hub.x, hub.z);
+            let normal = rs.terrain.normal(hub.x, hub.z);
+            let center = DVec3::new(hub.x, ground + w.radius, hub.z);
+            let steer_rot = DQuat::from_axis_angle(up, w.steer);
+            let heading = steer_rot * fwd;
+            let forward = (heading - normal * heading.dot(normal)).normalize_or_zero();
+            let axle = normal.cross(forward).normalize_or_zero();
+            let align = Quat::from_rotation_arc(Vec3::Y, axle.as_vec3());
+            let spin = Quat::from_axis_angle(axle.as_vec3(), rs.spin_angle[tag.0] as f32);
+            tf.translation = (center - anchor).as_vec3();
+            tf.rotation = spin * align;
+        }
+    }
+    for (tag, mut tf) in &mut part_q {
+        if let Some(part) = rs.lattice.parts.get(tag.0) {
+            let world_pos = body.position + q * (part.mount - rs.com);
+            tf.translation = (world_pos - anchor).as_vec3();
+            tf.rotation = q.as_quat();
+        }
+    }
+}
+
 fn draw_rover(mut gizmos: Gizmos, world: Res<WorkshopWorld>) {
     let Some(rs) = &world.rover else {
         return;
@@ -1272,22 +1452,8 @@ fn draw_rover(mut gizmos: Gizmos, world: Res<WorkshopWorld>) {
         );
     }
 
-    // Chassis: a cuboid sized to the lattice extent, at the CoM, oriented with the body.
-    let s = rs.lattice.cell_size;
-    let mut lo = IVec3::splat(i32::MAX);
-    let mut hi = IVec3::splat(i32::MIN);
-    for v in &rs.lattice.voxels {
-        lo = lo.min(v.cell);
-        hi = hi.max(v.cell);
-    }
-    if hi.x >= lo.x {
-        let extent = (hi - lo + IVec3::ONE).as_dvec3() * s;
-        gizmos.primitive_3d(
-            &Cuboid::new(extent.x as f32, extent.y as f32, extent.z as f32),
-            Isometry3d::new(to_render(body.position), body.orientation.as_quat()),
-            Color::srgb(0.80, 0.81, 0.86),
-        );
-    }
+    // The chassis, tyres, and parts are **solid meshes** (positioned by `track_rover_meshes`); the
+    // gizmos here are just overlays.
 
     // Forward indicator: +Z in the body frame (cyan arrow).
     let fwd = body.orientation * DVec3::Z;
@@ -1297,21 +1463,25 @@ fn draw_rover(mut gizmos: Gizmos, world: Res<WorkshopWorld>) {
         Color::srgb(0.1, 0.8, 1.0),
     );
 
-    // Wheels: a dark sphere at each contact point, with the suspension leg from the hub.
-    for w in &rs.rover.wheels {
+    // Spin spokes: a rotating cross on each tyre's outer face so the (rotationally symmetric) tyre
+    // mesh visibly rolls.
+    let up = body.orientation * DVec3::Y;
+    for (i, w) in rs.rover.wheels.iter().enumerate() {
         let hub = body.position + body.orientation * w.mount;
         let ground = terrain.height(hub.x, hub.z);
-        let contact = DVec3::new(hub.x, ground, hub.z);
-        gizmos.line(
-            to_render(hub),
-            to_render(contact),
-            Color::srgb(0.5, 0.5, 0.55),
-        );
-        gizmos.sphere(
-            Isometry3d::from_translation(to_render(contact)),
-            w.radius as f32,
-            Color::srgb(0.12, 0.12, 0.15),
-        );
+        let normal = terrain.normal(hub.x, hub.z);
+        let center = DVec3::new(hub.x, ground + w.radius, hub.z);
+        let steer_rot = DQuat::from_axis_angle(up, w.steer);
+        let heading = steer_rot * (body.orientation * DVec3::Z);
+        let forward = (heading - normal * heading.dot(normal)).normalize_or_zero();
+        let axle = normal.cross(forward).normalize_or_zero();
+        let face = center + axle * (w.radius * 0.27); // just outside the tyre's outer face
+        let spin = DQuat::from_axis_angle(axle, rs.spin_angle[i]);
+        let a = spin * forward * (w.radius * 0.85);
+        let b = spin * axle.cross(forward) * (w.radius * 0.85);
+        let spoke = Color::srgb(0.55, 0.55, 0.6);
+        gizmos.line(to_render(face - a), to_render(face + a), spoke);
+        gizmos.line(to_render(face - b), to_render(face + b), spoke);
     }
 }
 
