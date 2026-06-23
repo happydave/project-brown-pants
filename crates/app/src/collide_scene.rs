@@ -1,8 +1,8 @@
 //! Collide — craft↔craft and debris collision demo (`-- collide`, WI 593).
 //!
 //! The body↔body counterpart to `-- land`. Several movable craft share the textured ground:
-//! a **projectile** craft you fire (`SPACE`) at a **target** craft, plus a small pile of
-//! **debris** fragments that fall and settle on each other. Each active substep this scene
+//! a **projectile** craft you accelerate (hold `SPACE`) into a **target** craft, plus a small
+//! pile of **debris** fragments that fall and settle on each other. Each active substep this scene
 //! composes, for every body, gravity + the craft↔ground penalty wrench
 //! (`sounding_sim::contact::ground_contact_wrench`) + the pairwise craft↔craft wrench
 //! (`body_contact_wrench`, WI 593), then integrates each `ActiveBody` — so the same penalty
@@ -31,8 +31,8 @@ use sounding_sim::frame::{FrameId, WorldPos};
 const BODY: CentralBody = CentralBody::EARTHLIKE;
 const SUBSTEP_DT: f64 = 0.004;
 const MAX_SUBSTEPS: u32 = 250;
-/// Speed the projectile is launched at the target, m/s.
-const FIRE_SPEED: f64 = 6.0;
+/// Forward acceleration applied to the projectile while SPACE is held, m/s².
+const PROJECTILE_ACCEL: f64 = 25.0;
 /// Speed below which a body counts as resting, m/s.
 const REST_SPEED: f64 = 0.1;
 
@@ -69,6 +69,8 @@ struct CollideWorld {
     ground: CollisionShape,
     params: ContactParams,
     accumulator: f64,
+    /// Whether the projectile is being accelerated this step (SPACE held).
+    thrust: bool,
 }
 
 /// A solid cube of side `n` cells (1 m each) of the given material, centred-on-cell-corner like
@@ -103,18 +105,15 @@ impl CollideWorld {
             Collider::new(&target, DVec3::new(0.0, rest_y, 0.0), DVec3::ZERO),
         ];
 
-        // Debris: three 1-cell fragments dropped from staggered heights to settle into a pile,
-        // off to the side so they don't interfere with the head-on shot.
+        // Debris: three 1-cell fragments dropped straight down with >1 m vertical gaps (so they
+        // do not overlap at t=0 — an initial overlap would fling them apart) and a small
+        // horizontal offset, off to the side so they don't interfere with the head-on shot; they
+        // fall and settle into a small pile.
         let frag = cube_craft(1, Material::ALUMINIUM);
-        let frag_rest = surface + 0.5;
-        for (i, dz) in [0.0, 0.6, 0.3].into_iter().enumerate() {
+        for (x, y, z) in [(6.0, 0.5, 6.0), (6.1, 2.0, 6.0), (6.0, 3.5, 6.1)] {
             colliders.push(Collider::new(
                 &frag,
-                DVec3::new(
-                    6.0 + 0.2 * i as f64,
-                    frag_rest + 2.0 + 0.8 * i as f64,
-                    6.0 + dz,
-                ),
+                DVec3::new(x, surface + y, z),
                 DVec3::ZERO,
             ));
         }
@@ -124,6 +123,7 @@ impl CollideWorld {
             ground: ground_half_space(surface),
             params: ContactParams::default(),
             accumulator: 0.0,
+            thrust: false,
         }
     }
 
@@ -138,11 +138,7 @@ impl CollideWorld {
             c.body = c.home;
         }
         self.accumulator = 0.0;
-    }
-
-    /// Launch the projectile (index 0) toward the target (+x).
-    fn fire(&mut self) {
-        self.colliders[0].body.velocity = DVec3::new(FIRE_SPEED, 0.0, 0.0);
+        self.thrust = false;
     }
 
     /// Advance every body one substep: gravity + ground + pairwise craft↔craft, then integrate.
@@ -162,6 +158,11 @@ impl CollideWorld {
             );
             acc[i].0 += gf;
             acc[i].1 += gt;
+        }
+        // Projectile thrust while SPACE is held: a continuous forward (+x) acceleration so it
+        // ramps up to speed toward the target the longer it's held.
+        if self.thrust {
+            acc[0].0 += DVec3::new(self.colliders[0].body.mass * PROJECTILE_ACCEL, 0.0, 0.0);
         }
         // Pairwise craft↔craft (equal-and-opposite).
         for i in 0..n {
@@ -278,7 +279,7 @@ fn setup_scene(
     ));
 
     commands.spawn((
-        Text::new("SPACE fire projectile · R reset"),
+        Text::new("hold SPACE to accelerate projectile · R reset"),
         TextFont {
             font_size: 14.0,
             ..default()
@@ -292,9 +293,9 @@ fn setup_scene(
         },
     ));
 
-    // A fixed vantage looking at the action between projectile and target.
-    let look = DVec3::new(-1.0, 1.0, 0.0);
-    let cam = look + DVec3::new(10.0, 8.0, 18.0);
+    // A fixed vantage pulled back to frame the projectile, the target, and the debris pile.
+    let look = DVec3::new(0.0, 1.0, 2.0);
+    let cam = look + DVec3::new(16.0, 12.0, 30.0);
     commands.spawn((
         Camera3d::default(),
         Transform::from_translation(cam.as_vec3()).looking_at(look.as_vec3(), Vec3::Y),
@@ -309,11 +310,9 @@ fn setup_scene(
     ));
 }
 
-/// SPACE fires the projectile; R resets.
+/// Holding SPACE accelerates the projectile toward the target; R resets.
 fn collide_input(keys: Res<ButtonInput<KeyCode>>, mut world: ResMut<CollideWorld>) {
-    if keys.just_pressed(KeyCode::Space) {
-        world.fire();
-    }
+    world.thrust = keys.pressed(KeyCode::Space);
     if keys.just_pressed(KeyCode::KeyR) {
         world.reset();
     }
