@@ -141,7 +141,7 @@ mod tests {
         let bounds = craft_bounds(&craft).unwrap();
         assert_eq!(bounds.aabb_min, DVec3::ZERO);
         assert_eq!(bounds.aabb_max, DVec3::new(3.0, 1.0, 1.0)); // cells 0 and 2 occupied
-        // The sphere encloses every box corner.
+                                                                // The sphere encloses every box corner.
         let shape = craft_collision_shape(&craft);
         for bx in boxes(&shape) {
             let far = bx.center + bx.half_extents;
