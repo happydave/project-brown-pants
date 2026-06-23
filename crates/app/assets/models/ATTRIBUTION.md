@@ -23,9 +23,11 @@ game-light (decimated + 512 px JPEG texture) output.
   **DINOv2** backbone (`moge/model/dinov2`) which is **Apache-2.0** (Meta AI). Both are compatible
   with this project's `MIT OR Apache-2.0`. (Confirmed against the model card / repo.)
 - **DINOv2** — Apache-2.0 (Meta AI).
-- **Z-Image** — Apache-2.0 (per the asset-harness track docs).
+- **Z-Image** (Alibaba Tongyi-MAI) — generated images are released under **Apache-2.0**: free
+  commercial use, modification allowed, **no attribution required** (credited here for provenance
+  only).
 
-> Since MoGe is a permissive (MIT) tool, this asset's terms are governed mainly by the **Z-Image
-> concept image** it was generated from (the geometry and texture source). The asset-harness repo
-> is authoritative for the exact model/seed/prompt; confirm the Z-Image output terms before any
-> public redistribution.
+> **Cleared for redistribution.** Every link in the chain — the Z-Image concept image
+> (Apache-2.0), the MoGe-2 tool/weights (MIT; DINOv2 Apache-2.0), and the Blender step — is
+> permissive and compatible with this project's `MIT OR Apache-2.0`. The asset-harness repo
+> remains authoritative for the exact model/seed/prompt.
