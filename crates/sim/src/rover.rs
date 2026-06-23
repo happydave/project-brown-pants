@@ -194,6 +194,33 @@ impl Rover {
     pub fn height_above_terrain(&self, terrain: &Terrain) -> f64 {
         self.body.position.y - terrain.height(self.body.position.x, self.body.position.z)
     }
+
+    /// Coordinated **counter-steer** for the wheels in `steer` (indices). Each steered wheel's angle
+    /// is proportional to its longitudinal (body +Z) offset from the CoM (`mount.z`):
+    /// `δ_i = atan(κ · mount.z_i)`, with the gain `κ` scaled so the **farthest** steered wheel
+    /// reaches `max_angle` at `input = ±1`. Wheels behind the CoM (negative `mount.z`) therefore
+    /// steer the **opposite** way to those ahead, a wheel on the CoM barely steers, and the result is
+    /// scale-independent (the gain absorbs the build size). Wheels not listed are set straight.
+    pub fn set_steer(&mut self, input: f64, max_angle: f64, steer: &[usize]) {
+        for w in &mut self.wheels {
+            w.steer = 0.0;
+        }
+        let max_z = steer
+            .iter()
+            .filter_map(|&i| self.wheels.get(i))
+            .map(|w| w.mount.z.abs())
+            .fold(0.0_f64, f64::max);
+        if max_z <= 1e-9 || max_angle == 0.0 {
+            return;
+        }
+        let kappa = input * max_angle.tan() / max_z;
+        let limit = max_angle.abs() + 0.2;
+        for &i in steer {
+            if let Some(w) = self.wheels.get_mut(i) {
+                w.steer = (kappa * w.mount.z).atan().clamp(-limit, limit);
+            }
+        }
+    }
 }
 
 /// The result of assembling a rover from a built lattice (WI 607): the rover plus
@@ -442,6 +469,54 @@ mod tests {
         );
         // Some nose-up under acceleration is fine; a perpetual wheelie/flip is not.
         assert!(max_pitch < 3.0, "excessive pitch (wheelie): {max_pitch}");
+    }
+
+    #[test]
+    fn set_steer_counter_steers_behind_com() {
+        let s = 0.1;
+        let mut craft = VoxelCraft::new(s);
+        for x in 0..4 {
+            for z in 0..6 {
+                craft.voxels.push(Voxel {
+                    cell: IVec3::new(x, 0, z),
+                    material: Material::COMPOSITE,
+                });
+            }
+        }
+        // Four corner wheels, all steerable (front at z≈max, rear at z≈min).
+        for (cx, cz) in [(0, 0), (3, 0), (0, 5), (3, 5)] {
+            craft.parts.push(Part {
+                mount: DVec3::new((cx as f64 + 0.5) * s, -0.1, (cz as f64 + 0.5) * s),
+                mass: 3.0,
+                kind: PartKind::Wheel(WheelPart::for_cell_size(s, true, true)),
+            });
+        }
+        let mut rover = assemble_rover(&craft, DVec3::ZERO, 9.81).unwrap().rover;
+        let steer: Vec<usize> = (0..rover.wheels.len()).collect();
+        let max_angle = 0.4;
+
+        rover.set_steer(1.0, max_angle, &steer);
+        for w in &rover.wheels {
+            // Steer sign follows the longitudinal offset → rear (z<0) inverts vs front (z>0).
+            assert!((w.steer.signum() - w.mount.z.signum()).abs() < 1e-9);
+            assert!(w.steer.abs() <= max_angle + 1e-9);
+        }
+        let max = rover
+            .wheels
+            .iter()
+            .map(|w| w.steer.abs())
+            .fold(0.0, f64::max);
+        assert!(
+            (max - max_angle).abs() < 1e-6,
+            "farthest wheel hits max: {max}"
+        );
+        let front = rover.wheels.iter().find(|w| w.mount.z > 0.0).unwrap().steer;
+        let rear = rover.wheels.iter().find(|w| w.mount.z < 0.0).unwrap().steer;
+        assert!(front > 0.0 && rear < 0.0, "front {front}, rear {rear}");
+
+        // Zero input → all straight.
+        rover.set_steer(0.0, max_angle, &steer);
+        assert!(rover.wheels.iter().all(|w| w.steer == 0.0));
     }
 
     #[test]

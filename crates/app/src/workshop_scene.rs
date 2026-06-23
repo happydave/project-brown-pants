@@ -1124,10 +1124,10 @@ fn drive_rover(keys: &ButtonInput<KeyCode>, world: &mut WorkshopWorld) {
     } else {
         0.0
     };
-    let steer = if keys.pressed(KeyCode::KeyA) {
-        ROVER_STEER
+    let steer_input = if keys.pressed(KeyCode::KeyA) {
+        1.0
     } else if keys.pressed(KeyCode::KeyD) {
-        -ROVER_STEER
+        -1.0
     } else {
         0.0
     };
@@ -1138,9 +1138,12 @@ fn drive_rover(keys: &ButtonInput<KeyCode>, world: &mut WorkshopWorld) {
     };
     for (i, w) in rs.rover.wheels.iter_mut().enumerate() {
         w.drive_torque = if rs.drive.contains(&i) { throttle } else { 0.0 };
-        w.steer = if rs.steer.contains(&i) { steer } else { 0.0 };
         w.brake = brake;
     }
+    // Coordinated counter-steer: each steered wheel's angle ∝ its longitudinal offset from the CoM,
+    // so rear steer-wheels invert and the rover turns about itself instead of fighting itself.
+    let steer = rs.steer.clone();
+    rs.rover.set_steer(steer_input, ROVER_STEER, &steer);
 }
 
 fn step_workshop(time: Res<Time>, mut world: ResMut<WorkshopWorld>) {
