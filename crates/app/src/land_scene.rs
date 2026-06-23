@@ -129,6 +129,14 @@ impl LandWorld {
         self.body.position - DVec3::new(0.0, BODY.radius, 0.0)
     }
 
+    /// Render origin for the skin mesh: the mesh is in raw lattice coordinates while
+    /// `body.position` is the CoM, so place the mesh's lattice origin at the physical lattice
+    /// origin (`body.position − orientation·dry_com`) — where `flight_step`'s collision shape
+    /// sits — so the hull coincides with the physics (no float/sink).
+    fn mesh_origin(&self) -> DVec3 {
+        self.render_world() - self.body.orientation * self.craft.dry_com
+    }
+
     fn altitude(&self) -> f64 {
         self.body.position.length() - BODY.radius
     }
@@ -201,7 +209,7 @@ fn setup_scene(
         Mesh3d(mesh),
         MeshMaterial3d(material),
         Transform::default(),
-        WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, world.render_world())),
+        WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, world.mesh_origin())),
         CraftMarker,
     ));
 
@@ -297,7 +305,7 @@ fn track_craft(
     mut craft: Query<(&mut WorldPlacement, &mut Transform), With<CraftMarker>>,
 ) {
     if let Ok((mut wp, mut tf)) = craft.single_mut() {
-        wp.0 = WorldPos::new(FrameId::CENTRAL_BODY, world.render_world());
+        wp.0 = WorldPos::new(FrameId::CENTRAL_BODY, world.mesh_origin());
         tf.rotation = world.body.orientation.as_quat();
     }
 }

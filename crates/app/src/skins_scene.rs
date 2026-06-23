@@ -311,7 +311,10 @@ fn track_skins(
     world: Res<SkinsWorld>,
     mut slots: Query<(&SkinSlot, &mut WorldPlacement, &mut Transform)>,
 ) {
-    let base = world.render_world();
+    // Place each skin's lattice origin at the physical lattice origin (`body.position −
+    // orientation·dry_com`), so the hull coincides with the craft state rather than rendering
+    // offset by the CoM; then add the lateral slot offset for the side-by-side layout.
+    let base = world.render_world() - world.body.orientation * world.craft.dry_com;
     let rot = world.body.orientation.as_quat();
     for (slot, mut wp, mut tf) in &mut slots {
         wp.0 = WorldPos::new(FrameId::CENTRAL_BODY, base + slot.offset);

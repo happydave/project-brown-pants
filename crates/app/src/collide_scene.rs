@@ -127,9 +127,13 @@ impl CollideWorld {
         }
     }
 
-    /// World position of a collider relative to the rendered (surface-centred) origin.
+    /// Render origin for a collider's skin mesh: the mesh is in raw lattice coordinates while
+    /// `body.position` is the CoM, so place the mesh's lattice origin at the physical lattice
+    /// origin (`body.position − orientation·com`, where the collision shape sits) — the hull
+    /// then coincides with the physics (no float/sink).
     fn render_pos(&self, i: usize) -> DVec3 {
-        self.colliders[i].body.position - DVec3::new(0.0, BODY.radius, 0.0)
+        let c = &self.colliders[i];
+        c.body.position - c.body.orientation * c.com - DVec3::new(0.0, BODY.radius, 0.0)
     }
 
     /// Restore every body to its home state (the reset button).
