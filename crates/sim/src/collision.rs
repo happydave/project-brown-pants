@@ -77,6 +77,28 @@ pub fn craft_bounds(craft: &VoxelCraft) -> Option<Bounds> {
     })
 }
 
+/// The craft's bounding radius **about its centre of mass**: the farthest cell-corner distance
+/// from the CoM, an orientation-invariant conservative sphere (so a rotated craft never reaches
+/// past it). `None` for an empty craft. Used by the anti-tunnelling warp cap (WI 595) to bound
+/// how close any part of the craft is to a surface from the CoM alone.
+pub fn craft_bounding_radius(craft: &VoxelCraft) -> Option<f64> {
+    let com = craft.mass_properties()?.center_of_mass;
+    let s = craft.cell_size;
+    let mut r2 = 0.0_f64;
+    for v in &craft.voxels {
+        let lo = v.cell.as_dvec3() * s;
+        for cx in [0.0, s] {
+            for cy in [0.0, s] {
+                for cz in [0.0, s] {
+                    let corner = lo + DVec3::new(cx, cy, cz);
+                    r2 = r2.max((corner - com).length_squared());
+                }
+            }
+        }
+    }
+    Some(r2.sqrt())
+}
+
 /// A flat-ground half-space at height `surface_offset` with an upward (+Y) normal.
 pub fn ground_half_space(surface_offset: f64) -> CollisionShape {
     CollisionShape::HalfSpace {
