@@ -12,6 +12,7 @@ pub mod attitude;
 pub mod autopilot;
 pub mod breakage;
 pub mod collision;
+pub mod collision_detect;
 pub mod command;
 pub mod compartments;
 pub mod control;
