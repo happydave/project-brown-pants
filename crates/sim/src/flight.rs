@@ -15,6 +15,8 @@ use crate::active::ActiveBody;
 use crate::aero;
 use crate::attitude::AttitudePilot;
 use crate::autopilot::Autopilot;
+use crate::collision::{craft_bounds, craft_collision_shape, CollisionShape};
+use crate::contact::{ground_contact_wrench, ContactParams};
 use crate::control::{ControlSystem, ControlTier};
 use crate::fluid::{FluidMedium, FluidSample};
 use crate::launch::LaunchPad;
@@ -117,6 +119,17 @@ impl FlightCraft {
     }
 }
 
+/// A flat-ground collision plane for the active step (WI 592): an upward plane (`normal`,
+/// `offset`) the craft collides with, plus the penalty [`ContactParams`]. Copy (no `Vec`),
+/// so [`FlightParams`] stays `Copy`; the craft's own collision shape is derived from its
+/// voxels each step.
+#[derive(Clone, Copy, Debug)]
+pub struct GroundContact {
+    pub normal: DVec3,
+    pub offset: f64,
+    pub contact: ContactParams,
+}
+
 /// The fixed environment of an active flight. (Not serialized — reconstructed from
 /// the body/medium constants; only the craft state, [`FlightCraft`], is persisted.)
 #[derive(Clone, Copy, Debug)]
@@ -133,6 +146,8 @@ pub struct FlightParams {
     pub drag_coefficient: f64,
     /// Optional aero lift / wave drag (a winged craft); `None` for a ballistic body.
     pub lift: Option<GlideParams>,
+    /// Optional ground-collision plane (WI 592); `None` ⇒ no collision (existing behaviour).
+    pub ground: Option<GroundContact>,
 }
 
 /// Advance one active-flight sub-step: compose all forces/torques into one wrench
@@ -261,8 +276,24 @@ pub fn flight_step(
     let g = &mut propulsion.graph;
     g.integrate(g.time + dt);
 
-    let force = gravity + drag + buoyancy + thrust + lift;
-    let torque = thrust_torque + lift_torque + att_torque;
+    let mut force = gravity + drag + buoyancy + thrust + lift;
+    let mut torque = thrust_torque + lift_torque + att_torque;
+
+    // Ground collision (WI 592): when a scene supplies a ground plane, add the penalty
+    // contact wrench (craft shape derived from the voxels, placed at the CoM). `None`
+    // leaves the wrench untouched — existing scenes are unaffected.
+    if let Some(gc) = params.ground {
+        let shape = craft_collision_shape(voxels);
+        let bounds = craft_bounds(voxels);
+        let ground = CollisionShape::HalfSpace {
+            normal: gc.normal,
+            offset: gc.offset,
+        };
+        let (cf, ct) = ground_contact_wrench(body, &shape, bounds, *dry_com, &ground, &gc.contact);
+        force += cf;
+        torque += ct;
+    }
+
     pad.step(body, force, torque, dt);
     sample
 }
@@ -625,6 +656,7 @@ mod tests {
             drag_area,
             drag_coefficient: 1.0,
             lift: None,
+            ground: None,
         }
     }
 

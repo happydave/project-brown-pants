@@ -38,6 +38,7 @@ mod editor;
 mod floating_origin;
 mod flooding_scene;
 mod ground;
+mod land_scene;
 mod launch_scene;
 mod materials_scene;
 mod planet;
@@ -54,6 +55,7 @@ use compartments_scene::CompartmentsScenePlugin;
 use dive_scene::DiveScenePlugin;
 use editor::EditorPlugin;
 use flooding_scene::FloodingScenePlugin;
+use land_scene::LandScenePlugin;
 use launch_scene::LaunchScenePlugin;
 use materials_scene::MaterialsScenePlugin;
 use planet::PlanetPlugin;
@@ -78,6 +80,7 @@ enum Scene {
     Play,
     Materials,
     Skins,
+    Land,
     TerrainMesh,
 }
 
@@ -95,6 +98,7 @@ fn selected_scene() -> Scene {
         Some("play") => Scene::Play,
         Some("materials") => Scene::Materials,
         Some("skins") => Scene::Skins,
+        Some("land") => Scene::Land,
         Some("terrainmesh") => Scene::TerrainMesh,
         _ => Scene::Editor,
     }
@@ -164,6 +168,9 @@ fn main() {
         }
         Scene::Skins => {
             app.add_plugins(SkinsScenePlugin);
+        }
+        Scene::Land => {
+            app.add_plugins(LandScenePlugin);
         }
         Scene::TerrainMesh => {
             app.add_plugins(TerrainMeshScenePlugin);

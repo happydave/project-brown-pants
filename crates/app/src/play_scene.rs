@@ -143,6 +143,7 @@ impl PlayWorld {
                 drag_area,
                 drag_coefficient: 1.0,
                 lift: None,
+                ground: None,
             },
             craft: FlightCraft {
                 dry_mass: mp.mass,
