@@ -67,7 +67,7 @@ The app selects a toy scene at launch:
 - `cargo run -p sounding -- land` — craft↔terrain collision demo (WI 590–592): a craft is dropped onto the tiled ground and the penalty contact response (detection via `parry3d-f64`) brings it to rest — `R` re-drop, `1`/`2` low/high drop
 - `cargo run -p sounding -- collide` — craft↔craft collision demo (WI 593): fire a projectile craft (`SPACE`) at a target, plus a settling debris pile — the same penalty response generalized to body↔body — `R` reset
 - `cargo run -p sounding -- crash` — breakage-on-impact demo (WI 594): hold `SPACE` to ram a frangible craft into a heavy block; a hard impact routes the contact force into fracture and it shatters into collidable fragments — `R` reset
-- `cargo run -p sounding -- workshop` — grounded build-and-test sandbox (WI 599/602/603/604): **Build** a craft (voxel editor: cells, materials, devices `1`-`5`) ↔ **Test** — fly *what you built* on the textured ground with live collision (land, rest, drive, crash → shatter); toggle with `Enter`, in Test `Backspace` rebuilds
+- `cargo run -p sounding -- workshop` — grounded build-and-test sandbox (WI 599/602/603/604/607/612): **Build** a craft with the **mouse** on a solid 0.1 m grid (left-click a face to add, right-click to remove, middle-drag orbit, scroll zoom; brush = `Tab` material · `1`-`5` devices · `6`/`7` wheels) ↔ **Test** — *what you built*: a build with **wheels drives as a rover** (W/S drive · A/D steer · Space brake), anything else **flies** on the textured ground with live collision (land, rest, crash → shatter); toggle with `Enter`, `Backspace` rebuilds
 
 ## Runtime bus
 

@@ -15,6 +15,7 @@
 
 use crate::active::ActiveBody;
 use crate::terrain::Terrain;
+use crate::voxel::{DeviceKind, PartKind, VoxelCraft};
 use glam::{DMat3, DQuat, DVec3};
 
 /// Longitudinal slip stiffness (shape of the slip-ratio → force curve).
@@ -195,6 +196,104 @@ impl Rover {
     }
 }
 
+/// The result of assembling a rover from a built lattice (WI 607): the rover plus
+/// its drivetrain binding (which wheels drive / steer, by index into `rover.wheels`)
+/// and a signal for thrust engines that were placed but not wired.
+#[derive(Clone, Debug)]
+pub struct RoverAssembly {
+    /// The assembled rover (chassis body + wheels).
+    pub rover: Rover,
+    /// Indices into `rover.wheels` that receive drive/motor torque.
+    pub drive: Vec<usize>,
+    /// Indices into `rover.wheels` that turn with steering input.
+    pub steer: Vec<usize>,
+    /// Count of placed thrust engines (`DeviceKind::Engine`) that this rover assembly
+    /// did **not** wire (designreview finding 1): a wheels-and-thrust hybrid is out of
+    /// first-cut scope, so the rover path is taken and the thrust engines are reported
+    /// here rather than silently dropped. Zero for a pure rover.
+    pub unwired_thrust_engines: usize,
+}
+
+/// Assemble a [`Rover`] from a built `craft` (WI 607), placing its centre of mass at
+/// world `position` under `gravity`. Mass / inertia / CoM come from the chassis voxels
+/// **and** attached parts ([`VoxelCraft::mass_properties`]); each [`PartKind::Wheel`]
+/// part becomes a [`Wheel`] at its CoM-relative mount, carrying its suspension/tire
+/// parameters; drive/steer groups come from the wheel parts' flags.
+///
+/// Returns `None` when the craft has no mass or **no wheel parts** — a lattice without
+/// wheels is not a rover (the rocket assembly path handles those). This is the
+/// deterministic rocket-vs-rover discriminator: wheels ⇒ rover.
+pub fn assemble_rover(craft: &VoxelCraft, position: DVec3, gravity: f64) -> Option<RoverAssembly> {
+    let mp = craft.mass_properties()?;
+    let com = mp.center_of_mass;
+
+    let mut wheels = Vec::new();
+    let mut drive = Vec::new();
+    let mut steer = Vec::new();
+    for part in &craft.parts {
+        let PartKind::Wheel(spec) = part.kind else {
+            continue;
+        };
+        let i = wheels.len();
+        // Skip a degenerate wheel rather than producing a non-physical one.
+        if spec.radius <= 0.0 || spec.wheel_inertia <= 0.0 {
+            continue;
+        }
+        wheels.push(Wheel {
+            // The rover core mounts wheels relative to the body's CoM (`body.position`).
+            mount: part.mount - com,
+            radius: spec.radius,
+            rest_length: spec.rest_length,
+            stiffness: spec.stiffness,
+            damping: spec.damping,
+            max_force: spec.max_force,
+            steer: 0.0,
+            spin: 0.0,
+            wheel_inertia: spec.wheel_inertia,
+            drive_torque: 0.0,
+            brake: 0.0,
+        });
+        if spec.drive {
+            drive.push(i);
+        }
+        if spec.steer {
+            steer.push(i);
+        }
+    }
+
+    if wheels.is_empty() {
+        return None;
+    }
+
+    // Size each wheel's suspension to the assembled mass (WI 612 feedback): a spring stiff enough to
+    // carry its share of the weight at ~25% compression, damped near-critical, with headroom for
+    // bumps. Without this the fixed `WheelPart` springs were mismatched to the build (sagging or
+    // flinging), which read as "won't move / nose lifts".
+    let n = wheels.len() as f64;
+    let load = (mp.mass * gravity / n).max(1.0);
+    let m_wheel = mp.mass / n;
+    for w in &mut wheels {
+        let target_comp = (0.25 * w.rest_length).max(1e-3);
+        w.stiffness = (load / target_comp).clamp(1.0e3, 5.0e5);
+        w.max_force = (load * 6.0).max(1.0e3);
+        w.damping = 2.0 * 0.7 * (w.stiffness * m_wheel).sqrt();
+    }
+
+    let unwired_thrust_engines = craft
+        .devices
+        .iter()
+        .filter(|d| d.kind == DeviceKind::Engine)
+        .count();
+
+    let body = ActiveBody::from_mass_properties(position, DVec3::ZERO, &mp);
+    Some(RoverAssembly {
+        rover: Rover::new(body, wheels, gravity),
+        drive,
+        steer,
+        unwired_thrust_engines,
+    })
+}
+
 /// Drive torque after the motor's speed limit: it falls to zero as the wheel
 /// approaches [`MAX_WHEEL_SPIN`], so the wheels cannot spin up without bound.
 fn motor_torque(w: &Wheel) -> f64 {
@@ -223,8 +322,141 @@ fn tire_forces(slip_ratio: f64, slip_angle: f64, fmax: f64) -> (f64, f64) {
 mod tests {
     use super::*;
     use crate::surface::SurfaceMaterial;
-    use crate::voxel::{Material, Voxel, VoxelCraft};
+    use crate::voxel::{
+        Device, DeviceKind, Material, Part, PartKind, Voxel, VoxelCraft, WheelPart,
+    };
     use glam::IVec3;
+
+    /// A 3×5 voxel chassis (the rover-scene block) with `n_parts` wheel parts mounted
+    /// at the four corners (front pair steering, all driving).
+    fn chassis_with_wheels() -> VoxelCraft {
+        let mut craft = VoxelCraft::new(0.5);
+        for x in 0..3 {
+            for z in 0..5 {
+                craft.voxels.push(Voxel {
+                    cell: IVec3::new(x, 0, z),
+                    material: Material::COMPOSITE,
+                });
+            }
+        }
+        let mounts = [
+            (DVec3::new(-1.0, -0.2, -2.0), false), // rear-left: drive only
+            (DVec3::new(1.0, -0.2, -2.0), false),  // rear-right: drive only
+            (DVec3::new(-1.0, -0.2, 2.0), true),   // front-left: drive + steer
+            (DVec3::new(1.0, -0.2, 2.0), true),    // front-right: drive + steer
+        ];
+        for (mount, steer) in mounts {
+            craft.parts.push(Part {
+                mount,
+                mass: 40.0,
+                kind: PartKind::Wheel(WheelPart::new(true, steer)),
+            });
+        }
+        craft
+    }
+
+    #[test]
+    fn assemble_rover_builds_wheels_and_groups() {
+        let craft = chassis_with_wheels();
+        let mp = craft.mass_properties().unwrap();
+        let asm = assemble_rover(&craft, DVec3::new(0.0, 5.0, 0.0), 9.81).unwrap();
+
+        assert_eq!(asm.rover.wheels.len(), 4);
+        assert_eq!(asm.drive, vec![0, 1, 2, 3]); // all four drive
+        assert_eq!(asm.steer, vec![2, 3]); // only the front pair steer
+        assert_eq!(asm.unwired_thrust_engines, 0);
+        // Body mass equals the chassis-plus-parts mass.
+        assert!((asm.rover.body.mass - mp.mass).abs() < 1e-9);
+        // Wheel mounts are CoM-relative.
+        let expected = DVec3::new(-1.0, -0.2, -2.0) - mp.center_of_mass;
+        assert!((asm.rover.wheels[0].mount - expected).length() < 1e-12);
+    }
+
+    #[test]
+    fn assemble_rover_is_none_without_wheels() {
+        let mut craft = VoxelCraft::new(0.5);
+        craft.voxels.push(Voxel {
+            cell: IVec3::new(0, 0, 0),
+            material: Material::COMPOSITE,
+        });
+        assert!(assemble_rover(&craft, DVec3::ZERO, 9.81).is_none());
+        // Empty lattice (no mass) is also None.
+        assert!(assemble_rover(&VoxelCraft::new(0.5), DVec3::ZERO, 9.81).is_none());
+    }
+
+    #[test]
+    fn assembled_rover_drives_forward_without_wheelie() {
+        // A small (0.1 m cell) rover, assembled the way the workshop builds one: a flat chassis with
+        // four corner wheels just below it, sized to the cell and auto-tuned to the mass. It must
+        // actually drive forward (+Z) on flat ground and not flip into a perpetual wheelie.
+        let terrain = Terrain {
+            amplitude: 0.0,
+            ..Default::default()
+        };
+        let s = 0.1;
+        let mut craft = VoxelCraft::new(s);
+        for x in 0..4 {
+            for z in 0..6 {
+                craft.voxels.push(Voxel {
+                    cell: IVec3::new(x, 0, z),
+                    material: Material::COMPOSITE,
+                });
+            }
+        }
+        for (cx, cz, steer) in [(0, 0, false), (3, 0, false), (0, 5, true), (3, 5, true)] {
+            let mount = DVec3::new((cx as f64 + 0.5) * s, -0.1, (cz as f64 + 0.5) * s);
+            craft.parts.push(Part {
+                mount,
+                mass: 3.0,
+                kind: PartKind::Wheel(WheelPart::for_cell_size(s, true, steer)),
+            });
+        }
+        let mass = craft.mass_properties().unwrap().mass;
+        let asm = assemble_rover(&craft, DVec3::ZERO, 9.81).unwrap();
+        let mut rover = asm.rover;
+        // Rest it on the ground (lowest wheel at free length), then settle.
+        let drop = rover
+            .wheels
+            .iter()
+            .map(|w| w.rest_length + w.radius - w.mount.y)
+            .fold(0.0_f64, f64::max);
+        rover.body.position = DVec3::new(0.0, terrain.height(0.0, 0.0) + drop, 0.0);
+        for _ in 0..4_000 {
+            rover.step(&terrain, SUBSTEP_DT);
+        }
+        let z0 = rover.body.position.z;
+
+        for &i in &asm.drive {
+            rover.wheels[i].drive_torque = mass * 4.0;
+        }
+        let mut max_pitch = 0.0_f64;
+        for _ in 0..8_000 {
+            rover.step(&terrain, SUBSTEP_DT);
+            max_pitch = max_pitch.max(rover.body.angular_velocity().x.abs());
+        }
+        assert!(rover.body.position.is_finite());
+        assert!(
+            rover.body.position.z - z0 > 0.3,
+            "rover did not drive forward: Δz = {}",
+            rover.body.position.z - z0
+        );
+        // Some nose-up under acceleration is fine; a perpetual wheelie/flip is not.
+        assert!(max_pitch < 3.0, "excessive pitch (wheelie): {max_pitch}");
+    }
+
+    #[test]
+    fn assemble_rover_reports_unwired_thrust_engines() {
+        // A wheels-and-thrust hybrid takes the rover path and reports the engines.
+        let mut craft = chassis_with_wheels();
+        craft.devices.push(Device::structural(
+            IVec3::new(1, 0, 2),
+            100.0,
+            DeviceKind::Engine,
+        ));
+        let asm = assemble_rover(&craft, DVec3::ZERO, 9.81).unwrap();
+        assert_eq!(asm.rover.wheels.len(), 4);
+        assert_eq!(asm.unwired_thrust_engines, 1);
+    }
 
     /// The production sub-step (see [`super::SUBSTEP_DT`]).
     const DT: f64 = SUBSTEP_DT;

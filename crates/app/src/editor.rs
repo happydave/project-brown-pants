@@ -7,13 +7,15 @@
 //! derivations themselves are headless and unit-tested in `sounding_sim::voxel`;
 //! this module is the editor and the view.
 
+use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::math::DVec3;
 use bevy::prelude::*;
 use sounding_sim::control::{BatterySpec, ControlComputer};
 use sounding_sim::frame::{FrameId, WorldPos};
 use sounding_sim::persist::{CraftSubgraph, Kind, Payload, SavedDocument};
 use sounding_sim::voxel::{
-    AttachmentPoint, Axis, Device, DeviceKind, Face, Material, Voxel, VoxelCraft,
+    AttachmentPoint, Axis, Device, DeviceKind, Face, Material, Part, PartKind, Voxel, VoxelCraft,
+    WheelPart,
 };
 use std::fs;
 
@@ -28,20 +30,56 @@ const PALETTE: [(&str, Material); 4] = [
 const BLUEPRINT_PATH: &str = "blueprint.json";
 const SUBASSEMBLY_PATH: &str = "subassembly.json";
 
+/// The active placement tool (WI 612): what a click (or Space) places. The number keys select it;
+/// `Voxel` uses the active material. This is what makes mouse building work — the tool follows the
+/// cursor instead of every device piling onto the keyboard cursor cell.
+#[derive(Resource, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Brush {
+    #[default]
+    Voxel,
+    ControlPoint,
+    Computer,
+    Battery,
+    Engine,
+    Tank,
+    Wheel {
+        drive: bool,
+        steer: bool,
+    },
+}
+
+impl Brush {
+    /// A short label for the HUD.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Brush::Voxel => "voxel",
+            Brush::ControlPoint => "control point",
+            Brush::Computer => "computer",
+            Brush::Battery => "battery",
+            Brush::Engine => "engine",
+            Brush::Tank => "tank",
+            Brush::Wheel { steer: false, .. } => "wheel (drive)",
+            Brush::Wheel { steer: true, .. } => "wheel (drive+steer)",
+        }
+    }
+}
+
 /// The editor's state: the craft under construction, the build cursor, the
-/// selected material, and a loaded subassembly buffer.
+/// selected material, the active placement brush, and a loaded subassembly buffer.
 #[derive(Resource)]
 pub struct EditorState {
     pub craft: VoxelCraft,
     pub cursor: IVec3,
     pub material: usize,
+    pub(crate) brush: Brush,
     pub subassembly: Option<VoxelCraft>,
 }
 
 impl Default for EditorState {
     fn default() -> Self {
-        // A small seed craft so the derivations have something to show at startup.
-        let mut craft = VoxelCraft::new(1.0);
+        // A small seed craft so the derivations have something to show at startup. 0.1 m cells —
+        // fine enough to build vehicles, not castles (WI 612 feedback).
+        let mut craft = VoxelCraft::new(0.1);
         for x in 0..3 {
             for z in 0..2 {
                 craft.voxels.push(Voxel {
@@ -54,9 +92,64 @@ impl Default for EditorState {
             craft,
             cursor: IVec3::new(0, 1, 0),
             material: 0,
+            brush: Brush::Voxel,
             subassembly: None,
         }
     }
+}
+
+/// Places the active `brush` into `craft`. The three cells let the caller aim each kind: a voxel at
+/// `voxel_cell` (the empty face cell for the mouse), a device at `device_cell` (the hovered solid
+/// cell), and a wheel at `wheel_mount` (a continuous body-frame point).
+fn place_brush(
+    craft: &mut VoxelCraft,
+    brush: Brush,
+    material: Material,
+    voxel_cell: IVec3,
+    device_cell: IVec3,
+    wheel_mount: DVec3,
+) {
+    match brush {
+        Brush::Voxel => {
+            if !craft.voxels.iter().any(|v| v.cell == voxel_cell) {
+                craft.voxels.push(Voxel {
+                    cell: voxel_cell,
+                    material,
+                });
+            }
+        }
+        Brush::Wheel { drive, steer } => {
+            let s = craft.cell_size;
+            craft
+                .parts
+                .retain(|p| (p.mount - wheel_mount).length() > 1e-6);
+            craft.parts.push(Part {
+                mount: wheel_mount,
+                // Wheel mass scaled to the build (a few cells' worth of material).
+                mass: (15.0 * s).max(1.0),
+                kind: PartKind::Wheel(WheelPart::for_cell_size(s, drive, steer)),
+            });
+        }
+        device => {
+            let d = match device {
+                Brush::ControlPoint => Device::control_point(device_cell, 120.0, true),
+                Brush::Computer => {
+                    Device::computer(device_cell, 40.0, ControlComputer::tuning_computer(0.4))
+                }
+                Brush::Battery => Device::battery(device_cell, 60.0, BatterySpec::full(120.0)),
+                Brush::Engine => Device::structural(device_cell, 100.0, DeviceKind::Engine),
+                Brush::Tank => Device::structural(device_cell, 80.0, DeviceKind::Tank),
+                Brush::Voxel | Brush::Wheel { .. } => unreachable!(),
+            };
+            craft.devices.retain(|x| x.cell != device_cell);
+            craft.devices.push(d);
+        }
+    }
+}
+
+/// The human-readable name of palette material `index` (for HUD/palette display).
+pub(crate) fn material_label(index: usize) -> &'static str {
+    PALETTE[index % PALETTE.len()].0
 }
 
 pub struct EditorPlugin;
@@ -83,8 +176,8 @@ impl Default for OrbitCam {
     fn default() -> Self {
         Self {
             yaw: 0.7,
-            pitch: 0.5,
-            dist: 14.0,
+            pitch: 0.4,
+            dist: 3.0,
         }
     }
 }
@@ -105,6 +198,7 @@ fn setup_view(mut commands: Commands) {
 pub(crate) fn orbit_camera(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
+    editor: Res<EditorState>,
     mut cam: ResMut<OrbitCam>,
     mut camera: Query<&mut Transform, With<Camera3d>>,
 ) {
@@ -116,19 +210,24 @@ pub(crate) fn orbit_camera(
         cam.yaw -= dt;
     }
     if keys.pressed(KeyCode::KeyR) {
-        cam.pitch = (cam.pitch + dt).clamp(0.05, 1.5);
+        cam.pitch = (cam.pitch + dt).clamp(-1.4, 1.4);
     }
     if keys.pressed(KeyCode::KeyF) {
-        cam.pitch = (cam.pitch - dt).clamp(0.05, 1.5);
+        cam.pitch = (cam.pitch - dt).clamp(-1.4, 1.4);
     }
     if keys.pressed(KeyCode::KeyZ) {
-        cam.dist = (cam.dist - dt * 12.0).max(2.0);
+        cam.dist = (cam.dist - dt * cam.dist * 1.5).max(0.2);
     }
     if keys.pressed(KeyCode::KeyC) {
         cam.dist = (cam.dist + dt * 12.0).min(80.0);
     }
 
-    let target = Vec3::new(1.5, 0.5, 1.0);
+    // Frame the build: target its centre of mass so any cell size / build is centred.
+    let target = editor
+        .craft
+        .mass_properties()
+        .map(|mp| mp.center_of_mass.as_vec3())
+        .unwrap_or(Vec3::splat(0.5));
     let dir = Vec3::new(
         cam.yaw.cos() * cam.pitch.cos(),
         cam.pitch.sin(),
@@ -166,49 +265,54 @@ pub(crate) fn editor_input(keys: Res<ButtonInput<KeyCode>>, mut state: ResMut<Ed
         state.cursor += delta;
     }
 
-    // Add a voxel of the current material at the cursor (if empty).
+    // Select the active brush (what a click / Space places). Tab cycles material and returns to the
+    // voxel brush; the digit keys pick devices/wheels: 1 control point · 2 computer · 3 battery ·
+    // 4 (or G) engine · 5 tank · 6 wheel (drive) · 7 wheel (drive+steer).
+    if keys.just_pressed(KeyCode::Tab) {
+        state.material = (state.material + 1) % PALETTE.len();
+        state.brush = Brush::Voxel;
+        info!("material: {}", PALETTE[state.material].0);
+    }
+    if keys.just_pressed(KeyCode::Digit1) {
+        state.brush = Brush::ControlPoint;
+    } else if keys.just_pressed(KeyCode::Digit2) {
+        state.brush = Brush::Computer;
+    } else if keys.just_pressed(KeyCode::Digit3) {
+        state.brush = Brush::Battery;
+    } else if keys.just_pressed(KeyCode::KeyG) || keys.just_pressed(KeyCode::Digit4) {
+        state.brush = Brush::Engine;
+    } else if keys.just_pressed(KeyCode::Digit5) {
+        state.brush = Brush::Tank;
+    } else if keys.just_pressed(KeyCode::Digit6) {
+        state.brush = Brush::Wheel {
+            drive: true,
+            steer: false,
+        };
+    } else if keys.just_pressed(KeyCode::Digit7) {
+        state.brush = Brush::Wheel {
+            drive: true,
+            steer: true,
+        };
+    }
+
+    // Place the active brush at the cursor (keyboard fallback; the mouse is the primary path).
     if keys.just_pressed(KeyCode::Space) {
         let cell = state.cursor;
         let material = PALETTE[state.material].1;
-        if !state.craft.voxels.iter().any(|v| v.cell == cell) {
-            state.craft.voxels.push(Voxel { cell, material });
-        }
+        let brush = state.brush;
+        let mount = (cell.as_dvec3() + DVec3::splat(0.5)) * state.craft.cell_size;
+        place_brush(&mut state.craft, brush, material, cell, cell, mount);
     }
-    // Remove any voxel or device at the cursor.
+    // Remove any voxel, device, or attached part at the cursor.
     if keys.just_pressed(KeyCode::Backspace) {
         let cell = state.cursor;
+        let center = (cell.as_dvec3() + DVec3::splat(0.5)) * state.craft.cell_size;
         state.craft.voxels.retain(|v| v.cell != cell);
         state.craft.devices.retain(|d| d.cell != cell);
-    }
-    // Cycle the active material.
-    if keys.just_pressed(KeyCode::Tab) {
-        state.material = (state.material + 1) % PALETTE.len();
-        info!("material: {}", PALETTE[state.material].0);
-    }
-    // Place a device at the cursor. `G` is a shortcut for an engine; the digit keys place the
-    // full functional set (WI 604) so a build can be a flyable craft: 1 control point ·
-    // 2 computer · 3 battery · 4 engine · 5 tank. Any places one device per cell (replacing one).
-    let cell = state.cursor;
-    let device = if keys.just_pressed(KeyCode::KeyG) || keys.just_pressed(KeyCode::Digit4) {
-        Some(Device::structural(cell, 100.0, DeviceKind::Engine))
-    } else if keys.just_pressed(KeyCode::Digit1) {
-        Some(Device::control_point(cell, 120.0, true))
-    } else if keys.just_pressed(KeyCode::Digit2) {
-        Some(Device::computer(
-            cell,
-            40.0,
-            ControlComputer::tuning_computer(0.4),
-        ))
-    } else if keys.just_pressed(KeyCode::Digit3) {
-        Some(Device::battery(cell, 60.0, BatterySpec::full(120.0)))
-    } else if keys.just_pressed(KeyCode::Digit5) {
-        Some(Device::structural(cell, 80.0, DeviceKind::Tank))
-    } else {
-        None
-    };
-    if let Some(d) = device {
-        state.craft.devices.retain(|x| x.cell != cell);
-        state.craft.devices.push(d);
+        state
+            .craft
+            .parts
+            .retain(|p| (p.mount - center).length() > 1e-6);
     }
 
     // Save as a blueprint / a reusable subassembly.
@@ -244,6 +348,175 @@ pub(crate) fn editor_input(keys: Res<ButtonInput<KeyCode>>, mut state: ResMut<Ed
                 mp.mass, mp.center_of_mass.x, mp.center_of_mass.y, mp.center_of_mass.z
             );
         }
+    }
+}
+
+/// The voxel/face under the mouse cursor (WI 612): where a left-click adds, where a right-click
+/// removes (None when hovering empty ground), and the cell to highlight.
+#[derive(Clone, Copy)]
+pub(crate) struct Hovered {
+    pub add_cell: IVec3,
+    pub remove_cell: Option<IVec3>,
+    pub highlight: IVec3,
+}
+
+/// The current mouse hover, recomputed each frame (WI 612). `None` when the cursor is off-window or
+/// the ray misses both the craft and the ground plane.
+#[derive(Resource, Default)]
+pub(crate) struct HoverState(pub Option<Hovered>);
+
+/// Ray vs. one axis-aligned cell box; returns the entry distance and the entry-face normal.
+fn ray_aabb(o: Vec3, d: Vec3, min: Vec3, max: Vec3) -> Option<(f32, IVec3)> {
+    let inv = Vec3::new(1.0 / d.x, 1.0 / d.y, 1.0 / d.z);
+    let t1 = (min - o) * inv;
+    let t2 = (max - o) * inv;
+    let tmin = t1.min(t2);
+    let tmax = t1.max(t2);
+    let tnear = tmin.x.max(tmin.y).max(tmin.z);
+    let tfar = tmax.x.min(tmax.y).min(tmax.z);
+    // Require entering from outside the box (tnear ≥ 0) and a valid interval.
+    if !tnear.is_finite() || tnear > tfar || tnear < 0.0 {
+        return None;
+    }
+    let normal = if tnear == tmin.x {
+        IVec3::new(if d.x > 0.0 { -1 } else { 1 }, 0, 0)
+    } else if tnear == tmin.y {
+        IVec3::new(0, if d.y > 0.0 { -1 } else { 1 }, 0)
+    } else {
+        IVec3::new(0, 0, if d.z > 0.0 { -1 } else { 1 })
+    };
+    Some((tnear, normal))
+}
+
+/// Nearest voxel hit by the ray `(o, d)`: the hit cell and the entry-face normal. Brute-force over
+/// the (sparse, modest) voxel set. Crate-visible + pure so it is unit-testable.
+pub(crate) fn raycast_voxels(o: Vec3, d: Vec3, craft: &VoxelCraft) -> Option<(IVec3, IVec3)> {
+    let s = craft.cell_size as f32;
+    let mut best_t = f32::INFINITY;
+    let mut best = None;
+    for v in &craft.voxels {
+        let min = v.cell.as_vec3() * s;
+        let max = (v.cell + IVec3::ONE).as_vec3() * s;
+        if let Some((t, n)) = ray_aabb(o, d, min, max) {
+            if t < best_t {
+                best_t = t;
+                best = Some((v.cell, n));
+            }
+        }
+    }
+    best
+}
+
+/// Mouse orbit/zoom: middle-drag orbits, scroll zooms (WI 612). Left/right buttons stay free for
+/// building. Mutates [`OrbitCam`]; `orbit_camera` then positions the camera. Crate-visible so the
+/// workshop's Build mode runs it under a state run-condition.
+pub(crate) fn mouse_orbit_input(
+    motion: Res<AccumulatedMouseMotion>,
+    scroll: Res<AccumulatedMouseScroll>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    mut cam: ResMut<OrbitCam>,
+) {
+    if buttons.pressed(MouseButton::Middle) {
+        // Horizontal drag orbits (yaw); vertical drag tilts (pitch), allowed below the horizon so
+        // you can look up at the underside of the build.
+        cam.yaw += motion.delta.x * 0.01;
+        cam.pitch = (cam.pitch + motion.delta.y * 0.01).clamp(-1.4, 1.4);
+    }
+    if scroll.delta.y != 0.0 {
+        // Scale the zoom step with distance so it stays usable from 0.1 m builds out to large ones.
+        cam.dist = (cam.dist - scroll.delta.y * cam.dist * 0.1).clamp(0.2, 80.0);
+    }
+}
+
+/// Recompute the mouse hover from the camera ray (WI 612): the hovered voxel + entry face, or a
+/// ground-plane (y=0) cell when the ray misses the craft (so the first voxel can be placed).
+pub(crate) fn update_hover(
+    windows: Query<&Window>,
+    cameras: Query<(&Camera, &GlobalTransform)>,
+    editor: Res<EditorState>,
+    mut hover: ResMut<HoverState>,
+) {
+    hover.0 = None;
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let Some(cursor) = window.cursor_position() else {
+        return;
+    };
+    let Ok((cam, cam_tf)) = cameras.single() else {
+        return;
+    };
+    let Ok(ray) = cam.viewport_to_world(cam_tf, cursor) else {
+        return;
+    };
+    let o = ray.origin;
+    let d = *ray.direction;
+    let s = editor.craft.cell_size as f32;
+
+    if let Some((cell, n)) = raycast_voxels(o, d, &editor.craft) {
+        hover.0 = Some(Hovered {
+            add_cell: cell + n,
+            remove_cell: Some(cell),
+            highlight: cell,
+        });
+    } else if d.y.abs() > 1e-6 {
+        let t = -o.y / d.y;
+        if t > 0.0 {
+            let p = o + d * t;
+            let cell = IVec3::new((p.x / s).floor() as i32, 0, (p.z / s).floor() as i32);
+            hover.0 = Some(Hovered {
+                add_cell: cell,
+                remove_cell: None,
+                highlight: cell,
+            });
+        }
+    }
+}
+
+/// Mouse building (WI 612): left-click adds a voxel of the active material at the hovered face;
+/// right-click removes the hovered voxel and any device/part in that cell.
+pub(crate) fn mouse_build(
+    buttons: Res<ButtonInput<MouseButton>>,
+    hover: Res<HoverState>,
+    mut state: ResMut<EditorState>,
+) {
+    let Some(h) = hover.0 else {
+        return;
+    };
+    if buttons.just_pressed(MouseButton::Left) {
+        let material = PALETTE[state.material].1;
+        let brush = state.brush;
+        // Voxel/wheel go on the clicked face (the empty adjacent cell); a device goes into the
+        // hovered solid cell.
+        let device_cell = h.remove_cell.unwrap_or(h.add_cell);
+        let wheel_mount = (h.add_cell.as_dvec3() + DVec3::splat(0.5)) * state.craft.cell_size;
+        place_brush(
+            &mut state.craft,
+            brush,
+            material,
+            h.add_cell,
+            device_cell,
+            wheel_mount,
+        );
+    }
+    if buttons.just_pressed(MouseButton::Right) {
+        let s = state.craft.cell_size;
+        // Remove the voxel/device in the hovered solid cell.
+        if let Some(cell) = h.remove_cell {
+            state.craft.voxels.retain(|v| v.cell != cell);
+            state.craft.devices.retain(|dd| dd.cell != cell);
+        }
+        // Remove a wheel/part near the hovered cells. Wheels mount on a **face** (the empty adjacent
+        // cell), so they aren't in any voxel cell — check both the hovered cell and the face cell so
+        // a wheel is removable by right-clicking the face it hangs off (the "can't remove wheels" gap).
+        let mut centers = vec![(h.add_cell.as_dvec3() + DVec3::splat(0.5)) * s];
+        if let Some(cell) = h.remove_cell {
+            centers.push((cell.as_dvec3() + DVec3::splat(0.5)) * s);
+        }
+        state
+            .craft
+            .parts
+            .retain(|p| centers.iter().all(|c| (p.mount - *c).length() > 0.6 * s));
     }
 }
 
@@ -335,6 +608,17 @@ pub(crate) fn draw_editor(mut gizmos: Gizmos, state: Res<EditorState>) {
             Color::srgb(1.0, 0.55, 0.0),
         );
     }
+    // Attached wheel parts (dark spheres at their continuous mount; steer wheels tinted).
+    for p in &state.craft.parts {
+        if let PartKind::Wheel(spec) = p.kind {
+            let color = if spec.steer {
+                Color::srgb(0.15, 0.18, 0.28)
+            } else {
+                Color::srgb(0.12, 0.12, 0.14)
+            };
+            gizmos.sphere(p.mount.as_vec3(), spec.radius as f32, color);
+        }
+    }
     // Build cursor (yellow, slightly oversized).
     gizmos.primitive_3d(
         &Cuboid::new(s * 1.06, s * 1.06, s * 1.06),
@@ -383,5 +667,52 @@ pub(crate) fn draw_editor(mut gizmos: Gizmos, state: Res<EditorState>) {
             })
             .collect();
         gizmos.linestrip(points, Color::srgb(0.2, 1.0, 1.0));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raycast_hits_top_face_of_a_voxel() {
+        // A unit voxel at the origin cell; a ray straight down from above its centre.
+        let mut craft = VoxelCraft::new(1.0);
+        craft.voxels.push(Voxel {
+            cell: IVec3::ZERO,
+            material: Material::ALUMINIUM,
+        });
+        let hit = raycast_voxels(Vec3::new(0.5, 5.0, 0.5), Vec3::NEG_Y, &craft);
+        assert_eq!(hit, Some((IVec3::ZERO, IVec3::Y)), "top face, +Y normal");
+    }
+
+    #[test]
+    fn raycast_misses_when_pointing_away() {
+        let mut craft = VoxelCraft::new(1.0);
+        craft.voxels.push(Voxel {
+            cell: IVec3::ZERO,
+            material: Material::ALUMINIUM,
+        });
+        // Ray above the voxel pointing up — never enters the box.
+        assert_eq!(
+            raycast_voxels(Vec3::new(0.5, 5.0, 0.5), Vec3::Y, &craft),
+            None
+        );
+    }
+
+    #[test]
+    fn raycast_nearest_voxel_wins() {
+        let mut craft = VoxelCraft::new(1.0);
+        craft.voxels.push(Voxel {
+            cell: IVec3::ZERO,
+            material: Material::ALUMINIUM,
+        });
+        craft.voxels.push(Voxel {
+            cell: IVec3::new(0, 3, 0),
+            material: Material::ALUMINIUM,
+        });
+        // From far above looking down, the higher voxel (y=3) is hit first.
+        let hit = raycast_voxels(Vec3::new(0.5, 20.0, 0.5), Vec3::NEG_Y, &craft);
+        assert_eq!(hit, Some((IVec3::new(0, 3, 0), IVec3::Y)));
     }
 }

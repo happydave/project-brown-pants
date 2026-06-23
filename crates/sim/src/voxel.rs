@@ -212,6 +212,104 @@ pub struct MassProperties {
     pub principal_axes: DMat3,
 }
 
+/// A non-voxel **catalog part** attached to a chassis at a continuous body-frame
+/// pose (WI 607). Unlike a [`Device`] (locked to an integer lattice cell), a part
+/// mounts at an arbitrary sub-cell offset — which is why wheels (and seat / antenna /
+/// solar / bumper) are parts, not devices: the rover core mounts wheels at sub-cell,
+/// outboard positions a cell grid cannot express. A part contributes mass and
+/// (point-mass, parallel-axis) inertia like a device, and is render-relevant; a
+/// [`PartKind::Wheel`] is additionally physics-relevant (it becomes a rover wheel).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Part {
+    /// Mount position in the craft's local (lattice) frame, metres — the same frame
+    /// as [`Voxel::cell`] centres. Assembly subtracts the centre of mass to get the
+    /// body-frame (CoM-relative) mount the rover core expects.
+    pub mount: DVec3,
+    /// Part mass, kg.
+    pub mass: f64,
+    /// What the part is (and its kind-specific parameters).
+    pub kind: PartKind,
+}
+
+/// The kind of a catalog [`Part`] (WI 607). `Wheel` carries the physical and
+/// group parameters that assembly turns into a rover wheel; the remaining kinds are
+/// inert mass with a recognisable role (their meshes land in WI 608).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartKind {
+    /// A wheel + suspension + tire — the one physics-relevant part.
+    Wheel(WheelPart),
+    /// A crew seat (recognisability; crew/control comes from a control point device).
+    Seat,
+    /// A communications antenna (cosmetic now; a comms model is later).
+    Antenna,
+    /// A solar panel (electric charging is wired in the powertrain WI 609).
+    SolarPanel,
+    /// A bumper (structure that reads as a rover and breaks on impact, WI 610).
+    Bumper,
+}
+
+/// Physical and drivetrain parameters of a [`PartKind::Wheel`] (WI 607). The
+/// physical fields mirror [`crate::rover::Wheel`]'s suspension/tire parameters so
+/// assembly maps a wheel part straight onto a rover wheel; the group flags record
+/// the drivetrain membership the rover Test path commands (drive torque / steering)
+/// by group rather than by hard-coded index.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WheelPart {
+    /// Wheel radius (m).
+    pub radius: f64,
+    /// Suspension free length (m).
+    pub rest_length: f64,
+    /// Spring stiffness (N/m).
+    pub stiffness: f64,
+    /// Suspension damping (N·s/m).
+    pub damping: f64,
+    /// Maximum suspension normal force (N).
+    pub max_force: f64,
+    /// Wheel rotational inertia (kg·m²).
+    pub wheel_inertia: f64,
+    /// In the drive group (receives engine/motor torque).
+    pub drive: bool,
+    /// In the steer group (turns with steering input).
+    pub steer: bool,
+}
+
+impl WheelPart {
+    /// A wheel part with the rover core's sensible defaults (mirrors
+    /// [`crate::rover::Wheel::new`]); `drive`/`steer` choose the drivetrain groups.
+    pub fn new(drive: bool, steer: bool) -> Self {
+        Self {
+            radius: 0.35,
+            rest_length: 0.35,
+            stiffness: 4.5e4,
+            damping: 8.0e3,
+            max_force: 1.0e6,
+            wheel_inertia: 8.0,
+            drive,
+            steer,
+        }
+    }
+
+    /// A wheel part sized to the build's `cell_size` (WI 612 feedback): radius and suspension
+    /// travel scale with the cell so a 0.1 m build gets small wheels on short suspension, not
+    /// metre-scale stilts. The force parameters (`stiffness`/`damping`/`max_force`) are placeholders
+    /// — [`crate::rover::assemble_rover`] re-sizes them to the assembled rover's mass.
+    pub fn for_cell_size(cell_size: f64, drive: bool, steer: bool) -> Self {
+        let radius = 1.5 * cell_size;
+        Self {
+            radius,
+            rest_length: 0.5 * cell_size,
+            stiffness: 4.5e4,
+            damping: 8.0e3,
+            max_force: 1.0e6,
+            // ~ m·r² for a light wheel; keeps spin-up responsive at small scale.
+            wheel_inertia: (radius * radius * 40.0).max(0.05),
+            drive,
+            steer,
+        }
+    }
+}
+
 /// A craft: a sparse voxel lattice with devices and subassembly attachment points.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VoxelCraft {
@@ -227,6 +325,10 @@ pub struct VoxelCraft {
     /// WI 519). Defaulted on load so pre-doors saves stay backward-loadable.
     #[serde(default)]
     pub doors: Vec<Door>,
+    /// Attached catalog parts (wheels, seat, antenna, solar, bumper — WI 607).
+    /// Defaulted on load so pre-parts saves stay backward-loadable.
+    #[serde(default)]
+    pub parts: Vec<Part>,
 }
 
 impl Default for VoxelCraft {
@@ -237,6 +339,7 @@ impl Default for VoxelCraft {
             devices: Vec::new(),
             attachments: Vec::new(),
             doors: Vec::new(),
+            parts: Vec::new(),
         }
     }
 }
@@ -288,6 +391,10 @@ impl VoxelCraft {
             mass += d.mass;
             moment += d.mass * self.cell_center(d.cell);
         }
+        for p in &self.parts {
+            mass += p.mass;
+            moment += p.mass * p.mount;
+        }
         if mass <= 0.0 {
             return None;
         }
@@ -315,6 +422,17 @@ impl VoxelCraft {
         for d in &self.devices {
             let m = d.mass;
             let r = self.cell_center(d.cell) - com;
+            ixx += m * (r.y * r.y + r.z * r.z);
+            iyy += m * (r.x * r.x + r.z * r.z);
+            izz += m * (r.x * r.x + r.y * r.y);
+            ixy -= m * r.x * r.y;
+            ixz -= m * r.x * r.z;
+            iyz -= m * r.y * r.z;
+        }
+        // Attached parts as point masses at their continuous mount (parallel-axis).
+        for p in &self.parts {
+            let m = p.mass;
+            let r = p.mount - com;
             ixx += m * (r.y * r.y + r.z * r.z);
             iyy += m * (r.x * r.x + r.z * r.z);
             izz += m * (r.x * r.x + r.y * r.y);
@@ -481,6 +599,32 @@ mod tests {
         assert!((mp.mass - 8_000.0).abs() < 1e-6);
         // centre at the cell centre (1,1,1) for a 2 m cell at origin.
         assert!((mp.center_of_mass - DVec3::splat(1.0)).length() < 1e-9);
+    }
+
+    #[test]
+    fn attached_part_shifts_com_and_inertia() {
+        // A symmetric block: CoM at its geometric centre, finite inertia.
+        let base = block(2, 2, 2, 1.0, Material::COMPOSITE);
+        let mp0 = base.mass_properties().unwrap();
+
+        // Mount a heavy part outboard (+x) and low (−y) of the block.
+        let mut craft = base.clone();
+        let mount = DVec3::new(4.0, -1.0, 1.0);
+        craft.parts.push(Part {
+            mount,
+            mass: 500.0,
+            kind: PartKind::Wheel(WheelPart::new(true, false)),
+        });
+        let mp = craft.mass_properties().unwrap();
+
+        // Mass grows by exactly the part mass.
+        assert!((mp.mass - (mp0.mass + 500.0)).abs() < 1e-9);
+        // CoM shifts toward the part: +x and −y of the bare centre.
+        assert!(mp.center_of_mass.x > mp0.center_of_mass.x);
+        assert!(mp.center_of_mass.y < mp0.center_of_mass.y);
+        // The outboard mass raises the moments about the axes orthogonal to its offset
+        // (parallel-axis): an outboard +x/−y mass increases izz (about z).
+        assert!(mp.inertia.col(2).z > mp0.inertia.col(2).z);
     }
 
     #[test]

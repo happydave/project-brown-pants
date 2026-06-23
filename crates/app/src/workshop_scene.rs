@@ -10,21 +10,29 @@
 //!   hard crash (`breakage::fracture_on_impact`), substep-capped near the surface
 //!   (`warp::safe_substep_dt`). `Backspace` rebuilds the test craft.
 //!
-//! Build and Test are different coordinate worlds (the editor works near the origin; Test runs in
-//! planetary coordinates with floating origin), so each mode spawns and despawns its own entities
-//! on transition — they never coexist. **Test flies what you built** (WI 604): entering Test
-//! assembles the Build lattice into a `FlightCraft` (mass/inertia/skin from the voxels, engines
-//! from `Engine` devices, control from `assemble_control`) and drops it on the pad; a build with
-//! no control point is uncontrolled.
+//! **Test drives what you built if it's a rover** (WI 607): when the Build lattice carries wheel
+//! parts (placed with `6`/`7`), entering Test assembles a `rover::Rover` (mass/inertia from the
+//! voxels + parts, wheels from the wheel parts, drive/steer groups from their flags) and drives it
+//! on a flat pad via `rover::Rover::step` — rendered rover-anchored with gizmos and a fixed chase
+//! camera, like `-- rover`. Otherwise Test **flies** the build as a `FlightCraft` (WI 604). The
+//! rover-vs-rocket discriminator is `rover::assemble_rover` returning Some (wheels ⇒ rover).
 //!
-//! Test controls: Shift/Ctrl throttle · Z/X full/cut · W/S/A/D/Q/E attitude · T SAS · F off ·
-//! `,`/`.` warp · Backspace reset. Build controls: arrows/PageUp-Dn cursor · Space add ·
-//! Backspace remove · Tab material · Q/E/R/F/Z/C camera.
+//! Build and Test are different coordinate worlds (the editor works near the origin; the rocket
+//! Test runs in planetary coordinates with floating origin; the rover Test is rover-anchored), so
+//! each mode spawns and despawns its own entities on transition — they never coexist.
+//!
+//! Test controls (rocket): Shift/Ctrl throttle · Z/X full/cut · W/S/A/D/Q/E attitude · T SAS ·
+//! F off · `,`/`.` warp · Backspace reset. Test controls (rover): W/S drive · A/D steer ·
+//! Space brake · Backspace reset. Build controls (WI 612): **mouse** — left-click places the active
+//! brush on the hovered face, right-click removes, middle-drag orbits, scroll zooms. The brush is
+//! chosen with Tab (material) and 1-7 (1 control · 2 computer · 3 battery · 4 engine · 5 tank ·
+//! 6/7 wheel drive / drive+steer); the craft renders as a **solid** mesh, gizmos only overlay the
+//! CoM / inertia axes / hover. Arrows + Space remain a keyboard fallback.
 
 use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::light::{light_consts::lux, AtmosphereEnvironmentMapLight};
-use bevy::math::DVec3;
+use bevy::math::{DVec3, Isometry3d};
 use bevy::pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium};
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
@@ -46,11 +54,16 @@ use sounding_sim::launch::LaunchPad;
 use sounding_sim::medium::max_cross_section;
 use sounding_sim::propulsion::{Engine, EngineCommand, Propulsion};
 use sounding_sim::resource::{Reservoir, ReservoirId, ResourceGraph, ResourceType};
+use sounding_sim::rover::{assemble_rover, Rover, RoverAssembly, SUBSTEP_DT as ROVER_SUBSTEP_DT};
 use sounding_sim::sim::CentralBody;
-use sounding_sim::voxel::{Device, DeviceKind, Material, Voxel, VoxelCraft};
+use sounding_sim::terrain::Terrain;
+use sounding_sim::voxel::{Device, DeviceKind, Material, PartKind, Voxel, VoxelCraft};
 use sounding_sim::warp::safe_substep_dt;
 
-use crate::editor::{draw_editor, editor_input, orbit_camera, EditorState, OrbitCam};
+use crate::editor::{
+    editor_input, material_label, mouse_build, mouse_orbit_input, orbit_camera, update_hover,
+    Brush, EditorState, HoverState, OrbitCam,
+};
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
 use crate::voxel_skin::{build_skin_mesh, material_set_for, pbr_material, VoxelSkin};
 
@@ -83,6 +96,36 @@ enum CraftState {
     Fractured,
 }
 
+/// Rover acceleration gravity in the workshop (m/s²).
+const ROVER_GRAVITY: f64 = 9.81;
+/// Max rover physics substeps per frame (the rover sub-steps far finer than the rocket path).
+const ROVER_MAX_SUBSTEPS: u32 = 64;
+/// Drive torque per kg of rover mass at full throttle (N·m/kg) — scaled with mass so any build has
+/// enough authority to actually move off the line (rather than a fixed torque a heavy build ignores).
+const ROVER_DRIVE_PER_KG: f64 = 4.0;
+/// Brake torque per kg of rover mass (N·m/kg).
+const ROVER_BRAKE_PER_KG: f64 = 9.0;
+/// Steering angle applied to the steer-group wheels (rad).
+const ROVER_STEER: f64 = 0.35;
+
+/// The grounded workshop Test state for a **rover** build (WI 607): the assembled rover, its
+/// (flat) pad terrain, the drivetrain groups, the source lattice (for reset), and a substep
+/// accumulator. Present only when the build is a rover; the rocket path leaves it `None`.
+struct RoverState {
+    rover: Rover,
+    terrain: Terrain,
+    drive: Vec<usize>,
+    steer: Vec<usize>,
+    lattice: VoxelCraft,
+    unwired_thrust_engines: usize,
+    accumulator: f64,
+    /// World-space breadcrumb trail the rover leaves, so motion is visible against the
+    /// (otherwise self-similar, rover-anchored) flat ground.
+    track: Vec<DVec3>,
+    /// Substep counter for sampling the trail.
+    record: u32,
+}
+
 /// The grounded workshop Test state: one controllable craft, or its debris after a crash.
 #[derive(Resource)]
 struct WorkshopWorld {
@@ -96,13 +139,16 @@ struct WorkshopWorld {
     state: CraftState,
     fragments: Vec<(VoxelCraft, ActiveBody)>,
     dirty: bool,
+    /// When the build is a rover, its rover state; `None` for a rocket (the existing path).
+    rover: Option<RoverState>,
 }
 
 /// The default workshop craft as an **editable lattice**: a 2×2×2 "test frame" with a control
 /// point, a computer, a battery, an engine, and a tank — so it assembles into a flyable craft and
 /// the player can edit it in Build mode. Seeds the workshop's `EditorState`.
 fn default_lattice() -> VoxelCraft {
-    let mut v = VoxelCraft::new(1.0);
+    // 0.1 m cells — fine enough to build vehicles, not castles (WI 612 feedback).
+    let mut v = VoxelCraft::new(0.1);
     for x in 0..2 {
         for y in 0..2 {
             for z in 0..2 {
@@ -248,6 +294,7 @@ impl WorkshopWorld {
             state: CraftState::Intact,
             fragments: Vec::new(),
             dirty: true,
+            rover: None,
         }
     }
 
@@ -266,9 +313,62 @@ impl WorkshopWorld {
         Self::wrap(craft, body, pad)
     }
 
-    /// Rebuild the *current* test craft on the pad (the Backspace reset), re-assembling from the
-    /// same lattice it was flying.
+    /// A Test world **driving** an assembled rover (WI 607), resting on a flat pad terrain. The
+    /// rocket fields carry a harmless placeholder craft (never stepped — the rover branch handles
+    /// stepping/render/input); `rover` is `Some`.
+    fn rover(asm: RoverAssembly, lattice: VoxelCraft) -> Self {
+        let mut world = Self::new();
+        let terrain = Terrain {
+            amplitude: 0.0,
+            ..Default::default()
+        };
+        let mut rover = asm.rover;
+        // Rest the rover on the pad: place the CoM (`body.position`) high enough that **both** every
+        // wheel hub sits at its suspension free length above the surface **and** the chassis bottom
+        // clears the ground — so it never spawns partly underground (the "front falls through" bug),
+        // then it settles a little under load.
+        let ground = terrain.height(0.0, 0.0);
+        let wheel_drop = rover
+            .wheels
+            .iter()
+            .map(|w| w.rest_length + w.radius - w.mount.y)
+            .fold(0.0_f64, f64::max);
+        // Distance from the CoM down to the lowest chassis voxel (CoM-relative), so the chassis
+        // bottom lands at/above the ground.
+        let chassis_drop = lattice
+            .mass_properties()
+            .map(|mp| {
+                let min_cell_y = lattice.voxels.iter().map(|v| v.cell.y).min().unwrap_or(0) as f64
+                    * lattice.cell_size;
+                mp.center_of_mass.y - min_cell_y
+            })
+            .unwrap_or(0.0);
+        let drop = wheel_drop.max(chassis_drop) + 0.05;
+        rover.body.position = DVec3::new(0.0, ground + drop, 0.0);
+        world.rover = Some(RoverState {
+            rover,
+            terrain,
+            drive: asm.drive,
+            steer: asm.steer,
+            lattice,
+            unwired_thrust_engines: asm.unwired_thrust_engines,
+            accumulator: 0.0,
+            track: Vec::new(),
+            record: 0,
+        });
+        world
+    }
+
+    /// Rebuild the *current* test craft on the pad (the Backspace reset). For a rover, re-assemble
+    /// from its source lattice; otherwise re-assemble the flight craft from the lattice it flew.
     fn reset(&mut self) {
+        if let Some(rs) = &self.rover {
+            let lattice = rs.lattice.clone();
+            if let Some(asm) = assemble_rover(&lattice, DVec3::ZERO, ROVER_GRAVITY) {
+                *self = Self::rover(asm, lattice);
+                return;
+            }
+        }
         let voxels = self.craft.voxels.clone();
         *self = Self::from_lattice(&voxels);
     }
@@ -423,6 +523,9 @@ struct FragmentMarker(usize);
 struct TestHud;
 #[derive(Component)]
 struct BuildHud;
+/// Tags a solid mesh entity rendering part of the Build craft (rebuilt on edit).
+#[derive(Component)]
+struct BuildMesh;
 
 /// The grounded build-and-test workshop scene.
 pub struct WorkshopScenePlugin;
@@ -438,9 +541,11 @@ impl Plugin for WorkshopScenePlugin {
                 craft: default_lattice(),
                 cursor: IVec3::new(0, 2, 0),
                 material: 0,
+                brush: Brush::default(),
                 subassembly: None,
             })
             .init_resource::<OrbitCam>()
+            .init_resource::<HoverState>()
             .add_systems(OnEnter(WorkshopMode::Build), enter_build)
             .add_systems(OnExit(WorkshopMode::Build), exit_build)
             .add_systems(OnEnter(WorkshopMode::Test), enter_test)
@@ -448,7 +553,17 @@ impl Plugin for WorkshopScenePlugin {
             .add_systems(Update, toggle_mode)
             .add_systems(
                 Update,
-                (editor_input, draw_editor, orbit_camera, update_build_hud)
+                (
+                    editor_input,
+                    mouse_orbit_input,
+                    update_hover,
+                    mouse_build,
+                    orbit_camera,
+                    sync_build_meshes,
+                    draw_build_overlays,
+                    update_build_hud,
+                )
+                    .chain()
                     .run_if(in_state(WorkshopMode::Build)),
             )
             .add_systems(
@@ -459,6 +574,7 @@ impl Plugin for WorkshopScenePlugin {
                     reconcile_meshes,
                     track_meshes,
                     follow_camera,
+                    draw_rover,
                     update_test_hud,
                 )
                     .chain()
@@ -484,8 +600,27 @@ fn toggle_mode(
 // --- Build mode ---
 
 fn enter_build(mut commands: Commands) {
-    // The editor's orbit camera (positioned each frame by `orbit_camera`); gizmos are unlit.
-    commands.spawn((Camera3d::default(), Transform::default(), BuildEntity));
+    // The editor's orbit camera (positioned each frame by `orbit_camera`). An ambient term on the
+    // camera (Bevy 0.18 makes AmbientLight per-camera) fills shadowed faces of the solid build mesh.
+    commands.spawn((
+        Camera3d::default(),
+        Transform::default(),
+        AmbientLight {
+            brightness: 250.0,
+            ..default()
+        },
+        BuildEntity,
+    ));
+    // A sun so the solid (PBR) build meshes are lit.
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 8_000.0,
+            shadows_enabled: true,
+            ..default()
+        },
+        Transform::from_xyz(6.0, 14.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y),
+        BuildEntity,
+    ));
     commands.spawn((
         Text::new("workshop · BUILD"),
         TextFont {
@@ -504,7 +639,7 @@ fn enter_build(mut commands: Commands) {
     ));
     commands.spawn((
         Text::new(
-            "arrows/PgUp-Dn cursor · Space add · Backspace remove · Tab material · 1-5 devices (ctrl/cpu/batt/engine/tank) · QE/RF/ZC camera · Enter → TEST (fly it)",
+            "MOUSE: left-click place brush · right-click remove · middle-drag orbit · scroll zoom. Brush: Tab material · 1 ctrl · 2 cpu · 3 batt · 4 engine · 5 tank · 6/7 wheel · Enter → TEST (4 wheels ⇒ drive it)",
         ),
         TextFont {
             font_size: 14.0,
@@ -534,14 +669,147 @@ fn update_build_hud(editor: Res<EditorState>, mut hud: Query<&mut Text, With<Bui
             .mass_properties()
             .map(|mp| mp.mass)
             .unwrap_or(0.0);
+        let brush = match editor.brush {
+            Brush::Voxel => format!("voxel ({})", material_label(editor.material)),
+            other => other.label().to_string(),
+        };
         text.0 = format!(
-            "workshop · BUILD\nvoxels:  {}\ndevices: {}\nmass:    {mass:.0} kg\ncursor:  ({}, {}, {})",
+            "workshop · BUILD\nbrush:   {brush}\nvoxels:  {}\ndevices: {}\nwheels:  {}\nmass:    {mass:.0} kg",
             editor.craft.voxels.len(),
             editor.craft.devices.len(),
-            editor.cursor.x,
-            editor.cursor.y,
-            editor.cursor.z,
+            editor.craft.parts.len(),
         );
+    }
+}
+
+/// Rebuilds the **solid** Build meshes when the lattice changes (WI 612): the hull via the skin
+/// pipeline (the same one the rocket Test uses), devices as small cubes, wheel parts as cylinders.
+/// Replaces the old wireframe-cuboid gizmos; overlays (CoM / axes / cursor) stay gizmos.
+fn sync_build_meshes(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    editor: Res<EditorState>,
+    existing: Query<Entity, With<BuildMesh>>,
+) {
+    // Rebuild on edit, and whenever the meshes are missing (e.g. after re-entering Build).
+    if !editor.is_changed() && !existing.is_empty() {
+        return;
+    }
+    for e in &existing {
+        commands.entity(e).despawn();
+    }
+
+    let s = editor.craft.cell_size as f32;
+    // Solid hull from the voxels (same skin + PBR pipeline as the rocket Test).
+    if !editor.craft.voxels.is_empty() {
+        let hull = pbr_material(
+            material_set_for(Material::ALUMINIUM),
+            &asset_server,
+            &mut materials,
+        );
+        let mesh = meshes.add(build_skin_mesh(&editor.craft, VoxelSkin::Hull));
+        commands.spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(hull),
+            Transform::default(),
+            BuildMesh,
+            BuildEntity,
+        ));
+    }
+    // Devices: small orange cubes at their cell centres.
+    let dev_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.55, 0.0),
+        perceptual_roughness: 0.8,
+        ..default()
+    });
+    for d in &editor.craft.devices {
+        let c = ((d.cell.as_dvec3() + DVec3::splat(0.5)) * editor.craft.cell_size).as_vec3();
+        let m = meshes.add(Mesh::from(Cuboid::new(s * 0.55, s * 0.55, s * 0.55)));
+        commands.spawn((
+            Mesh3d(m),
+            MeshMaterial3d(dev_mat.clone()),
+            Transform::from_translation(c),
+            BuildMesh,
+            BuildEntity,
+        ));
+    }
+    // Wheel parts: dark cylinders at their mount, axis along X (the spin axis).
+    let wheel_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.10, 0.10, 0.13),
+        perceptual_roughness: 0.9,
+        ..default()
+    });
+    for p in &editor.craft.parts {
+        if let PartKind::Wheel(spec) = p.kind {
+            let m = meshes.add(Mesh::from(Cylinder::new(
+                spec.radius as f32,
+                (spec.radius * 0.6) as f32,
+            )));
+            let tf = Transform::from_translation(p.mount.as_vec3())
+                .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2));
+            commands.spawn((
+                Mesh3d(m),
+                MeshMaterial3d(wheel_mat.clone()),
+                tf,
+                BuildMesh,
+                BuildEntity,
+            ));
+        }
+    }
+}
+
+/// Draws Build **overlays** as gizmos (WI 612): the mouse hover highlight + add-ghost, the keyboard
+/// cursor, and the derived CoM / principal inertia axes. The solid geometry itself is meshes
+/// (`sync_build_meshes`); gizmos are only for these overlays.
+fn draw_build_overlays(mut gizmos: Gizmos, editor: Res<EditorState>, hover: Res<HoverState>) {
+    let s = editor.craft.cell_size as f32;
+    let cc = |c: IVec3| ((c.as_dvec3() + DVec3::splat(0.5)) * editor.craft.cell_size).as_vec3();
+
+    // Keyboard cursor (faint yellow) — the precise fallback.
+    gizmos.primitive_3d(
+        &Cuboid::new(s * 1.04, s * 1.04, s * 1.04),
+        cc(editor.cursor),
+        Color::srgba(1.0, 1.0, 0.1, 0.45),
+    );
+    // Mouse hover: highlight the hovered cell and ghost where a click would add.
+    if let Some(h) = hover.0 {
+        gizmos.primitive_3d(
+            &Cuboid::new(s * 1.08, s * 1.08, s * 1.08),
+            cc(h.highlight),
+            Color::srgb(0.2, 1.0, 0.45),
+        );
+        gizmos.primitive_3d(
+            &Cuboid::new(s * 0.94, s * 0.94, s * 0.94),
+            cc(h.add_cell),
+            Color::srgba(0.2, 1.0, 0.45, 0.4),
+        );
+    }
+
+    if let Some(mp) = editor.craft.mass_properties() {
+        let com = mp.center_of_mass.as_vec3();
+        gizmos.sphere(com, s * 0.3, Color::srgb(1.0, 0.1, 1.0));
+        // Forward indicator: +Z is the assembled craft/rover's forward (cyan arrow).
+        let fwd_len = (s * 5.0).max(1.5);
+        gizmos.arrow(com, com + Vec3::Z * fwd_len, Color::srgb(0.1, 0.8, 1.0));
+        let colors = [
+            Color::srgb(1.0, 0.3, 0.3),
+            Color::srgb(0.3, 1.0, 0.3),
+            Color::srgb(0.4, 0.5, 1.0),
+        ];
+        let moments = [
+            mp.principal_moments.x,
+            mp.principal_moments.y,
+            mp.principal_moments.z,
+        ];
+        let max_m = moments.iter().cloned().fold(0.0_f64, f64::max).max(1e-9);
+        for i in 0..3 {
+            let axis = mp.principal_axes.col(i).as_vec3().normalize_or_zero();
+            let len = s * 2.5 * (moments[i] / max_m).sqrt() as f32;
+            gizmos.line(com, com + axis * len, colors[i]);
+            gizmos.line(com, com - axis * len, colors[i]);
+        }
     }
 }
 
@@ -556,8 +824,62 @@ fn enter_test(
     mut world: ResMut<WorkshopWorld>,
     editor: Res<EditorState>,
 ) {
-    // Fly **what was built**: assemble the editor's lattice into a fresh craft on the pad
-    // (WI 604). An empty/unassemblable build falls back to the default craft.
+    // Drive **what was built** if it is a rover (the build has wheel parts): assemble a rover and
+    // run the rover Test path (rover-anchored gizmos + a fixed chase camera, the proven
+    // `-- rover` rendering). The rover-vs-rocket discriminator is `assemble_rover` returning Some.
+    if let Some(asm) = assemble_rover(&editor.craft, DVec3::ZERO, ROVER_GRAVITY) {
+        *world = WorkshopWorld::rover(asm, editor.craft.clone());
+        // A fixed chase camera: the rover is rendered anchored at its own position, so a static
+        // camera keeps it framed while the terrain scrolls beneath it.
+        commands.spawn((
+            Camera3d::default(),
+            Transform::from_xyz(0.0, 7.0, -16.0).looking_at(Vec3::new(0.0, 1.0, 4.0), Vec3::Y),
+            TestEntity,
+        ));
+        commands.spawn((
+            DirectionalLight {
+                illuminance: 8_000.0,
+                ..default()
+            },
+            Transform::from_xyz(6.0, 14.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
+            TestEntity,
+        ));
+        commands.spawn((
+            Text::new("workshop · TEST (rover)"),
+            TextFont {
+                font_size: 18.0,
+                ..default()
+            },
+            TextColor(Color::srgb(0.9, 0.95, 1.0)),
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(10.0),
+                left: Val::Px(12.0),
+                ..default()
+            },
+            TestHud,
+            TestEntity,
+        ));
+        commands.spawn((
+            Text::new("W/S drive · A/D steer · Space brake · Backspace reset · Enter → BUILD"),
+            TextFont {
+                font_size: 14.0,
+                ..default()
+            },
+            TextColor(Color::srgb(0.7, 0.75, 0.8)),
+            Node {
+                position_type: PositionType::Absolute,
+                bottom: Val::Px(10.0),
+                left: Val::Px(12.0),
+                ..default()
+            },
+            TestEntity,
+        ));
+        return;
+    }
+
+    // Otherwise fly **what was built**: assemble the editor's lattice into a fresh craft on the
+    // pad (WI 604). An empty/unassemblable build falls back to the default craft.
     *world = WorkshopWorld::from_lattice(&editor.craft);
 
     let ground =
@@ -642,6 +964,10 @@ fn workshop_input(
         world.reset();
         return;
     }
+    if world.rover.is_some() {
+        drive_rover(&keys, &mut world);
+        return;
+    }
     if world.state != CraftState::Intact {
         return; // debris isn't controllable
     }
@@ -711,7 +1037,63 @@ fn workshop_input(
     }
 }
 
+/// Drive the rover by **group**: throttle the drive wheels, steer the steer wheels, brake all.
+fn drive_rover(keys: &ButtonInput<KeyCode>, world: &mut WorkshopWorld) {
+    let Some(rs) = world.rover.as_mut() else {
+        return;
+    };
+    // Scale drive/brake with mass so a device-laden build still moves (fixed torque was too weak).
+    let drive = rs.rover.body.mass * ROVER_DRIVE_PER_KG;
+    let throttle = if keys.pressed(KeyCode::KeyW) {
+        drive
+    } else if keys.pressed(KeyCode::KeyS) {
+        -drive
+    } else {
+        0.0
+    };
+    let steer = if keys.pressed(KeyCode::KeyA) {
+        ROVER_STEER
+    } else if keys.pressed(KeyCode::KeyD) {
+        -ROVER_STEER
+    } else {
+        0.0
+    };
+    let brake = if keys.pressed(KeyCode::Space) {
+        rs.rover.body.mass * ROVER_BRAKE_PER_KG
+    } else {
+        0.0
+    };
+    for (i, w) in rs.rover.wheels.iter_mut().enumerate() {
+        w.drive_torque = if rs.drive.contains(&i) { throttle } else { 0.0 };
+        w.steer = if rs.steer.contains(&i) { steer } else { 0.0 };
+        w.brake = brake;
+    }
+}
+
 fn step_workshop(time: Res<Time>, mut world: ResMut<WorkshopWorld>) {
+    if world.rover.is_some() {
+        let frame_dt = time.delta_secs_f64();
+        let rs = world.rover.as_mut().expect("rover present");
+        rs.accumulator += frame_dt;
+        let terrain = rs.terrain;
+        let mut n = 0;
+        while rs.accumulator >= ROVER_SUBSTEP_DT && n < ROVER_MAX_SUBSTEPS {
+            rs.rover.step(&terrain, ROVER_SUBSTEP_DT);
+            rs.accumulator -= ROVER_SUBSTEP_DT;
+            n += 1;
+            // Drop a breadcrumb under the rover every so often (motion reference).
+            rs.record += 1;
+            if rs.record.is_multiple_of(48) {
+                let p = rs.rover.body.position;
+                rs.track
+                    .push(DVec3::new(p.x, rs.terrain.height(p.x, p.z), p.z));
+                if rs.track.len() > 400 {
+                    rs.track.remove(0);
+                }
+            }
+        }
+        return;
+    }
     world.accumulator += time.delta_secs_f64() * world.warp;
     let mut n = 0;
     while world.accumulator >= SUBSTEP_DT && n < MAX_SUBSTEPS {
@@ -740,6 +1122,11 @@ fn reconcile_meshes(
     craft_q: Query<Entity, With<CraftMarker>>,
     frag_q: Query<Entity, With<FragmentMarker>>,
 ) {
+    // The rover path renders with gizmos (`draw_rover`); no skin meshes to reconcile.
+    if world.rover.is_some() {
+        world.dirty = false;
+        return;
+    }
     if !world.dirty {
         return;
     }
@@ -798,6 +1185,9 @@ fn track_meshes(
         Query<(&FragmentMarker, &mut WorldPlacement, &mut Transform)>,
     )>,
 ) {
+    if world.rover.is_some() {
+        return; // rover meshes are gizmos, not tracked entities
+    }
     match world.state {
         CraftState::Intact => {
             if let Ok((mut wp, mut tf)) = sets.p0().single_mut() {
@@ -827,6 +1217,9 @@ fn follow_camera(
     world: Res<WorkshopWorld>,
     mut camera: Query<(&mut Transform, &mut WorldPlacement), With<AnchorCamera>>,
 ) {
+    if world.rover.is_some() {
+        return; // the rover uses a fixed chase camera (rover-anchored rendering)
+    }
     if let Ok((mut tf, mut placement)) = camera.single_mut() {
         let target = world.focus();
         let eye = target + DVec3::new(14.0, 7.0, 16.0);
@@ -838,8 +1231,109 @@ fn follow_camera(
     }
 }
 
+/// Draws the rover, its wheels/suspension, and a terrain grid as gizmos, **rover-anchored**
+/// (everything is drawn relative to the rover so the fixed chase camera keeps it framed). Mirrors
+/// the `-- rover` scene; the recognisable wheel/chassis meshes arrive in WI 608.
+fn draw_rover(mut gizmos: Gizmos, world: Res<WorkshopWorld>) {
+    let Some(rs) = &world.rover else {
+        return;
+    };
+    let body = &rs.rover.body;
+    let anchor = body.position;
+    let to_render = |p: DVec3| (p - anchor).as_vec3();
+    let terrain = &rs.terrain;
+
+    // Terrain grid, **world-locked** (snapped to world coordinates) so it scrolls under the rover as
+    // it drives — a rover-relative grid looks identical everywhere on flat ground (the "feels like
+    // sitting still" bug).
+    let step = 1.0;
+    let n = 18;
+    let base_x = (anchor.x / step).round() * step;
+    let base_z = (anchor.z / step).round() * step;
+    let grid = Color::srgb(0.30, 0.26, 0.22);
+    for i in -n..=n {
+        let mut row = Vec::new();
+        let mut col = Vec::new();
+        for j in -n..=n {
+            let (xi, zj) = (base_x + i as f64 * step, base_z + j as f64 * step);
+            let (xj, zi) = (base_x + j as f64 * step, base_z + i as f64 * step);
+            row.push(to_render(DVec3::new(xi, terrain.height(xi, zj), zj)));
+            col.push(to_render(DVec3::new(xj, terrain.height(xj, zi), zi)));
+        }
+        gizmos.linestrip(row, grid);
+        gizmos.linestrip(col, grid);
+    }
+
+    // Breadcrumb trail (world-space) — recedes behind the rover as it moves.
+    if rs.track.len() > 1 {
+        gizmos.linestrip(
+            rs.track.iter().map(|p| to_render(*p)),
+            Color::srgb(0.9, 0.7, 0.2),
+        );
+    }
+
+    // Chassis: a cuboid sized to the lattice extent, at the CoM, oriented with the body.
+    let s = rs.lattice.cell_size;
+    let mut lo = IVec3::splat(i32::MAX);
+    let mut hi = IVec3::splat(i32::MIN);
+    for v in &rs.lattice.voxels {
+        lo = lo.min(v.cell);
+        hi = hi.max(v.cell);
+    }
+    if hi.x >= lo.x {
+        let extent = (hi - lo + IVec3::ONE).as_dvec3() * s;
+        gizmos.primitive_3d(
+            &Cuboid::new(extent.x as f32, extent.y as f32, extent.z as f32),
+            Isometry3d::new(to_render(body.position), body.orientation.as_quat()),
+            Color::srgb(0.80, 0.81, 0.86),
+        );
+    }
+
+    // Forward indicator: +Z in the body frame (cyan arrow).
+    let fwd = body.orientation * DVec3::Z;
+    gizmos.arrow(
+        to_render(body.position),
+        to_render(body.position + fwd * 3.0),
+        Color::srgb(0.1, 0.8, 1.0),
+    );
+
+    // Wheels: a dark sphere at each contact point, with the suspension leg from the hub.
+    for w in &rs.rover.wheels {
+        let hub = body.position + body.orientation * w.mount;
+        let ground = terrain.height(hub.x, hub.z);
+        let contact = DVec3::new(hub.x, ground, hub.z);
+        gizmos.line(
+            to_render(hub),
+            to_render(contact),
+            Color::srgb(0.5, 0.5, 0.55),
+        );
+        gizmos.sphere(
+            Isometry3d::from_translation(to_render(contact)),
+            w.radius as f32,
+            Color::srgb(0.12, 0.12, 0.15),
+        );
+    }
+}
+
 fn update_test_hud(world: Res<WorkshopWorld>, mut hud: Query<&mut Text, With<TestHud>>) {
     if let Ok(mut text) = hud.single_mut() {
+        if let Some(rs) = &world.rover {
+            let speed = rs.rover.body.velocity.length();
+            let height = rs.rover.height_above_terrain(&rs.terrain);
+            let warn = if rs.unwired_thrust_engines > 0 {
+                format!(
+                    "\n⚠ {} thrust engine(s) ignored (rover path)",
+                    rs.unwired_thrust_engines
+                )
+            } else {
+                String::new()
+            };
+            text.0 = format!(
+                "workshop · TEST (rover)\nspeed:  {speed:6.2} m/s\nheight: {height:6.2} m\nwheels: {}{warn}",
+                rs.rover.wheels.len(),
+            );
+            return;
+        }
         match world.state {
             CraftState::Intact => {
                 let speed = world.body.velocity.length();
@@ -928,5 +1422,36 @@ mod tests {
     #[test]
     fn empty_lattice_does_not_assemble() {
         assert!(assemble_from_lattice(&VoxelCraft::new(1.0)).is_none());
+    }
+
+    /// A lattice with wheel parts is a rover: `assemble_rover` returns Some, and the rover Test
+    /// world places it resting on the pad with its drivetrain groups intact.
+    #[test]
+    fn wheeled_lattice_drives_as_a_rover() {
+        use sounding_sim::voxel::{Part, PartKind, WheelPart};
+        let mut v = default_lattice();
+        for (x, z, steer) in [(0, 0, false), (1, 0, false), (0, 1, true), (1, 1, true)] {
+            v.parts.push(Part {
+                mount: DVec3::new(x as f64, -0.3, z as f64),
+                mass: 60.0,
+                kind: PartKind::Wheel(WheelPart::new(true, steer)),
+            });
+        }
+        let asm = assemble_rover(&v, DVec3::ZERO, ROVER_GRAVITY).expect("wheels ⇒ rover");
+        assert_eq!(asm.rover.wheels.len(), 4);
+        assert_eq!(asm.steer.len(), 2);
+
+        let world = WorkshopWorld::rover(asm, v);
+        let rs = world.rover.as_ref().expect("rover world");
+        // Rests on the pad: the CoM sits above the flat surface (height 0), finite.
+        assert!(rs.rover.body.position.y > 0.0 && rs.rover.body.position.y.is_finite());
+        assert_eq!(rs.drive.len(), 4);
+    }
+
+    /// The default (wheel-less) lattice is a rocket: `assemble_rover` is None, so the Test path
+    /// flies it (the discriminator).
+    #[test]
+    fn default_lattice_is_not_a_rover() {
+        assert!(assemble_rover(&default_lattice(), DVec3::ZERO, ROVER_GRAVITY).is_none());
     }
 }
