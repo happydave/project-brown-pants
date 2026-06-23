@@ -69,9 +69,10 @@ impl Plugin for EditorPlugin {
     }
 }
 
-/// Orbit-camera state: yaw, pitch, and distance about the craft.
+/// Orbit-camera state: yaw, pitch, and distance about the craft. Reused by the workshop's
+/// Build mode (WI 603), so it is crate-visible.
 #[derive(Resource)]
-struct OrbitCam {
+pub(crate) struct OrbitCam {
     yaw: f32,
     pitch: f32,
     dist: f32,
@@ -98,8 +99,9 @@ fn setup_view(mut commands: Commands) {
     ));
 }
 
-/// Keyboard orbit camera, always framing the editor's build volume.
-fn orbit_camera(
+/// Keyboard orbit camera, always framing the editor's build volume. Crate-visible so the
+/// workshop's Build mode (WI 603) can run it under a state run-condition.
+pub(crate) fn orbit_camera(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     mut cam: ResMut<OrbitCam>,
@@ -136,7 +138,9 @@ fn orbit_camera(
     }
 }
 
-fn editor_input(keys: Res<ButtonInput<KeyCode>>, mut state: ResMut<EditorState>) {
+/// Editor keybindings over [`EditorState`]. Crate-visible so the workshop's Build mode (WI 603)
+/// can run it under a state run-condition.
+pub(crate) fn editor_input(keys: Res<ButtonInput<KeyCode>>, mut state: ResMut<EditorState>) {
     // Move the cursor.
     let mut delta = IVec3::ZERO;
     if keys.just_pressed(KeyCode::ArrowLeft) {
@@ -293,7 +297,9 @@ fn material_color(m: Material) -> Color {
     }
 }
 
-fn draw_editor(mut gizmos: Gizmos, state: Res<EditorState>) {
+/// Draws the editor's craft, cursor, and derived properties as gizmos. Crate-visible so the
+/// workshop's Build mode (WI 603) can run it under a state run-condition.
+pub(crate) fn draw_editor(mut gizmos: Gizmos, state: Res<EditorState>) {
     let s = state.craft.cell_size as f32;
 
     // Voxels.

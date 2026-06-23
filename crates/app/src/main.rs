@@ -18,7 +18,7 @@
 //! - `cargo run -p sounding -- land` — drop a craft and watch the collision response bring it to rest
 //! - `cargo run -p sounding -- collide` — fire a craft at another (and a debris pile) — craft↔craft collision
 //! - `cargo run -p sounding -- crash` — ram a frangible craft into a block — breakage-on-impact (it shatters)
-//! - `cargo run -p sounding -- workshop` — grounded build-and-test sandbox: fly a craft by hand with live ground collision (land/rest/crash)
+//! - `cargo run -p sounding -- workshop` — grounded build-and-test sandbox: Build (voxel editor) ↔ Test (fly by hand with live ground collision), toggle with Enter
 //! - `cargo run -p sounding -- materials` — preview a generated PBR material set on lit geometry
 //! - `cargo run -p sounding -- terrainmesh` — preview a generated MoGe terrain relief (glTF)
 //!

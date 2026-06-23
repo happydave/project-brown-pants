@@ -59,25 +59,28 @@ fn ground_material(
 
 /// Spawn a tiled textured ground patch at the local surface (`y = 0`, lifted a hair above
 /// the planet sphere's top), floating-origin anchored so it stays put as the craft moves.
-/// Call once from a flat-ground scene's `setup`.
+/// Call once from a flat-ground scene's `setup`. Returns the spawned entity so callers that
+/// tear the scene down (e.g. the workshop's mode switch) can tag/despawn it.
 pub fn spawn_ground(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     asset_server: &AssetServer,
-) {
+) -> Entity {
     let mesh = meshes.add(
         Mesh::from(Plane3d::default().mesh().size(GROUND_SIZE, GROUND_SIZE))
             .with_generated_tangents()
             .expect("plane has normals + UVs"),
     );
-    commands.spawn((
-        Mesh3d(mesh),
-        MeshMaterial3d(ground_material(asset_server, materials)),
-        Transform::default(),
-        WorldPlacement(WorldPos::new(
-            FrameId::CENTRAL_BODY,
-            DVec3::new(0.0, GROUND_LIFT, 0.0),
-        )),
-    ));
+    commands
+        .spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(ground_material(asset_server, materials)),
+            Transform::default(),
+            WorldPlacement(WorldPos::new(
+                FrameId::CENTRAL_BODY,
+                DVec3::new(0.0, GROUND_LIFT, 0.0),
+            )),
+        ))
+        .id()
 }

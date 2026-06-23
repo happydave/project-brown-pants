@@ -1,20 +1,23 @@
-//! Workshop — grounded build-and-test sandbox (`-- workshop`, WI 599; the Test slice of the
-//! workshop loop, WI 602).
+//! Workshop — grounded build-and-test sandbox (`-- workshop`).
 //!
-//! The first time collision is **live in the flight pipeline**: a controllable craft sits on the
-//! textured ground and is flown by hand through `sounding_sim::flight::flight_step` with a real
-//! ground plane, so it lands, rests, drives, and — on a hard enough crash — **shatters** (the
-//! contact force is fed to `breakage::fracture_on_impact`, and the fragments become ordinary
-//! collidable debris). Time-warp is capped near the surface (`warp::safe_substep_dt`) so a fast
-//! descent can't tunnel. `Backspace` rebuilds the craft.
+//! The build-and-test loop in one scene with a **Build ↔ Test** toggle (`Enter`):
 //!
-//! Flat-ground collision is **local** (a half-space tangent at the pad), which is why this lives
-//! in a grounded workshop rather than the orbital `-- play` (whose curved planet needs terrain
-//! collision, WI 601). The craft uses a lightweight "test frame" material so a hard slam visibly
-//! breaks it while normal landings hold.
+//! - **Build** (WI 603): the voxel editor runs on the workshop's editable craft (reusing the
+//!   `editor` module's systems under a state run-condition) — place/remove cells, materials,
+//!   devices, the live mass/inertia gizmos. The edited lattice persists across toggles.
+//! - **Test** (WI 599 / 602): a controllable craft on the textured ground, hand-flown through
+//!   `flight::flight_step` with **live collision** — it lands, rests, drives, and shatters on a
+//!   hard crash (`breakage::fracture_on_impact`), substep-capped near the surface
+//!   (`warp::safe_substep_dt`). `Backspace` rebuilds the test craft.
 //!
-//! Controls: Shift/Ctrl throttle · Z/X full/cut · W/S/A/D/Q/E attitude · T SAS hold · F SAS off
-//! · `,`/`.` warp · Backspace reset.
+//! Build and Test are different coordinate worlds (the editor works near the origin; Test runs in
+//! planetary coordinates with floating origin), so each mode spawns and despawns its own entities
+//! on transition — they never coexist. (Until WI 604, Test flies a fixed preset craft, not the
+//! Build lattice.)
+//!
+//! Test controls: Shift/Ctrl throttle · Z/X full/cut · W/S/A/D/Q/E attitude · T SAS · F off ·
+//! `,`/`.` warp · Backspace reset. Build controls: arrows/PageUp-Dn cursor · Space add ·
+//! Backspace remove · Tab material · Q/E/R/F/Z/C camera.
 
 use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::Tonemapping;
@@ -45,6 +48,7 @@ use sounding_sim::sim::CentralBody;
 use sounding_sim::voxel::{Device, Material, Voxel, VoxelCraft};
 use sounding_sim::warp::safe_substep_dt;
 
+use crate::editor::{draw_editor, editor_input, orbit_camera, EditorState, OrbitCam};
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
 use crate::voxel_skin::{build_skin_mesh, material_set_for, pbr_material, VoxelSkin};
 
@@ -63,13 +67,21 @@ const FRAME: Material = Material {
     strength: 3.0e6,
 };
 
+/// Which half of the build-and-test loop is active.
+#[derive(States, Default, Debug, Clone, PartialEq, Eq, Hash)]
+enum WorkshopMode {
+    #[default]
+    Build,
+    Test,
+}
+
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum CraftState {
     Intact,
     Fractured,
 }
 
-/// The grounded workshop: one controllable craft, or its debris after a crash.
+/// The grounded workshop Test state: one controllable craft, or its debris after a crash.
 #[derive(Resource)]
 struct WorkshopWorld {
     body: ActiveBody,
@@ -80,9 +92,7 @@ struct WorkshopWorld {
     throttle: f64,
     warp: f64,
     state: CraftState,
-    /// Debris after a fracture (empty while intact).
     fragments: Vec<(VoxelCraft, ActiveBody)>,
-    /// The rendered entities need rebuilding (initial spawn, fracture, or reset).
     dirty: bool,
 }
 
@@ -153,8 +163,6 @@ fn build_craft() -> (FlightCraft, ActiveBody, LaunchPad) {
         mp.mass + propellant,
         mp.inertia,
     );
-    // Released pad: the ground contact (not the pad) supports the craft, so it can lift off and
-    // land back freely.
     let mut pad = LaunchPad::resting(rest_radius);
     pad.released = true;
 
@@ -207,7 +215,6 @@ impl WorkshopWorld {
         pos - DVec3::new(0.0, BODY.radius, 0.0)
     }
 
-    /// The point the camera should frame (the craft, or the debris centroid).
     fn focus(&self) -> DVec3 {
         match self.state {
             CraftState::Intact => self.render_of(self.body.position),
@@ -226,7 +233,6 @@ impl WorkshopWorld {
         self.body.position.length() - BODY.radius
     }
 
-    /// Point-mass gravity force on a body about the central attractor.
     fn gravity_force(body: &ActiveBody) -> DVec3 {
         let r = body.position;
         let r2 = r.length_squared();
@@ -236,13 +242,12 @@ impl WorkshopWorld {
         -BODY.mu * body.mass * r / (r2 * r2.sqrt())
     }
 
-    /// The flat ground as a collision shape (for the fracture force recompute / debris).
     fn ground_shape(&self) -> CollisionShape {
         ground_half_space(BODY.radius)
     }
 
     /// Advance the intact craft one substep through the live flight pipeline, capping the step
-    /// near the surface so a fast descent cannot tunnel. Returns `true` if the craft fractured.
+    /// near the surface (anti-tunnel). Returns `true` if the craft fractured.
     fn step_intact(&mut self, frame_dt: f64) -> bool {
         let radius = craft_bounding_radius(&self.craft.voxels).unwrap_or(0.0);
         let gap = self.body.position.y - BODY.radius - radius;
@@ -258,8 +263,6 @@ impl WorkshopWorld {
         } = self;
         flight_step(body, craft, params, pad, dt);
 
-        // Recompute the ground contact force at the post-step state and feed breakage: a hard
-        // crash shatters the craft; a gentle landing leaves it intact.
         let shape = craft_collision_shape(&self.craft.voxels);
         let bounds = craft_bounds(&self.craft.voxels);
         let ground = self.ground_shape();
@@ -333,12 +336,22 @@ impl WorkshopWorld {
     }
 }
 
+// --- Entity markers ---
+
+/// Tags every entity owned by Test mode (despawned on leaving Test).
+#[derive(Component)]
+struct TestEntity;
+/// Tags every entity owned by Build mode (despawned on leaving Build).
+#[derive(Component)]
+struct BuildEntity;
 #[derive(Component)]
 struct CraftMarker;
 #[derive(Component)]
 struct FragmentMarker(usize);
 #[derive(Component)]
-struct Hud;
+struct TestHud;
+#[derive(Component)]
+struct BuildHud;
 
 /// The grounded build-and-test workshop scene.
 pub struct WorkshopScenePlugin;
@@ -346,8 +359,20 @@ pub struct WorkshopScenePlugin;
 impl Plugin for WorkshopScenePlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(FloatingOriginPlugin)
+            .init_state::<WorkshopMode>()
             .insert_resource(WorkshopWorld::new())
-            .add_systems(Startup, setup_scene)
+            .init_resource::<EditorState>()
+            .init_resource::<OrbitCam>()
+            .add_systems(OnEnter(WorkshopMode::Build), enter_build)
+            .add_systems(OnExit(WorkshopMode::Build), exit_build)
+            .add_systems(OnEnter(WorkshopMode::Test), enter_test)
+            .add_systems(OnExit(WorkshopMode::Test), exit_test)
+            .add_systems(Update, toggle_mode)
+            .add_systems(
+                Update,
+                (editor_input, draw_editor, orbit_camera, update_build_hud)
+                    .run_if(in_state(WorkshopMode::Build)),
+            )
             .add_systems(
                 Update,
                 (
@@ -356,34 +381,35 @@ impl Plugin for WorkshopScenePlugin {
                     reconcile_meshes,
                     track_meshes,
                     follow_camera,
-                    update_hud,
+                    update_test_hud,
                 )
-                    .chain(),
+                    .chain()
+                    .run_if(in_state(WorkshopMode::Test)),
             );
     }
 }
 
-fn setup_scene(
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut scattering: ResMut<Assets<ScatteringMedium>>,
-    world: Res<WorkshopWorld>,
+/// `Enter` toggles between Build and Test (from either mode).
+fn toggle_mode(
+    keys: Res<ButtonInput<KeyCode>>,
+    state: Res<State<WorkshopMode>>,
+    mut next: ResMut<NextState<WorkshopMode>>,
 ) {
-    crate::ground::spawn_ground(&mut commands, &mut meshes, &mut materials, &asset_server);
+    if keys.just_pressed(KeyCode::Enter) {
+        next.set(match state.get() {
+            WorkshopMode::Build => WorkshopMode::Test,
+            WorkshopMode::Test => WorkshopMode::Build,
+        });
+    }
+}
 
-    commands.spawn((
-        DirectionalLight {
-            illuminance: lux::RAW_SUNLIGHT,
-            shadows_enabled: true,
-            ..default()
-        },
-        Transform::from_rotation(Quat::from_rotation_x(-0.5) * Quat::from_rotation_y(0.6)),
-    ));
+// --- Build mode ---
 
+fn enter_build(mut commands: Commands) {
+    // The editor's orbit camera (positioned each frame by `orbit_camera`); gizmos are unlit.
+    commands.spawn((Camera3d::default(), Transform::default(), BuildEntity));
     commands.spawn((
-        Text::new("workshop: ready"),
+        Text::new("workshop · BUILD"),
         TextFont {
             font_size: 18.0,
             ..default()
@@ -395,11 +421,12 @@ fn setup_scene(
             left: Val::Px(12.0),
             ..default()
         },
-        Hud,
+        BuildHud,
+        BuildEntity,
     ));
     commands.spawn((
         Text::new(
-            "Shift/Ctrl throttle · Z/X full/cut · WSAD QE attitude · T SAS  F off · ,/. warp · Backspace reset",
+            "arrows/PgUp-Dn cursor · Space add · Backspace remove · Tab material · G engine · QE/RF/ZC camera · Enter → TEST",
         ),
         TextFont {
             font_size: 14.0,
@@ -412,6 +439,90 @@ fn setup_scene(
             left: Val::Px(12.0),
             ..default()
         },
+        BuildEntity,
+    ));
+}
+
+fn exit_build(mut commands: Commands, q: Query<Entity, With<BuildEntity>>) {
+    for e in &q {
+        commands.entity(e).despawn();
+    }
+}
+
+fn update_build_hud(editor: Res<EditorState>, mut hud: Query<&mut Text, With<BuildHud>>) {
+    if let Ok(mut text) = hud.single_mut() {
+        let mass = editor
+            .craft
+            .mass_properties()
+            .map(|mp| mp.mass)
+            .unwrap_or(0.0);
+        text.0 = format!(
+            "workshop · BUILD\nvoxels:  {}\ndevices: {}\nmass:    {mass:.0} kg\ncursor:  ({}, {}, {})",
+            editor.craft.voxels.len(),
+            editor.craft.devices.len(),
+            editor.cursor.x,
+            editor.cursor.y,
+            editor.cursor.z,
+        );
+    }
+}
+
+// --- Test mode ---
+
+fn enter_test(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut scattering: ResMut<Assets<ScatteringMedium>>,
+    mut world: ResMut<WorkshopWorld>,
+) {
+    world.reset(); // fresh test craft on the pad each time we enter Test
+
+    let ground =
+        crate::ground::spawn_ground(&mut commands, &mut meshes, &mut materials, &asset_server);
+    commands.entity(ground).insert(TestEntity); // so it's cleaned up on exit
+    commands.spawn((
+        DirectionalLight {
+            illuminance: lux::RAW_SUNLIGHT,
+            shadows_enabled: true,
+            ..default()
+        },
+        Transform::from_rotation(Quat::from_rotation_x(-0.5) * Quat::from_rotation_y(0.6)),
+        TestEntity,
+    ));
+    commands.spawn((
+        Text::new("workshop · TEST"),
+        TextFont {
+            font_size: 18.0,
+            ..default()
+        },
+        TextColor(Color::srgb(0.9, 0.95, 1.0)),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(10.0),
+            left: Val::Px(12.0),
+            ..default()
+        },
+        TestHud,
+        TestEntity,
+    ));
+    commands.spawn((
+        Text::new(
+            "Shift/Ctrl throttle · Z/X full/cut · WSAD QE attitude · T SAS  F off · ,/. warp · Backspace reset · Enter → BUILD",
+        ),
+        TextFont {
+            font_size: 14.0,
+            ..default()
+        },
+        TextColor(Color::srgb(0.7, 0.75, 0.8)),
+        Node {
+            position_type: PositionType::Absolute,
+            bottom: Val::Px(10.0),
+            left: Val::Px(12.0),
+            ..default()
+        },
+        TestEntity,
     ));
 
     let cam = world.focus() + DVec3::new(14.0, 7.0, 16.0);
@@ -426,7 +537,18 @@ fn setup_scene(
         AtmosphereEnvironmentMapLight::default(),
         WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, cam)),
         AnchorCamera,
+        TestEntity,
     ));
+}
+
+#[allow(clippy::type_complexity)]
+fn exit_test(
+    mut commands: Commands,
+    q: Query<Entity, Or<(With<TestEntity>, With<CraftMarker>, With<FragmentMarker>)>>,
+) {
+    for e in &q {
+        commands.entity(e).despawn();
+    }
 }
 
 /// Translates keys into commands (throttle/attitude/SAS), plus warp and reset.
@@ -516,7 +638,7 @@ fn step_workshop(time: Res<Time>, mut world: ResMut<WorkshopWorld>) {
             CraftState::Intact => {
                 if world.step_intact(SUBSTEP_DT) {
                     world.accumulator = 0.0;
-                    break; // fractured this step; debris takes over next frame
+                    break;
                 }
             }
             CraftState::Fractured => world.step_fragments(SUBSTEP_DT),
@@ -526,8 +648,8 @@ fn step_workshop(time: Res<Time>, mut world: ResMut<WorkshopWorld>) {
     }
 }
 
-/// Rebuilds the rendered craft/debris entities when the world changes (initial spawn, fracture,
-/// reset). Cheap: only runs on the `dirty` frames, not every frame.
+/// Rebuilds the rendered craft/debris entities when the Test world changes (enter, fracture,
+/// reset). Cheap: only on `dirty` frames.
 fn reconcile_meshes(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
@@ -562,6 +684,7 @@ fn reconcile_meshes(
                 Transform::default(),
                 WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, render)),
                 CraftMarker,
+                TestEntity,
             ));
         }
         CraftState::Fractured => {
@@ -574,6 +697,7 @@ fn reconcile_meshes(
                     Transform::default(),
                     WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, render)),
                     FragmentMarker(i),
+                    TestEntity,
                 ));
             }
         }
@@ -622,7 +746,7 @@ fn follow_camera(
     }
 }
 
-fn update_hud(world: Res<WorkshopWorld>, mut hud: Query<&mut Text, With<Hud>>) {
+fn update_test_hud(world: Res<WorkshopWorld>, mut hud: Query<&mut Text, With<TestHud>>) {
     if let Ok(mut text) = hud.single_mut() {
         match world.state {
             CraftState::Intact => {
@@ -636,7 +760,7 @@ fn update_hud(world: Res<WorkshopWorld>, mut hud: Query<&mut Text, With<Hud>>) {
                     SasMode::Point(_) => "point",
                 };
                 text.0 = format!(
-                    "workshop: {state}\nthrottle: {:3.0}%\naltitude: {:6.2} m\nv-speed:  {:+6.2} m/s\nspeed:    {:6.2} m/s\nSAS {sas}   warp {:.0}x",
+                    "workshop · TEST: {state}\nthrottle: {:3.0}%\naltitude: {:6.2} m\nv-speed:  {:+6.2} m/s\nspeed:    {:6.2} m/s\nSAS {sas}   warp {:.0}x",
                     world.throttle * 100.0,
                     world.altitude(),
                     world.body.velocity.y,
@@ -646,7 +770,7 @@ fn update_hud(world: Res<WorkshopWorld>, mut hud: Query<&mut Text, With<Hud>>) {
             }
             CraftState::Fractured => {
                 text.0 = format!(
-                    "workshop: CRASHED — fractured into {} pieces\nBackspace to rebuild",
+                    "workshop · TEST: CRASHED — fractured into {} pieces\nBackspace to rebuild",
                     world.fragments.len()
                 );
             }
