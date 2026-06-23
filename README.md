@@ -66,6 +66,7 @@ The app selects a toy scene at launch:
 - `cargo run -p sounding -- skins` — voxel-skin comparison (WI 582/583): the same craft rendered two ways and flown side by side from one sim state under the `hull_panel` PBR — **blocky** (per-cell cubes, Stormworks-style) vs the **greedy-meshed hull** (Starbase-style, the primary look), over a tiled **rocky-ground** surface (WI 588). WI 582 lands the blocky skin + the scene; WI 583 adds the hull
 - `cargo run -p sounding -- land` — craft↔terrain collision demo (WI 590–592): a craft is dropped onto the tiled ground and the penalty contact response (detection via `parry3d-f64`) brings it to rest — `R` re-drop, `1`/`2` low/high drop
 - `cargo run -p sounding -- collide` — craft↔craft collision demo (WI 593): fire a projectile craft (`SPACE`) at a target, plus a settling debris pile — the same penalty response generalized to body↔body — `R` reset
+- `cargo run -p sounding -- crash` — breakage-on-impact demo (WI 594): hold `SPACE` to ram a frangible craft into a heavy block; a hard impact routes the contact force into fracture and it shatters into collidable fragments — `R` reset
 
 ## Runtime bus
 

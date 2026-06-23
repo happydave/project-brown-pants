@@ -276,6 +276,24 @@ pub fn fracture(
     Some(fragments.into_iter().zip(bodies).collect())
 }
 
+/// Break an active craft under a **contact force** (WI 594) — the collision→fracture coupling.
+/// A contact force `F` transmitted through the structure decelerates the craft's CoM at `F/m`,
+/// which is exactly the applied acceleration the [`fracture`] stress proxy consumes; so a hard
+/// impact (large contact force) fractures the craft and a gentle touchdown (small force) leaves
+/// it intact, using the same material-strength threshold as every other break. Returns
+/// momentum-conserving fragment `(VoxelCraft, ActiveBody)` pairs, or `None` if it holds
+/// (including a massless body, which cannot transmit a load).
+pub fn fracture_on_impact(
+    craft: &VoxelCraft,
+    body: &ActiveBody,
+    contact_force: DVec3,
+) -> Option<Vec<(VoxelCraft, ActiveBody)>> {
+    if body.mass <= 0.0 {
+        return None;
+    }
+    fracture(craft, body, contact_force / body.mass)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,6 +535,69 @@ mod tests {
         let mp = c.mass_properties().unwrap();
         let body = ActiveBody::new(DVec3::ZERO, DVec3::ZERO, mp.mass, mp.inertia);
         assert!(fracture(&c, &body, DVec3::ZERO).is_none());
+    }
+
+    // --- WI 594: breakage-on-impact (contact force → fracture) ---
+
+    /// A frangible (low-strength) material so an achievable impact force crosses the threshold.
+    const FRANGIBLE: Material = Material {
+        density: 2700.0,
+        strength: 2.0e6,
+    };
+
+    #[test]
+    fn hard_impact_force_fractures_but_gentle_does_not() {
+        // A 6-cell frangible bar. Axial contact force along its length.
+        let c = bar(6, FRANGIBLE);
+        let mp = c.mass_properties().unwrap();
+        let body = ActiveBody::new(DVec3::ZERO, DVec3::new(50.0, 0.0, 0.0), mp.mass, mp.inertia);
+        // Gentle: a small contact force (CoM decel ~30 m/s²) — bonds hold.
+        assert!(
+            fracture_on_impact(&c, &body, DVec3::new(-5.0e5, 0.0, 0.0)).is_none(),
+            "a light touch should not fracture"
+        );
+        // Hard: a large contact force (CoM decel ~300 m/s²) overruns the 2 MPa bonds.
+        let pieces = fracture_on_impact(&c, &body, DVec3::new(-5.0e6, 0.0, 0.0))
+            .expect("a hard impact should fracture");
+        assert!(pieces.len() >= 2, "expected a break, got {}", pieces.len());
+    }
+
+    #[test]
+    fn impact_fragments_are_collidable() {
+        // Every fragment from an impact has a non-empty collision shape and broad-phase bounds,
+        // so it participates in collision thereafter (WI 593).
+        use crate::collision::{craft_bounds, craft_collision_shape, CollisionShape};
+        let c = bar(6, FRANGIBLE);
+        let mp = c.mass_properties().unwrap();
+        let body = ActiveBody::new(DVec3::ZERO, DVec3::ZERO, mp.mass, mp.inertia);
+        let pieces = fracture_on_impact(&c, &body, DVec3::new(-5.0e6, 0.0, 0.0)).unwrap();
+        for (frag, _) in &pieces {
+            let CollisionShape::CuboidCompound(boxes) = craft_collision_shape(frag) else {
+                panic!("fragment shape is a cuboid compound");
+            };
+            assert!(!boxes.is_empty(), "fragment has collision boxes");
+            assert!(
+                craft_bounds(frag).is_some(),
+                "fragment has broad-phase bounds"
+            );
+        }
+    }
+
+    #[test]
+    fn massless_body_does_not_fracture() {
+        let c = bar(4, FRANGIBLE);
+        let body = ActiveBody::new(DVec3::ZERO, DVec3::ZERO, 0.0, glam::DMat3::ZERO);
+        assert!(fracture_on_impact(&c, &body, DVec3::new(1.0e9, 0.0, 0.0)).is_none());
+    }
+
+    #[test]
+    fn strong_craft_survives_the_same_impact() {
+        // The same hard impact that shatters the frangible bar leaves a titanium bar intact —
+        // the threshold is the material's, not a fixed force.
+        let c = bar(6, Material::TITANIUM);
+        let mp = c.mass_properties().unwrap();
+        let body = ActiveBody::new(DVec3::ZERO, DVec3::ZERO, mp.mass, mp.inertia);
+        assert!(fracture_on_impact(&c, &body, DVec3::new(-5.0e6, 0.0, 0.0)).is_none());
     }
 
     // --- durable-format backward compatibility (the serde default) ---
