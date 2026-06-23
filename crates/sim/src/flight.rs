@@ -661,6 +661,46 @@ mod tests {
     }
 
     #[test]
+    fn flight_step_with_ground_lands_and_rests() {
+        // WI 599: collision live in the flight pipeline. A craft released above a flat ground,
+        // no thrust, falls under gravity and the in-step penalty contact brings it to rest just
+        // above the surface — no tunnelling, no kraken.
+        let (mut craft, wet0) = rocket();
+        let mut p = params(crate::medium::max_cross_section(&craft.voxels));
+        let surface = BODY.radius;
+        p.ground = Some(GroundContact {
+            normal: DVec3::Y,
+            offset: surface,
+            contact: ContactParams::default(),
+        });
+        // Released pad so collision (not the pad) supports it; start a few metres up.
+        let mut pad = LaunchPad::resting(surface);
+        pad.released = true;
+        let mut body = ActiveBody::new(
+            DVec3::new(0.0, surface + craft.dry_com.y + 5.0, 0.0),
+            DVec3::ZERO,
+            wet0,
+            craft.voxels.mass_properties().unwrap().inertia,
+        );
+        for _ in 0..8_000 {
+            flight_step(&mut body, &mut craft, &p, &mut pad, 0.004);
+        }
+        let altitude = body.position.y - surface; // CoM height above the plane
+        assert!(
+            body.velocity.length() < 0.1,
+            "came to rest: v={}",
+            body.velocity.length()
+        );
+        // Rests with the base on the surface: CoM ≈ dry_com.y above it (tiny penalty sink).
+        assert!(
+            altitude > craft.dry_com.y - 0.2 && altitude <= craft.dry_com.y + 1e-3,
+            "resting on the surface: altitude={altitude}, com.y={}",
+            craft.dry_com.y
+        );
+        assert!(body.position.is_finite());
+    }
+
+    #[test]
     fn flight_step_launches_and_ascends() {
         let (mut craft, wet0) = rocket();
         let p = params(crate::medium::max_cross_section(&craft.voxels));

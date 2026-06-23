@@ -18,6 +18,7 @@
 //! - `cargo run -p sounding -- land` — drop a craft and watch the collision response bring it to rest
 //! - `cargo run -p sounding -- collide` — fire a craft at another (and a debris pile) — craft↔craft collision
 //! - `cargo run -p sounding -- crash` — ram a frangible craft into a block — breakage-on-impact (it shatters)
+//! - `cargo run -p sounding -- workshop` — grounded build-and-test sandbox: fly a craft by hand with live ground collision (land/rest/crash)
 //! - `cargo run -p sounding -- materials` — preview a generated PBR material set on lit geometry
 //! - `cargo run -p sounding -- terrainmesh` — preview a generated MoGe terrain relief (glTF)
 //!
@@ -53,6 +54,7 @@ mod skins_scene;
 mod terrain_mesh_scene;
 mod voxel_skin;
 mod wind_tunnel_scene;
+mod workshop_scene;
 
 use autopilot_scene::AutopilotScenePlugin;
 use break_scene::BreakScenePlugin;
@@ -71,6 +73,7 @@ use rover_scene::RoverScenePlugin;
 use skins_scene::SkinsScenePlugin;
 use terrain_mesh_scene::TerrainMeshScenePlugin;
 use wind_tunnel_scene::WindTunnelScenePlugin;
+use workshop_scene::WorkshopScenePlugin;
 
 /// Which toy scene the windowed app shows.
 enum Scene {
@@ -90,6 +93,7 @@ enum Scene {
     Land,
     Collide,
     Crash,
+    Workshop,
     TerrainMesh,
 }
 
@@ -110,6 +114,7 @@ fn selected_scene() -> Scene {
         Some("land") => Scene::Land,
         Some("collide") => Scene::Collide,
         Some("crash") => Scene::Crash,
+        Some("workshop") => Scene::Workshop,
         Some("terrainmesh") => Scene::TerrainMesh,
         _ => Scene::Editor,
     }
@@ -188,6 +193,9 @@ fn main() {
         }
         Scene::Crash => {
             app.add_plugins(CrashScenePlugin);
+        }
+        Scene::Workshop => {
+            app.add_plugins(WorkshopScenePlugin);
         }
         Scene::TerrainMesh => {
             app.add_plugins(TerrainMeshScenePlugin);
