@@ -16,6 +16,7 @@
 //! - `cargo run -p sounding -- play` — fly a craft by hand: throttle/attitude/SAS/warp, with a full flight HUD (Δv, apsides, energy)
 //! - `cargo run -p sounding -- skins` — voxel-skin comparison: the same craft flown side by side, blocky vs greedy-meshed hull
 //! - `cargo run -p sounding -- land` — drop a craft and watch the collision response bring it to rest
+//! - `cargo run -p sounding -- collide` — fire a craft at another (and a debris pile) — craft↔craft collision
 //! - `cargo run -p sounding -- materials` — preview a generated PBR material set on lit geometry
 //! - `cargo run -p sounding -- terrainmesh` — preview a generated MoGe terrain relief (glTF)
 //!
@@ -33,6 +34,7 @@ use sounding_sim::sim::{CentralBody, OrbitPlugin};
 mod autopilot_scene;
 mod break_scene;
 mod bus;
+mod collide_scene;
 mod compartments_scene;
 mod dive_scene;
 mod editor;
@@ -52,6 +54,7 @@ mod wind_tunnel_scene;
 
 use autopilot_scene::AutopilotScenePlugin;
 use break_scene::BreakScenePlugin;
+use collide_scene::CollideScenePlugin;
 use compartments_scene::CompartmentsScenePlugin;
 use dive_scene::DiveScenePlugin;
 use editor::EditorPlugin;
@@ -82,6 +85,7 @@ enum Scene {
     Materials,
     Skins,
     Land,
+    Collide,
     TerrainMesh,
 }
 
@@ -100,6 +104,7 @@ fn selected_scene() -> Scene {
         Some("materials") => Scene::Materials,
         Some("skins") => Scene::Skins,
         Some("land") => Scene::Land,
+        Some("collide") => Scene::Collide,
         Some("terrainmesh") => Scene::TerrainMesh,
         _ => Scene::Editor,
     }
@@ -172,6 +177,9 @@ fn main() {
         }
         Scene::Land => {
             app.add_plugins(LandScenePlugin);
+        }
+        Scene::Collide => {
+            app.add_plugins(CollideScenePlugin);
         }
         Scene::TerrainMesh => {
             app.add_plugins(TerrainMeshScenePlugin);

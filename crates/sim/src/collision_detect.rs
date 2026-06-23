@@ -8,7 +8,9 @@
 //! resting, without parry's persistent-manifold pipeline. Broad phase culls by bounding
 //! sphere first.
 //!
-//! Two contact paths: **box↔convex (box) via parry** (the general case, craft↔craft); and
+//! Two contact paths: **box↔box via parry's multi-point contact manifold** (the general case,
+//! craft↔craft; SAT + face clipping yields up to 4 coplanar points for a face-face rest, which
+//! is what makes stacking stable — a single deepest point cannot resist tipping); and
 //! **box-corner↔plane analytically** for flat ground (exact, no half-space-orientation
 //! ambiguity, and it yields a contact per penetrating corner → 4-corner support for a
 //! resting craft).
@@ -19,7 +21,8 @@
 use crate::collision::{Bounds, BoxShape, CollisionShape};
 use glam::{DQuat, DVec3};
 use parry3d_f64::math::{Pose, Rot3, Vector};
-use parry3d_f64::query;
+use parry3d_f64::query::details::contact_manifold_cuboid_cuboid;
+use parry3d_f64::query::ContactManifold;
 use parry3d_f64::shape::Cuboid;
 
 /// A single contact: a world point, a unit `normal` (the direction to push **body A** out of
@@ -119,7 +122,11 @@ fn boxes_vs_plane(
     out
 }
 
-/// Box↔box via parry, per box pair. `normal2` (= push A out) is our contact normal.
+/// Box↔box via parry's **multi-point contact manifold**, per box pair. parry's `local_n1` is
+/// box-A's outward normal (A→B); we negate it to push **A** out (B→A). Each manifold point that
+/// is penetrating (`dist ≤ 0`) becomes a [`ContactPoint`] at the point on A's surface — so a
+/// face-resting pair contributes its (up to 4) coplanar corners and rests/stacks without
+/// tipping.
 fn boxes_vs_boxes(
     boxes_a: &[BoxShape],
     a_pose: Pose6,
@@ -134,12 +141,20 @@ fn boxes_vs_boxes(
         for bb in boxes_b {
             let cb = Cuboid::new(to_v(bb.half_extents));
             let pb = box_pose(b_pose, bb);
-            if let Ok(Some(c)) = query::contact(&pa, &ca, &pb, &cb, prediction) {
-                if c.dist <= 0.0 {
+            let pos12 = pa.inv_mul(&pb); // pose of B in A's frame
+            let mut manifold: ContactManifold<(), ()> = ContactManifold::new();
+            contact_manifold_cuboid_cuboid(&pos12, &ca, &cb, prediction, &mut manifold);
+            if manifold.points.is_empty() {
+                continue;
+            }
+            // local_n1 is A's outward normal (A→B); the push-A-out direction is its negation.
+            let normal = -from_v(pa.transform_vector(manifold.local_n1));
+            for p in &manifold.points {
+                if p.dist <= 0.0 {
                     out.push(ContactPoint {
-                        point: from_v(c.point1),
-                        normal: from_v(c.normal2), // points from B toward A → push A out
-                        depth: -c.dist,
+                        point: from_v(pa.transform_point(p.local_p1)),
+                        normal,
+                        depth: -p.dist,
                     });
                 }
             }
