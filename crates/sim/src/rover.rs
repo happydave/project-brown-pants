@@ -39,6 +39,27 @@ const JITTER_ANGULAR_DRAG: f64 = 1_500.0;
 /// Cap on the jitter ratio feeding `JITTER_ANGULAR_DRAG`, so a single hard landing spike can't make
 /// the damping unboundedly large.
 const JITTER_RATIO_CAP: f64 = 3.0;
+
+/// Wheel-mount shear model (WI 618). A mount is **rated for an impact speed**: a wheel shears when the
+/// closing speed of an obstacle impact (scaled by how directly the wheel faces it) exceeds its rated
+/// speed. Keying off impact *speed* — not sustained contact force — means leaning on a wall (closing
+/// speed ≈ 0) never shears, only genuine hits do; and it is mass-independent (a given build shears at a
+/// characteristic speed regardless of how heavy it is). The rated speed scales with the chassis
+/// material at the wheel: `BASE × sqrt(strength / REFERENCE)`, floored.
+const BASE_SHEAR_SPEED: f64 = 8.0;
+/// Reference material strength (Pa) at which a mount is rated for [`BASE_SHEAR_SPEED`] (≈ steel).
+const REF_SHEAR_STRENGTH: f64 = 5.0e8;
+/// Floor on a wheel's rated impact speed (m/s), so a flimsy-material chassis still survives a tap.
+const MIN_SHEAR_SPEED: f64 = 3.0;
+/// The share of an impact a far-side wheel still feels (WI 618). A near wheel (facing the obstacle)
+/// feels ~the full closing speed and shears first; a far wheel feels only this baseline, so it shears
+/// only under a much faster hit — making impact damage speed-graded.
+const SHEAR_SIDE_BIAS: f64 = 0.25;
+
+/// The mount's rated impact speed (m/s) for a chassis material of tensile `strength` (Pa) (WI 618).
+fn rated_shear_speed(strength: f64) -> f64 {
+    (BASE_SHEAR_SPEED * (strength / REF_SHEAR_STRENGTH).sqrt()).max(MIN_SHEAR_SPEED)
+}
 /// Motor's maximum wheel speed (rad/s). Drive torque falls off as the wheel nears
 /// it, so flooring the throttle cannot spin the wheels up without bound — a burnout
 /// would use all the tyre's grip longitudinally and leave none for cornering,
@@ -76,6 +97,13 @@ pub struct Wheel {
     pub drive_torque: f64,
     /// Applied brake torque magnitude (N·m).
     pub brake: f64,
+    /// Sheared off by a hard impact (WI 618): an inert wheel exerts no contact/suspension force, takes
+    /// no drive, and does not spin — the rover behaves as if that corner has no wheel.
+    pub inert: bool,
+    /// Impact speed (m/s) the mount is rated for before shearing (WI 618): set from the chassis
+    /// material at the wheel by [`assemble_rover`] via [`rated_shear_speed`]. A stronger material holds
+    /// its wheel through faster hits.
+    pub shear_speed: f64,
 }
 
 impl Wheel {
@@ -96,6 +124,8 @@ impl Wheel {
             wheel_inertia: 8.0,
             drive_torque: 0.0,
             brake: 0.0,
+            inert: false,
+            shear_speed: BASE_SHEAR_SPEED,
         }
     }
 }
@@ -110,6 +140,11 @@ pub struct Rover {
     /// Last step's peak per-wheel normal-force change — a contact-jitter signal.
     pub contact_jitter: f64,
     last_total_normal: f64,
+    /// Body-frame contact points on the hull's underside — the belly skids that rest on the ground
+    /// when the wheels can't (sheared off or bottomed out), so the chassis doesn't tunnel through the
+    /// terrain (WI 618). Spread across the footprint (one under each wheel corner) so the ends are
+    /// supported and don't sink on a hard hit. Each sits at the lowest wheel-mount height.
+    belly_points: Vec<DVec3>,
     /// External contact wrench to apply next step (WI 610); accumulated via [`Rover::apply_external`].
     external_force: DVec3,
     external_torque: DVec3,
@@ -118,12 +153,24 @@ pub struct Rover {
 impl Rover {
     /// Builds a rover from an active body, wheels, and gravity.
     pub fn new(body: ActiveBody, wheels: Vec<Wheel>, gravity: f64) -> Self {
+        // Belly skids: one under each wheel corner, at the lowest wheel-mount height, so a wheel-less
+        // chassis rests across its whole footprint (the ends don't sink) instead of tunnelling.
+        let belly_y = wheels
+            .iter()
+            .map(|w| w.mount.y)
+            .fold(f64::INFINITY, f64::min);
+        let belly_y = if belly_y.is_finite() { belly_y } else { 0.0 };
+        let belly_points = wheels
+            .iter()
+            .map(|w| DVec3::new(w.mount.x, belly_y, w.mount.z))
+            .collect();
         Self {
             body,
             wheels,
             gravity,
             contact_jitter: 0.0,
             last_total_normal: 0.0,
+            belly_points,
             external_force: DVec3::ZERO,
             external_torque: DVec3::ZERO,
         }
@@ -140,6 +187,10 @@ impl Rover {
         let mut total_normal = 0.0;
 
         for w in &mut self.wheels {
+            // A sheared-off wheel (WI 618) exerts nothing and does not spin.
+            if w.inert {
+                continue;
+            }
             let hub = self.body.position + r * w.mount;
             let hub_vel =
                 self.body.velocity + self.body.angular_velocity().cross(hub - self.body.position);
@@ -151,8 +202,8 @@ impl Rover {
 
             if compression <= 0.0 {
                 // Airborne: the wheel spins freely under drive/brake, no contact force.
-                let brake_torque = -w.brake * w.spin.signum();
-                w.spin += (motor_torque(w) + brake_torque) / w.wheel_inertia * dt;
+                w.spin += motor_torque(w) / w.wheel_inertia * dt;
+                w.spin = apply_brake(w.spin, w.brake, w.wheel_inertia, dt);
                 continue;
             }
 
@@ -188,11 +239,49 @@ impl Rover {
             net_force += force;
             net_torque += (contact - self.body.position).cross(force);
 
-            // Wheel spin: motor torque accelerates (falling off near the speed limit
-            // so it never burns out); ground longitudinal reaction and brake decelerate.
+            // Wheel spin: motor torque accelerates (falling off near the speed limit so it never
+            // burns out); ground longitudinal reaction decelerates; the brake then clamps toward zero
+            // (it can lock a wheel, not reverse it — a locked wheel then brakes at the tire-grip limit).
             let ground_torque = -fx * w.radius;
-            let brake_torque = -w.brake * w.spin.signum();
-            w.spin += (motor_torque(w) + ground_torque + brake_torque) / w.wheel_inertia * dt;
+            w.spin += (motor_torque(w) + ground_torque) / w.wheel_inertia * dt;
+            w.spin = apply_brake(w.spin, w.brake, w.wheel_inertia, dt);
+        }
+
+        // Chassis belly contact (WI 618): penalty contacts at the hull's underside skids (one under
+        // each wheel corner) so a chassis with sheared-off wheels (or bottomed-out suspension) rests
+        // on its belly across its whole footprint — the ends don't sink — instead of tunnelling. The
+        // skids sit below the wheeled resting height, so they're inert during normal driving.
+        let n_belly = self.belly_points.len().max(1) as f64;
+        // Per-skid stiffness shares the weight at ~2 cm penetration; damping near-critical for the
+        // mass fraction each skid carries. Scaled to the mass so the penalty stays sub-step stable.
+        let k = self.body.mass * self.gravity / 0.02 / n_belly;
+        let c = 2.0 * 0.7 * (k * self.body.mass / n_belly).sqrt();
+        for &bp in &self.belly_points {
+            let p = self.body.position + r * bp;
+            let ground = terrain.height(p.x, p.z);
+            if p.y >= ground {
+                continue;
+            }
+            let normal = terrain.normal(p.x, p.z);
+            let pen = ground - p.y;
+            let arm = p - self.body.position;
+            let v = self.body.velocity + self.body.angular_velocity().cross(arm);
+            let closing = -v.dot(normal);
+            let nf = (k * pen + c * closing).max(0.0);
+            // Coulomb friction opposing tangential slip (so a wreck slides to a stop), capped at μN
+            // and at the impulse that would just arrest this skid's share of the slip this sub-step.
+            let v_t = v - normal * v.dot(normal);
+            let material = terrain.material_at(p.x, p.z);
+            let f_t = if v_t.length() > 1e-6 {
+                let cap =
+                    (material.friction * nf).min(self.body.mass * v_t.length() / dt / n_belly);
+                -v_t.normalize() * cap
+            } else {
+                DVec3::ZERO
+            };
+            let force = normal * nf + f_t;
+            net_force += force;
+            net_torque += arm.cross(force);
         }
 
         // Aerodynamic drag → a finite top speed, keeping the rover in the stable band.
@@ -261,6 +350,57 @@ impl Rover {
             }
         }
     }
+
+    /// Apply an obstacle impact to the wheels (WI 618). `closing_speed` is the rover's approach speed
+    /// into the obstacle (m/s, ≥ 0 — zero when leaning/separating, so leaning never shears) and
+    /// `into_obstacle` is the (horizontal, unit) direction toward it. Each still-live wheel feels an
+    /// effective impact speed `closing_speed × share`, where a near wheel (facing the obstacle) gets
+    /// ~the full speed and a far one only [`SHEAR_SIDE_BIAS`]; it shears (marked [`Wheel::inert`])
+    /// when that exceeds its rated [`Wheel::shear_speed`]. So a slow nudge shears nothing, a fast hit
+    /// shears the near wheels, and a very fast one can take them all. Returns an [`ImpactOutcome`] for
+    /// diagnostics. The caller drops the sheared indices from its drive/steer groups.
+    pub fn shear_on_impact(&mut self, closing_speed: f64, into_obstacle: DVec3) -> ImpactOutcome {
+        let mut out = ImpactOutcome::default();
+        if closing_speed <= 0.0 {
+            return out;
+        }
+        let into = DVec3::new(into_obstacle.x, 0.0, into_obstacle.z).normalize_or_zero();
+        let r = DMat3::from_quat(self.body.orientation);
+        for i in 0..self.wheels.len() {
+            if self.wheels[i].inert {
+                continue;
+            }
+            let m = r * self.wheels[i].mount;
+            let dir = DVec3::new(m.x, 0.0, m.z).normalize_or_zero();
+            let facing = dir.dot(into).max(0.0);
+            let demand = closing_speed * (SHEAR_SIDE_BIAS + (1.0 - SHEAR_SIDE_BIAS) * facing);
+            if demand > out.peak_demand {
+                out.peak_demand = demand;
+                out.peak_wheel = Some(i);
+                out.peak_capacity = self.wheels[i].shear_speed;
+            }
+            if demand > self.wheels[i].shear_speed {
+                self.wheels[i].inert = true;
+                out.sheared.push(i);
+            }
+        }
+        out
+    }
+}
+
+/// What an obstacle impact did to the wheels (WI 618): which wheels sheared, plus the most-stressed
+/// live wheel and the effective impact speed it felt vs. its rated speed — the data behind the
+/// impact diagnostic. All speeds in m/s.
+#[derive(Clone, Debug, Default)]
+pub struct ImpactOutcome {
+    /// Indices of wheels that sheared off this impact.
+    pub sheared: Vec<usize>,
+    /// The most-stressed still-live wheel at the moment of impact (if any).
+    pub peak_wheel: Option<usize>,
+    /// The effective impact speed that wheel felt (closing × share), m/s.
+    pub peak_demand: f64,
+    /// That wheel's rated shear speed, m/s — shears when `peak_demand` exceeds it.
+    pub peak_capacity: f64,
 }
 
 /// The result of assembling a rover from a built lattice (WI 607): the rover plus
@@ -278,6 +418,22 @@ pub struct RoverAssembly {
     /// (WI 609): an `Engine`+`Tank` build burns fuel, a `Battery` build draws charge (solar from
     /// panels), and a build with neither gets a self-sustaining default.
     pub powertrain: RoverPowertrain,
+}
+
+/// The tensile strength (Pa) of the chassis voxel nearest `point` (craft frame) — the material a
+/// wheel mount inherits for its shear strength (WI 618). Zero when the craft has no voxels.
+fn nearest_material_strength(craft: &VoxelCraft, point: DVec3) -> f64 {
+    let s = craft.cell_size;
+    craft
+        .voxels
+        .iter()
+        .map(|v| {
+            let center = (v.cell.as_dvec3() + DVec3::splat(0.5)) * s;
+            ((center - point).length_squared(), v.material.strength)
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, strength)| strength)
+        .unwrap_or(0.0)
 }
 
 /// Assemble a [`Rover`] from a built `craft` (WI 607), placing its centre of mass at
@@ -315,9 +471,15 @@ pub fn assemble_rover(craft: &VoxelCraft, position: DVec3, gravity: f64) -> Opti
             max_force: spec.max_force,
             steer: 0.0,
             spin: 0.0,
-            wheel_inertia: spec.wheel_inertia,
+            // Physical wheel inertia from the actual wheel-part mass (½·m·r², solid disk) — not the
+            // old oversized constant, which stored so much spin energy that a stopped rover's wheels
+            // flung it forward again after a wall bounce (WI 618 user feedback).
+            wheel_inertia: (0.5 * part.mass * spec.radius * spec.radius).max(0.02),
             drive_torque: 0.0,
             brake: 0.0,
+            inert: false,
+            // Rated impact speed from the chassis material at the wheel (WI 618).
+            shear_speed: rated_shear_speed(nearest_material_strength(craft, part.mount)),
         });
         if spec.drive {
             drive.push(i);
@@ -376,6 +538,22 @@ pub fn assemble_rover(craft: &VoxelCraft, position: DVec3, gravity: f64) -> Opti
 fn motor_torque(w: &Wheel) -> f64 {
     let scale = (1.0 - w.spin.abs() / MAX_WHEEL_SPIN).clamp(0.0, 1.0);
     w.drive_torque * scale
+}
+
+/// Apply `brake` torque to a wheel's `spin` over `dt` **without overshooting zero** (WI 618). A brake
+/// can stop a wheel, not spin it backwards — clamping at zero avoids the huge-brake / low-inertia
+/// chatter (spin flipping sign every sub-step) that made straight-line braking feel mushy. Once the
+/// wheel locks (`spin == 0`) the tire brakes at the grip limit via its (large) longitudinal slip.
+fn apply_brake(spin: f64, brake: f64, inertia: f64, dt: f64) -> f64 {
+    if brake <= 0.0 || spin == 0.0 {
+        return spin;
+    }
+    let delta = brake / inertia * dt; // magnitude the brake would shed this sub-step
+    if spin.abs() <= delta {
+        0.0
+    } else {
+        spin - spin.signum() * delta
+    }
 }
 
 /// Simplified slip-based tire forces (longitudinal, lateral), saturating at the
@@ -1073,6 +1251,151 @@ mod tests {
         assert!(
             min_up_y > 0.85,
             "nominal cruise spuriously rolled: min up.y = {min_up_y}"
+        );
+    }
+
+    #[test]
+    fn braking_locks_wheels_and_stops_the_rover() {
+        // WI 618: a strong brake must cleanly stop the rover (lock the wheels), not chatter the spin.
+        let terrain = Terrain {
+            amplitude: 0.0,
+            ..Default::default()
+        };
+        let s = 0.1;
+        let mut craft = VoxelCraft::new(s);
+        for x in 0..4 {
+            for z in 0..6 {
+                craft.voxels.push(Voxel {
+                    cell: IVec3::new(x, 0, z),
+                    material: Material::COMPOSITE,
+                });
+            }
+        }
+        for (cx, cz, st) in [(0, 0, false), (3, 0, false), (0, 5, true), (3, 5, true)] {
+            craft.parts.push(Part {
+                mount: DVec3::new((cx as f64 + 0.5) * s, -0.1, (cz as f64 + 0.5) * s),
+                mass: 3.0,
+                kind: PartKind::Wheel(WheelPart::for_cell_size(s, true, st)),
+            });
+        }
+        let mass = craft.mass_properties().unwrap().mass;
+        let asm = assemble_rover(&craft, DVec3::ZERO, 9.81).unwrap();
+        let mut rover = asm.rover;
+        let drop = rover
+            .wheels
+            .iter()
+            .map(|w| w.rest_length + w.radius - w.mount.y)
+            .fold(0.0_f64, f64::max);
+        rover.body.position = DVec3::new(0.0, terrain.height(0.0, 0.0) + drop, 0.0);
+
+        // Drive up to speed.
+        for &i in &asm.drive {
+            rover.wheels[i].drive_torque = mass * 4.0;
+        }
+        for _ in 0..6_000 {
+            rover.step(&terrain, SUBSTEP_DT);
+        }
+        assert!(
+            rover.body.velocity.z > 1.0,
+            "rover should be moving before braking: {}",
+            rover.body.velocity.z
+        );
+
+        // Cut throttle, slam the brake (as the app does).
+        for w in &mut rover.wheels {
+            w.drive_torque = 0.0;
+            w.brake = mass * 35.0;
+        }
+        for _ in 0..4_000 {
+            rover.step(&terrain, SUBSTEP_DT);
+        }
+        // It came to a near-stop, and the (locked) wheels are not chattering at high spin.
+        assert!(
+            rover.body.velocity.length() < 0.3,
+            "brake did not stop the rover: v = {:?}",
+            rover.body.velocity
+        );
+        assert!(
+            rover.wheels.iter().all(|w| w.spin.abs() < 5.0),
+            "wheels still spinning under full brake (chatter): {:?}",
+            rover.wheels.iter().map(|w| w.spin).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn shear_on_impact_is_speed_and_side_graded() {
+        // WI 618: shearing is keyed to impact (closing) speed vs. each mount's rated speed, and to
+        // which side faces the obstacle. `into_obstacle = +Z` means the front wheels (mount.z > 0)
+        // face the impact.
+        let craft = chassis_with_wheels();
+        let mut rover = assemble_rover(&craft, DVec3::new(0.0, 5.0, 0.0), 9.81)
+            .unwrap()
+            .rover;
+        // Pin every mount's rated speed so the test is independent of the calibration constants.
+        for w in &mut rover.wheels {
+            w.shear_speed = 6.0;
+        }
+        let into = DVec3::Z;
+
+        // Leaning (zero closing speed) never shears — the key fix.
+        let out = rover.shear_on_impact(0.0, into);
+        assert!(out.sheared.is_empty());
+
+        // Slow nudge (below rating even for a head-on wheel): nothing shears.
+        let out = rover.shear_on_impact(4.0, into);
+        assert!(out.sheared.is_empty());
+        assert!(rover.wheels.iter().all(|w| !w.inert));
+        assert!(out.peak_wheel.is_some());
+        assert!((out.peak_capacity - 6.0).abs() < 1e-9);
+
+        // Fast forward hit: the front wheels (facing +Z) exceed their rating; rear survive.
+        let out = rover.shear_on_impact(10.0, into);
+        assert!(!out.sheared.is_empty());
+        assert!(
+            out.sheared.iter().all(|&i| rover.wheels[i].mount.z > 0.0),
+            "only front wheels shear on a fast forward hit"
+        );
+        assert!(rover.wheels.iter().any(|w| !w.inert), "rear wheels survive");
+
+        // Very fast hit: even the far (rear, share = bias) wheels exceed their rating → all shear.
+        let out = rover.shear_on_impact(40.0, into);
+        assert!(!out.sheared.is_empty());
+        assert!(
+            rover.wheels.iter().all(|w| w.inert),
+            "a very fast hit shears every wheel"
+        );
+    }
+
+    #[test]
+    fn wheelless_chassis_rests_on_its_belly_without_tunnelling() {
+        // WI 618: with every wheel sheared inert, the chassis settles onto its belly contact rather
+        // than tunnelling through the terrain — it drops a little (wheels gone), then comes to rest at
+        // a finite, bounded height instead of falling away.
+        let terrain = Terrain {
+            amplitude: 0.0,
+            ..Default::default()
+        };
+        let mut rover = rover_at(&terrain, 0.0, 0.0, 0.0);
+        for _ in 0..2_000 {
+            rover.step(&terrain, DT); // settle on its wheels
+        }
+        let h0 = rover.height_above_terrain(&terrain);
+        for w in &mut rover.wheels {
+            w.inert = true;
+        }
+        for _ in 0..4_000 {
+            rover.step(&terrain, DT);
+        }
+        let h1 = rover.height_above_terrain(&terrain);
+        assert!(rover.body.position.is_finite());
+        // It sat down (lost its wheels) but did NOT tunnel away.
+        assert!(h1 < h0, "chassis did not sit down: h0={h0}, h1={h1}");
+        assert!(h1 > -0.5, "chassis tunnelled through the ground: h1={h1}");
+        // And it came to rest (belly damping + friction arrested it).
+        assert!(
+            rover.body.velocity.length() < 0.5,
+            "wheelless chassis did not settle: v={:?}",
+            rover.body.velocity
         );
     }
 

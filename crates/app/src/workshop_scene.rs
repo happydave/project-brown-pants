@@ -101,14 +101,25 @@ enum CraftState {
 const ROVER_GRAVITY: f64 = 9.81;
 /// Max rover physics substeps per frame (the rover sub-steps far finer than the rocket path).
 const ROVER_MAX_SUBSTEPS: u32 = 64;
-/// Brake torque per kg of rover mass (N·m/kg).
-const ROVER_BRAKE_PER_KG: f64 = 9.0;
+/// Brake torque per kg of rover mass (N·m/kg). Well above the drive torque (≈4 N·m/kg) so braking
+/// firmly locks the wheels and stops at the tire-grip limit — brakes bite harder than the throttle.
+const ROVER_BRAKE_PER_KG: f64 = 35.0;
 /// Steering angle applied to the steer-group wheels (rad).
 const ROVER_STEER: f64 = 0.35;
 /// Supplemental inward-velocity damping for obstacle contact (1/s): unclamped, approach-only damping
 /// that bleeds the rover's speed *into* an obstacle so it thuds and stops instead of springing back
 /// off the (elastic) penalty contact. Safe against a static obstacle (no reduced-mass instability).
 const OBSTACLE_CONTACT_DAMP: f64 = 40.0;
+/// Minimum closing speed (m/s) for an obstacle contact to count as an "impact" for the diagnostic
+/// (WI 618) — filters out resting/leaning/sliding contact so only real knocks are reported.
+const IMPACT_MIN_CLOSING: f64 = 1.0;
+/// Duration of the post-impact watch (s): how long after an impact to watch for a kraken / fall-through.
+const IMPACT_WATCH_SECONDS: f64 = 2.5;
+/// Post-impact kraken thresholds (WI 618): angular speed (rad/s) and vertical bounce (m/s) above which
+/// the watch flags a kraken; and the height (m, below terrain) that counts as falling through the world.
+const KRAKEN_OMEGA: f64 = 8.0;
+const KRAKEN_BOUNCE: f64 = 8.0;
+const FALL_THROUGH_HEIGHT: f64 = -0.5;
 
 /// A few obstacles scattered on the pad to drive into (WI 610): a low wall ahead and a couple of
 /// rocks off to the sides, clear of the spawn.
@@ -149,6 +160,152 @@ impl Obstacle {
     }
 }
 
+/// The post-impact watch result (WI 618): what happened in the seconds after an impact — used to
+/// catch a kraken (excessive rotation/bounce) or the rover falling through the world.
+#[derive(Clone)]
+struct WatchResult {
+    max_speed: f64,
+    max_omega: f64,
+    max_bounce: f64,
+    min_height: f64,
+    verdict: String,
+}
+
+/// A captured rover↔obstacle impact (WI 618 diagnostic): the impact (closing) speed, what was hit,
+/// the most-stressed wheel's effective impact speed vs. its rated speed, which wheels sheared, and —
+/// once the post-impact watch completes — what happened next. Surfaced on the HUD and logged as a
+/// copy-pasteable block so impacts can be tuned against real data.
+#[derive(Clone)]
+struct ImpactReport {
+    /// Rover speed at impact (m/s).
+    speed: f64,
+    /// Closing speed into the obstacle (m/s).
+    closing: f64,
+    /// What was struck — "chassis" today (the obstacle collision is the hull only); true tire/rim
+    /// attribution is WI 631.
+    impacted: &'static str,
+    /// The most-stressed wheel at impact (index into `rover.wheels`), if any.
+    peak_wheel: Option<usize>,
+    /// Effective impact speed that wheel felt (closing × side share), m/s.
+    demand: f64,
+    /// That wheel's rated shear speed, m/s.
+    capacity: f64,
+    /// Wheels that sheared off at this impact.
+    sheared: Vec<usize>,
+    /// Filled in when the post-impact watch finishes.
+    watch: Option<WatchResult>,
+}
+
+/// The in-progress post-impact watch (WI 618): tracks the seconds after an impact for kraken /
+/// fall-through signs, then writes a [`WatchResult`] onto the last impact.
+#[derive(Clone)]
+struct ImpactWatch {
+    steps_left: u32,
+    max_speed: f64,
+    max_omega: f64,
+    max_bounce: f64,
+    min_height: f64,
+}
+
+impl ImpactReport {
+    /// A one-line HUD summary (plus the post-impact verdict once the watch finishes).
+    fn hud_line(&self) -> String {
+        let result = if self.sheared.is_empty() {
+            "intact".to_string()
+        } else {
+            format!("sheared {:?}", self.sheared)
+        };
+        let base = format!(
+            "impact: {:.1} m/s ({}) · load {:.1}/{:.1} m/s · {result}",
+            self.closing, self.impacted, self.demand, self.capacity
+        );
+        match &self.watch {
+            Some(w) => format!("{base} · {}", w.verdict),
+            None => base,
+        }
+    }
+
+    /// A multi-line, copy-pasteable diagnostic block (logged to the console at each impact).
+    fn log_block(&self) -> String {
+        format!(
+            "===== ROVER IMPACT (WI 618) =====\n\
+             impacted:      {}\n\
+             rover speed:   {:.2} m/s\n\
+             closing speed: {:.2} m/s (into obstacle)\n\
+             peak wheel:    {}\n\
+             impact speed:  {:.2} m/s (effective, this wheel)\n\
+             rated speed:   {:.2} m/s  ({})\n\
+             sheared:       {}\n\
+             =================================",
+            self.impacted,
+            self.speed,
+            self.closing,
+            self.peak_wheel
+                .map_or("none".to_string(), |i| i.to_string()),
+            self.demand,
+            self.capacity,
+            if self.demand > self.capacity {
+                "exceeded"
+            } else {
+                "held"
+            },
+            if self.sheared.is_empty() {
+                "none".to_string()
+            } else {
+                format!("{:?}", self.sheared)
+            },
+        )
+    }
+
+    /// The copy-pasteable post-impact watch block (logged when the watch finishes).
+    fn watch_block(w: &WatchResult) -> String {
+        format!(
+            "----- post-impact (next few s) -----\n\
+             verdict:    {}\n\
+             max speed:  {:.2} m/s\n\
+             max omega:  {:.2} rad/s\n\
+             max bounce: {:.2} m/s (vertical)\n\
+             min height: {:.2} m (above terrain)\n\
+             ------------------------------------",
+            w.verdict, w.max_speed, w.max_omega, w.max_bounce, w.min_height,
+        )
+    }
+}
+
+impl ImpactWatch {
+    /// Begin a watch covering [`IMPACT_WATCH_SECONDS`] of sub-steps.
+    fn start() -> Self {
+        Self {
+            steps_left: (IMPACT_WATCH_SECONDS / ROVER_SUBSTEP_DT) as u32,
+            max_speed: 0.0,
+            max_omega: 0.0,
+            max_bounce: 0.0,
+            min_height: f64::INFINITY,
+        }
+    }
+
+    /// Finish the watch and classify what happened (kraken / fell through / OK).
+    fn finish(&self) -> WatchResult {
+        let verdict = if self.min_height < FALL_THROUGH_HEIGHT {
+            format!("FELL THROUGH WORLD (min height {:.1} m)", self.min_height)
+        } else if self.max_omega > KRAKEN_OMEGA || self.max_bounce > KRAKEN_BOUNCE {
+            format!(
+                "KRAKEN (omega {:.1} rad/s, bounce {:.1} m/s)",
+                self.max_omega, self.max_bounce
+            )
+        } else {
+            "OK (recovered)".to_string()
+        };
+        WatchResult {
+            max_speed: self.max_speed,
+            max_omega: self.max_omega,
+            max_bounce: self.max_bounce,
+            min_height: self.min_height,
+            verdict,
+        }
+    }
+}
+
 /// The grounded workshop Test state for a **rover** build (WI 607): the assembled rover, its
 /// (flat) pad terrain, the drivetrain groups, the source lattice (for reset), and a substep
 /// accumulator. Present only when the build is a rover; the rocket path leaves it `None`.
@@ -176,6 +333,15 @@ struct RoverState {
     com: DVec3,
     /// Accumulated wheel spin angle (rad) per wheel, for the rolling-wheel render.
     spin_angle: Vec<f64>,
+    /// Whether a contact episode is open, and its peak closing speed so far (WI 618 diagnostic) —
+    /// used to emit a "survived" report when a notable but non-shearing episode ends.
+    episode: Option<(f64, ImpactReport)>,
+    /// Whether the open episode already logged a shear (so its end doesn't double-report).
+    episode_reported: bool,
+    /// The last completed impact, shown on the HUD and logged to the console.
+    last_impact: Option<ImpactReport>,
+    /// The in-progress post-impact watch, if any.
+    watch: Option<ImpactWatch>,
 }
 
 /// The grounded workshop Test state: one controllable craft, or its debris after a crash.
@@ -417,6 +583,10 @@ impl WorkshopWorld {
             record: 0,
             com,
             spin_angle,
+            episode: None,
+            episode_reported: false,
+            last_impact: None,
+            watch: None,
         });
         world
     }
@@ -1370,6 +1540,7 @@ fn step_workshop(time: Res<Time>, mut world: ResMut<WorkshopWorld>) {
         let contact = ContactParams::default();
         let mut n = 0;
         while rs.accumulator >= ROVER_SUBSTEP_DT && n < ROVER_MAX_SUBSTEPS {
+            let mut any_contact = false;
             for obs in &rs.obstacles {
                 let ((mut force, torque), _) = body_contact_wrench(
                     &rs.rover.body,
@@ -1391,9 +1562,77 @@ fn step_workshop(time: Res<Time>, mut world: ResMut<WorkshopWorld>) {
                         force -= n * (vn * OBSTACLE_CONTACT_DAMP * rs.rover.body.mass);
                     }
                 }
+                // Impact damage (WI 618): keyed to the *closing speed* into the obstacle (not the
+                // sustained contact force, so leaning never shears). A hit shears the wheels facing it
+                // when their effective impact speed exceeds their material-rated speed; sheared wheels
+                // drop from the drive/steer groups and their tyres hide.
+                let mut closing = 0.0;
+                let mut into = DVec3::ZERO;
+                if force.length_squared() > 1e-9 {
+                    let nrm = force.normalize();
+                    closing = (-rs.rover.body.velocity.dot(nrm)).max(0.0);
+                    into = -nrm; // toward the obstacle
+                }
+                let outcome = rs.rover.shear_on_impact(closing, into);
+                for &idx in &outcome.sheared {
+                    rs.drive.retain(|&x| x != idx);
+                    rs.steer.retain(|&x| x != idx);
+                }
+                // Diagnostic: build a report for a notable impact; log shears immediately (so a
+                // sustained square-on hit still reports), and remember a non-shearing episode's peak
+                // to emit a "survived" report when it ends.
+                if closing > IMPACT_MIN_CLOSING {
+                    any_contact = true;
+                    let report = ImpactReport {
+                        speed: rs.rover.body.velocity.length(),
+                        closing,
+                        impacted: "chassis",
+                        peak_wheel: outcome.peak_wheel,
+                        demand: outcome.peak_demand,
+                        capacity: outcome.peak_capacity,
+                        sheared: outcome.sheared.clone(),
+                        watch: None,
+                    };
+                    if !outcome.sheared.is_empty() {
+                        info!("{}", report.log_block());
+                        rs.watch = Some(ImpactWatch::start());
+                        rs.last_impact = Some(report);
+                        rs.episode_reported = true;
+                    } else if rs.episode.as_ref().is_none_or(|(c, _)| closing > *c) {
+                        rs.episode = Some((closing, report));
+                    }
+                }
                 rs.rover.apply_external(force, torque);
             }
+            // Episode ended this sub-step: if a notable hit didn't shear anything, emit it now.
+            if !any_contact {
+                if let Some((_, report)) = rs.episode.take() {
+                    if !rs.episode_reported {
+                        info!("{}", report.log_block());
+                        rs.watch = Some(ImpactWatch::start());
+                        rs.last_impact = Some(report);
+                    }
+                }
+                rs.episode_reported = false;
+            }
             rs.rover.step(&terrain, ROVER_SUBSTEP_DT);
+            // Post-impact watch (WI 618): tally kraken / fall-through signs for a few seconds after an
+            // impact, then write the verdict onto the last impact (console + HUD).
+            if let Some(w) = rs.watch.as_mut() {
+                w.max_speed = w.max_speed.max(rs.rover.body.velocity.length());
+                w.max_omega = w.max_omega.max(rs.rover.body.angular_velocity().length());
+                w.max_bounce = w.max_bounce.max(rs.rover.body.velocity.y.abs());
+                w.min_height = w.min_height.min(rs.rover.height_above_terrain(&terrain));
+                w.steps_left = w.steps_left.saturating_sub(1);
+                if w.steps_left == 0 {
+                    let result = w.finish();
+                    info!("{}", ImpactReport::watch_block(&result));
+                    if let Some(last) = rs.last_impact.as_mut() {
+                        last.watch = Some(result);
+                    }
+                    rs.watch = None;
+                }
+            }
             rs.accumulator -= ROVER_SUBSTEP_DT;
             n += 1;
             // Accumulate each wheel's spin angle for the rolling-wheel render.
@@ -1649,6 +1888,11 @@ fn track_rover_meshes(
     let fwd = q * DVec3::Z;
     for (tag, mut tf) in &mut wheel_q {
         if let Some(w) = rs.rover.wheels.get(tag.0) {
+            // A sheared-off wheel (WI 618) is hidden by collapsing its mesh to zero scale.
+            if w.inert {
+                tf.scale = Vec3::ZERO;
+                continue;
+            }
             let hub = body.position + q * w.mount;
             let ground = rs.terrain.height(hub.x, hub.z);
             let normal = rs.terrain.normal(hub.x, hub.z);
@@ -1755,8 +1999,14 @@ fn update_test_hud(world: Res<WorkshopWorld>, mut hud: Query<&mut Text, With<Tes
         if let Some(rs) = &world.rover {
             let speed = rs.rover.body.velocity.length();
             let height = rs.rover.height_above_terrain(&rs.terrain);
+            let live = rs.rover.wheels.iter().filter(|w| !w.inert).count();
+            let impact = rs
+                .last_impact
+                .as_ref()
+                .map(|r| format!("\n{}", r.hud_line()))
+                .unwrap_or_default();
             text.0 = format!(
-                "workshop · TEST (rover)\nspeed:  {speed:6.2} m/s\nheight: {height:6.2} m\nwheels: {}\n{}:  {:3.0}%",
+                "workshop · TEST (rover)\nspeed:  {speed:6.2} m/s\nheight: {height:6.2} m\nwheels: {live}/{}\n{}:  {:3.0}%{impact}",
                 rs.rover.wheels.len(),
                 rs.powertrain.label(),
                 rs.powertrain.fraction() * 100.0,
