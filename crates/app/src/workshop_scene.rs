@@ -63,7 +63,7 @@ use sounding_sim::warp::safe_substep_dt;
 
 use crate::editor::{
     editor_input, material_label, mouse_build, mouse_orbit_input, orbit_camera, update_hover,
-    Brush, EditorState, HoverState, OrbitCam,
+    Brush, EditorState, HoverState, OrbitCam, PaletteEntry, PointerOnPalette, PALETTE_GROUPS,
 };
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
 use crate::voxel_skin::{build_skin_mesh, material_set_for, pbr_material, VoxelSkin};
@@ -583,6 +583,13 @@ struct BuildHud;
 /// Tags a solid mesh entity rendering part of the Build craft (rebuilt on edit).
 #[derive(Component)]
 struct BuildMesh;
+/// The root container of the Build palette (WI 613); carries `Interaction` so hovering its
+/// background/gaps still counts as "pointer over the palette".
+#[derive(Component)]
+struct PaletteRoot;
+/// A clickable Build-palette entry button (WI 613): clicking it selects that block/device/part.
+#[derive(Component)]
+struct PaletteButton(PaletteEntry);
 /// The rover Test's solid chassis skin mesh (WI 608).
 #[derive(Component)]
 struct RoverChassisMesh;
@@ -615,6 +622,7 @@ impl Plugin for WorkshopScenePlugin {
             })
             .init_resource::<OrbitCam>()
             .init_resource::<HoverState>()
+            .init_resource::<PointerOnPalette>()
             .add_systems(OnEnter(WorkshopMode::Build), enter_build)
             .add_systems(OnExit(WorkshopMode::Build), exit_build)
             .add_systems(OnEnter(WorkshopMode::Test), enter_test)
@@ -626,10 +634,13 @@ impl Plugin for WorkshopScenePlugin {
                     editor_input,
                     mouse_orbit_input,
                     update_hover,
+                    track_pointer_over_palette,
+                    palette_click,
                     mouse_build,
                     orbit_camera,
                     sync_build_meshes,
                     draw_build_overlays,
+                    update_palette_highlight,
                     update_build_hud,
                 )
                     .chain()
@@ -691,6 +702,7 @@ fn enter_build(mut commands: Commands) {
         Transform::from_xyz(6.0, 14.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y),
         BuildEntity,
     ));
+    // Status HUD moved to the top-right (WI 613) to clear the left-edge palette.
     commands.spawn((
         Text::new("workshop · BUILD"),
         TextFont {
@@ -701,7 +713,7 @@ fn enter_build(mut commands: Commands) {
         Node {
             position_type: PositionType::Absolute,
             top: Val::Px(10.0),
-            left: Val::Px(12.0),
+            right: Val::Px(12.0),
             ..default()
         },
         BuildHud,
@@ -709,7 +721,7 @@ fn enter_build(mut commands: Commands) {
     ));
     commands.spawn((
         Text::new(
-            "MOUSE: left-click place brush · right-click remove · middle-drag orbit · scroll zoom. Brush: Tab material · 1 ctrl · 2 cpu · 3 batt · 4 engine · 5 tank · 6/7 wheel · 8 seat · 9 antenna · 0 solar · - bumper · Enter → TEST (4 wheels ⇒ drive it)",
+            "left-click place · right-click remove · middle-drag orbit · scroll zoom · Tab cycles material · Enter → TEST (4 wheels ⇒ drive it)",
         ),
         TextFont {
             font_size: 14.0,
@@ -724,6 +736,126 @@ fn enter_build(mut commands: Commands) {
         },
         BuildEntity,
     ));
+    spawn_palette(&mut commands);
+}
+
+/// Spawns the left-edge Build palette (WI 613): a docked column of grouped, clickable swatch+label
+/// entries — Blocks, Devices, Parts — one [`PaletteButton`] per buildable item. The root carries an
+/// `Interaction` so hovering its background (between buttons) still registers as "over the palette".
+fn spawn_palette(commands: &mut Commands) {
+    let idle = Color::srgb(0.16, 0.16, 0.18);
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(10.0),
+                left: Val::Px(12.0),
+                width: Val::Px(168.0),
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(4.0),
+                padding: UiRect::all(Val::Px(8.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+            Interaction::default(),
+            PaletteRoot,
+            BuildEntity,
+        ))
+        .with_children(|root| {
+            for (group, entries) in PALETTE_GROUPS {
+                root.spawn((
+                    Text::new(*group),
+                    TextFont {
+                        font_size: 12.0,
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.55, 0.6, 0.68)),
+                    Node {
+                        margin: UiRect::top(Val::Px(4.0)),
+                        ..default()
+                    },
+                ));
+                for &entry in *entries {
+                    root.spawn((
+                        Button,
+                        Node {
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            column_gap: Val::Px(8.0),
+                            padding: UiRect::all(Val::Px(4.0)),
+                            ..default()
+                        },
+                        BackgroundColor(idle),
+                        PaletteButton(entry),
+                        // No BuildEntity here: buttons are children of the PaletteRoot, so the
+                        // recursive despawn in exit_build removes them with the root (avoids a
+                        // double-despawn warning on each Build→Test switch).
+                    ))
+                    .with_children(|btn| {
+                        // Identity swatch.
+                        btn.spawn((
+                            Node {
+                                width: Val::Px(16.0),
+                                height: Val::Px(16.0),
+                                ..default()
+                            },
+                            BackgroundColor(entry.swatch_color()),
+                            BorderColor::all(Color::srgb(0.0, 0.0, 0.0)),
+                        ));
+                        // Label (so identity never rests on colour alone).
+                        btn.spawn((
+                            Text::new(entry.label()),
+                            TextFont {
+                                font_size: 13.0,
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.88, 0.9, 0.94)),
+                        ));
+                    });
+                }
+            }
+        });
+}
+
+/// Sets [`PointerOnPalette`] when the cursor is over the palette root or any entry (WI 613), so
+/// `mouse_build` can skip a click that lands on the UI.
+fn track_pointer_over_palette(
+    mut flag: ResMut<PointerOnPalette>,
+    roots: Query<&Interaction, With<PaletteRoot>>,
+    buttons: Query<&Interaction, With<PaletteButton>>,
+) {
+    let over = roots.iter().any(|i| *i != Interaction::None)
+        || buttons.iter().any(|i| *i != Interaction::None);
+    flag.0 = over;
+}
+
+/// Applies a palette entry to the editor selection when its button is pressed (WI 613).
+fn palette_click(
+    buttons: Query<(&PaletteButton, &Interaction), Changed<Interaction>>,
+    mut editor: ResMut<EditorState>,
+) {
+    for (button, interaction) in &buttons {
+        if *interaction == Interaction::Pressed {
+            button.0.apply(&mut editor);
+        }
+    }
+}
+
+/// Highlights the active palette entry and reflects hover (WI 613): selected reads from the editor
+/// state, so keyboard shortcuts and palette clicks stay in sync through the one source of truth.
+fn update_palette_highlight(
+    editor: Res<EditorState>,
+    mut buttons: Query<(&PaletteButton, &Interaction, &mut BackgroundColor)>,
+) {
+    for (button, interaction, mut bg) in &mut buttons {
+        *bg = if button.0.is_active(&editor) {
+            BackgroundColor(Color::srgb(0.20, 0.42, 0.78))
+        } else if *interaction == Interaction::Hovered {
+            BackgroundColor(Color::srgb(0.30, 0.30, 0.34))
+        } else {
+            BackgroundColor(Color::srgb(0.16, 0.16, 0.18))
+        };
+    }
 }
 
 fn exit_build(mut commands: Commands, q: Query<Entity, With<BuildEntity>>) {

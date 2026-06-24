@@ -178,6 +178,114 @@ pub(crate) fn material_label(index: usize) -> &'static str {
     PALETTE[index % PALETTE.len()].0
 }
 
+/// One selectable item in the Build palette (WI 613). A `Material` entry selects a structural
+/// material and switches the active brush to `Voxel` (the same semantics as cycling material with
+/// Tab); a `Tool` entry selects a non-voxel brush (a device or a part). The palette is a *view* of
+/// the selection held in [`EditorState`] — these are the pure mappings between an entry and that
+/// state, kept Bevy/ECS-free so they are unit-testable.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaletteEntry {
+    Material(usize),
+    Tool(Brush),
+}
+
+/// The palette's grouped, ordered entries: structural blocks, then devices, then attached parts.
+/// Adding a buildable item is one line here; the entry↔state mappings and the round-trip test then
+/// cover it automatically.
+pub(crate) const PALETTE_GROUPS: &[(&str, &[PaletteEntry])] = &[
+    (
+        "BLOCKS",
+        &[
+            PaletteEntry::Material(0),
+            PaletteEntry::Material(1),
+            PaletteEntry::Material(2),
+            PaletteEntry::Material(3),
+        ],
+    ),
+    (
+        "DEVICES",
+        &[
+            PaletteEntry::Tool(Brush::ControlPoint),
+            PaletteEntry::Tool(Brush::Computer),
+            PaletteEntry::Tool(Brush::Battery),
+            PaletteEntry::Tool(Brush::Engine),
+            PaletteEntry::Tool(Brush::Tank),
+        ],
+    ),
+    (
+        "PARTS",
+        &[
+            PaletteEntry::Tool(Brush::Wheel {
+                drive: true,
+                steer: false,
+            }),
+            PaletteEntry::Tool(Brush::Wheel {
+                drive: true,
+                steer: true,
+            }),
+            PaletteEntry::Tool(Brush::Seat),
+            PaletteEntry::Tool(Brush::Antenna),
+            PaletteEntry::Tool(Brush::SolarPanel),
+            PaletteEntry::Tool(Brush::Bumper),
+        ],
+    ),
+];
+
+impl PaletteEntry {
+    /// Applies this entry to the editor selection: a material sets the material and the Voxel brush;
+    /// a tool sets its brush.
+    pub(crate) fn apply(self, state: &mut EditorState) {
+        match self {
+            PaletteEntry::Material(i) => {
+                state.material = i % PALETTE.len();
+                state.brush = Brush::Voxel;
+            }
+            PaletteEntry::Tool(brush) => state.brush = brush,
+        }
+    }
+
+    /// Whether this entry is the one currently selected. For the Voxel brush, the active entry is the
+    /// *material* being placed (so the palette shows which block), not a generic voxel entry.
+    pub(crate) fn is_active(self, state: &EditorState) -> bool {
+        match self {
+            PaletteEntry::Material(i) => {
+                state.brush == Brush::Voxel && state.material % PALETTE.len() == i % PALETTE.len()
+            }
+            PaletteEntry::Tool(brush) => state.brush == brush,
+        }
+    }
+
+    /// The short label shown beneath/beside the swatch.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            PaletteEntry::Material(i) => material_label(i),
+            PaletteEntry::Tool(brush) => brush.label(),
+        }
+    }
+
+    /// The swatch colour: a material's own colour, or a representative tint per device/part. Identity
+    /// is always paired with the text label, so colour is never the sole carrier of meaning.
+    pub(crate) fn swatch_color(self) -> Color {
+        match self {
+            PaletteEntry::Material(i) => material_color(PALETTE[i % PALETTE.len()].1),
+            PaletteEntry::Tool(brush) => match brush {
+                Brush::Voxel => Color::srgb(0.70, 0.72, 0.78),
+                Brush::ControlPoint => Color::srgb(0.30, 0.80, 0.90),
+                Brush::Computer => Color::srgb(0.30, 0.80, 0.45),
+                Brush::Battery => Color::srgb(0.90, 0.80, 0.20),
+                Brush::Engine => Color::srgb(1.00, 0.45, 0.10),
+                Brush::Tank => Color::srgb(0.55, 0.62, 0.82),
+                Brush::Wheel { steer: false, .. } => Color::srgb(0.12, 0.12, 0.14),
+                Brush::Wheel { steer: true, .. } => Color::srgb(0.20, 0.24, 0.38),
+                Brush::Seat => Color::srgb(0.50, 0.35, 0.20),
+                Brush::Antenna => Color::srgb(0.82, 0.82, 0.86),
+                Brush::SolarPanel => Color::srgb(0.12, 0.22, 0.62),
+                Brush::Bumper => Color::srgb(0.72, 0.16, 0.16),
+            },
+        }
+    }
+}
+
 pub struct EditorPlugin;
 
 impl Plugin for EditorPlugin {
@@ -399,6 +507,12 @@ pub(crate) struct Hovered {
 #[derive(Resource, Default)]
 pub(crate) struct HoverState(pub Option<Hovered>);
 
+/// True while the mouse pointer is over the Build palette UI (WI 613). Set by the workshop's palette
+/// systems and read by [`mouse_build`] so a click that lands on the palette selects a brush instead
+/// of also editing the world behind it (the input-isolation invariant).
+#[derive(Resource, Default)]
+pub(crate) struct PointerOnPalette(pub bool);
+
 /// Ray vs. one axis-aligned cell box; returns the entry distance and the entry-face normal.
 fn ray_aabb(o: Vec3, d: Vec3, min: Vec3, max: Vec3) -> Option<(f32, IVec3)> {
     let inv = Vec3::new(1.0 / d.x, 1.0 / d.y, 1.0 / d.z);
@@ -512,8 +626,13 @@ pub(crate) fn update_hover(
 pub(crate) fn mouse_build(
     buttons: Res<ButtonInput<MouseButton>>,
     hover: Res<HoverState>,
+    pointer_on_palette: Res<PointerOnPalette>,
     mut state: ResMut<EditorState>,
 ) {
+    // A click that lands on the palette selects a brush; it must not also edit the world (WI 613).
+    if pointer_on_palette.0 {
+        return;
+    }
     let Some(h) = hover.0 else {
         return;
     };
@@ -732,6 +851,49 @@ mod tests {
             raycast_voxels(Vec3::new(0.5, 5.0, 0.5), Vec3::Y, &craft),
             None
         );
+    }
+
+    #[test]
+    fn palette_entries_round_trip_to_selection() {
+        // Applying each palette entry to a fresh state must select it, and exactly that entry must
+        // then report active — for every block, device, and part (WI 613).
+        for (_group, entries) in PALETTE_GROUPS {
+            for &entry in *entries {
+                let mut state = EditorState::default();
+                entry.apply(&mut state);
+                assert!(
+                    entry.is_active(&state),
+                    "applied entry must read back as active: {}",
+                    entry.label()
+                );
+                // No other entry claims to be active at the same time.
+                let active: Vec<&str> = PALETTE_GROUPS
+                    .iter()
+                    .flat_map(|(_, es)| es.iter())
+                    .filter(|e| e.is_active(&state))
+                    .map(|e| e.label())
+                    .collect();
+                assert_eq!(
+                    active,
+                    vec![entry.label()],
+                    "exactly one entry active for {}",
+                    entry.label()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn voxel_brush_activates_the_selected_material_entry() {
+        // With the Voxel brush, the active palette entry is the *material* being placed, so the
+        // palette shows which block lands (WI 613).
+        let state = EditorState {
+            brush: Brush::Voxel,
+            material: 2,
+            ..Default::default()
+        };
+        assert!(PaletteEntry::Material(2).is_active(&state));
+        assert!(!PaletteEntry::Material(0).is_active(&state));
     }
 
     #[test]
