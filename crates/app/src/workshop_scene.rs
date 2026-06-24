@@ -32,7 +32,7 @@
 use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::light::{light_consts::lux, AtmosphereEnvironmentMapLight};
-use bevy::math::{DQuat, DVec3};
+use bevy::math::{DMat3, DQuat, DVec3};
 use bevy::pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium};
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
@@ -42,7 +42,7 @@ use sounding_sim::attitude::{AttitudeControl, AttitudePilot, ReactionWheels, Sas
 use sounding_sim::breakage::fracture_on_impact;
 use sounding_sim::collision::{
     craft_bounding_radius, craft_bounds, craft_collision_shape, ground_half_space, Bounds,
-    CollisionShape,
+    BoxShape, CollisionShape,
 };
 use sounding_sim::command::{Command, SasMode};
 use sounding_sim::contact::{body_contact_wrench, ground_contact_wrench, ContactParams};
@@ -105,6 +105,49 @@ const ROVER_MAX_SUBSTEPS: u32 = 64;
 const ROVER_BRAKE_PER_KG: f64 = 9.0;
 /// Steering angle applied to the steer-group wheels (rad).
 const ROVER_STEER: f64 = 0.35;
+/// Supplemental inward-velocity damping for obstacle contact (1/s): unclamped, approach-only damping
+/// that bleeds the rover's speed *into* an obstacle so it thuds and stops instead of springing back
+/// off the (elastic) penalty contact. Safe against a static obstacle (no reduced-mass instability).
+const OBSTACLE_CONTACT_DAMP: f64 = 40.0;
+
+/// A few obstacles scattered on the pad to drive into (WI 610): a low wall ahead and a couple of
+/// rocks off to the sides, clear of the spawn.
+fn rover_obstacles() -> Vec<Obstacle> {
+    vec![
+        Obstacle::new(DVec3::new(0.0, 0.5, 4.0), DVec3::new(2.0, 0.5, 0.25)),
+        Obstacle::new(DVec3::new(2.2, 0.4, 2.0), DVec3::new(0.4, 0.4, 0.4)),
+        Obstacle::new(DVec3::new(-2.0, 0.35, 2.8), DVec3::new(0.35, 0.35, 0.35)),
+    ]
+}
+
+/// A static collidable obstacle on the rover pad (WI 610): a fixed box the rover bumps into.
+struct Obstacle {
+    /// Fixed body at the box centre (zero velocity, effectively infinite mass).
+    body: ActiveBody,
+    shape: CollisionShape,
+    bounds: Option<Bounds>,
+    /// Half-extents (m), for rendering the box mesh.
+    half: DVec3,
+}
+
+impl Obstacle {
+    fn new(center: DVec3, half: DVec3) -> Self {
+        Self {
+            body: ActiveBody::new(center, DVec3::ZERO, 1.0e12, DMat3::IDENTITY),
+            shape: CollisionShape::CuboidCompound(vec![BoxShape {
+                center: DVec3::ZERO,
+                half_extents: half,
+            }]),
+            bounds: Some(Bounds {
+                aabb_min: -half,
+                aabb_max: half,
+                sphere_center: DVec3::ZERO,
+                sphere_radius: half.length(),
+            }),
+            half,
+        }
+    }
+}
 
 /// The grounded workshop Test state for a **rover** build (WI 607): the assembled rover, its
 /// (flat) pad terrain, the drivetrain groups, the source lattice (for reset), and a substep
@@ -122,6 +165,8 @@ struct RoverState {
     /// Brake torque magnitude applied to every wheel.
     brake: f64,
     accumulator: f64,
+    /// Static obstacles on the pad the rover collides with (WI 610).
+    obstacles: Vec<Obstacle>,
     /// World-space breadcrumb trail the rover leaves, so motion is visible against the
     /// (otherwise self-similar, rover-anchored) flat ground.
     track: Vec<DVec3>,
@@ -362,6 +407,7 @@ impl WorkshopWorld {
             throttle: 0.0,
             brake: 0.0,
             accumulator: 0.0,
+            obstacles: rover_obstacles(),
             track: Vec::new(),
             record: 0,
             com,
@@ -546,6 +592,9 @@ struct RoverWheelMesh(usize);
 /// A rover Test cosmetic part (seat/antenna/solar/bumper) mesh by part index (WI 608).
 #[derive(Component)]
 struct RoverPartMesh(usize);
+/// A rover Test obstacle box mesh by obstacle index (WI 610).
+#[derive(Component)]
+struct RoverObstacleMesh(usize);
 
 /// The grounded build-and-test workshop scene.
 pub struct WorkshopScenePlugin;
@@ -952,6 +1001,26 @@ fn enter_test(
                     TestEntity,
                 ));
             }
+            // Obstacles (WI 610): solid boxes to drive into.
+            let obs_mat = materials.add(StandardMaterial {
+                base_color: Color::srgb(0.42, 0.36, 0.30),
+                perceptual_roughness: 1.0,
+                ..default()
+            });
+            for (k, obs) in rs.obstacles.iter().enumerate() {
+                let m = meshes.add(Mesh::from(Cuboid::new(
+                    (obs.half.x * 2.0) as f32,
+                    (obs.half.y * 2.0) as f32,
+                    (obs.half.z * 2.0) as f32,
+                )));
+                commands.spawn((
+                    Mesh3d(m),
+                    MeshMaterial3d(obs_mat.clone()),
+                    Transform::default(),
+                    RoverObstacleMesh(k),
+                    TestEntity,
+                ));
+            }
         }
         return;
     }
@@ -1161,8 +1230,37 @@ fn step_workshop(time: Res<Time>, mut world: ResMut<WorkshopWorld>) {
         }
         rs.accumulator += frame_dt;
         let terrain = rs.terrain;
+        // Rover↔obstacle contact (WI 610): the chassis collision shape vs. each static obstacle,
+        // injected as an external wrench per sub-step (the seam — `rover.step` integrates it).
+        let rover_shape = craft_collision_shape(&rs.lattice);
+        let rover_bounds = craft_bounds(&rs.lattice);
+        let com = rs.com;
+        let contact = ContactParams::default();
         let mut n = 0;
         while rs.accumulator >= ROVER_SUBSTEP_DT && n < ROVER_MAX_SUBSTEPS {
+            for obs in &rs.obstacles {
+                let ((mut force, torque), _) = body_contact_wrench(
+                    &rs.rover.body,
+                    &rover_shape,
+                    rover_bounds,
+                    com,
+                    &obs.body,
+                    &obs.shape,
+                    obs.bounds,
+                    DVec3::ZERO,
+                    &contact,
+                );
+                // Kill the elastic rebound: when in contact and still moving *into* the obstacle,
+                // add unclamped damping along the contact normal so it thuds and stops.
+                if force.length_squared() > 1e-9 {
+                    let n = force.normalize();
+                    let vn = rs.rover.body.velocity.dot(n);
+                    if vn < 0.0 {
+                        force -= n * (vn * OBSTACLE_CONTACT_DAMP * rs.rover.body.mass);
+                    }
+                }
+                rs.rover.apply_external(force, torque);
+            }
             rs.rover.step(&terrain, ROVER_SUBSTEP_DT);
             rs.accumulator -= ROVER_SUBSTEP_DT;
             n += 1;
@@ -1320,9 +1418,6 @@ fn follow_camera(
     }
 }
 
-/// Draws the rover, its wheels/suspension, and a terrain grid as gizmos, **rover-anchored**
-/// (everything is drawn relative to the rover so the fixed chase camera keeps it framed). Mirrors
-/// the `-- rover` scene; the recognisable wheel/chassis meshes arrive in WI 608.
 /// A procedural mesh + material for a catalog part (WI 608), sized to `cell_size`. Recognisable
 /// primitive shapes (textured asset-harness versions are deferred to WI 614).
 fn part_mesh(
@@ -1376,15 +1471,32 @@ fn track_rover_meshes(
             With<RoverChassisMesh>,
             Without<RoverWheelMesh>,
             Without<RoverPartMesh>,
+            Without<RoverObstacleMesh>,
         ),
     >,
     mut wheel_q: Query<
         (&RoverWheelMesh, &mut Transform),
-        (Without<RoverChassisMesh>, Without<RoverPartMesh>),
+        (
+            Without<RoverChassisMesh>,
+            Without<RoverPartMesh>,
+            Without<RoverObstacleMesh>,
+        ),
     >,
     mut part_q: Query<
         (&RoverPartMesh, &mut Transform),
-        (Without<RoverChassisMesh>, Without<RoverWheelMesh>),
+        (
+            Without<RoverChassisMesh>,
+            Without<RoverWheelMesh>,
+            Without<RoverObstacleMesh>,
+        ),
+    >,
+    mut obstacle_q: Query<
+        (&RoverObstacleMesh, &mut Transform),
+        (
+            Without<RoverChassisMesh>,
+            Without<RoverWheelMesh>,
+            Without<RoverPartMesh>,
+        ),
     >,
 ) {
     let Some(rs) = &world.rover else {
@@ -1422,6 +1534,13 @@ fn track_rover_meshes(
             let world_pos = body.position + q * (part.mount - rs.com);
             tf.translation = (world_pos - anchor).as_vec3();
             tf.rotation = q.as_quat();
+        }
+    }
+    // Obstacles are world-static; rover-anchored, they slide relative to the rover.
+    for (tag, mut tf) in &mut obstacle_q {
+        if let Some(obs) = rs.obstacles.get(tag.0) {
+            tf.translation = (obs.body.position - anchor).as_vec3();
+            tf.rotation = Quat::IDENTITY;
         }
     }
 }

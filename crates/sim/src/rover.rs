@@ -101,6 +101,9 @@ pub struct Rover {
     /// Last step's peak per-wheel normal-force change — a contact-jitter signal.
     pub contact_jitter: f64,
     last_total_normal: f64,
+    /// External contact wrench to apply next step (WI 610); accumulated via [`Rover::apply_external`].
+    external_force: DVec3,
+    external_torque: DVec3,
 }
 
 impl Rover {
@@ -112,6 +115,8 @@ impl Rover {
             gravity,
             contact_jitter: 0.0,
             last_total_normal: 0.0,
+            external_force: DVec3::ZERO,
+            external_torque: DVec3::ZERO,
         }
     }
 
@@ -186,9 +191,22 @@ impl Rover {
         // Angular drag → damps any rotational runaway from the stiff contacts.
         net_torque -= ANGULAR_DRAG * self.body.angular_velocity();
 
+        // External contact wrench (WI 610): obstacle contacts accumulated by the caller this step.
+        net_force += self.external_force;
+        net_torque += self.external_torque;
+        self.external_force = DVec3::ZERO;
+        self.external_torque = DVec3::ZERO;
+
         self.contact_jitter = (total_normal - self.last_total_normal).abs();
         self.last_total_normal = total_normal;
         self.body.integrate_wrench(net_force, net_torque, dt);
+    }
+
+    /// Accumulate an external contact wrench (force + torque about the CoM, world frame) to apply on
+    /// the next [`step`] (WI 610). Multiple obstacle contacts sum; `step` clears it after applying.
+    pub fn apply_external(&mut self, force: DVec3, torque: DVec3) {
+        self.external_force += force;
+        self.external_torque += torque;
     }
 
     /// Height of the body origin above the terrain directly beneath it.
@@ -481,6 +499,109 @@ mod tests {
         );
         // Some nose-up under acceleration is fine; a perpetual wheelie/flip is not.
         assert!(max_pitch < 3.0, "excessive pitch (wheelie): {max_pitch}");
+    }
+
+    #[test]
+    fn rover_stops_at_an_obstacle_without_tunnelling() {
+        use crate::collision::{craft_bounds, craft_collision_shape, BoxShape, CollisionShape};
+        use crate::contact::{body_contact_wrench, ContactParams};
+
+        let terrain = Terrain {
+            amplitude: 0.0,
+            ..Default::default()
+        };
+        let s = 0.1;
+        let mut craft = VoxelCraft::new(s);
+        for x in 0..4 {
+            for z in 0..6 {
+                craft.voxels.push(Voxel {
+                    cell: IVec3::new(x, 0, z),
+                    material: Material::COMPOSITE,
+                });
+            }
+        }
+        for (cx, cz, st) in [(0, 0, false), (3, 0, false), (0, 5, true), (3, 5, true)] {
+            craft.parts.push(Part {
+                mount: DVec3::new((cx as f64 + 0.5) * s, -0.1, (cz as f64 + 0.5) * s),
+                mass: 3.0,
+                kind: PartKind::Wheel(WheelPart::for_cell_size(s, true, st)),
+            });
+        }
+        let mp = craft.mass_properties().unwrap();
+        let com = mp.center_of_mass;
+        let asm = assemble_rover(&craft, DVec3::ZERO, 9.81).unwrap();
+        let mut rover = asm.rover;
+        let drop = rover
+            .wheels
+            .iter()
+            .map(|w| w.rest_length + w.radius - w.mount.y)
+            .fold(0.0_f64, f64::max);
+        rover.body.position = DVec3::new(0.0, terrain.height(0.0, 0.0) + drop, 0.0);
+
+        let rover_shape = craft_collision_shape(&craft);
+        let rover_bounds = craft_bounds(&craft);
+
+        // A wall across the path at z ≈ 3 m.
+        let wall_z = 3.0;
+        let obstacle = ActiveBody::new(
+            DVec3::new(0.0, 0.6, wall_z),
+            DVec3::ZERO,
+            1.0e12,
+            DMat3::IDENTITY,
+        );
+        let obs_shape = CollisionShape::CuboidCompound(vec![BoxShape {
+            center: DVec3::ZERO,
+            half_extents: DVec3::new(3.0, 1.2, 0.2),
+        }]);
+        let obs_bounds = Some(crate::collision::Bounds {
+            aabb_min: DVec3::new(-3.0, -1.2, -0.2),
+            aabb_max: DVec3::new(3.0, 1.2, 0.2),
+            sphere_center: DVec3::ZERO,
+            sphere_radius: DVec3::new(3.0, 1.2, 0.2).length(),
+        });
+        let params = ContactParams::default();
+
+        let mut max_vy = 0.0_f64;
+        for step in 0..40_000 {
+            if step > 3_000 {
+                for &i in &asm.drive {
+                    rover.wheels[i].drive_torque = mp.mass * 6.0; // floor it into the wall
+                }
+            }
+            let (wrench, _) = body_contact_wrench(
+                &rover.body,
+                &rover_shape,
+                rover_bounds,
+                com,
+                &obstacle,
+                &obs_shape,
+                obs_bounds,
+                DVec3::ZERO,
+                &params,
+            );
+            rover.apply_external(wrench.0, wrench.1);
+            rover.step(&terrain, SUBSTEP_DT);
+            assert!(rover.body.position.is_finite(), "non-finite at {step}");
+            if step > 5_000 {
+                max_vy = max_vy.max(rover.body.velocity.y.abs());
+            }
+        }
+        // It advanced toward the wall but did **not** tunnel through it (front face ≈ 2.8 m), and
+        // the contact never launched it.
+        assert!(
+            rover.body.position.z > 0.3,
+            "rover did not drive toward the wall: {}",
+            rover.body.position.z
+        );
+        assert!(
+            rover.body.position.z < 2.9,
+            "rover tunnelled through the wall: {}",
+            rover.body.position.z
+        );
+        assert!(
+            max_vy < 5.0,
+            "obstacle contact launched the rover: {max_vy}"
+        );
     }
 
     #[test]
