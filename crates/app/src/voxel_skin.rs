@@ -7,7 +7,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::image::{ImageAddressMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
-use sounding_sim::voxel::{Material, VoxelCraft};
+use sounding_sim::voxel::{Material, Voxel, VoxelCraft};
 use sounding_sim::voxel_mesh::{blocky_mesh, greedy_mesh, SkinMesh};
 
 /// How a craft's render mesh is built from its voxel lattice.
@@ -46,10 +46,85 @@ pub fn build_skin_mesh(craft: &VoxelCraft, skin: VoxelSkin) -> Mesh {
 }
 
 /// The asset material-set basename for a structural cell (the data-shaped cell-material →
-/// material-set seam, WI 582). One set for all structural cells for now; a per-material /
-/// asset-pack catalog is future work (ties into the content catalog, WI 547).
+/// material-set seam, WI 582). One shared texture set for all structural cells for now; the four
+/// materials are separated by appearance (`material_visual`, WI 614). Bespoke per-material texture
+/// sets are future work (WI 624) — this is the seam they will plug into.
 pub fn material_set_for(_material: Material) -> &'static str {
     "hull_panel"
+}
+
+/// Per-material surface appearance (WI 614): the **single source** for how a structural material
+/// looks — consumed by the craft skin material, the editor gizmo voxel colour, and the Build palette
+/// swatch, so they cannot disagree. Until bespoke per-material textures land (WI 624) the four
+/// materials share the `hull_panel` textures and are separated by tint + metallic + roughness.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MaterialVisual {
+    pub tint: Color,
+    pub metallic: f32,
+    pub perceptual_roughness: f32,
+}
+
+/// The appearance for a structural `material` (WI 614). Tuned so the four read distinctly under the
+/// shared PBR textures: light semi-matte aluminium, glossy steel, warm satin titanium, dark matte
+/// composite.
+pub fn material_visual(material: Material) -> MaterialVisual {
+    match material {
+        x if x == Material::ALUMINIUM => MaterialVisual {
+            tint: Color::srgb(0.78, 0.80, 0.84),
+            metallic: 0.9,
+            perceptual_roughness: 0.45,
+        },
+        x if x == Material::STEEL => MaterialVisual {
+            tint: Color::srgb(0.52, 0.55, 0.60),
+            metallic: 1.0,
+            perceptual_roughness: 0.28,
+        },
+        x if x == Material::TITANIUM => MaterialVisual {
+            tint: Color::srgb(0.74, 0.68, 0.58),
+            metallic: 0.85,
+            perceptual_roughness: 0.55,
+        },
+        x if x == Material::COMPOSITE => MaterialVisual {
+            tint: Color::srgb(0.20, 0.20, 0.24),
+            metallic: 0.1,
+            perceptual_roughness: 0.85,
+        },
+        _ => MaterialVisual {
+            tint: Color::srgb(0.55, 0.35, 0.55),
+            metallic: 0.5,
+            perceptual_roughness: 0.6,
+        },
+    }
+}
+
+/// The distinct materials present in `craft`, in first-seen order (WI 614).
+pub fn materials_present(craft: &VoxelCraft) -> Vec<Material> {
+    let mut out: Vec<Material> = Vec::new();
+    for v in &craft.voxels {
+        if !out.contains(&v.material) {
+            out.push(v.material);
+        }
+    }
+    out
+}
+
+/// Split `craft` into one render sub-mesh per distinct material present (WI 614), so each can be bound
+/// to its own [`material_visual`] appearance. Returns `(material, mesh)` pairs; empty when the craft
+/// has no voxels. The union of the sub-meshes' voxels is exactly the craft's voxels.
+pub fn skin_submeshes(craft: &VoxelCraft, skin: VoxelSkin) -> Vec<(Material, Mesh)> {
+    materials_present(craft)
+        .into_iter()
+        .map(|m| {
+            let mut sub = VoxelCraft::new(craft.cell_size);
+            sub.voxels = craft
+                .voxels
+                .iter()
+                .filter(|v| v.material == m)
+                .cloned()
+                .collect::<Vec<Voxel>>();
+            (m, build_skin_mesh(&sub, skin))
+        })
+        .collect()
 }
 
 /// Load a texture with a **repeat-wrapped**, linear-filtered sampler so tiled UVs (UVs that
@@ -66,15 +141,19 @@ pub fn load_repeat(asset_server: &AssetServer, path: String, srgb: bool) -> Hand
     })
 }
 
-/// Build the `StandardMaterial` for a named PBR set (albedo sRGB; normal /
-/// metallic-roughness / occlusion linear), repeat-wrapped so the greedy hull's tiled UVs
-/// repeat per cell. Textures supply the variation, so multipliers stay neutral-high.
+/// Build the `StandardMaterial` for a structural `material` (WI 614): the shared PBR texture set
+/// (albedo sRGB; normal / metallic-roughness / occlusion linear), repeat-wrapped so the greedy hull's
+/// tiled UVs repeat per cell, modulated by the material's [`material_visual`] tint, metallic, and
+/// roughness so the four materials read distinctly over the one texture set.
 pub fn pbr_material(
-    set: &str,
+    material: Material,
     asset_server: &AssetServer,
     materials: &mut Assets<StandardMaterial>,
 ) -> Handle<StandardMaterial> {
+    let set = material_set_for(material);
+    let visual = material_visual(material);
     materials.add(StandardMaterial {
+        base_color: visual.tint,
         base_color_texture: Some(load_repeat(
             asset_server,
             format!("materials/{set}_albedo.png"),
@@ -95,8 +174,72 @@ pub fn pbr_material(
             format!("materials/{set}_occlusion.png"),
             false,
         )),
-        perceptual_roughness: 1.0,
-        metallic: 1.0,
+        perceptual_roughness: visual.perceptual_roughness,
+        metallic: visual.metallic,
         ..default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STRUCTURAL: [Material; 4] = [
+        Material::ALUMINIUM,
+        Material::STEEL,
+        Material::TITANIUM,
+        Material::COMPOSITE,
+    ];
+
+    #[test]
+    fn four_materials_have_distinct_tints() {
+        // Guard against a copy-paste collision: no two structural materials share a tint (WI 614).
+        for (i, a) in STRUCTURAL.iter().enumerate() {
+            for b in STRUCTURAL.iter().skip(i + 1) {
+                assert_ne!(
+                    material_visual(*a).tint,
+                    material_visual(*b).tint,
+                    "two structural materials share a tint"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn split_partitions_voxels_by_material() {
+        // One entry per distinct material present, and the per-material counts sum to the whole
+        // (no voxel dropped or duplicated) (WI 614).
+        let mut craft = VoxelCraft::new(1.0);
+        craft.voxels.push(Voxel {
+            cell: IVec3::new(0, 0, 0),
+            material: Material::ALUMINIUM,
+        });
+        craft.voxels.push(Voxel {
+            cell: IVec3::new(1, 0, 0),
+            material: Material::STEEL,
+        });
+        craft.voxels.push(Voxel {
+            cell: IVec3::new(2, 0, 0),
+            material: Material::ALUMINIUM,
+        });
+
+        let present = materials_present(&craft);
+        assert_eq!(present.len(), 2, "two distinct materials present");
+
+        let total: usize = present
+            .iter()
+            .map(|m| craft.voxels.iter().filter(|v| v.material == *m).count())
+            .sum();
+        assert_eq!(
+            total,
+            craft.voxels.len(),
+            "partition covers every voxel once"
+        );
+    }
+
+    #[test]
+    fn empty_craft_has_no_submeshes() {
+        let craft = VoxelCraft::new(1.0);
+        assert!(skin_submeshes(&craft, VoxelSkin::Hull).is_empty());
+    }
 }

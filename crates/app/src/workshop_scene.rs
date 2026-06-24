@@ -66,7 +66,7 @@ use crate::editor::{
     Brush, EditorState, HoverState, OrbitCam, PaletteEntry, PointerOnPalette, PALETTE_GROUPS,
 };
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
-use crate::voxel_skin::{build_skin_mesh, material_set_for, pbr_material, VoxelSkin};
+use crate::voxel_skin::{pbr_material, skin_submeshes, VoxelSkin};
 
 const BODY: CentralBody = CentralBody::EARTHLIKE;
 const SUBSTEP_DT: f64 = 0.004;
@@ -904,16 +904,12 @@ fn sync_build_meshes(
     }
 
     let s = editor.craft.cell_size as f32;
-    // Solid hull from the voxels (same skin + PBR pipeline as the rocket Test).
-    if !editor.craft.voxels.is_empty() {
-        let hull = pbr_material(
-            material_set_for(Material::ALUMINIUM),
-            &asset_server,
-            &mut materials,
-        );
-        let mesh = meshes.add(build_skin_mesh(&editor.craft, VoxelSkin::Hull));
+    // Solid hull from the voxels, one sub-mesh per material so each renders with its own appearance
+    // (WI 614; same skin + PBR pipeline as the rocket Test).
+    for (material, mesh) in skin_submeshes(&editor.craft, VoxelSkin::Hull) {
+        let hull = pbr_material(material, &asset_server, &mut materials);
         commands.spawn((
-            Mesh3d(mesh),
+            Mesh3d(meshes.add(mesh)),
             MeshMaterial3d(hull),
             Transform::default(),
             BuildMesh,
@@ -1091,18 +1087,17 @@ fn enter_test(
 
         // Solid render (WI 608): chassis skin mesh + a tyre mesh per wheel + cosmetic part meshes,
         // all positioned each frame by `track_rover_meshes`. Replaces the gizmo cuboid + spheres.
-        let chassis_mat = pbr_material(
-            material_set_for(Material::ALUMINIUM),
-            &asset_server,
-            &mut materials,
-        );
-        commands.spawn((
-            Mesh3d(meshes.add(build_skin_mesh(&editor.craft, VoxelSkin::Hull))),
-            MeshMaterial3d(chassis_mat),
-            Transform::default(),
-            RoverChassisMesh,
-            TestEntity,
-        ));
+        // Chassis skin, one sub-mesh per material (WI 614); all positioned by `track_rover_meshes`.
+        for (material, mesh) in skin_submeshes(&editor.craft, VoxelSkin::Hull) {
+            let chassis_mat = pbr_material(material, &asset_server, &mut materials);
+            commands.spawn((
+                Mesh3d(meshes.add(mesh)),
+                MeshMaterial3d(chassis_mat),
+                Transform::default(),
+                RoverChassisMesh,
+                TestEntity,
+            ));
+        }
         let tyre_mat = materials.add(StandardMaterial {
             base_color: Color::srgb(0.07, 0.07, 0.09),
             perceptual_roughness: 0.95,
@@ -1456,40 +1451,40 @@ fn reconcile_meshes(
         commands.entity(e).despawn();
     }
 
-    let material = pbr_material(
-        material_set_for(Material::COMPOSITE),
-        &asset_server,
-        &mut materials,
-    );
+    // One sub-mesh per material so the hull renders as the materials it's made of (WI 614).
     match world.state {
         CraftState::Intact => {
-            let mesh = meshes.add(build_skin_mesh(&world.craft.voxels, VoxelSkin::Hull));
             let render = world.mesh_origin(&world.body, world.craft.dry_com);
-            commands.spawn((
-                Mesh3d(mesh),
-                MeshMaterial3d(material),
-                Transform::default(),
-                WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, render)),
-                CraftMarker,
-                TestEntity,
-            ));
+            for (material, mesh) in skin_submeshes(&world.craft.voxels, VoxelSkin::Hull) {
+                let mat = pbr_material(material, &asset_server, &mut materials);
+                commands.spawn((
+                    Mesh3d(meshes.add(mesh)),
+                    MeshMaterial3d(mat),
+                    Transform::default(),
+                    WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, render)),
+                    CraftMarker,
+                    TestEntity,
+                ));
+            }
         }
         CraftState::Fractured => {
             for (i, (voxels, body)) in world.fragments.iter().enumerate() {
-                let mesh = meshes.add(build_skin_mesh(voxels, VoxelSkin::Hull));
                 let com = voxels
                     .mass_properties()
                     .map(|mp| mp.center_of_mass)
                     .unwrap_or(DVec3::ZERO);
                 let render = world.mesh_origin(body, com);
-                commands.spawn((
-                    Mesh3d(mesh),
-                    MeshMaterial3d(material.clone()),
-                    Transform::default(),
-                    WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, render)),
-                    FragmentMarker(i),
-                    TestEntity,
-                ));
+                for (material, mesh) in skin_submeshes(voxels, VoxelSkin::Hull) {
+                    let mat = pbr_material(material, &asset_server, &mut materials);
+                    commands.spawn((
+                        Mesh3d(meshes.add(mesh)),
+                        MeshMaterial3d(mat),
+                        Transform::default(),
+                        WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, render)),
+                        FragmentMarker(i),
+                        TestEntity,
+                    ));
+                }
             }
         }
     }
@@ -1509,7 +1504,8 @@ fn track_meshes(
     }
     match world.state {
         CraftState::Intact => {
-            if let Ok((mut wp, mut tf)) = sets.p0().single_mut() {
+            // Per-material sub-meshes (WI 614) all carry CraftMarker; place them together.
+            for (mut wp, mut tf) in &mut sets.p0() {
                 wp.0 = WorldPos::new(
                     FrameId::CENTRAL_BODY,
                     world.mesh_origin(&world.body, world.craft.dry_com),
@@ -1638,7 +1634,8 @@ fn track_rover_meshes(
     let anchor = body.position;
     let q = body.orientation;
 
-    if let Ok(mut tf) = chassis_q.single_mut() {
+    // Per-material chassis sub-meshes (WI 614) all share the chassis transform.
+    for mut tf in &mut chassis_q {
         tf.translation = (-(q * rs.com)).as_vec3();
         tf.rotation = q.as_quat();
     }

@@ -25,7 +25,7 @@ use sounding_sim::sim::CentralBody;
 use sounding_sim::voxel::{Material, Voxel, VoxelCraft};
 
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
-use crate::voxel_skin::{build_skin_mesh, material_set_for, pbr_material, VoxelSkin};
+use crate::voxel_skin::{build_skin_mesh, pbr_material, VoxelSkin};
 use sounding_sim::frame::{FrameId, WorldPos};
 
 const BODY: CentralBody = CentralBody::EARTHLIKE;
@@ -247,7 +247,7 @@ fn setup_scene(
             (&frag, Material::ALUMINIUM)
         };
         let mesh = meshes.add(build_skin_mesh(voxels, VoxelSkin::Hull));
-        let material = pbr_material(material_set_for(mat), &asset_server, &mut materials);
+        let material = pbr_material(mat, &asset_server, &mut materials);
         commands.spawn((
             Mesh3d(mesh),
             MeshMaterial3d(material),

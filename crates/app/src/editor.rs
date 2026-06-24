@@ -730,14 +730,10 @@ fn cell_center(c: IVec3, cell_size: f64) -> Vec3 {
     ((c.as_dvec3() + DVec3::splat(0.5)) * cell_size).as_vec3()
 }
 
+/// The editor gizmo / palette-swatch colour for a material — the same per-material appearance the
+/// skin renders with (WI 614), so the palette and the built craft agree.
 fn material_color(m: Material) -> Color {
-    match m {
-        x if x == Material::ALUMINIUM => Color::srgb(0.70, 0.72, 0.78),
-        x if x == Material::STEEL => Color::srgb(0.45, 0.47, 0.52),
-        x if x == Material::TITANIUM => Color::srgb(0.62, 0.60, 0.52),
-        x if x == Material::COMPOSITE => Color::srgb(0.25, 0.24, 0.30),
-        _ => Color::srgb(0.55, 0.35, 0.55),
-    }
+    crate::voxel_skin::material_visual(m).tint
 }
 
 /// Draws the editor's craft, cursor, and derived properties as gizmos. Crate-visible so the

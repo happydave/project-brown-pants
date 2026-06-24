@@ -29,7 +29,7 @@ use sounding_sim::sim::CentralBody;
 use sounding_sim::voxel::{Material, Voxel, VoxelCraft};
 
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
-use crate::voxel_skin::{build_skin_mesh, material_set_for, pbr_material, VoxelSkin};
+use crate::voxel_skin::{build_skin_mesh, pbr_material, VoxelSkin};
 
 const BODY: CentralBody = CentralBody::EARTHLIKE;
 const SUBSTEP_DT: f64 = 0.004;
@@ -175,11 +175,7 @@ fn setup_scene(
 ) {
     // The same lattice the sim flies (the world owns the authoritative copy).
     let craft_voxels = world.craft.voxels.clone();
-    let material = pbr_material(
-        material_set_for(Material::COMPOSITE),
-        &asset_server,
-        &mut materials,
-    );
+    let material = pbr_material(Material::COMPOSITE, &asset_server, &mut materials);
 
     // Two slots from one sim state, separated laterally so they read side by side: the
     // blocky skin (left) and the greedy-meshed hull (right, WI 583) of the same lattice.
