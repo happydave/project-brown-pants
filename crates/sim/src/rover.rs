@@ -27,9 +27,18 @@ const EPS: f64 = 1e-3;
 /// Aerodynamic drag coefficient (N·s²/m²): gives the rover a finite (but high)
 /// top speed of roughly 100 m/s.
 const DRAG: f64 = 0.55;
-/// Angular drag (N·m·s): rotational damping that prevents any tumbling runaway
-/// from the stiff coupled contacts, while still letting the rover turn and tilt.
-const ANGULAR_DRAG: f64 = 1_500.0;
+/// Baseline angular drag (N·m·s) under *smooth* contact (WI 611): a gentle restoring term that keeps
+/// nominal driving tidy without preventing an intentional flip — far weaker than the old blanket
+/// damper, so genuine rotation survives.
+const BASELINE_ANGULAR_DRAG: f64 = 40.0;
+/// Jitter-scaled angular drag (N·m·s) (WI 611): added in proportion to the contact-jitter ratio
+/// (per-substep normal-force change ÷ weight), so the numerical "kraken" buzz — which oscillates the
+/// normal force every sub-step — is damped hard, while a genuine, smooth-contact rotation (an
+/// intentional rollover) passes nearly undamped. Replaces the old blanket `ANGULAR_DRAG`.
+const JITTER_ANGULAR_DRAG: f64 = 1_500.0;
+/// Cap on the jitter ratio feeding `JITTER_ANGULAR_DRAG`, so a single hard landing spike can't make
+/// the damping unboundedly large.
+const JITTER_RATIO_CAP: f64 = 3.0;
 /// Motor's maximum wheel speed (rad/s). Drive torque falls off as the wheel nears
 /// it, so flooring the throttle cannot spin the wheels up without bound — a burnout
 /// would use all the tyre's grip longitudinally and leave none for cornering,
@@ -188,8 +197,20 @@ impl Rover {
 
         // Aerodynamic drag → a finite top speed, keeping the rover in the stable band.
         net_force -= DRAG * self.body.velocity * self.body.velocity.length();
-        // Angular drag → damps any rotational runaway from the stiff contacts.
-        net_torque -= ANGULAR_DRAG * self.body.angular_velocity();
+
+        // Jitter-selective angular drag (WI 611): scale the damper by the contact-jitter signal so
+        // the numerical kraken buzz (which rattles the total normal force every sub-step) is caged,
+        // while a genuine, smooth-contact rotation — an intentional flip from a sharp turn or an
+        // obstacle clip — passes nearly undamped. Replaces the old blanket angular damper.
+        let jitter = (total_normal - self.last_total_normal).abs();
+        let weight = self.body.mass * self.gravity;
+        let jitter_ratio = if weight > 1e-9 {
+            (jitter / weight).min(JITTER_RATIO_CAP)
+        } else {
+            0.0
+        };
+        let angular_drag = BASELINE_ANGULAR_DRAG + JITTER_ANGULAR_DRAG * jitter_ratio;
+        net_torque -= angular_drag * self.body.angular_velocity();
 
         // External contact wrench (WI 610): obstacle contacts accumulated by the caller this step.
         net_force += self.external_force;
@@ -197,7 +218,7 @@ impl Rover {
         self.external_force = DVec3::ZERO;
         self.external_torque = DVec3::ZERO;
 
-        self.contact_jitter = (total_normal - self.last_total_normal).abs();
+        self.contact_jitter = jitter;
         self.last_total_normal = total_normal;
         self.body.integrate_wrench(net_force, net_torque, dt);
     }
@@ -893,7 +914,9 @@ mod tests {
         // It reaches a high speed and catches real air over the crests…
         assert!(top_speed > 75.0, "top speed too low: {top_speed}");
         assert!(max_air > 0.8, "rover did not catch air: {max_air}");
-        // …but never tumbles out of control or spins endlessly (recovers).
+        // …but stays finite and recovers rather than spinning endlessly: the jitter-selective damper
+        // (WI 611) still caps the rough-landing buzz, so even reckless straight-line bump-flying keeps
+        // bounded angular velocity. (A *steered* hard turn is the intentional-rollover case.)
         assert!(
             max_omega < 6.0,
             "rover tumbled at high speed over bumps: {max_omega}"
@@ -930,6 +953,126 @@ mod tests {
         assert!(
             w.x.abs() < 1.0 && w.y.abs() < 1.0 && w.z.abs() < 1.0,
             "per-axis spin at speed: {w:?}"
+        );
+    }
+
+    /// A tall, narrow (roll-prone) four-wheel rover resting on flat ground at the origin: high CoM
+    /// over a short track, so a hard turn at speed can tip it (WI 611).
+    fn roll_prone_rover() -> (Rover, Vec<usize>) {
+        let s = 0.5;
+        let mut craft = VoxelCraft::new(s);
+        // 1 cell wide (x), 3 long (z), 4 tall (y): a high centre of mass.
+        for y in 0..4 {
+            for z in 0..3 {
+                craft.voxels.push(Voxel {
+                    cell: IVec3::new(0, y, z),
+                    material: Material::COMPOSITE,
+                });
+            }
+        }
+        // Four wheels on a narrow track (x ≈ ±0.15 about the chassis centre x≈0.25), at the bottom.
+        let mounts = [
+            (DVec3::new(0.1, -0.3, 0.25), false),
+            (DVec3::new(0.4, -0.3, 0.25), false),
+            (DVec3::new(0.1, -0.3, 1.25), true),
+            (DVec3::new(0.4, -0.3, 1.25), true),
+        ];
+        for (mount, steer) in mounts {
+            craft.parts.push(Part {
+                mount,
+                mass: 8.0,
+                kind: PartKind::Wheel(WheelPart::for_cell_size(s, true, steer)),
+            });
+        }
+        let terrain = Terrain {
+            amplitude: 0.0,
+            ..Default::default()
+        };
+        let asm = assemble_rover(&craft, DVec3::ZERO, 9.81).unwrap();
+        let mut rover = asm.rover;
+        let drop = rover
+            .wheels
+            .iter()
+            .map(|w| w.rest_length + w.radius - w.mount.y)
+            .fold(0.0_f64, f64::max);
+        rover.body.position = DVec3::new(0.0, terrain.height(0.0, 0.0) + drop, 0.0);
+        for _ in 0..4_000 {
+            rover.step(&terrain, DT);
+        }
+        (rover, asm.drive)
+    }
+
+    fn body_up(rover: &Rover) -> DVec3 {
+        DMat3::from_quat(rover.body.orientation) * DVec3::Y
+    }
+
+    #[test]
+    fn sharp_turn_at_speed_can_roll() {
+        // Provoked driving (WI 611): bring a roll-prone rover up to speed, then jam a hard steer.
+        // The lateral force at the tyres, acting through the high CoM over the narrow track, must be
+        // able to tip it past upright — the whole point of relaxing the blanket angular damper.
+        let terrain = Terrain {
+            amplitude: 0.0,
+            ..Default::default()
+        };
+        let (mut rover, drive) = roll_prone_rover();
+        let mass = rover.body.mass;
+        // Accelerate to speed.
+        for &i in &drive {
+            rover.wheels[i].drive_torque = mass * 6.0;
+        }
+        for _ in 0..6_000 {
+            rover.step(&terrain, DT);
+        }
+        // Jam a hard steer on the front pair and hold the throttle.
+        rover.wheels[2].steer = 0.6;
+        rover.wheels[3].steer = 0.6;
+        let mut min_up_y = 1.0_f64;
+        for _ in 0..20_000 {
+            rover.step(&terrain, DT);
+            min_up_y = min_up_y.min(body_up(&rover).y);
+        }
+        assert!(rover.body.position.is_finite());
+        assert!(
+            min_up_y < 0.5,
+            "roll-prone rover did not tip on a hard turn at speed: min up.y = {min_up_y}"
+        );
+    }
+
+    #[test]
+    fn nominal_cruise_does_not_spuriously_roll() {
+        // The other side (WI 611): a normal low-wide rover cruising at a moderate speed with a gentle
+        // steer over mild terrain must stay upright — no spurious flip from the relaxed damper.
+        let terrain = Terrain {
+            amplitude: 0.25,
+            ..Default::default()
+        };
+        let mut rover = rover_at(&terrain, 0.0, 0.0, 0.2);
+        for _ in 0..2_000 {
+            rover.step(&terrain, DT); // settle
+        }
+        let target_speed = 8.0;
+        let mut min_up_y = 1.0_f64;
+        for step in 0..20_000 {
+            let throttle = if rover.body.velocity.length() < target_speed {
+                1_500.0
+            } else {
+                0.0
+            };
+            for w in &mut rover.wheels {
+                w.drive_torque = throttle;
+            }
+            // A gentle, steady steer (a wide easy turn).
+            rover.wheels[2].steer = 0.08;
+            rover.wheels[3].steer = 0.08;
+            rover.step(&terrain, DT);
+            if step > 2_000 {
+                min_up_y = min_up_y.min(body_up(&rover).y);
+            }
+        }
+        assert!(
+            min_up_y > 0.85,
+            "nominal cruise spuriously rolled: min up.y = {min_up_y}"
         );
     }
 
