@@ -14,6 +14,7 @@
 //! / no-launch test (the design's kraken detector as an automated bound).
 
 use crate::active::ActiveBody;
+use crate::powertrain::{build_powertrain, RoverPowertrain};
 use crate::terrain::Terrain;
 use crate::voxel::{DeviceKind, PartKind, VoxelCraft};
 use glam::{DMat3, DQuat, DVec3};
@@ -225,7 +226,7 @@ impl Rover {
 
 /// The result of assembling a rover from a built lattice (WI 607): the rover plus
 /// its drivetrain binding (which wheels drive / steer, by index into `rover.wheels`)
-/// and a signal for thrust engines that were placed but not wired.
+/// and the powertrain that feeds the drive wheels (WI 609).
 #[derive(Clone, Debug)]
 pub struct RoverAssembly {
     /// The assembled rover (chassis body + wheels).
@@ -234,11 +235,10 @@ pub struct RoverAssembly {
     pub drive: Vec<usize>,
     /// Indices into `rover.wheels` that turn with steering input.
     pub steer: Vec<usize>,
-    /// Count of placed thrust engines (`DeviceKind::Engine`) that this rover assembly
-    /// did **not** wire (designreview finding 1): a wheels-and-thrust hybrid is out of
-    /// first-cut scope, so the rover path is taken and the thrust engines are reported
-    /// here rather than silently dropped. Zero for a pure rover.
-    pub unwired_thrust_engines: usize,
+    /// The drive power source (combustion / electric) derived from the build's devices/parts
+    /// (WI 609): an `Engine`+`Tank` build burns fuel, a `Battery` build draws charge (solar from
+    /// panels), and a build with neither gets a self-sustaining default.
+    pub powertrain: RoverPowertrain,
 }
 
 /// Assemble a [`Rover`] from a built `craft` (WI 607), placing its centre of mass at
@@ -306,18 +306,29 @@ pub fn assemble_rover(craft: &VoxelCraft, position: DVec3, gravity: f64) -> Opti
         w.damping = 2.0 * 0.7 * (w.stiffness * m_wheel).sqrt();
     }
 
-    let unwired_thrust_engines = craft
-        .devices
+    // Powertrain (WI 609): an `Engine` device is a combustion engine for the rover (drivetrain),
+    // not thrust; `Tank` feeds it, `Battery` + `SolarPanel` parts are the electric path.
+    let count_dev = |k: DeviceKind| craft.devices.iter().filter(|d| d.kind == k).count();
+    let solar = craft
+        .parts
         .iter()
-        .filter(|d| d.kind == DeviceKind::Engine)
+        .filter(|p| matches!(p.kind, PartKind::SolarPanel))
         .count();
+    let powertrain = build_powertrain(
+        count_dev(DeviceKind::Engine),
+        count_dev(DeviceKind::Tank),
+        count_dev(DeviceKind::Battery),
+        solar,
+        mp.mass,
+        drive.len(),
+    );
 
     let body = ActiveBody::from_mass_properties(position, DVec3::ZERO, &mp);
     Some(RoverAssembly {
         rover: Rover::new(body, wheels, gravity),
         drive,
         steer,
-        unwired_thrust_engines,
+        powertrain,
     })
 }
 
@@ -391,7 +402,8 @@ mod tests {
         assert_eq!(asm.rover.wheels.len(), 4);
         assert_eq!(asm.drive, vec![0, 1, 2, 3]); // all four drive
         assert_eq!(asm.steer, vec![2, 3]); // only the front pair steer
-        assert_eq!(asm.unwired_thrust_engines, 0);
+                                           // No power devices ⇒ the default (electric) powertrain.
+        assert_eq!(asm.powertrain.label(), "charge");
         // Body mass equals the chassis-plus-parts mass.
         assert!((asm.rover.body.mass - mp.mass).abs() < 1e-9);
         // Wheel mounts are CoM-relative.
@@ -520,17 +532,23 @@ mod tests {
     }
 
     #[test]
-    fn assemble_rover_reports_unwired_thrust_engines() {
-        // A wheels-and-thrust hybrid takes the rover path and reports the engines.
+    fn engine_and_tank_make_a_combustion_powertrain() {
+        // An Engine device on a rover is a combustion engine (drivetrain), fed by a Tank (WI 609).
         let mut craft = chassis_with_wheels();
         craft.devices.push(Device::structural(
             IVec3::new(1, 0, 2),
             100.0,
             DeviceKind::Engine,
         ));
+        craft.devices.push(Device::structural(
+            IVec3::new(1, 0, 3),
+            80.0,
+            DeviceKind::Tank,
+        ));
         let asm = assemble_rover(&craft, DVec3::ZERO, 9.81).unwrap();
         assert_eq!(asm.rover.wheels.len(), 4);
-        assert_eq!(asm.unwired_thrust_engines, 1);
+        assert_eq!(asm.powertrain.label(), "fuel");
+        assert!(asm.powertrain.reservoir.amount > 0.0);
     }
 
     /// The production sub-step (see [`super::SUBSTEP_DT`]).

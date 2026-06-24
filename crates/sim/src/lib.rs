@@ -27,6 +27,7 @@ pub mod launch;
 pub mod medium;
 pub mod orbit;
 pub mod persist;
+pub mod powertrain;
 pub mod propulsion;
 pub mod resource;
 pub mod rover;

@@ -52,6 +52,7 @@ use sounding_sim::fluid::FluidMedium;
 use sounding_sim::frame::{FrameId, WorldPos};
 use sounding_sim::launch::LaunchPad;
 use sounding_sim::medium::max_cross_section;
+use sounding_sim::powertrain::RoverPowertrain;
 use sounding_sim::propulsion::{Engine, EngineCommand, Propulsion};
 use sounding_sim::resource::{Reservoir, ReservoirId, ResourceGraph, ResourceType};
 use sounding_sim::rover::{assemble_rover, Rover, RoverAssembly, SUBSTEP_DT as ROVER_SUBSTEP_DT};
@@ -100,9 +101,6 @@ enum CraftState {
 const ROVER_GRAVITY: f64 = 9.81;
 /// Max rover physics substeps per frame (the rover sub-steps far finer than the rocket path).
 const ROVER_MAX_SUBSTEPS: u32 = 64;
-/// Drive torque per kg of rover mass at full throttle (N·m/kg) — scaled with mass so any build has
-/// enough authority to actually move off the line (rather than a fixed torque a heavy build ignores).
-const ROVER_DRIVE_PER_KG: f64 = 4.0;
 /// Brake torque per kg of rover mass (N·m/kg).
 const ROVER_BRAKE_PER_KG: f64 = 9.0;
 /// Steering angle applied to the steer-group wheels (rad).
@@ -117,7 +115,12 @@ struct RoverState {
     drive: Vec<usize>,
     steer: Vec<usize>,
     lattice: VoxelCraft,
-    unwired_thrust_engines: usize,
+    /// The drive power source (combustion / electric) — gates drive torque by fuel/charge (WI 609).
+    powertrain: RoverPowertrain,
+    /// Throttle intent (−1..1), set by input and routed through the powertrain each frame.
+    throttle: f64,
+    /// Brake torque magnitude applied to every wheel.
+    brake: f64,
     accumulator: f64,
     /// World-space breadcrumb trail the rover leaves, so motion is visible against the
     /// (otherwise self-similar, rover-anchored) flat ground.
@@ -355,7 +358,9 @@ impl WorkshopWorld {
             drive: asm.drive,
             steer: asm.steer,
             lattice,
-            unwired_thrust_engines: asm.unwired_thrust_engines,
+            powertrain: asm.powertrain,
+            throttle: 0.0,
+            brake: 0.0,
             accumulator: 0.0,
             track: Vec::new(),
             record: 0,
@@ -1115,12 +1120,17 @@ fn drive_rover(keys: &ButtonInput<KeyCode>, world: &mut WorkshopWorld) {
     let Some(rs) = world.rover.as_mut() else {
         return;
     };
-    // Scale drive/brake with mass so a device-laden build still moves (fixed torque was too weak).
-    let drive = rs.rover.body.mass * ROVER_DRIVE_PER_KG;
-    let throttle = if keys.pressed(KeyCode::KeyW) {
-        drive
+    // Set the throttle/brake **intent**; the powertrain turns throttle into (fuel-gated) torque each
+    // frame in `step_workshop` (WI 609).
+    rs.throttle = if keys.pressed(KeyCode::KeyW) {
+        1.0
     } else if keys.pressed(KeyCode::KeyS) {
-        -drive
+        -1.0
+    } else {
+        0.0
+    };
+    rs.brake = if keys.pressed(KeyCode::Space) {
+        rs.rover.body.mass * ROVER_BRAKE_PER_KG
     } else {
         0.0
     };
@@ -1131,15 +1141,6 @@ fn drive_rover(keys: &ButtonInput<KeyCode>, world: &mut WorkshopWorld) {
     } else {
         0.0
     };
-    let brake = if keys.pressed(KeyCode::Space) {
-        rs.rover.body.mass * ROVER_BRAKE_PER_KG
-    } else {
-        0.0
-    };
-    for (i, w) in rs.rover.wheels.iter_mut().enumerate() {
-        w.drive_torque = if rs.drive.contains(&i) { throttle } else { 0.0 };
-        w.brake = brake;
-    }
     // Coordinated counter-steer: each steered wheel's angle ∝ its longitudinal offset from the CoM,
     // so rear steer-wheels invert and the rover turns about itself instead of fighting itself.
     let steer = rs.steer.clone();
@@ -1150,6 +1151,14 @@ fn step_workshop(time: Res<Time>, mut world: ResMut<WorkshopWorld>) {
     if world.rover.is_some() {
         let frame_dt = time.delta_secs_f64();
         let rs = world.rover.as_mut().expect("rover present");
+        // Route throttle through the powertrain (consumes fuel/charge over the frame); the realized
+        // torque drives the drive-group wheels, brake applies to all.
+        let torque = rs.powertrain.drive_torque(rs.throttle, frame_dt);
+        let brake = rs.brake;
+        for (i, w) in rs.rover.wheels.iter_mut().enumerate() {
+            w.drive_torque = if rs.drive.contains(&i) { torque } else { 0.0 };
+            w.brake = brake;
+        }
         rs.accumulator += frame_dt;
         let terrain = rs.terrain;
         let mut n = 0;
@@ -1493,17 +1502,11 @@ fn update_test_hud(world: Res<WorkshopWorld>, mut hud: Query<&mut Text, With<Tes
         if let Some(rs) = &world.rover {
             let speed = rs.rover.body.velocity.length();
             let height = rs.rover.height_above_terrain(&rs.terrain);
-            let warn = if rs.unwired_thrust_engines > 0 {
-                format!(
-                    "\n⚠ {} thrust engine(s) ignored (rover path)",
-                    rs.unwired_thrust_engines
-                )
-            } else {
-                String::new()
-            };
             text.0 = format!(
-                "workshop · TEST (rover)\nspeed:  {speed:6.2} m/s\nheight: {height:6.2} m\nwheels: {}{warn}",
+                "workshop · TEST (rover)\nspeed:  {speed:6.2} m/s\nheight: {height:6.2} m\nwheels: {}\n{}:  {:3.0}%",
                 rs.rover.wheels.len(),
+                rs.powertrain.label(),
+                rs.powertrain.fraction() * 100.0,
             );
             return;
         }
