@@ -87,6 +87,30 @@ pub enum DeviceKind {
     Battery,
 }
 
+impl DeviceKind {
+    /// Bulk density of this device kind, kg/m³ (WI 615). A device fills roughly one cell, so its mass
+    /// is `density × cell_size³` — the same shape as a structural voxel's `material.density × cell³`.
+    /// Densities are chosen comparable to the structural materials (≈1600–7850 kg/m³) so a device
+    /// weighs about as much as the voxels around it at any cell size, instead of a fixed mass that
+    /// dominates a small build. Tank is light (an empty shell; propellant is modelled separately).
+    pub fn density(self) -> f64 {
+        match self {
+            DeviceKind::Command => 800.0,
+            DeviceKind::Computer => 1_200.0,
+            DeviceKind::Battery => 2_500.0,
+            DeviceKind::Engine => 3_000.0,
+            DeviceKind::Tank => 600.0,
+            DeviceKind::Rcs => 1_000.0,
+        }
+    }
+}
+
+/// The mass (kg) of a device of `kind` filling a cell of side `cell_size` m (WI 615):
+/// `density(kind) × cell_size³`. Use this at every placement site so device mass tracks build scale.
+pub fn device_mass(kind: DeviceKind, cell_size: f64) -> f64 {
+    kind.density() * cell_size * cell_size * cell_size
+}
+
 /// A mounted functional device: a mass at a cell. Contributes to mass and inertia
 /// (never to the voxel-occupancy area curve). Beyond mass, a device may carry a
 /// [`crate::control::DeviceFunction`] giving it real flight behaviour assembled into
@@ -580,6 +604,31 @@ mod tests {
             }
         }
         craft
+    }
+
+    #[test]
+    fn device_mass_scales_with_cell_volume_and_is_voxel_comparable() {
+        // Mass scales with the cube of cell size (WI 615): doubling the cell ⇒ 8× mass.
+        for kind in [
+            DeviceKind::Command,
+            DeviceKind::Computer,
+            DeviceKind::Battery,
+            DeviceKind::Engine,
+            DeviceKind::Tank,
+        ] {
+            let m01 = device_mass(kind, 0.1);
+            let m02 = device_mass(kind, 0.2);
+            assert!(
+                (m02 - 8.0 * m01).abs() < 1e-9,
+                "device mass must scale with cell³"
+            );
+            // At 0.1 m a device is comparable to a FRAME-ish structural voxel (~1.6 kg), not 10–100×.
+            let frame_voxel = 1_600.0 * 0.1 * 0.1 * 0.1; // ≈1.6 kg
+            assert!(
+                m01 > 0.2 * frame_voxel && m01 < 5.0 * frame_voxel,
+                "device {kind:?} mass {m01} kg not voxel-comparable at 0.1 m"
+            );
+        }
     }
 
     #[test]

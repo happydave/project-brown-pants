@@ -58,7 +58,7 @@ use sounding_sim::resource::{Reservoir, ReservoirId, ResourceGraph, ResourceType
 use sounding_sim::rover::{assemble_rover, Rover, RoverAssembly, SUBSTEP_DT as ROVER_SUBSTEP_DT};
 use sounding_sim::sim::CentralBody;
 use sounding_sim::terrain::Terrain;
-use sounding_sim::voxel::{Device, DeviceKind, Material, PartKind, Voxel, VoxelCraft};
+use sounding_sim::voxel::{device_mass, Device, DeviceKind, Material, PartKind, Voxel, VoxelCraft};
 use sounding_sim::warp::safe_substep_dt;
 
 use crate::editor::{
@@ -211,26 +211,31 @@ fn default_lattice() -> VoxelCraft {
             }
         }
     }
-    v.devices
-        .push(Device::control_point(IVec3::new(0, 0, 0), 120.0, true));
+    // Device masses scale with cell volume (WI 615) so the seed craft isn't device-mass-dominated.
+    let s = v.cell_size;
+    v.devices.push(Device::control_point(
+        IVec3::new(0, 0, 0),
+        device_mass(DeviceKind::Command, s),
+        true,
+    ));
     v.devices.push(Device::computer(
         IVec3::new(1, 1, 1),
-        40.0,
+        device_mass(DeviceKind::Computer, s),
         ControlComputer::tuning_computer(0.4),
     ));
     v.devices.push(Device::battery(
         IVec3::new(0, 1, 0),
-        60.0,
+        device_mass(DeviceKind::Battery, s),
         BatterySpec::full(120.0),
     ));
     v.devices.push(Device::structural(
         IVec3::new(1, 0, 1),
-        100.0,
+        device_mass(DeviceKind::Engine, s),
         DeviceKind::Engine,
     ));
     v.devices.push(Device::structural(
         IVec3::new(0, 0, 1),
-        80.0,
+        device_mass(DeviceKind::Tank, s),
         DeviceKind::Tank,
     ));
     v

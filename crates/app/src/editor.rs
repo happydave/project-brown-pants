@@ -14,8 +14,8 @@ use sounding_sim::control::{BatterySpec, ControlComputer};
 use sounding_sim::frame::{FrameId, WorldPos};
 use sounding_sim::persist::{CraftSubgraph, Kind, Payload, SavedDocument};
 use sounding_sim::voxel::{
-    AttachmentPoint, Axis, Device, DeviceKind, Face, Material, Part, PartKind, Voxel, VoxelCraft,
-    WheelPart,
+    device_mass, AttachmentPoint, Axis, Device, DeviceKind, Face, Material, Part, PartKind, Voxel,
+    VoxelCraft, WheelPart,
 };
 use std::fs;
 
@@ -157,14 +157,33 @@ fn place_brush(
             });
         }
         Brush::ControlPoint | Brush::Computer | Brush::Battery | Brush::Engine | Brush::Tank => {
+            // Device mass scales with the build's cell volume (WI 615) so a device is comparable to
+            // the voxels around it, not a fixed 40–120 kg that dominates a small build.
+            let s = craft.cell_size;
             let d = match brush {
-                Brush::ControlPoint => Device::control_point(device_cell, 120.0, true),
-                Brush::Computer => {
-                    Device::computer(device_cell, 40.0, ControlComputer::tuning_computer(0.4))
+                Brush::ControlPoint => {
+                    Device::control_point(device_cell, device_mass(DeviceKind::Command, s), true)
                 }
-                Brush::Battery => Device::battery(device_cell, 60.0, BatterySpec::full(120.0)),
-                Brush::Engine => Device::structural(device_cell, 100.0, DeviceKind::Engine),
-                Brush::Tank => Device::structural(device_cell, 80.0, DeviceKind::Tank),
+                Brush::Computer => Device::computer(
+                    device_cell,
+                    device_mass(DeviceKind::Computer, s),
+                    ControlComputer::tuning_computer(0.4),
+                ),
+                Brush::Battery => Device::battery(
+                    device_cell,
+                    device_mass(DeviceKind::Battery, s),
+                    BatterySpec::full(120.0),
+                ),
+                Brush::Engine => Device::structural(
+                    device_cell,
+                    device_mass(DeviceKind::Engine, s),
+                    DeviceKind::Engine,
+                ),
+                Brush::Tank => Device::structural(
+                    device_cell,
+                    device_mass(DeviceKind::Tank, s),
+                    DeviceKind::Tank,
+                ),
                 _ => unreachable!(),
             };
             craft.devices.retain(|x| x.cell != device_cell);
