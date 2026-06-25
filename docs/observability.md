@@ -12,29 +12,28 @@ build/speed). The items below remove that blindfold.
 
 | Thread | Why | Status / work item |
 | --- | --- | --- |
-| **Vehicle (craft) save/load** | Save a built rover/craft to a file; reload it. Saves the user re-building; lets the assistant load the *exact* craft under test. | **New** → `tickets/docs/pending/637-snd-craft-save-load/`. Builds on `crates/sim/src/persist.rs` (the versioned lattice persist format already exists). |
-| **World pause** | Freeze the running scene to inspect a state without it evolving. | **New** → `tickets/docs/pending/638-snd-world-pause/`. The sim already has a `pause`/warp command path (`apply_command`); this is wiring scene-level pause + a clear indicator. |
+| **Vehicle (craft) save/load** | Save a built rover/craft to a file; reload it. Saves the user re-building; lets the assistant load the *exact* craft under test. | **Done (WI 637)** — `editor.rs` `K` save / `O` open `craft.json` via the versioned `persist` envelope. |
+| **World pause** | Freeze the running scene to inspect a state without it evolving. | **Done (WI 638)** — `P` emits `Command::SetPaused` on the bus; `workshop`/`rover`/`play` gate their step on `SimClock.paused`, with a `⏸ PAUSED` HUD banner (`crate::pause`). |
 | **World save/load + save-file inspector** | Persist a whole scenario (craft + world + clock); a CLI/tool to **dump/inspect** a save file so the assistant can read what's there. | Partly designed: **WI 537** (fp-world-save, deferred) and **WI 553** (sc-content-aware-persistence, pending — subsumes 537). The *inspector tool* is the new, assistant-facing piece → tracked in 553's scope / a small CLI. |
-| **Dev MCP (live introspection)** | An MCP bridge to the running game so the assistant can query ECS state / telemetry / the command bus live. | **Spike** → `tickets/docs/pending/639-snd-dev-mcp-spike/`. See findings below. |
+| **Dev MCP (live introspection)** | An MCP bridge to the running game so the assistant can query ECS state / telemetry / the command bus live. | **Spike done (WI 639)** — bridge at `dev/mcp/` (command-bus over BRP-generic); self-test green. Two follow-ups: user registers it; enrich `Telemetry` with rover pose/contact. See findings below. |
 
 (Foundational observability already exists: **WI 499** observability harness + physics-invariant
 metrics; `crates/sim/src/{telemetry,diagnostics}.rs`; the `Telemetry` snapshot is a versioned API.)
 
-## Dev-MCP findings (what's there, what's missing)
+## Dev-MCP findings (WI 639 spike — resolved)
 
-- The design intent is recorded in `tickets/docs/projects/sounding/project.md` (§dev tooling): **Bevy
-  Remote Protocol (BRP) + MCP** for ECS introspection and scenario/test harnesses, plus a custom
-  **command-bus MCP** for domain-level verbs — all **dev-only, behind the `dev` cargo feature**, never
-  load-bearing.
-- BRP is gated behind the app's `dev` feature (see CLAUDE.md "Dev tooling"). So the *engine side* of
-  live introspection is partly in place.
-- **Missing:** the MCP **bridge** that connects the running game (BRP and/or the always-on command bus)
-  to the assistant's tool surface, and the wiring to register it (e.g. in the Claude config). In the
-  current environment **no dev MCP is reachable from the assistant** — confirmed during the 631/634
-  work; that's why reproduction was headless-only.
-- Spike goal: stand up the BRP-or-command-bus → MCP path end to end on one scenario (e.g. `workshop`),
-  confirm the assistant can read live state (rover pose, contact signals like `hull_penetration`,
-  telemetry), and decide BRP-generic vs a domain command-bus MCP.
+Full write-up: `tickets/docs/pending/639-snd-dev-mcp-spike/spike.md`. Summary:
+
+- **Verdict: GO**, via the **command bus** (`bus.rs`, always-on `127.0.0.1:8787`), not BRP-generic.
+  The bus is always compiled (no `dev` rebuild), already JSON, and a **versioned public surface**
+  (`Telemetry`/`Command`); BRP stays the dev-only god-mode escape hatch for raw ECS poking.
+- **Artifact:** `dev/mcp/sounding_mcp.py` — a stdlib-only stdio MCP bridge exposing `get_telemetry` /
+  `send_command`; `dev/mcp/test_bridge.py` proves the `initialize`/`tools/list`/`tools/call` handshake
+  + HTTP proxying against a stub bus (green) without needing the windowed game.
+- **Two follow-ups:** (1) **user** registers the MCP in `~/.claude.json` (`dev/mcp/README.md`); the
+  assistant can't reach it until then. (2) **Enrich `Telemetry`** with rover pose / `hull_penetration`
+  / per-wheel state — the bridge forwards whatever `/telemetry` returns, so only the snapshot needs
+  growing; that is the piece that actually lifts the 631/634 blindfold. Recommend a new WI.
 
 ## Notes
 

@@ -13,9 +13,11 @@ lives in the workflow ticket tree (a separate location), and this folder points 
   one-patch-per-ticket).
 - [`../README.md`](../README.md) — build/run, and the catalog of `cargo run -p sounding -- <scene>`
   scenarios.
-- [`observability.md`](observability.md) — how to **observe a running scenario** (dev tooling: BRP,
-  save-file inspection, world pause/save, the dev-MCP plan). The standing reference for the
-  observability work.
+- [`observability.md`](observability.md) — how to **observe a running scenario** (dev tooling: craft
+  save/load + world pause (done), the dev-MCP bridge, BRP, save-file inspection, world save). The
+  standing reference for the observability work.
+- [`../dev/mcp/README.md`](../dev/mcp/README.md) — the dev-only **MCP bridge** over the runtime bus
+  (`get_telemetry`/`send_command`); run it, self-test it, and register it (WI 639).
 
 ## Planning / backlog (workflow tickets, outside this repo)
 

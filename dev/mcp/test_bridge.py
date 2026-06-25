@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Self-test for the WI 639 MCP bridge — proves the path end to end without the windowed game.
+
+Spins a stub HTTP server standing in for the runtime bus, drives `sounding_mcp.py` as a subprocess
+over stdio, and asserts the MCP handshake (`initialize` / `tools/list` / `tools/call`) plus that the
+two tools actually proxy to `GET /telemetry` and `POST /command`.
+
+Run: ``python3 dev/mcp/test_bridge.py`` (stdlib only; exits non-zero on failure).
+"""
+
+import json
+import subprocess
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+BRIDGE = Path(__file__).with_name("sounding_mcp.py")
+
+received = {"posts": []}
+
+
+class StubBus(BaseHTTPRequestHandler):
+    def log_message(self, *_):  # silence
+        pass
+
+    def do_GET(self):
+        if self.path == "/telemetry":
+            body = b'{"clock":{"time":1.0,"warp":1.0,"paused":false}}'
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length).decode("utf-8")
+        received["posts"].append((self.path, body))
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'{"ok":true}')
+
+
+def rpc(proc, message):
+    proc.stdin.write(json.dumps(message) + "\n")
+    proc.stdin.flush()
+    return json.loads(proc.stdout.readline())
+
+
+def main():
+    server = HTTPServer(("127.0.0.1", 0), StubBus)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    proc = subprocess.Popen(
+        [sys.executable, str(BRIDGE)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        env={"SOUNDING_BUS_URL": f"http://127.0.0.1:{port}", "PATH": "/usr/bin:/bin"},
+    )
+    try:
+        init = rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        assert init["result"]["serverInfo"]["name"] == "sounding-mcp", init
+
+        tools = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        names = {t["name"] for t in tools["result"]["tools"]}
+        assert names == {"get_telemetry", "send_command"}, names
+
+        tele = rpc(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "get_telemetry", "arguments": {}},
+            },
+        )
+        text = tele["result"]["content"][0]["text"]
+        assert json.loads(text)["clock"]["paused"] is False, text
+
+        cmd = rpc(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": "send_command", "arguments": {"command": {"SetPaused": True}}},
+            },
+        )
+        assert json.loads(cmd["result"]["content"][0]["text"])["ok"] is True, cmd
+        assert received["posts"] == [("/command", '{"SetPaused": true}')], received["posts"]
+
+        # A notification draws no reply (id-less) — the bridge must not wedge.
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+        proc.stdin.flush()
+        ping = rpc(proc, {"jsonrpc": "2.0", "id": 5, "method": "tools/list"})
+        assert ping["id"] == 5, ping
+
+        print("OK: MCP handshake + telemetry/command proxying verified")
+    finally:
+        proc.stdin.close()
+        proc.terminate()
+        server.shutdown()
+
+
+if __name__ == "__main__":
+    main()
