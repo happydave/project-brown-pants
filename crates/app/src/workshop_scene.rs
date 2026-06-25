@@ -57,7 +57,7 @@ use sounding_sim::propulsion::{Engine, EngineCommand, Propulsion};
 use sounding_sim::resource::{Reservoir, ReservoirId, ResourceGraph, ResourceType};
 use sounding_sim::rover::{assemble_rover, Rover, RoverAssembly, SUBSTEP_DT as ROVER_SUBSTEP_DT};
 use sounding_sim::sim::CentralBody;
-use sounding_sim::terrain::Terrain;
+use sounding_sim::terrain::{Ramp, Terrain};
 use sounding_sim::voxel::{device_mass, Device, DeviceKind, Material, PartKind, Voxel, VoxelCraft};
 use sounding_sim::warp::safe_substep_dt;
 
@@ -104,8 +104,15 @@ const ROVER_MAX_SUBSTEPS: u32 = 64;
 /// Brake torque per kg of rover mass (N·m/kg). Well above the drive torque (≈4 N·m/kg) so braking
 /// firmly locks the wheels and stops at the tire-grip limit — brakes bite harder than the throttle.
 const ROVER_BRAKE_PER_KG: f64 = 35.0;
-/// Steering angle applied to the steer-group wheels (rad).
+/// Maximum steering angle applied to the steer-group wheels at low speed (rad). Reduced with speed
+/// (see [`STEER_SPEED_REF`]) so a flick at speed doesn't spin the rover.
 const ROVER_STEER: f64 = 0.35;
+/// How fast keyboard steering ramps toward full lock / recenters (1/s): a quick tap yields a small
+/// angle instead of instant full lock (WI 630 feel tuning), so light corrections don't spin.
+const STEER_RATE: f64 = 3.0;
+/// Speed (m/s) at which steering authority halves: effective lock = `ROVER_STEER / (1 + v/ref)`. Keeps
+/// low-speed manoeuvring sharp while making high-speed steering progressively gentler (WI 630).
+const STEER_SPEED_REF: f64 = 7.0;
 /// Supplemental inward-velocity damping for obstacle contact (1/s): unclamped, approach-only damping
 /// that bleeds the rover's speed *into* an obstacle so it thuds and stops instead of springing back
 /// off the (elastic) penalty contact. Safe against a static obstacle (no reduced-mass instability).
@@ -120,6 +127,20 @@ const IMPACT_WATCH_SECONDS: f64 = 2.5;
 const KRAKEN_OMEGA: f64 = 8.0;
 const KRAKEN_BOUNCE: f64 = 8.0;
 const FALL_THROUGH_HEIGHT: f64 = -0.5;
+/// Minimum landing (downward) speed (m/s) for a touchdown to count as a fall worth reporting / damaging
+/// (WI 630) — normal driving over bumps stays below this, so only real drops register. The actual wheel
+/// shear is still gated per-wheel by the rated shear speed.
+const FALL_MIN_SPEED: f64 = 3.0;
+
+/// A 30° wedge ramp off the left of the pad (WI 630 test affordance): steer left and drive up it to
+/// launch off the lip and check the rover tumbles. Clear of the spawn and the obstacle course.
+const ROVER_TEST_RAMP: Ramp = Ramp {
+    center_x: -4.5,
+    half_width: 1.8,
+    start_z: 1.0,
+    run: 3.0,
+    angle: std::f64::consts::FRAC_PI_6, // 30°
+};
 
 /// A few obstacles scattered on the pad to drive into (WI 610): a low wall ahead and a couple of
 /// rocks off to the sides, clear of the spawn.
@@ -342,6 +363,12 @@ struct RoverState {
     last_impact: Option<ImpactReport>,
     /// The in-progress post-impact watch, if any.
     watch: Option<ImpactWatch>,
+    /// Whether the rover is currently airborne (all wheels off the ground), for fall-damage detection.
+    airborne: bool,
+    /// Peak downward speed (m/s) accumulated while airborne — the landing speed when it touches down.
+    fall_peak: f64,
+    /// Smoothed steering input (−1..1): ramps toward the key target so a tap is a gentle correction.
+    steer_input: f64,
 }
 
 /// The grounded workshop Test state: one controllable craft, or its debris after a crash.
@@ -543,6 +570,9 @@ impl WorkshopWorld {
         let mut world = Self::new();
         let terrain = Terrain {
             amplitude: 0.0,
+            // A 30° wedge off to the side to drive up and launch off (WI 630 test affordance): steer
+            // left, climb it, and catch air over the lip to check the rover tumbles when it should.
+            ramp: Some(ROVER_TEST_RAMP),
             ..Default::default()
         };
         let mut rover = asm.rover;
@@ -587,6 +617,9 @@ impl WorkshopWorld {
             episode_reported: false,
             last_impact: None,
             watch: None,
+            airborne: false,
+            fall_peak: 0.0,
+            steer_input: 0.0,
         });
         world
     }
@@ -777,6 +810,9 @@ struct RoverPartMesh(usize);
 /// A rover Test obstacle box mesh by obstacle index (WI 610).
 #[derive(Component)]
 struct RoverObstacleMesh(usize);
+/// The rover Test wedge-ramp mesh (WI 630 test affordance).
+#[derive(Component)]
+struct RoverRampMesh;
 
 /// The grounded build-and-test workshop scene.
 pub struct WorkshopScenePlugin;
@@ -829,6 +865,7 @@ impl Plugin for WorkshopScenePlugin {
                     reconcile_meshes,
                     track_meshes,
                     track_rover_meshes,
+                    track_ramp_mesh,
                     follow_camera,
                     draw_rover,
                     update_test_hud,
@@ -1323,6 +1360,25 @@ fn enter_test(
                     TestEntity,
                 ));
             }
+            // Test ramp (WI 630): a wedge to drive up and launch off the lip.
+            let r = ROVER_TEST_RAMP;
+            let slope_len = (r.run / r.angle.cos()) as f32;
+            let ramp_mesh = meshes.add(Mesh::from(Cuboid::new(
+                (r.half_width * 2.0) as f32,
+                0.15,
+                slope_len,
+            )));
+            commands.spawn((
+                Mesh3d(ramp_mesh),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::srgb(0.50, 0.45, 0.30),
+                    perceptual_roughness: 1.0,
+                    ..default()
+                })),
+                Transform::default(),
+                RoverRampMesh,
+                TestEntity,
+            ));
         }
         return;
     }
@@ -1414,7 +1470,7 @@ fn workshop_input(
         return;
     }
     if world.rover.is_some() {
-        drive_rover(&keys, &mut world);
+        drive_rover(&keys, &mut world, time.delta_secs_f64());
         return;
     }
     if world.state != CraftState::Intact {
@@ -1487,7 +1543,7 @@ fn workshop_input(
 }
 
 /// Drive the rover by **group**: throttle the drive wheels, steer the steer wheels, brake all.
-fn drive_rover(keys: &ButtonInput<KeyCode>, world: &mut WorkshopWorld) {
+fn drive_rover(keys: &ButtonInput<KeyCode>, world: &mut WorkshopWorld, dt: f64) {
     let Some(rs) = world.rover.as_mut() else {
         return;
     };
@@ -1505,17 +1561,26 @@ fn drive_rover(keys: &ButtonInput<KeyCode>, world: &mut WorkshopWorld) {
     } else {
         0.0
     };
-    let steer_input = if keys.pressed(KeyCode::KeyA) {
+    // Smooth the keyboard steer toward its target so a quick tap is a small correction, not instant
+    // full lock (WI 630 feel tuning).
+    let target = if keys.pressed(KeyCode::KeyA) {
         1.0
     } else if keys.pressed(KeyCode::KeyD) {
         -1.0
     } else {
         0.0
     };
+    let step = STEER_RATE * dt;
+    rs.steer_input += (target - rs.steer_input).clamp(-step, step);
+    // Speed-sensitive authority: full lock when slow, progressively gentler with speed so a flick at
+    // speed can't spin the rover.
+    let speed = rs.rover.body.velocity.length();
+    let max_angle = ROVER_STEER / (1.0 + speed / STEER_SPEED_REF);
     // Coordinated counter-steer: each steered wheel's angle ∝ its longitudinal offset from the CoM,
     // so rear steer-wheels invert and the rover turns about itself instead of fighting itself.
     let steer = rs.steer.clone();
-    rs.rover.set_steer(steer_input, ROVER_STEER, &steer);
+    let steer_input = rs.steer_input;
+    rs.rover.set_steer(steer_input, max_angle, &steer);
 }
 
 fn step_workshop(time: Res<Time>, mut world: ResMut<WorkshopWorld>) {
@@ -1631,6 +1696,40 @@ fn step_workshop(time: Res<Time>, mut world: ResMut<WorkshopWorld>) {
                         last.watch = Some(result);
                     }
                     rs.watch = None;
+                }
+            }
+            // Fall damage (WI 630): accumulate downward speed while airborne; on touchdown, a hard
+            // enough landing shears wheels (graded by their rated shear speed) and reports like an
+            // impact. Normal bump-hopping stays below FALL_MIN_SPEED and is ignored.
+            let vy = rs.rover.body.velocity.y;
+            if rs.rover.airborne(&terrain) {
+                rs.airborne = true;
+                if vy < 0.0 {
+                    rs.fall_peak = rs.fall_peak.max(-vy);
+                }
+            } else if rs.airborne {
+                rs.airborne = false;
+                let landing = rs.fall_peak;
+                rs.fall_peak = 0.0;
+                if landing > FALL_MIN_SPEED {
+                    let outcome = rs.rover.shear_on_landing(landing);
+                    for &idx in &outcome.sheared {
+                        rs.drive.retain(|&x| x != idx);
+                        rs.steer.retain(|&x| x != idx);
+                    }
+                    let report = ImpactReport {
+                        speed: rs.rover.body.velocity.length(),
+                        closing: landing,
+                        impacted: "landing",
+                        peak_wheel: outcome.peak_wheel,
+                        demand: outcome.peak_demand,
+                        capacity: outcome.peak_capacity,
+                        sheared: outcome.sheared.clone(),
+                        watch: None,
+                    };
+                    info!("{}", report.log_block());
+                    rs.watch = Some(ImpactWatch::start());
+                    rs.last_impact = Some(report);
                 }
             }
             rs.accumulator -= ROVER_SUBSTEP_DT;
@@ -1820,6 +1919,20 @@ fn part_mesh(
             Mesh::from(Cylinder::new(w.radius as f32, (w.radius * 0.5) as f32)),
             Color::srgb(0.07, 0.07, 0.09),
         ),
+        // Wheel-station components (WI 630): the suspension strut, the metallic rim, and the rubber
+        // tire. (Station render is refined in Phase C; these are recognisable placeholders.)
+        PartKind::Suspension(susp) => (
+            Mesh::from(Cylinder::new(s * 0.08, susp.rest_length as f32)),
+            Color::srgb(0.55, 0.45, 0.2),
+        ),
+        PartKind::Rim(r) => (
+            Mesh::from(Cylinder::new(r.radius as f32, (r.radius * 0.45) as f32)),
+            Color::srgb(0.6, 0.62, 0.68),
+        ),
+        PartKind::Tire(t) => (
+            Mesh::from(Cylinder::new(t.profile as f32 * 2.0, t.profile as f32)),
+            Color::srgb(0.07, 0.07, 0.09),
+        ),
     };
     (
         meshes.add(mesh),
@@ -1895,12 +2008,21 @@ fn track_rover_meshes(
             }
             let hub = body.position + q * w.mount;
             let ground = rs.terrain.height(hub.x, hub.z);
-            let normal = rs.terrain.normal(hub.x, hub.z);
-            let center = DVec3::new(hub.x, ground + w.radius, hub.z);
+            // Where the wheel actually sits (WI 630 fix): on the ground when in contact, else hanging
+            // from the body at full suspension droop — so an airborne wheel stays with the rover
+            // instead of tracking the terrain below it like a shadow.
+            let contact_center = DVec3::new(hub.x, ground + w.radius, hub.z);
+            let droop_center = hub - up * w.rest_length;
+            let in_contact = contact_center.y >= droop_center.y;
+            let (center, align_normal) = if in_contact {
+                (contact_center, rs.terrain.normal(hub.x, hub.z))
+            } else {
+                (droop_center, up) // hang and align to the body while airborne
+            };
             let steer_rot = DQuat::from_axis_angle(up, w.steer);
             let heading = steer_rot * fwd;
-            let forward = (heading - normal * heading.dot(normal)).normalize_or_zero();
-            let axle = normal.cross(forward).normalize_or_zero();
+            let forward = (heading - align_normal * heading.dot(align_normal)).normalize_or_zero();
+            let axle = align_normal.cross(forward).normalize_or_zero();
             let align = Quat::from_rotation_arc(Vec3::Y, axle.as_vec3());
             let spin = Quat::from_axis_angle(axle.as_vec3(), rs.spin_angle[tag.0] as f32);
             tf.translation = (center - anchor).as_vec3();
@@ -1920,6 +2042,25 @@ fn track_rover_meshes(
             tf.translation = (obs.body.position - anchor).as_vec3();
             tf.rotation = Quat::IDENTITY;
         }
+    }
+}
+
+/// Positions the world-static test ramp mesh (WI 630), rover-anchored, tilted to the incline so its
+/// top face is the surface the wheels climb.
+fn track_ramp_mesh(world: Res<WorkshopWorld>, mut q: Query<&mut Transform, With<RoverRampMesh>>) {
+    let Some(rs) = &world.rover else { return };
+    let Some(r) = rs.terrain.ramp else { return };
+    let anchor = rs.rover.body.position;
+    // Centre of the inclined slab (base terrain is flat here, so y is half the peak height).
+    let center = DVec3::new(
+        r.center_x,
+        0.5 * r.run * r.angle.tan(),
+        r.start_z + 0.5 * r.run,
+    );
+    for mut tf in &mut q {
+        tf.translation = (center - anchor).as_vec3();
+        tf.translation.y -= 0.075; // sink half the slab thickness so the top face is the surface
+        tf.rotation = Quat::from_rotation_x(-r.angle as f32);
     }
 }
 
@@ -1976,14 +2117,26 @@ fn draw_rover(mut gizmos: Gizmos, world: Res<WorkshopWorld>) {
     // mesh visibly rolls.
     let up = body.orientation * DVec3::Y;
     for (i, w) in rs.rover.wheels.iter().enumerate() {
+        // A sheared wheel has no tyre, so no spokes.
+        if w.inert {
+            continue;
+        }
         let hub = body.position + body.orientation * w.mount;
         let ground = terrain.height(hub.x, hub.z);
-        let normal = terrain.normal(hub.x, hub.z);
-        let center = DVec3::new(hub.x, ground + w.radius, hub.z);
+        // Match the wheel mesh (WI 630): on the ground in contact, else hanging at suspension droop —
+        // so the spokes don't stay on the ground "shadowing" the rover while it's airborne.
+        let contact_center = DVec3::new(hub.x, ground + w.radius, hub.z);
+        let droop_center = hub - up * w.rest_length;
+        let in_contact = contact_center.y >= droop_center.y;
+        let (center, align_normal) = if in_contact {
+            (contact_center, terrain.normal(hub.x, hub.z))
+        } else {
+            (droop_center, up)
+        };
         let steer_rot = DQuat::from_axis_angle(up, w.steer);
         let heading = steer_rot * (body.orientation * DVec3::Z);
-        let forward = (heading - normal * heading.dot(normal)).normalize_or_zero();
-        let axle = normal.cross(forward).normalize_or_zero();
+        let forward = (heading - align_normal * heading.dot(align_normal)).normalize_or_zero();
+        let axle = align_normal.cross(forward).normalize_or_zero();
         let face = center + axle * (w.radius * 0.27); // just outside the tyre's outer face
         let spin = DQuat::from_axis_angle(axle, rs.spin_angle[i]);
         let a = spin * forward * (w.radius * 0.85);
@@ -2005,8 +2158,22 @@ fn update_test_hud(world: Res<WorkshopWorld>, mut hud: Query<&mut Text, With<Tes
                 .as_ref()
                 .map(|r| format!("\n{}", r.hud_line()))
                 .unwrap_or_default();
+            // Per-wheel component readout (WI 630): the lead wheel's grip, effective radius, slip, and
+            // ride (sprung vs riding on the tire), so swapping a component shows a measurable change.
+            let tires = rs
+                .rover
+                .wheels
+                .first()
+                .map(|w| {
+                    let ride = if w.rigid_suspension { "tire" } else { "sprung" };
+                    format!(
+                        "\ntire:   grip ×{:.2}  R {:.2} m  slip {:.1}/{:.1}  [{ride}]",
+                        w.grip_scale, w.radius, w.slip_long, w.slip_lat,
+                    )
+                })
+                .unwrap_or_default();
             text.0 = format!(
-                "workshop · TEST (rover)\nspeed:  {speed:6.2} m/s\nheight: {height:6.2} m\nwheels: {live}/{}\n{}:  {:3.0}%{impact}",
+                "workshop · TEST (rover)\nspeed:  {speed:6.2} m/s\nheight: {height:6.2} m\nwheels: {live}/{}{tires}\n{}:  {:3.0}%{impact}",
                 rs.rover.wheels.len(),
                 rs.powertrain.label(),
                 rs.powertrain.fraction() * 100.0,
@@ -2114,6 +2281,7 @@ mod tests {
                 mount: DVec3::new(x as f64, -0.3, z as f64),
                 mass: 60.0,
                 kind: PartKind::Wheel(WheelPart::new(true, steer)),
+                station: None,
             });
         }
         let asm = assemble_rover(&v, DVec3::ZERO, ROVER_GRAVITY).expect("wheels ⇒ rover");

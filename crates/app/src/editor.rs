@@ -14,8 +14,8 @@ use sounding_sim::control::{BatterySpec, ControlComputer};
 use sounding_sim::frame::{FrameId, WorldPos};
 use sounding_sim::persist::{CraftSubgraph, Kind, Payload, SavedDocument};
 use sounding_sim::voxel::{
-    device_mass, AttachmentPoint, Axis, Device, DeviceKind, Face, Material, Part, PartKind, Voxel,
-    VoxelCraft, WheelPart,
+    device_mass, AttachmentPoint, Axis, Device, DeviceKind, Face, Material, Part, PartKind,
+    RimSpec, SuspensionSpec, TireSpec, Voxel, VoxelCraft,
 };
 use std::fs;
 
@@ -30,6 +30,73 @@ const PALETTE: [(&str, Material); 4] = [
 const BLUEPRINT_PATH: &str = "blueprint.json";
 const SUBASSEMBLY_PATH: &str = "subassembly.json";
 
+/// A rim+tire combination the player picks as a unit (WI 630). Each preset is a coherent
+/// rim+tire character — the felt difference of "change the tires" — while the underlying suspension /
+/// rim / tire are still separate components (so per-component mixing and failure modes land later).
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum WheelPreset {
+    /// Grippy, soft, tall — planted and bouncy on rough ground.
+    OffRoad,
+    /// Balanced all-rounder.
+    #[default]
+    Road,
+    /// Very grippy, stiff, low-profile — responsive and harsh.
+    Slick,
+}
+
+impl WheelPreset {
+    /// The total (effective rolling) wheel radius for this preset at `cell_size`, matching the legacy
+    /// wheel sizing (1.5 × cell) so builds read the same; the tire profile is a fraction of it.
+    fn total_radius(self, cell_size: f64) -> f64 {
+        1.5 * cell_size
+    }
+
+    /// The tire's section height as a fraction of the total radius (tall off-road … low-profile slick).
+    fn profile_frac(self) -> f64 {
+        match self {
+            WheelPreset::OffRoad => 0.45,
+            WheelPreset::Road => 0.30,
+            WheelPreset::Slick => 0.15,
+        }
+    }
+
+    /// The rim component for this preset, carrying the drivetrain flags (drive is always on, as before).
+    fn rim(self, cell_size: f64, steer: bool) -> RimSpec {
+        let total = self.total_radius(cell_size);
+        RimSpec {
+            radius: total - self.profile_frac() * total,
+            drive: true,
+            steer,
+        }
+    }
+
+    /// The tire component for this preset: grip (compound), compliance (rubber/air spring), slip
+    /// stiffness (response), and profile (with the rim → effective radius).
+    fn tire(self, cell_size: f64) -> TireSpec {
+        let total = self.total_radius(cell_size);
+        let (grip_scale, stiffness, slip_long, slip_lat) = match self {
+            WheelPreset::OffRoad => (1.35, 5.0e4, 4.5, 3.5),
+            WheelPreset::Road => (1.0, 1.5e5, 5.0, 4.0),
+            WheelPreset::Slick => (1.6, 4.0e5, 6.5, 5.5),
+        };
+        TireSpec {
+            profile: self.profile_frac() * total,
+            grip_scale,
+            slip_long,
+            slip_lat,
+            stiffness,
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            WheelPreset::OffRoad => Color::srgb(0.30, 0.22, 0.12),
+            WheelPreset::Road => Color::srgb(0.12, 0.12, 0.14),
+            WheelPreset::Slick => Color::srgb(0.05, 0.05, 0.07),
+        }
+    }
+}
+
 /// The active placement tool (WI 612): what a click (or Space) places. The number keys select it;
 /// `Voxel` uses the active material. This is what makes mouse building work — the tool follows the
 /// cursor instead of every device piling onto the keyboard cursor cell.
@@ -42,10 +109,16 @@ pub(crate) enum Brush {
     Battery,
     Engine,
     Tank,
+    /// A rim+tire wheel of the chosen preset (drive always on); `steer` adds it to the steer group.
+    /// Placed at a wheel station; a suspension may be added to the same station, or omitted to ride on
+    /// the tire (WI 630).
     Wheel {
-        drive: bool,
+        preset: WheelPreset,
         steer: bool,
     },
+    /// An optional suspension strut for a wheel station (WI 630): adds spring travel; omit it and the
+    /// wheel rides on the tire's compliance.
+    Suspension,
     Seat,
     Antenna,
     SolarPanel,
@@ -62,8 +135,31 @@ impl Brush {
             Brush::Battery => "battery",
             Brush::Engine => "engine",
             Brush::Tank => "tank",
-            Brush::Wheel { steer: false, .. } => "wheel (drive)",
-            Brush::Wheel { steer: true, .. } => "wheel (drive+steer)",
+            Brush::Wheel {
+                preset: WheelPreset::OffRoad,
+                steer: false,
+            } => "off-road wheel",
+            Brush::Wheel {
+                preset: WheelPreset::OffRoad,
+                steer: true,
+            } => "off-road wheel (steer)",
+            Brush::Wheel {
+                preset: WheelPreset::Road,
+                steer: false,
+            } => "road wheel",
+            Brush::Wheel {
+                preset: WheelPreset::Road,
+                steer: true,
+            } => "road wheel (steer)",
+            Brush::Wheel {
+                preset: WheelPreset::Slick,
+                steer: false,
+            } => "slick wheel",
+            Brush::Wheel {
+                preset: WheelPreset::Slick,
+                steer: true,
+            } => "slick wheel (steer)",
+            Brush::Suspension => "suspension",
             Brush::Seat => "seat",
             Brush::Antenna => "antenna",
             Brush::SolarPanel => "solar panel",
@@ -106,6 +202,26 @@ impl Default for EditorState {
     }
 }
 
+/// The wheel-station id of any part mounted at (≈) `mount`, if one exists (WI 630): lets a suspension
+/// and a rim+tire placed at the same corner join the same station.
+fn station_at(craft: &VoxelCraft, mount: DVec3) -> Option<u32> {
+    craft
+        .parts
+        .iter()
+        .filter(|p| (p.mount - mount).length() <= 1e-6)
+        .find_map(|p| p.station)
+}
+
+/// A station id not yet used by any part (WI 630): the next corner gets a fresh station.
+fn next_station_id(craft: &VoxelCraft) -> u32 {
+    craft
+        .parts
+        .iter()
+        .filter_map(|p| p.station)
+        .max()
+        .map_or(0, |m| m + 1)
+}
+
 /// Places the active `brush` into `craft`. The three cells let the caller aim each kind: a voxel at
 /// `voxel_cell` (the empty face cell for the mouse), a device at `device_cell` (the hovered solid
 /// cell), and a wheel at `wheel_mount` (a continuous body-frame point).
@@ -126,16 +242,40 @@ fn place_brush(
                 });
             }
         }
-        Brush::Wheel { drive, steer } => {
+        Brush::Wheel { preset, steer } => {
             let s = craft.cell_size;
-            craft
-                .parts
-                .retain(|p| (p.mount - wheel_mount).length() > 1e-6);
+            // Find this corner's station (reusing one a suspension already created here) or start a new
+            // one; replace any rim/tire already on it, keeping a suspension that is present (WI 630).
+            let id = station_at(craft, wheel_mount).unwrap_or_else(|| next_station_id(craft));
+            craft.parts.retain(|p| {
+                !(p.station == Some(id) && matches!(p.kind, PartKind::Rim(_) | PartKind::Tire(_)))
+            });
             craft.parts.push(Part {
                 mount: wheel_mount,
-                // Wheel mass scaled to the build (a few cells' worth of material).
-                mass: (15.0 * s).max(1.0),
-                kind: PartKind::Wheel(WheelPart::for_cell_size(s, drive, steer)),
+                mass: (8.0 * s).max(0.5),
+                kind: PartKind::Rim(preset.rim(s, steer)),
+                station: Some(id),
+            });
+            craft.parts.push(Part {
+                mount: wheel_mount,
+                mass: (8.0 * s).max(0.5),
+                kind: PartKind::Tire(preset.tire(s)),
+                station: Some(id),
+            });
+        }
+        Brush::Suspension => {
+            // Optional strut for a wheel station: reuse the corner's station (or start one), replacing
+            // a strut already there. Omitting it leaves the wheel riding on the tire (WI 630).
+            let s = craft.cell_size;
+            let id = station_at(craft, wheel_mount).unwrap_or_else(|| next_station_id(craft));
+            craft
+                .parts
+                .retain(|p| !(p.station == Some(id) && matches!(p.kind, PartKind::Suspension(_))));
+            craft.parts.push(Part {
+                mount: wheel_mount,
+                mass: (4.0 * s).max(0.3),
+                kind: PartKind::Suspension(SuspensionSpec::for_cell_size(s)),
+                station: Some(id),
             });
         }
         Brush::Seat | Brush::Antenna | Brush::SolarPanel | Brush::Bumper => {
@@ -154,6 +294,7 @@ fn place_brush(
                 mount: wheel_mount,
                 mass: (10.0 * craft.cell_size).max(1.0),
                 kind,
+                station: None,
             });
         }
         Brush::ControlPoint | Brush::Computer | Brush::Battery | Brush::Engine | Brush::Tank => {
@@ -232,16 +373,38 @@ pub(crate) const PALETTE_GROUPS: &[(&str, &[PaletteEntry])] = &[
         ],
     ),
     (
-        "PARTS",
+        "WHEELS",
         &[
             PaletteEntry::Tool(Brush::Wheel {
-                drive: true,
+                preset: WheelPreset::OffRoad,
                 steer: false,
             }),
             PaletteEntry::Tool(Brush::Wheel {
-                drive: true,
+                preset: WheelPreset::OffRoad,
                 steer: true,
             }),
+            PaletteEntry::Tool(Brush::Wheel {
+                preset: WheelPreset::Road,
+                steer: false,
+            }),
+            PaletteEntry::Tool(Brush::Wheel {
+                preset: WheelPreset::Road,
+                steer: true,
+            }),
+            PaletteEntry::Tool(Brush::Wheel {
+                preset: WheelPreset::Slick,
+                steer: false,
+            }),
+            PaletteEntry::Tool(Brush::Wheel {
+                preset: WheelPreset::Slick,
+                steer: true,
+            }),
+            PaletteEntry::Tool(Brush::Suspension),
+        ],
+    ),
+    (
+        "PARTS",
+        &[
             PaletteEntry::Tool(Brush::Seat),
             PaletteEntry::Tool(Brush::Antenna),
             PaletteEntry::Tool(Brush::SolarPanel),
@@ -294,8 +457,19 @@ impl PaletteEntry {
                 Brush::Battery => Color::srgb(0.90, 0.80, 0.20),
                 Brush::Engine => Color::srgb(1.00, 0.45, 0.10),
                 Brush::Tank => Color::srgb(0.55, 0.62, 0.82),
-                Brush::Wheel { steer: false, .. } => Color::srgb(0.12, 0.12, 0.14),
-                Brush::Wheel { steer: true, .. } => Color::srgb(0.20, 0.24, 0.38),
+                Brush::Wheel {
+                    preset,
+                    steer: false,
+                } => preset.color(),
+                Brush::Wheel {
+                    preset,
+                    steer: true,
+                } => {
+                    // Steer variants tinted bluer so they read apart from the drive-only siblings.
+                    let c = preset.color().to_srgba();
+                    Color::srgb(c.red + 0.08, c.green + 0.10, c.blue + 0.22)
+                }
+                Brush::Suspension => Color::srgb(0.55, 0.45, 0.20),
                 Brush::Seat => Color::srgb(0.50, 0.35, 0.20),
                 Brush::Antenna => Color::srgb(0.82, 0.82, 0.86),
                 Brush::SolarPanel => Color::srgb(0.12, 0.22, 0.62),
@@ -438,14 +612,16 @@ pub(crate) fn editor_input(keys: Res<ButtonInput<KeyCode>>, mut state: ResMut<Ed
         state.brush = Brush::Tank;
     } else if keys.just_pressed(KeyCode::Digit6) {
         state.brush = Brush::Wheel {
-            drive: true,
+            preset: WheelPreset::Road,
             steer: false,
         };
     } else if keys.just_pressed(KeyCode::Digit7) {
         state.brush = Brush::Wheel {
-            drive: true,
+            preset: WheelPreset::Road,
             steer: true,
         };
+    } else if keys.just_pressed(KeyCode::KeyU) {
+        state.brush = Brush::Suspension;
     } else if keys.just_pressed(KeyCode::Digit8) {
         state.brush = Brush::Seat;
     } else if keys.just_pressed(KeyCode::Digit9) {
@@ -776,15 +952,31 @@ pub(crate) fn draw_editor(mut gizmos: Gizmos, state: Res<EditorState>) {
             Color::srgb(1.0, 0.55, 0.0),
         );
     }
-    // Attached wheel parts (dark spheres at their continuous mount; steer wheels tinted).
+    // Attached wheel parts (dark spheres at their continuous mount; steer wheels tinted). Both the
+    // legacy monolithic wheel and the new rim+tire components draw the wheel; a suspension draws a
+    // small amber marker so an added strut is visible (WI 630).
     for p in &state.craft.parts {
-        if let PartKind::Wheel(spec) = p.kind {
-            let color = if spec.steer {
-                Color::srgb(0.15, 0.18, 0.28)
-            } else {
-                Color::srgb(0.12, 0.12, 0.14)
-            };
-            gizmos.sphere(p.mount.as_vec3(), spec.radius as f32, color);
+        match p.kind {
+            PartKind::Wheel(spec) => {
+                let color = if spec.steer {
+                    Color::srgb(0.15, 0.18, 0.28)
+                } else {
+                    Color::srgb(0.12, 0.12, 0.14)
+                };
+                gizmos.sphere(p.mount.as_vec3(), spec.radius as f32, color);
+            }
+            PartKind::Rim(r) => {
+                let color = if r.steer {
+                    Color::srgb(0.15, 0.18, 0.28)
+                } else {
+                    Color::srgb(0.12, 0.12, 0.14)
+                };
+                gizmos.sphere(p.mount.as_vec3(), r.radius as f32, color);
+            }
+            PartKind::Suspension(_) => {
+                gizmos.sphere(p.mount.as_vec3(), s * 0.4, Color::srgb(0.85, 0.65, 0.2));
+            }
+            _ => {}
         }
     }
     // Build cursor (yellow, slightly oversized).
@@ -896,6 +1088,120 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A small chassis to attach wheels to (gives the craft mass so assembly succeeds).
+    fn chassis() -> VoxelCraft {
+        let mut craft = VoxelCraft::new(0.5);
+        for x in 0..3 {
+            for z in 0..4 {
+                craft.voxels.push(Voxel {
+                    cell: IVec3::new(x, 0, z),
+                    material: Material::COMPOSITE,
+                });
+            }
+        }
+        craft
+    }
+
+    #[test]
+    fn wheel_brush_places_a_complete_station() {
+        // Placing a wheel brush drops a rim + tire sharing one station id — a complete wheel (WI 630).
+        let mut craft = chassis();
+        let mount = DVec3::new(0.5, -0.2, 0.5);
+        place_brush(
+            &mut craft,
+            Brush::Wheel {
+                preset: WheelPreset::OffRoad,
+                steer: true,
+            },
+            Material::COMPOSITE,
+            IVec3::ZERO,
+            IVec3::ZERO,
+            mount,
+        );
+        let rim = craft
+            .parts
+            .iter()
+            .find(|p| matches!(p.kind, PartKind::Rim(_)))
+            .unwrap();
+        let tire = craft
+            .parts
+            .iter()
+            .find(|p| matches!(p.kind, PartKind::Tire(_)))
+            .unwrap();
+        assert_eq!(rim.station, tire.station);
+        assert!(rim.station.is_some());
+        let asm = sounding_sim::rover::assemble_rover(&craft, DVec3::new(0.0, 5.0, 0.0), 9.81)
+            .expect("a placed wheel ⇒ a rover");
+        assert_eq!(asm.rover.wheels.len(), 1);
+        assert_eq!(asm.steer, vec![0]); // the steer flag carried onto the rim
+    }
+
+    #[test]
+    fn suspension_joins_the_wheels_station_and_makes_it_sprung() {
+        // A suspension placed at the same corner joins the wheel's station (one station, three
+        // components) and the assembled wheel is sprung rather than riding on the tire (WI 630).
+        let mut craft = chassis();
+        let mount = DVec3::new(0.5, -0.2, 0.5);
+        place_brush(
+            &mut craft,
+            Brush::Wheel {
+                preset: WheelPreset::Road,
+                steer: false,
+            },
+            Material::COMPOSITE,
+            IVec3::ZERO,
+            IVec3::ZERO,
+            mount,
+        );
+        place_brush(
+            &mut craft,
+            Brush::Suspension,
+            Material::COMPOSITE,
+            IVec3::ZERO,
+            IVec3::ZERO,
+            mount,
+        );
+        let ids: std::collections::BTreeSet<_> =
+            craft.parts.iter().filter_map(|p| p.station).collect();
+        assert_eq!(ids.len(), 1, "all three components share one station");
+        assert_eq!(craft.parts.len(), 3, "rim + tire + suspension");
+        let asm =
+            sounding_sim::rover::assemble_rover(&craft, DVec3::new(0.0, 5.0, 0.0), 9.81).unwrap();
+        assert!(
+            !asm.rover.wheels[0].rigid_suspension,
+            "a station with a suspension is sprung"
+        );
+    }
+
+    #[test]
+    fn reselecting_a_preset_replaces_the_rim_and_tire_in_place() {
+        // Placing a different preset at an existing station swaps its rim+tire (not a second wheel),
+        // and the tire character changes (WI 630).
+        let mut craft = chassis();
+        let mount = DVec3::new(0.5, -0.2, 0.5);
+        let place = |craft: &mut VoxelCraft, preset| {
+            place_brush(
+                craft,
+                Brush::Wheel {
+                    preset,
+                    steer: false,
+                },
+                Material::COMPOSITE,
+                IVec3::ZERO,
+                IVec3::ZERO,
+                mount,
+            );
+        };
+        place(&mut craft, WheelPreset::Road);
+        place(&mut craft, WheelPreset::Slick);
+        assert_eq!(craft.parts.len(), 2, "still one rim + one tire");
+        let asm =
+            sounding_sim::rover::assemble_rover(&craft, DVec3::new(0.0, 5.0, 0.0), 9.81).unwrap();
+        assert_eq!(asm.rover.wheels.len(), 1);
+        // Slick grip (1.6) replaced road grip (1.0).
+        assert!((asm.rover.wheels[0].grip_scale - 1.6).abs() < 1e-9);
     }
 
     #[test]

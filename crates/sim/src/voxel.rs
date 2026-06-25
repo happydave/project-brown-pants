@@ -253,6 +253,13 @@ pub struct Part {
     pub mass: f64,
     /// What the part is (and its kind-specific parameters).
     pub kind: PartKind,
+    /// Wheel-station id (WI 630): groups a [`PartKind::Suspension`] + [`PartKind::Rim`] +
+    /// [`PartKind::Tire`] into one wheel. `None` for parts that are not part of a station
+    /// (seat, antenna, solar, bumper, and legacy monolithic [`PartKind::Wheel`]). A station is
+    /// **complete** when all three component kinds share an id; only complete stations become rover
+    /// wheels. Defaulted on load so pre-component saves stay backward-loadable.
+    #[serde(default)]
+    pub station: Option<u32>,
 }
 
 /// The kind of a catalog [`Part`] (WI 607). `Wheel` carries the physical and
@@ -261,8 +268,19 @@ pub struct Part {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PartKind {
-    /// A wheel + suspension + tire — the one physics-relevant part.
+    /// A **legacy** monolithic wheel + suspension + tire (WI 607). Still authored by the editor and
+    /// loadable from old saves; assembly migrates it to a [`Suspension`]/[`Rim`]/[`Tire`] station via
+    /// [`WheelPart::to_components`] (WI 630). New authoring places the three components instead.
     Wheel(WheelPart),
+    /// The spring-damper strut of a wheel station (WI 630): anchors the station and owns ride height
+    /// and travel. Optional — a station with a rigid/zero-travel strut still rides on tire compliance.
+    Suspension(SuspensionSpec),
+    /// The rim/hub of a wheel station (WI 630): owns the rim radius and the drivetrain (drive/steer)
+    /// membership of the wheel.
+    Rim(RimSpec),
+    /// The tire of a wheel station (WI 630): owns grip (rubber compound), slip stiffness, and the
+    /// profile that — with the rim radius — sets the effective rolling radius.
+    Tire(TireSpec),
     /// A crew seat (recognisability; crew/control comes from a control point device).
     Seat,
     /// A communications antenna (cosmetic now; a comms model is later).
@@ -271,6 +289,125 @@ pub enum PartKind {
     SolarPanel,
     /// A bumper (structure that reads as a rover and breaks on impact, WI 610).
     Bumper,
+}
+
+/// Spring-damper strut parameters of a [`PartKind::Suspension`] (WI 630). Owns ride height and
+/// travel; the spring stiffness / damping / max force are sized to the assembled rover's mass by
+/// [`crate::rover::assemble_rover`] (so a heavy build does not sag), not authored here.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SuspensionSpec {
+    /// Suspension free length (m) — ride height.
+    pub rest_length: f64,
+    /// Suspension travel (m) — usable compression before bottoming.
+    pub travel: f64,
+    /// A rigid strut (WI 630): no spring travel of its own, so the wheel rides on the tire's
+    /// compliance alone — the user's "remove suspension travel, keep some from the rubber/air".
+    /// Defaulted `false` (a normal sprung strut) so pre-630 saves load as before.
+    #[serde(default)]
+    pub rigid: bool,
+}
+
+impl SuspensionSpec {
+    /// A strut with the rover core's sensible defaults (mirrors [`crate::rover::Wheel::new`]).
+    pub fn new() -> Self {
+        Self {
+            rest_length: 0.35,
+            travel: 0.35,
+            rigid: false,
+        }
+    }
+
+    /// A rigid strut: no suspension travel; the wheel rides on tire compliance only (WI 630).
+    pub fn rigid(rest_length: f64) -> Self {
+        Self {
+            rest_length,
+            travel: 0.0,
+            rigid: true,
+        }
+    }
+
+    /// A strut sized to the build's `cell_size` (WI 630). Ride height and travel scale with the cell so
+    /// a small build gets a short strut, not a fixed 0.35 m one that reaches far below the hub — which
+    /// kept a tipping rover's raised wheels glued to the ground instead of letting it tumble.
+    pub fn for_cell_size(cell_size: f64) -> Self {
+        Self {
+            rest_length: 0.35 * cell_size,
+            travel: 0.25 * cell_size,
+            rigid: false,
+        }
+    }
+}
+
+impl Default for SuspensionSpec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Rim/hub parameters of a [`PartKind::Rim`] (WI 630). Owns the rim radius (the effective rolling
+/// radius is `rim radius + tire profile`) and the wheel's drivetrain group membership.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RimSpec {
+    /// Rim radius (m); the tire's profile is added to get the effective rolling radius.
+    pub radius: f64,
+    /// In the drive group (receives engine/motor torque).
+    pub drive: bool,
+    /// In the steer group (turns with steering input).
+    pub steer: bool,
+}
+
+impl RimSpec {
+    /// A rim with the rover core's default radius; `drive`/`steer` choose the drivetrain groups.
+    pub fn new(drive: bool, steer: bool) -> Self {
+        Self {
+            radius: 0.25,
+            drive,
+            steer,
+        }
+    }
+}
+
+/// Tire parameters of a [`PartKind::Tire`] (WI 630). Owns grip (rubber compound, scaling surface
+/// friction), slip stiffness (how sharply force builds with slip), and the profile (section height
+/// added to the rim radius). Defaults reproduce the pre-split behaviour (grip 1.0, slip = the rover
+/// core's slip constants), so a migrated wheel drives identically until the tire is changed.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TireSpec {
+    /// Section height (m) added to the rim radius for the effective rolling radius.
+    pub profile: f64,
+    /// Grip multiplier over the surface material's friction (rubber compound). 1.0 = baseline.
+    pub grip_scale: f64,
+    /// Longitudinal slip stiffness (shape of the slip-ratio → force curve).
+    pub slip_long: f64,
+    /// Lateral slip stiffness (shape of the slip-angle → force curve).
+    pub slip_lat: f64,
+    /// Tire compliance — the rubber/air spring rate (N/m), in **series** with the suspension spring
+    /// (WI 630). A high value (the default) is effectively rigid, so a migrated wheel rides as before;
+    /// a lower value softens the ride and lets a no-suspension build ride on the tire. Defaulted high
+    /// on load so pre-630 saves are unchanged.
+    #[serde(default = "TireSpec::default_stiffness")]
+    pub stiffness: f64,
+}
+
+impl TireSpec {
+    /// A tire whose parameters reproduce the pre-split rover wheel (WI 630). The slip defaults match
+    /// the rover core's `C_LONG` / `C_LAT`, and the stiffness is effectively rigid so the series
+    /// spring equals the suspension spring (no behaviour change); `profile` is the section height.
+    pub fn new(profile: f64) -> Self {
+        Self {
+            profile,
+            grip_scale: 1.0,
+            slip_long: 5.0,
+            slip_lat: 4.0,
+            stiffness: Self::default_stiffness(),
+        }
+    }
+
+    /// The default (effectively rigid) tire spring rate, N/m: high enough that the series combination
+    /// with any sized suspension spring is the suspension spring to within f64 tolerance (WI 630).
+    pub fn default_stiffness() -> f64 {
+        1.0e9
+    }
 }
 
 /// Physical and drivetrain parameters of a [`PartKind::Wheel`] (WI 607). The
@@ -331,6 +468,30 @@ impl WheelPart {
             drive,
             steer,
         }
+    }
+
+    /// Migrate a legacy monolithic wheel to the three station components (WI 630). The split is
+    /// behaviour-preserving: the effective rolling radius (rim + tire profile) equals the old radius
+    /// exactly, the tire reproduces the pre-split grip/slip, and `rest_length` / `drive` / `steer`
+    /// carry over. The component masses are the caller's concern (the legacy part's single mass is
+    /// used directly for inertia by [`crate::rover::assemble_rover`]).
+    pub fn to_components(&self) -> (SuspensionSpec, RimSpec, TireSpec) {
+        // 30 % of the radius is tire profile; the rest is rim. Computing rim as `radius - profile`
+        // keeps `rim + profile == radius` exact in IEEE arithmetic.
+        let profile = 0.3 * self.radius;
+        (
+            SuspensionSpec {
+                rest_length: self.rest_length,
+                travel: self.rest_length,
+                rigid: false,
+            },
+            RimSpec {
+                radius: self.radius - profile,
+                drive: self.drive,
+                steer: self.steer,
+            },
+            TireSpec::new(profile),
+        )
     }
 }
 
@@ -590,6 +751,26 @@ fn jacobi_symmetric(mat: DMat3) -> (DVec3, DMat3) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cell_scaled_suspension_is_short_and_sprung() {
+        // The strut's ride height and travel scale with the build (WI 630): a small build gets a short
+        // strut, not the fixed 0.35 m one that reached far below the hub and glued a tipping rover's
+        // raised wheels to the ground. A 0.1 m build's strut is far shorter than that old fixed value.
+        let s = SuspensionSpec::for_cell_size(0.1);
+        assert!(!s.rigid);
+        assert!(
+            s.rest_length < 0.1,
+            "rest_length should scale down with the cell"
+        );
+        assert!(
+            s.travel < s.rest_length,
+            "travel is a fraction of the ride height"
+        );
+        // Doubling the cell doubles the ride height.
+        let big = SuspensionSpec::for_cell_size(0.2);
+        assert!((big.rest_length - 2.0 * s.rest_length).abs() < 1e-12);
+    }
+
     /// Builds a solid rectangular block of cells, all of `material`.
     fn block(nx: i32, ny: i32, nz: i32, cell_size: f64, material: Material) -> VoxelCraft {
         let mut craft = VoxelCraft::new(cell_size);
@@ -663,6 +844,7 @@ mod tests {
             mount,
             mass: 500.0,
             kind: PartKind::Wheel(WheelPart::new(true, false)),
+            station: None,
         });
         let mp = craft.mass_properties().unwrap();
 
