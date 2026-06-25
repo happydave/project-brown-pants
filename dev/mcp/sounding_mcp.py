@@ -9,6 +9,8 @@ scenario under test instead of reproducing it headlessly:
   * ``get_telemetry`` → ``GET /telemetry`` — the versioned `Telemetry` snapshot (clock, orbit,
     active-flight autonomy, and — in a rover scene — a ``rover`` block with pose/contact/per-wheel
     state, WI 640).
+  * ``get_telemetry_history`` → ``GET /telemetry/history`` — a JSON array of the last few seconds of
+    snapshots, oldest-first (WI 644); a time series for spiky signals (pair with a paused ``Step``).
   * ``send_command``  → ``POST /command``  — inject one JSON `Command` (e.g. ``{"SetPaused": true}``,
     ``{"SetWarp": 4.0}``, or — while paused — ``{"Step": {"seconds": 0.1}}`` to advance a frozen scene
     a known amount for inspection, WI 643).
@@ -40,10 +42,19 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
+        "name": "get_telemetry_history",
+        "description": (
+            "Read the recent telemetry history (GET /telemetry/history): a JSON array of the last few "
+            "seconds of snapshots, oldest-first — a time series for inspecting how a signal evolves "
+            "(pair with a paused Step). Prefer this over polling get_telemetry for spiky signals."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
         "name": "send_command",
         "description": (
             "Inject one Command into the running game (POST /command). `command` is the JSON body, "
-            'e.g. {"SetPaused": true} or {"SetWarp": 4.0}.'
+            'e.g. {"SetPaused": true}, {"SetWarp": 4.0}, or while paused {"Step": {"seconds": 0.1}}.'
         ),
         "inputSchema": {
             "type": "object",
@@ -82,6 +93,8 @@ def _call_tool(name: str, arguments: dict) -> dict:
     try:
         if name == "get_telemetry":
             text = _http_get("/telemetry")
+        elif name == "get_telemetry_history":
+            text = _http_get("/telemetry/history")
         elif name == "send_command":
             command = arguments.get("command")
             if command is None:

@@ -30,6 +30,11 @@ class StubBus(BaseHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
             self.wfile.write(body)
+        elif self.path == "/telemetry/history":
+            body = b'[{"t":1.0},{"t":2.0}]'
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self.send_response(404)
             self.end_headers()
@@ -67,7 +72,19 @@ def main():
 
         tools = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         names = {t["name"] for t in tools["result"]["tools"]}
-        assert names == {"get_telemetry", "send_command"}, names
+        assert names == {"get_telemetry", "get_telemetry_history", "send_command"}, names
+
+        hist = rpc(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {"name": "get_telemetry_history", "arguments": {}},
+            },
+        )
+        htext = hist["result"]["content"][0]["text"]
+        assert isinstance(json.loads(htext), list), htext
 
         tele = rpc(
             proc,
