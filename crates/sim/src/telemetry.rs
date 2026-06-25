@@ -78,6 +78,11 @@ pub struct RoverTelemetry {
     pub contact_jitter: f64,
     /// Hull penetration depth into the terrain (m) — the hull-shell contact signal (WI 634).
     pub hull_penetration: f64,
+    /// Whether the rover is touching the ground at all (WI 642): any wheel in contact or the hull
+    /// penetrating. Disambiguates `contact_jitter` — `false` here means a jitter spike is the wheels
+    /// leaving the ground, not a live load. Additive/serde-defaulted.
+    #[serde(default)]
+    pub grounded: bool,
     /// Per-wheel state, in build order.
     pub wheels: Vec<WheelTelemetry>,
 }
@@ -107,6 +112,10 @@ pub struct WheelTelemetry {
     pub rim_bent: bool,
     /// Suspension damper blown — bouncy corner (WI 631b). Latched.
     pub damper_blown: bool,
+    /// Whether this wheel carried ground load on the last step (WI 642): `false` if airborne or
+    /// sheared. Additive/serde-defaulted. Lets a reader tell a grazing wheel from a loaded one.
+    #[serde(default)]
+    pub tire_contact: bool,
 }
 
 impl RoverTelemetry {
@@ -128,6 +137,7 @@ impl RoverTelemetry {
             angular_velocity: [omega.x, omega.y, omega.z],
             contact_jitter: rover.contact_jitter,
             hull_penetration: rover.hull_penetration,
+            grounded: rover.hull_penetration > 0.0 || rover.wheels.iter().any(|w| w.tire_contact),
             wheels: rover
                 .wheels
                 .iter()
@@ -143,6 +153,7 @@ impl RoverTelemetry {
                     tire_blown: w.tire_blown,
                     rim_bent: w.rim_bent,
                     damper_blown: w.damper_blown,
+                    tire_contact: w.tire_contact,
                 })
                 .collect(),
         }
@@ -379,6 +390,7 @@ mod tests {
         rover.wheels[1].tire_blown = true;
         rover.wheels[1].inert = true;
 
+        rover.wheels[0].tire_contact = true;
         let rt = RoverTelemetry::from_rover(&rover);
         assert_eq!(rt.position, [1.0, 2.0, 3.0]);
         assert_eq!(rt.velocity, [0.5, 0.0, -0.5]);
@@ -386,6 +398,10 @@ mod tests {
         assert_eq!(rt.wheels.len(), 2);
         assert!(!rt.wheels[0].tire_blown);
         assert!(rt.wheels[1].tire_blown && rt.wheels[1].inert);
+        // Contact flags (WI 642): wheel 0 carries load, wheel 1 doesn't; the rover is grounded
+        // (a wheel in contact, and the hull penetrating).
+        assert!(rt.wheels[0].tire_contact && !rt.wheels[1].tire_contact);
+        assert!(rt.grounded);
         // The angular-velocity y-component reflects the imposed spin.
         assert!((rt.angular_velocity[1] - 0.1).abs() < 1e-9);
 

@@ -251,6 +251,10 @@ pub struct Wheel {
     /// Suspension damper blown (WI 631b): this corner's [`Wheel::damping`] has been cut, so it is
     /// bouncy. Latched.
     pub damper_blown: bool,
+    /// Whether the tire produced ground normal load on the last [`step`] (WI 642): `n_ground > 0`.
+    /// An observability signal (telemetry) that disambiguates `contact_jitter` — airborne vs slamming
+    /// vs resting; an inert/sheared or airborne wheel is `false`. Not used by the physics.
+    pub tire_contact: bool,
 }
 
 impl Wheel {
@@ -296,6 +300,7 @@ impl Wheel {
             tire_blown: false,
             rim_bent: false,
             damper_blown: false,
+            tire_contact: false,
         }
     }
 
@@ -433,6 +438,9 @@ impl Rover {
         let mut total_normal = 0.0;
 
         for w in &mut self.wheels {
+            // Contact observability (WI 642): reset each step; set true below once the wheel is found to
+            // carry ground load. A sheared/airborne wheel leaves it false.
+            w.tire_contact = false;
             // A sheared-off wheel (WI 618) exerts nothing and does not spin.
             if w.inert {
                 continue;
@@ -542,6 +550,8 @@ impl Rover {
             // the support magnitude (the single series spring); on the quarter-car path it is the
             // spikier tire load (the suspension would over-smooth it and under-cage the kraken).
             total_normal += n_ground;
+            // Contact observability (WI 642): this wheel carries ground load this step.
+            w.tire_contact = n_ground > 0.0;
 
             // Ground tangent basis: steered heading projected perpendicular to the normal. A bent rim
             // adds a small persistent steer bias (WI 631b), so a damaged corner pulls.
@@ -1503,6 +1513,32 @@ mod tests {
         assert!(
             (floored_a - floored_b).abs() < 0.01,
             "below-floor tires should ride alike (floored): {floored_a:.3} vs {floored_b:.3}"
+        );
+    }
+
+    #[test]
+    fn tire_contact_tracks_ground_contact() {
+        // WI 642: a settled rover reports wheels in contact; lifted far above the terrain it reports
+        // none. (The observability flag the telemetry exposes.)
+        let terrain = Terrain {
+            amplitude: 0.0,
+            ..Default::default()
+        };
+        let mut rover = station_assembly(SuspensionSpec::new(), TireSpec::new(0.1), &terrain).rover;
+        for _ in 0..6_000 {
+            rover.step(&terrain, DT);
+        }
+        assert!(
+            rover.wheels.iter().any(|w| w.tire_contact),
+            "a settled rover should have at least one wheel in contact"
+        );
+
+        // Lift it far above the terrain and step: no wheel should report contact.
+        rover.body.position.y += 1_000.0;
+        rover.step(&terrain, DT);
+        assert!(
+            rover.wheels.iter().all(|w| !w.tire_contact),
+            "a high-airborne rover should have no wheel in contact"
         );
     }
 
