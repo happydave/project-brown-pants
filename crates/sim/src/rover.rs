@@ -66,6 +66,15 @@ const TIRE_OMEGA_DT_MAX: f64 = 0.3;
 /// Minimum unsprung mass (kg) for the quarter-car path: below this a corner uses the legacy
 /// series-spring contact, so a degenerate (near-massless) station never divides by ~zero or rings.
 const MIN_UNSPRUNG_MASS: f64 = 0.02;
+/// Minimum tire-to-suspension stiffness ratio (WI 631b ride pass). In a real vehicle the tire is
+/// several times **stiffer** than the suspension spring, so the body's heave rides on the (well-damped)
+/// suspension rather than bobbing on a soft tire. The suspension rate is auto-sized to the build mass,
+/// so on a heavy rover it can exceed an authored (absolute) tire rate — inverting that ordering and
+/// leaving the heave-on-tire mode badly under-damped (a slow wallow after a landing). Flooring the tire
+/// at this multiple of the suspension rate restores the real ordering at any build scale, while a tire
+/// already stiffer than the floor keeps its authored feel (the soft/stiff preset distinction on lighter
+/// builds where the suspension rate is well below the authored tire rate).
+const TIRE_TO_SUSPENSION_RATIO: f64 = 4.0;
 /// Tire load-sensitivity cap (WI 631a): the grip a corner can generate saturates at this multiple of
 /// its **static** load. The quarter-car's dynamic ground load spikes on bump/landing impacts; without a
 /// cap, those spikes multiply through the friction ellipse (especially with a grippy tire) into force
@@ -103,6 +112,33 @@ const SHEAR_SIDE_BIAS: f64 = 0.25;
 fn rated_shear_speed(strength: f64) -> f64 {
     (BASE_SHEAR_SPEED * (strength / REF_SHEAR_STRENGTH).sqrt()).max(MIN_SHEAR_SPEED)
 }
+
+/// Component failure ladder (WI 631b). Each wheel station fails its components in severity order
+/// *below* the catastrophic mount shear (WI 618), so a graded impact damages the soft outer parts
+/// first and only a hard hit tears the wheel off. The ratings are expressed as fractions of the
+/// wheel's own (chassis-material-sourced, mass-independent) shear speed, so the strict ordering
+/// `tire_burst < rim_bend < damper_fail < shear` holds automatically at any build scale. (The full
+/// "move shear strength onto the components" of the design is a deliberate partial here — only these
+/// new sub-shear ratings are component/shear-derived; the mount shear itself is unchanged.)
+const TIRE_BURST_FRACTION: f64 = 0.70;
+/// Rim-bend impact rating as a fraction of the mount shear speed (WI 631b).
+const RIM_BEND_FRACTION: f64 = 0.82;
+/// Damper-failure impact rating as a fraction of the mount shear speed (WI 631b).
+const DAMPER_FAIL_FRACTION: f64 = 0.92;
+/// Residual grip multiplier of a blown tire (WI 631b): grip collapses to this fraction (running on the
+/// bare rim has far less traction).
+const TIRE_BLOWN_GRIP: f64 = 0.3;
+/// Rolling-resistance multiplier added by a blown tire (WI 631b): a rim drags far more than rubber.
+const TIRE_BLOWN_ROLLING: f64 = 4.0;
+/// Rolling-resistance multiplier added by a bent rim (WI 631b): a buckled rim scrubs as it rolls.
+const RIM_BENT_ROLLING: f64 = 2.0;
+/// Steer/camber bias (rad) a bent rim adds to its wheel (WI 631b): a persistent pull / visible wobble.
+const RIM_BENT_STEER: f64 = 0.04;
+/// Remaining suspension damping fraction after a blown damper (WI 631b): that corner becomes bouncy.
+const DAMPER_BLOWN_DAMPING: f64 = 0.1;
+/// Tire spring rate (N/m) of a blown tire run on the bare rim (WI 631b): effectively rigid — the
+/// step caps it at the sub-step-stable ceiling, so the corner stops absorbing/bouncing and thuds.
+const RIGID_TIRE_STIFFNESS: f64 = 1.0e9;
 /// Motor's maximum wheel speed (rad/s). Drive torque falls off as the wheel nears
 /// it, so flooring the throttle cannot spin the wheels up without bound — a burnout
 /// would use all the tyre's grip longitudinally and leave none for cornering,
@@ -180,6 +216,24 @@ pub struct Wheel {
     /// load-sensitivity grip cap ([`GRIP_LOAD_FACTOR`]). Set by [`assemble_rover`]; zero on the legacy
     /// path (no cap, so hand-built fixtures are unchanged).
     pub static_load: f64,
+    /// Rim radius (m) — the run-on-rim target if the tire blows (WI 631b). The tire profile is
+    /// `radius − rim_radius`; a blown tire drops [`Wheel::radius`] to this. Set by [`assemble_rover`]
+    /// from the rim component; defaults to the full radius (no drop) for hand-built fixtures.
+    pub rim_radius: f64,
+    /// Rolling-resistance multiplier (WI 631b): 1.0 normally; raised when the tire blows or the rim
+    /// bends so a damaged corner drags more.
+    pub rolling_scale: f64,
+    /// Steer/camber bias (rad) added to [`Wheel::steer`] (WI 631b): 0 normally; a bent rim adds a small
+    /// persistent offset (a pull / wobble).
+    pub steer_bias: f64,
+    /// Tire blown out (WI 631b): grip has collapsed to a residual and the wheel runs on the rim
+    /// (reduced [`Wheel::radius`]). Latched.
+    pub tire_blown: bool,
+    /// Rim bent (WI 631b): added rolling resistance and a steer/camber bias. Latched.
+    pub rim_bent: bool,
+    /// Suspension damper blown (WI 631b): this corner's [`Wheel::damping`] has been cut, so it is
+    /// bouncy. Latched.
+    pub damper_blown: bool,
 }
 
 impl Wheel {
@@ -216,6 +270,83 @@ impl Wheel {
             axle_drop: 0.35,
             axle_drop_vel: 0.0,
             static_load: 0.0,
+            // Failure state (WI 631b): undamaged. `rim_radius` defaults to the full radius so a blown
+            // tire on a hand-built fixture drops nothing (fixtures never blow in practice — see step);
+            // [`assemble_rover`] sets the real rim radius for component-built wheels.
+            rim_radius: 0.35,
+            rolling_scale: 1.0,
+            steer_bias: 0.0,
+            tire_blown: false,
+            rim_bent: false,
+            damper_blown: false,
+        }
+    }
+
+    /// Blow this tire out (WI 631b): collapse grip to a residual, run on the rim (drop the rolling
+    /// radius to [`Wheel::rim_radius`], rescaling spin inertia for the smaller wheel), add rolling
+    /// resistance, and **make the contact rigid** — a flat tire run on the bare rim has essentially no
+    /// compliance, so it stops absorbing and stops bouncing on a phantom tire spring (it thuds harshly
+    /// instead; the suspension, if any, still does the absorbing). Latched — returns `true` only the
+    /// first time (so the impact diagnostic reports a *new* blowout and re-hits don't compound).
+    fn blow_tire(&mut self) -> bool {
+        if self.tire_blown {
+            return false;
+        }
+        self.tire_blown = true;
+        self.grip_scale *= TIRE_BLOWN_GRIP;
+        self.rolling_scale *= TIRE_BLOWN_ROLLING;
+        // Run on the rim: rigid contact (the step caps this at the sub-step-stable ceiling), no give.
+        self.tire_stiffness = RIGID_TIRE_STIFFNESS;
+        if self.rim_radius > 0.0 && self.rim_radius < self.radius {
+            let scale = self.rim_radius / self.radius;
+            self.wheel_inertia = (self.wheel_inertia * scale * scale).max(0.02);
+            self.radius = self.rim_radius;
+        }
+        true
+    }
+
+    /// Bend this rim (WI 631b): add rolling resistance and a small persistent steer/camber bias (a
+    /// pull / wobble). Latched — returns `true` only the first time.
+    fn bend_rim(&mut self) -> bool {
+        if self.rim_bent {
+            return false;
+        }
+        self.rim_bent = true;
+        self.rolling_scale *= RIM_BENT_ROLLING;
+        self.steer_bias += RIM_BENT_STEER;
+        true
+    }
+
+    /// Blow this corner's damper (WI 631b): cut the suspension damping so the corner becomes bouncy
+    /// (the spring rate is untouched). Latched — returns `true` only the first time.
+    fn blow_damper(&mut self) -> bool {
+        if self.damper_blown {
+            return false;
+        }
+        self.damper_blown = true;
+        self.damping *= DAMPER_BLOWN_DAMPING;
+        true
+    }
+
+    /// Apply the graded impact-failure ladder for an effective impact `demand` speed (m/s) (WI 631b),
+    /// recording any *new* component failures into `out` for the wheel at index `i`. A demand above the
+    /// mount [`Wheel::shear_speed`] shears the wheel off ([`Wheel::inert`], as WI 618), superseding the
+    /// lesser failures; otherwise every milder component whose rating the demand exceeds fails (the
+    /// strict fraction ordering makes a damper failure imply a bent rim and a blown tire too).
+    fn apply_impact(&mut self, demand: f64, i: usize, out: &mut ImpactOutcome) {
+        if demand > self.shear_speed {
+            self.inert = true;
+            out.sheared.push(i);
+            return;
+        }
+        if demand > DAMPER_FAIL_FRACTION * self.shear_speed && self.blow_damper() {
+            out.blown_dampers.push(i);
+        }
+        if demand > RIM_BEND_FRACTION * self.shear_speed && self.bend_rim() {
+            out.bent_rims.push(i);
+        }
+        if demand > TIRE_BURST_FRACTION * self.shear_speed && self.blow_tire() {
+            out.blown_tires.push(i);
         }
     }
 }
@@ -275,6 +406,8 @@ impl Rover {
         let mut net_force = DVec3::new(0.0, -self.gravity * self.body.mass, 0.0);
         let mut net_torque = DVec3::ZERO;
         let mut total_normal = 0.0;
+        // Live wheel count for the per-wheel inverted-slide friction cap (WI 631b playtest).
+        let live_wheels = self.wheels.iter().filter(|w| !w.inert).count().max(1) as f64;
 
         for w in &mut self.wheels {
             // A sheared-off wheel (WI 618) exerts nothing and does not spin.
@@ -387,8 +520,9 @@ impl Rover {
             // spikier tire load (the suspension would over-smooth it and under-cage the kraken).
             total_normal += n_ground;
 
-            // Ground tangent basis: steered heading projected perpendicular to the normal.
-            let steer_rot = DQuat::from_axis_angle(body_up, w.steer);
+            // Ground tangent basis: steered heading projected perpendicular to the normal. A bent rim
+            // adds a small persistent steer bias (WI 631b), so a damaged corner pulls.
+            let steer_rot = DQuat::from_axis_angle(body_up, w.steer + w.steer_bias);
             let heading = steer_rot * body_fwd;
             let forward = (heading - normal * heading.dot(normal)).normalize_or_zero();
             let lateral = normal.cross(forward);
@@ -412,7 +546,9 @@ impl Rover {
             let slip_ratio = (wheel_speed - v_long) / (v_long.abs() + 1.0);
             let slip_angle = (-v_lat).atan2(v_long.abs() + EPS);
             let (fx, fy) = tire_forces(slip_ratio, slip_angle, fmax, w.slip_long, w.slip_lat);
-            let rolling = -material.rolling_resistance * n_ground * v_long.signum();
+            // Rolling resistance, scaled up for a damaged corner (blown tire / bent rim, WI 631b).
+            let rolling =
+                -material.rolling_resistance * w.rolling_scale * n_ground * v_long.signum();
 
             // Fade the tangential (drive/grip) forces only once the rover is **past upright** (tipped
             // beyond 90°, on its side/back) (WI 631a): such a wheel is not underneath the vehicle and
@@ -421,8 +557,25 @@ impl Rover {
             // (sub-90°) attitude so bouncing/driving is unaffected, fading to zero as it inverts; the
             // normal support is never faded (no tunnelling).
             let upright = (body_up.dot(normal) * 2.0 + 1.0).clamp(0.0, 1.0);
+            // Past upright, replace the faded traction with a **purely dissipative** Coulomb friction
+            // opposing the contact point's tangential slip (WI 631b playtest): a friction that opposes
+            // motion can only remove kinetic energy, so it cannot pump a wreck up (the reason the slip/
+            // drive forces are faded) — but it does stop an upside-down rover from **sliding forever**
+            // on its orientation-agnostic wheel-springs (the frictionless rest the fade left behind).
+            // Blended by `upright`, so an upright rover is unaffected and a tumbled one slides to a halt.
+            let v_t = hub_vel - normal * hub_vel.dot(normal);
+            let v_t_speed = v_t.length();
+            let coulomb = if v_t_speed > 1e-6 {
+                let cap = (material.friction * n_ground)
+                    .min(self.body.mass * v_t_speed / dt / live_wheels);
+                -v_t / v_t_speed * cap
+            } else {
+                DVec3::ZERO
+            };
             let contact = DVec3::new(hub.x, ground, hub.z);
-            let force = support + (forward * (fx + rolling) + lateral * fy) * upright;
+            let force = support
+                + (forward * (fx + rolling) + lateral * fy) * upright
+                + coulomb * (1.0 - upright);
             net_force += force;
             net_torque += (contact - self.body.position).cross(force);
 
@@ -594,10 +747,9 @@ impl Rover {
                 out.peak_wheel = Some(i);
                 out.peak_capacity = self.wheels[i].shear_speed;
             }
-            if demand > self.wheels[i].shear_speed {
-                self.wheels[i].inert = true;
-                out.sheared.push(i);
-            }
+            // The graded failure ladder (WI 631b): below the mount shear, the soft components fail
+            // first (tire, then rim, then damper); at/above it the wheel shears clean off (WI 618).
+            self.wheels[i].apply_impact(demand, i, &mut out);
         }
         out
     }
@@ -622,10 +774,9 @@ impl Rover {
                 out.peak_wheel = Some(i);
                 out.peak_capacity = self.wheels[i].shear_speed;
             }
-            if closing_speed > self.wheels[i].shear_speed {
-                self.wheels[i].inert = true;
-                out.sheared.push(i);
-            }
+            // A hard landing applies the same graded ladder as a horizontal impact (WI 631b): a heavy
+            // touchdown can blow tires / bend rims before the drop is fatal enough to shear the wheels.
+            self.wheels[i].apply_impact(closing_speed, i, &mut out);
         }
         out
     }
@@ -638,6 +789,12 @@ impl Rover {
 pub struct ImpactOutcome {
     /// Indices of wheels that sheared off this impact.
     pub sheared: Vec<usize>,
+    /// Indices of wheels whose tire newly blew out this impact (WI 631b).
+    pub blown_tires: Vec<usize>,
+    /// Indices of wheels whose rim newly bent this impact (WI 631b).
+    pub bent_rims: Vec<usize>,
+    /// Indices of wheels whose damper newly blew this impact (WI 631b).
+    pub blown_dampers: Vec<usize>,
     /// The most-stressed still-live wheel at the moment of impact (if any).
     pub peak_wheel: Option<usize>,
     /// The effective impact speed that wheel felt (closing × share), m/s.
@@ -713,6 +870,8 @@ fn compose_wheel(
     // The rover core mounts wheels relative to the body's CoM (`body.position`).
     let mut w = Wheel::new(mount_local - com);
     w.radius = radius;
+    // The rim radius is the run-on-rim target if the tire blows (WI 631b).
+    w.rim_radius = rim.radius;
     w.rest_length = susp.rest_length;
     w.wheel_inertia = (0.5 * inertia_mass * radius * radius).max(0.02);
     w.shear_speed = rated_shear_speed(nearest_material_strength(craft, mount_local));
@@ -886,6 +1045,13 @@ pub fn assemble_rover(craft: &VoxelCraft, position: DVec3, gravity: f64) -> Opti
             let k_ceiling = (TIRE_OMEGA_DT_MAX / SUBSTEP_DT).powi(2) * w.unsprung_mass;
             w.stiffness = (load / target_comp).clamp(1.0e3, 5.0e5).min(k_ceiling);
             w.damping = 2.0 * 0.7 * (w.stiffness * m_corner).sqrt();
+            // Keep the tire stiffer than the suspension (real ordering), so the body heave rides on the
+            // well-damped suspension instead of wallowing on a soft tire (WI 631b ride pass). Honour an
+            // authored tire that is already stiffer; clamp to the sub-step ceiling.
+            w.tire_stiffness = w
+                .tire_stiffness
+                .max(TIRE_TO_SUSPENSION_RATIO * w.stiffness)
+                .min(k_ceiling);
             w.static_load = corner_static;
         }
     }
@@ -1237,8 +1403,11 @@ mod tests {
 
     #[test]
     fn softer_tire_settles_lower_than_a_stiff_tire() {
-        // A softer tire (lower series stiffness) compresses more under the same load, so the body
-        // rests lower — the felt difference of "change the tires" (WI 630). Both settle finite.
+        // A softer (but still physical) tire compresses more under load, so the body rests a little
+        // lower — the felt difference of "change the tires" (WI 630). But the tire is floored at
+        // TIRE_TO_SUSPENSION_RATIO× the suspension rate (WI 631b ride pass: a real tire is stiffer than
+        // the spring), so an *absurdly* soft tire does not sink/wallow — it clamps to the floor and
+        // rides the same as any other below-floor tire. Both settle finite.
         let terrain = Terrain {
             amplitude: 0.0,
             ..Default::default()
@@ -1251,15 +1420,56 @@ mod tests {
             assert!(rover.body.position.is_finite());
             rover.body.position.y
         };
-        let stiff = settle(TireSpec::new(0.1)); // default (rigid) tire
+        // Within the physical range (both above the floor), a softer tire rides lower.
+        let stiff = settle(TireSpec::new(0.1)); // near-rigid
         let soft = settle(TireSpec {
-            stiffness: 3.0e4,
+            stiffness: 4.0e5,
             ..TireSpec::new(0.1)
         });
         assert!(
-            soft < stiff - 0.05,
-            "soft tire did not ride noticeably lower: soft {soft:.3} vs stiff {stiff:.3}"
+            soft < stiff - 0.01,
+            "a softer (physical) tire did not ride lower: soft {soft:.3} vs stiff {stiff:.3}"
         );
+        // Below the floor, tires clamp to the same rate (no wallow): two very soft tires ride alike.
+        let floored_a = settle(TireSpec {
+            stiffness: 3.0e4,
+            ..TireSpec::new(0.1)
+        });
+        let floored_b = settle(TireSpec {
+            stiffness: 1.0e4,
+            ..TireSpec::new(0.1)
+        });
+        assert!(
+            (floored_a - floored_b).abs() < 0.01,
+            "below-floor tires should ride alike (floored): {floored_a:.3} vs {floored_b:.3}"
+        );
+    }
+
+    #[test]
+    fn assembled_tire_is_stiffer_than_the_suspension() {
+        // WI 631b ride pass: the real-world ordering (tire stiffer than the spring) must hold after
+        // assembly at any build scale, even when the authored tire is softer than the mass-sized
+        // suspension — otherwise the body wallows on a soft tire. A too-soft authored tire is floored.
+        let terrain = Terrain {
+            amplitude: 0.0,
+            ..Default::default()
+        };
+        let soft_tire = TireSpec {
+            stiffness: 1.0e4, // absurdly soft — must be floored above the suspension
+            ..TireSpec::new(0.1)
+        };
+        let rover = station_assembly(SuspensionSpec::new(), soft_tire, &terrain).rover;
+        for w in &rover.wheels {
+            let k_ceiling = (TIRE_OMEGA_DT_MAX / SUBSTEP_DT).powi(2) * w.unsprung_mass;
+            let expected = (TIRE_TO_SUSPENSION_RATIO * w.stiffness).min(k_ceiling);
+            assert!(
+                w.tire_stiffness >= expected - 1.0,
+                "tire not floored above the spring: k_tire {} < {}× k_susp {}",
+                w.tire_stiffness,
+                TIRE_TO_SUSPENSION_RATIO,
+                w.stiffness
+            );
+        }
     }
 
     #[test]
@@ -1543,6 +1753,185 @@ mod tests {
         let mut hard = make();
         assert_eq!(hard.shear_on_landing(50.0).sheared.len(), 4);
         assert!(hard.wheels.iter().all(|w| w.inert));
+    }
+
+    #[test]
+    fn graded_impact_ladder_fails_components_in_severity_order() {
+        // WI 631b: below the catastrophic mount shear (WI 618), an impact fails the soft components
+        // first — tire, then rim, then damper — and only a hard enough hit shears the wheel off. A
+        // hard landing applies the full (un-side-graded) demand, so the speed thresholds are crisp on
+        // default fixtures (shear = BASE_SHEAR_SPEED).
+        let make = || {
+            let body = ActiveBody::new(DVec3::ZERO, DVec3::ZERO, 100.0, DMat3::IDENTITY);
+            let wheels = vec![
+                Wheel::new(DVec3::new(-1.0, -0.2, -1.0)),
+                Wheel::new(DVec3::new(1.0, -0.2, -1.0)),
+            ];
+            Rover::new(body, wheels, 9.81)
+        };
+        let s = BASE_SHEAR_SPEED;
+
+        // Tire only (demand in (tire_burst, rim_bend) = (0.70, 0.82) · shear).
+        let mut r = make();
+        let o = r.shear_on_landing(0.76 * s);
+        assert_eq!(o.blown_tires.len(), 2);
+        assert!(o.bent_rims.is_empty() && o.blown_dampers.is_empty() && o.sheared.is_empty());
+        assert!(r
+            .wheels
+            .iter()
+            .all(|w| w.tire_blown && !w.rim_bent && !w.damper_blown && !w.inert));
+
+        // Tire + rim (demand in (rim_bend, damper_fail) = (0.82, 0.92) · shear).
+        let mut r = make();
+        let o = r.shear_on_landing(0.87 * s);
+        assert_eq!(o.blown_tires.len(), 2);
+        assert_eq!(o.bent_rims.len(), 2);
+        assert!(o.blown_dampers.is_empty() && o.sheared.is_empty());
+        assert!(r
+            .wheels
+            .iter()
+            .all(|w| w.tire_blown && w.rim_bent && !w.damper_blown && !w.inert));
+
+        // Tire + rim + damper (demand in (damper_fail, shear) = (0.92, 1.0) · shear).
+        let mut r = make();
+        let o = r.shear_on_landing(0.96 * s);
+        assert_eq!(o.blown_tires.len(), 2);
+        assert_eq!(o.bent_rims.len(), 2);
+        assert_eq!(o.blown_dampers.len(), 2);
+        assert!(o.sheared.is_empty());
+        assert!(r
+            .wheels
+            .iter()
+            .all(|w| w.tire_blown && w.rim_bent && w.damper_blown && !w.inert));
+
+        // Catastrophic: above the mount shear the wheel shears clean off (WI 618 unchanged).
+        let mut r = make();
+        let o = r.shear_on_landing(1.5 * s);
+        assert_eq!(o.sheared.len(), 2);
+        assert!(
+            o.blown_tires.is_empty(),
+            "a clean shear supersedes lesser failures"
+        );
+        assert!(r.wheels.iter().all(|w| w.inert));
+    }
+
+    #[test]
+    fn impact_failures_latch_and_do_not_compound() {
+        // A failed component stays failed: re-hitting it at the same severity is a no-op (no compounding
+        // grip loss, no duplicate report), but a harder hit can still escalate to the next component.
+        let body = ActiveBody::new(DVec3::ZERO, DVec3::ZERO, 100.0, DMat3::IDENTITY);
+        let mut r = Rover::new(body, vec![Wheel::new(DVec3::new(-1.0, -0.2, -1.0))], 9.81);
+        let s = BASE_SHEAR_SPEED;
+        assert_eq!(r.shear_on_landing(0.76 * s).blown_tires.len(), 1);
+        let grip_after = r.wheels[0].grip_scale;
+        let again = r.shear_on_landing(0.76 * s);
+        assert!(again.blown_tires.is_empty(), "no second blowout report");
+        assert_eq!(r.wheels[0].grip_scale, grip_after, "grip did not compound");
+        // A harder hit escalates to the rim without re-blowing the (already blown) tire.
+        let harder = r.shear_on_landing(0.87 * s);
+        assert!(harder.blown_tires.is_empty());
+        assert_eq!(harder.bent_rims.len(), 1);
+    }
+
+    #[test]
+    fn blown_tire_loses_grip_and_runs_on_the_rim() {
+        // WI 631b: on an assembled (component) rover the rim radius is real, so a blown tire collapses
+        // grip to a residual, drops the rolling radius to the rim (runs on the rim), and drags more.
+        let craft = chassis_with_stations();
+        let mut rover = assemble_rover(&craft, DVec3::new(0.0, 5.0, 0.0), 9.81)
+            .unwrap()
+            .rover;
+        let s = rover.wheels[0].shear_speed;
+        let (grip0, radius0, rim, k0) = {
+            let w = &rover.wheels[0];
+            (w.grip_scale, w.radius, w.rim_radius, w.tire_stiffness)
+        };
+        assert!(rim < radius0, "rim radius is below the rolling radius");
+        let o = rover.shear_on_landing(0.76 * s); // tire only
+        assert_eq!(o.blown_tires.len(), 4);
+        let w = &rover.wheels[0];
+        assert!(w.tire_blown);
+        assert!(
+            w.grip_scale < grip0 && w.grip_scale > 0.0,
+            "grip collapsed to a residual: {} -> {}",
+            grip0,
+            w.grip_scale
+        );
+        assert!((w.radius - rim).abs() < 1e-9, "now runs on the rim radius");
+        assert!(w.rolling_scale > 1.0, "more rolling resistance");
+        assert!(
+            w.tire_stiffness > k0,
+            "a blown tire runs rigid on the rim (no compliance): {k0} -> {}",
+            w.tire_stiffness
+        );
+    }
+
+    #[test]
+    fn bent_rim_and_blown_damper_change_the_corner() {
+        // WI 631b: a hit between damper_fail and shear bends the rim (adds a steer/camber bias) and
+        // blows the damper (cuts that corner's damping) without removing the wheel.
+        let craft = chassis_with_stations();
+        let mut rover = assemble_rover(&craft, DVec3::new(0.0, 5.0, 0.0), 9.81)
+            .unwrap()
+            .rover;
+        let s = rover.wheels[0].shear_speed;
+        let damp0 = rover.wheels[0].damping;
+        let o = rover.shear_on_landing(0.93 * s);
+        assert_eq!(o.bent_rims.len(), 4);
+        assert_eq!(o.blown_dampers.len(), 4);
+        assert!(o.sheared.is_empty());
+        let w = &rover.wheels[0];
+        assert!(
+            w.rim_bent && w.steer_bias.abs() > 0.0,
+            "bent rim adds a steer bias"
+        );
+        assert!(
+            w.damper_blown && w.damping < damp0 * 0.5,
+            "damper cut: {} -> {}",
+            damp0,
+            w.damping
+        );
+    }
+
+    #[test]
+    fn a_damaged_rover_stays_within_kraken_bounds() {
+        // A rover with every corner damaged (tire blown — running on the rims — rim bent, damper blown)
+        // must still drive over bumps finite and untumbled: a failure must never wake the kraken.
+        let terrain = Terrain {
+            amplitude: 0.3,
+            ..Default::default()
+        };
+        let asm = station_assembly(SuspensionSpec::new(), TireSpec::new(0.1), &terrain);
+        let (mut rover, drive) = (asm.rover, asm.drive);
+        for _ in 0..3_000 {
+            rover.step(&terrain, DT); // settle
+        }
+        let s = rover.wheels[0].shear_speed;
+        let o = rover.shear_on_landing(0.93 * s); // damage every corner short of shearing
+        assert!(o.sheared.is_empty());
+        assert!(rover
+            .wheels
+            .iter()
+            .all(|w| w.tire_blown && w.rim_bent && w.damper_blown));
+        for &i in &drive {
+            rover.wheels[i].drive_torque = rover.body.mass;
+        }
+        let mut max_omega = 0.0_f64;
+        for step in 0..16_000 {
+            rover.step(&terrain, DT);
+            assert!(
+                rover.body.position.is_finite() && rover.body.velocity.is_finite(),
+                "damaged rover non-finite at step {step}"
+            );
+            if step > 1_000 {
+                max_omega = max_omega.max(rover.body.angular_velocity().length());
+            }
+        }
+        assert!(
+            max_omega < 6.0,
+            "damaged rover tumbled: max_omega = {max_omega}"
+        );
+        assert!(body_up(&rover).y > 0.5, "damaged rover flipped");
     }
 
     #[test]
@@ -1838,6 +2227,39 @@ mod tests {
         assert!(
             h > -1.0,
             "inverted rover tunnelled through the world: h {h:.2}"
+        );
+    }
+
+    #[test]
+    fn an_upside_down_rover_slides_to_a_stop() {
+        // WI 631b playtest: a rover resting upside down must **stop sliding**, not coast forever. It
+        // rests on its (orientation-agnostic) wheel-springs; the past-upright traction fade left that
+        // contact frictionless, so a tumbled rover kept ~all its horizontal speed indefinitely. The
+        // dissipative past-upright Coulomb friction must bleed that off (without tunnelling).
+        let terrain = Terrain {
+            amplitude: 0.0,
+            ..Default::default()
+        };
+        let craft = chassis_with_stations();
+        let mut rover = assemble_rover(&craft, DVec3::ZERO, 9.81).unwrap().rover;
+        rover.body.orientation = DQuat::from_rotation_x(std::f64::consts::PI); // fully inverted
+        rover.body.position = DVec3::new(0.0, terrain.height(0.0, 0.0) + 1.0, 0.0);
+        rover.body.velocity = DVec3::new(6.0, 0.0, 0.0);
+        for _ in 0..40_000 {
+            rover.step(&terrain, DT);
+        }
+        assert!(
+            body_up(&rover).y < -0.9,
+            "test precondition: stays inverted"
+        );
+        let v_horiz = DVec3::new(rover.body.velocity.x, 0.0, rover.body.velocity.z).length();
+        assert!(
+            v_horiz < 0.3,
+            "inverted rover still sliding: |v_horiz| = {v_horiz:.3}"
+        );
+        assert!(
+            rover.height_above_terrain(&terrain) > -1.0,
+            "inverted rover tunnelled"
         );
     }
 

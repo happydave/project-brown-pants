@@ -215,6 +215,12 @@ struct ImpactReport {
     capacity: f64,
     /// Wheels that sheared off at this impact.
     sheared: Vec<usize>,
+    /// Wheels whose tire blew out at this impact (WI 631b).
+    blown_tires: Vec<usize>,
+    /// Wheels whose rim bent at this impact (WI 631b).
+    bent_rims: Vec<usize>,
+    /// Wheels whose damper blew at this impact (WI 631b).
+    blown_dampers: Vec<usize>,
     /// Filled in when the post-impact watch finishes.
     watch: Option<WatchResult>,
 }
@@ -231,13 +237,31 @@ struct ImpactWatch {
 }
 
 impl ImpactReport {
-    /// A one-line HUD summary (plus the post-impact verdict once the watch finishes).
-    fn hud_line(&self) -> String {
-        let result = if self.sheared.is_empty() {
+    /// A compact "what failed" summary across components and shear (WI 631b), or "intact".
+    fn damage_summary(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if !self.blown_tires.is_empty() {
+            parts.push(format!("blew tire {:?}", self.blown_tires));
+        }
+        if !self.bent_rims.is_empty() {
+            parts.push(format!("bent rim {:?}", self.bent_rims));
+        }
+        if !self.blown_dampers.is_empty() {
+            parts.push(format!("blew damper {:?}", self.blown_dampers));
+        }
+        if !self.sheared.is_empty() {
+            parts.push(format!("sheared {:?}", self.sheared));
+        }
+        if parts.is_empty() {
             "intact".to_string()
         } else {
-            format!("sheared {:?}", self.sheared)
-        };
+            parts.join(", ")
+        }
+    }
+
+    /// A one-line HUD summary (plus the post-impact verdict once the watch finishes).
+    fn hud_line(&self) -> String {
+        let result = self.damage_summary();
         let base = format!(
             "impact: {:.1} m/s ({}) · load {:.1}/{:.1} m/s · {result}",
             self.closing, self.impacted, self.demand, self.capacity
@@ -258,7 +282,7 @@ impl ImpactReport {
              peak wheel:    {}\n\
              impact speed:  {:.2} m/s (effective, this wheel)\n\
              rated speed:   {:.2} m/s  ({})\n\
-             sheared:       {}\n\
+             damage:        {}\n\
              =================================",
             self.impacted,
             self.speed,
@@ -272,11 +296,7 @@ impl ImpactReport {
             } else {
                 "held"
             },
-            if self.sheared.is_empty() {
-                "none".to_string()
-            } else {
-                format!("{:?}", self.sheared)
-            },
+            self.damage_summary(),
         )
     }
 
@@ -803,9 +823,11 @@ struct PaletteButton(PaletteEntry);
 /// The rover Test's solid chassis skin mesh (WI 608).
 #[derive(Component)]
 struct RoverChassisMesh;
-/// A rover Test wheel (tyre) mesh by wheel index (WI 608).
+/// A rover Test wheel (tyre) mesh: wheel index, plus the radius it was built at (WI 608); the second
+/// field lets the render shrink the mesh when a tire blows and the wheel runs on its smaller rim
+/// (WI 631b).
 #[derive(Component)]
-struct RoverWheelMesh(usize);
+struct RoverWheelMesh(usize, f32);
 /// A rover Test cosmetic part (seat/antenna/solar/bumper) mesh by part index (WI 608).
 #[derive(Component)]
 struct RoverPartMesh(usize);
@@ -1324,7 +1346,7 @@ fn enter_test(
                     Mesh3d(meshes.add(Mesh::from(Cylinder::new(r, r * 0.5)))),
                     MeshMaterial3d(tyre_mat.clone()),
                     Transform::default(),
-                    RoverWheelMesh(i),
+                    RoverWheelMesh(i, r),
                     TestEntity,
                 ));
             }
@@ -1658,9 +1680,17 @@ fn step_workshop(time: Res<Time>, mut world: ResMut<WorkshopWorld>) {
                         demand: outcome.peak_demand,
                         capacity: outcome.peak_capacity,
                         sheared: outcome.sheared.clone(),
+                        blown_tires: outcome.blown_tires.clone(),
+                        bent_rims: outcome.bent_rims.clone(),
+                        blown_dampers: outcome.blown_dampers.clone(),
                         watch: None,
                     };
-                    if !outcome.sheared.is_empty() {
+                    // Any component failure (not just a clean shear) is a notable, loggable event.
+                    let damaged = !outcome.sheared.is_empty()
+                        || !outcome.blown_tires.is_empty()
+                        || !outcome.bent_rims.is_empty()
+                        || !outcome.blown_dampers.is_empty();
+                    if damaged {
                         info!("{}", report.log_block());
                         rs.watch = Some(ImpactWatch::start());
                         rs.last_impact = Some(report);
@@ -1727,6 +1757,9 @@ fn step_workshop(time: Res<Time>, mut world: ResMut<WorkshopWorld>) {
                         demand: outcome.peak_demand,
                         capacity: outcome.peak_capacity,
                         sheared: outcome.sheared.clone(),
+                        blown_tires: outcome.blown_tires.clone(),
+                        bent_rims: outcome.bent_rims.clone(),
+                        blown_dampers: outcome.blown_dampers.clone(),
                         watch: None,
                     };
                     info!("{}", report.log_block());
@@ -2037,9 +2070,13 @@ fn track_rover_meshes(
                 tf.scale = Vec3::ZERO;
                 continue;
             }
+            // A blown tire runs on the smaller rim (WI 631b): shrink the mesh to the current radius
+            // relative to the radius it was built at.
+            tf.scale = Vec3::splat((w.radius as f32 / tag.1).clamp(0.05, 1.0));
             let hub = body.position + q * w.mount;
             let (center, align_normal) = wheel_render_pose(w, hub, &rs.terrain, up);
-            let steer_rot = DQuat::from_axis_angle(up, w.steer);
+            // Include the bent-rim steer/camber bias (WI 631b) so a damaged wheel visibly points off.
+            let steer_rot = DQuat::from_axis_angle(up, w.steer + w.steer_bias);
             let heading = steer_rot * fwd;
             let forward = (heading - align_normal * heading.dot(align_normal)).normalize_or_zero();
             let axle = align_normal.cross(forward).normalize_or_zero();
