@@ -55,7 +55,9 @@ use sounding_sim::medium::max_cross_section;
 use sounding_sim::powertrain::RoverPowertrain;
 use sounding_sim::propulsion::{Engine, EngineCommand, Propulsion};
 use sounding_sim::resource::{Reservoir, ReservoirId, ResourceGraph, ResourceType};
-use sounding_sim::rover::{assemble_rover, Rover, RoverAssembly, SUBSTEP_DT as ROVER_SUBSTEP_DT};
+use sounding_sim::rover::{
+    assemble_rover, Rover, RoverAssembly, Wheel, SUBSTEP_DT as ROVER_SUBSTEP_DT,
+};
 use sounding_sim::sim::CentralBody;
 use sounding_sim::terrain::{Ramp, Terrain};
 use sounding_sim::voxel::{device_mass, Device, DeviceKind, Material, PartKind, Voxel, VoxelCraft};
@@ -1944,6 +1946,35 @@ fn part_mesh(
     )
 }
 
+/// Where a wheel's mesh sits and how it aligns, given its suspension mount `hub` (world) and the body
+/// `up`. For a quarter-car wheel (WI 631a) this is the **actual axle height** (`hub − axle_drop`
+/// vertically), so the wheel visibly hops, squats under load, and droops when airborne — the ride
+/// dynamics are seen, not re-derived. For a legacy wheel (no unsprung DOF) it falls back to the WI 630
+/// rule: on the ground when in contact, else hanging at full suspension droop (so an airborne wheel
+/// stays with the rover instead of shadowing the terrain). The returned normal aligns the axle: the
+/// terrain normal when the tyre touches, the body up while airborne.
+fn wheel_render_pose(w: &Wheel, hub: DVec3, terrain: &Terrain, up: DVec3) -> (DVec3, DVec3) {
+    let ground = terrain.height(hub.x, hub.z);
+    if w.unsprung_mass > 0.0 {
+        let axle_y = hub.y - w.axle_drop;
+        let center = DVec3::new(hub.x, axle_y, hub.z);
+        let normal = if axle_y <= ground + w.radius + 1e-3 {
+            terrain.normal(hub.x, hub.z)
+        } else {
+            up
+        };
+        (center, normal)
+    } else {
+        let contact_center = DVec3::new(hub.x, ground + w.radius, hub.z);
+        let droop_center = hub - up * w.rest_length;
+        if contact_center.y >= droop_center.y {
+            (contact_center, terrain.normal(hub.x, hub.z))
+        } else {
+            (droop_center, up)
+        }
+    }
+}
+
 /// Positions the rover's solid meshes (WI 608) each frame, rover-anchored: the chassis skin at the
 /// lattice origin, each tyre at its wheel (steered, riding the suspension), each cosmetic part at
 /// its mount — all oriented with the body.
@@ -2007,18 +2038,7 @@ fn track_rover_meshes(
                 continue;
             }
             let hub = body.position + q * w.mount;
-            let ground = rs.terrain.height(hub.x, hub.z);
-            // Where the wheel actually sits (WI 630 fix): on the ground when in contact, else hanging
-            // from the body at full suspension droop — so an airborne wheel stays with the rover
-            // instead of tracking the terrain below it like a shadow.
-            let contact_center = DVec3::new(hub.x, ground + w.radius, hub.z);
-            let droop_center = hub - up * w.rest_length;
-            let in_contact = contact_center.y >= droop_center.y;
-            let (center, align_normal) = if in_contact {
-                (contact_center, rs.terrain.normal(hub.x, hub.z))
-            } else {
-                (droop_center, up) // hang and align to the body while airborne
-            };
+            let (center, align_normal) = wheel_render_pose(w, hub, &rs.terrain, up);
             let steer_rot = DQuat::from_axis_angle(up, w.steer);
             let heading = steer_rot * fwd;
             let forward = (heading - align_normal * heading.dot(align_normal)).normalize_or_zero();
@@ -2122,17 +2142,7 @@ fn draw_rover(mut gizmos: Gizmos, world: Res<WorkshopWorld>) {
             continue;
         }
         let hub = body.position + body.orientation * w.mount;
-        let ground = terrain.height(hub.x, hub.z);
-        // Match the wheel mesh (WI 630): on the ground in contact, else hanging at suspension droop —
-        // so the spokes don't stay on the ground "shadowing" the rover while it's airborne.
-        let contact_center = DVec3::new(hub.x, ground + w.radius, hub.z);
-        let droop_center = hub - up * w.rest_length;
-        let in_contact = contact_center.y >= droop_center.y;
-        let (center, align_normal) = if in_contact {
-            (contact_center, terrain.normal(hub.x, hub.z))
-        } else {
-            (droop_center, up)
-        };
+        let (center, align_normal) = wheel_render_pose(w, hub, terrain, up);
         let steer_rot = DQuat::from_axis_angle(up, w.steer);
         let heading = steer_rot * (body.orientation * DVec3::Z);
         let forward = (heading - align_normal * heading.dot(align_normal)).normalize_or_zero();

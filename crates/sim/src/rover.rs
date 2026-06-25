@@ -42,6 +42,47 @@ const JITTER_ANGULAR_DRAG_RATE: f64 = 0.85;
 /// the damping unboundedly large.
 const JITTER_RATIO_CAP: f64 = 3.0;
 
+/// Quarter-car unsprung mass (WI 631a). Each assembled wheel gains its own vertical degree of freedom
+/// and mass (the unsprung mass: rim + tire). The contact normal force then comes from a two-mass
+/// system — a suspension spring-damper between the chassis and the axle, and a stiff tire spring
+/// between the axle and the ground — instead of the WI 630 single series spring (which was the
+/// rigid-unsprung-mass limit of this model). This gives real ride dynamics (wheel hop, bump
+/// absorption, dynamic load transfer) and is the one integrator-level change of Phase 2.
+///
+/// Tire-spring damping ratio: near-critical, so wheel hop settles in roughly one oscillation and the
+/// dynamic ground load stays smooth (a ringing tire load would feed grip noise into the body and
+/// excite tumbling over rough ground). Real tires are lighter-damped, but the strut+tire pair here is
+/// the whole vertical damping path, so it carries the suspension's job too.
+const TIRE_DAMPING_RATIO: f64 = 0.7;
+/// Shared stability/feel ceiling on the axle springs, expressed as a maximum `ω·dt`
+/// (`ω = √(k/m_unsprung)`) (WI 631a). The axle's own DOF is integrated implicitly, but its **coupling
+/// to the chassis** (the suspension reaction) and the body integrator are explicit, so a spring on the
+/// light unsprung mass still rings the chassis once `ω·dt` approaches ~1. Capping every axle spring
+/// (tire and suspension) at this `ω·dt` — i.e. `k ≤ (ω·dt_max / dt)² · m_unsprung`, a mass-relative
+/// rate (the project's scale-relative-physics convention) — keeps the contact smooth at **any** build
+/// scale. It is what makes a **no-suspension ("rigid") strut** the *stiffest stable* strut: still far
+/// above any tire (so the wheel rides on the tire), but smooth rather than a chassis-jolting 1e9.
+const TIRE_OMEGA_DT_MAX: f64 = 0.3;
+/// Minimum unsprung mass (kg) for the quarter-car path: below this a corner uses the legacy
+/// series-spring contact, so a degenerate (near-massless) station never divides by ~zero or rings.
+const MIN_UNSPRUNG_MASS: f64 = 0.02;
+/// Tire load-sensitivity cap (WI 631a): the grip a corner can generate saturates at this multiple of
+/// its **static** load. The quarter-car's dynamic ground load spikes on bump/landing impacts; without a
+/// cap, those spikes multiply through the friction ellipse (especially with a grippy tire) into force
+/// spikes that tumble the rover over rough ground. Real tires have exactly this "load sensitivity"
+/// (grip per newton falls at high load), so the cap is physical, not just a kraken guard. It bounds the
+/// grip used in the friction limit only; the true dynamic load still drives the axle's vertical motion
+/// and the ride feel, and normal cornering/braking load transfer (well under the cap) is unaffected.
+const GRIP_LOAD_FACTOR: f64 = 3.5;
+/// Cap on each corner's unsprung mass as a fraction of the craft's even per-corner share (WI 631a).
+/// Only a fraction of a wheel (the rim/tire contact ring, not the hub/brake/mount) is truly unsprung;
+/// real vehicles keep unsprung mass well under the sprung. Capping it keeps the sprung chassis body
+/// dominant — so its rotational inertia stays high enough that hard braking/cornering does not pitch
+/// or roll it over (a heavy-wheel build would otherwise flip), and the CoM shift off the WI 630 body
+/// stays small (as the design intends) — while still giving every corner a real vertical DOF for hop.
+/// The rim+tire's **full** mass still sets the wheel's spin inertia; only the *vertical* mass is capped.
+const UNSPRUNG_FRACTION: f64 = 0.15;
+
 /// Wheel-mount shear model (WI 618). A mount is **rated for an impact speed**: a wheel shears when the
 /// closing speed of an obstacle impact (scaled by how directly the wheel faces it) exceeds its rated
 /// speed. Keying off impact *speed* — not sustained contact force — means leaning on a wall (closing
@@ -121,6 +162,24 @@ pub struct Wheel {
     /// Whether the suspension strut is rigid (WI 630): if so, [`assemble_rover`] does not mass-size its
     /// spring (it stays very stiff) and the wheel rides on the tire's compliance.
     pub rigid_suspension: bool,
+    /// Unsprung mass (kg) of this corner — rim + tire (WI 631a). Zero ⇒ the legacy series-spring
+    /// contact (the rigid-unsprung-mass limit, used by hand-built fixtures); positive ⇒ the
+    /// quarter-car (per-wheel vertical DOF). Set by [`assemble_rover`] from the station's rim+tire mass.
+    pub unsprung_mass: f64,
+    /// Suspension travel (m) before the droop stop (WI 631a): how far the axle may hang below its free
+    /// length when airborne. From the suspension component; a rigid strut has zero travel.
+    pub suspension_travel: f64,
+    /// Axle (wheel-centre) drop below the chassis mount, measured vertically (m) (WI 631a): the
+    /// quarter-car's vertical state. Free length at rest; grows as the wheel droops, shrinks as the
+    /// suspension compresses. Maintained only on the quarter-car path; ignored when `unsprung_mass` 0.
+    pub axle_drop: f64,
+    /// Rate of change of [`Wheel::axle_drop`] (m/s) (WI 631a): the axle's vertical velocity **relative
+    /// to the chassis mount**. The axle's absolute vertical velocity is `mount_velocity.y - axle_drop_vel`.
+    pub axle_drop_vel: f64,
+    /// Static ground load (N) this corner carries at rest (WI 631a): the reference for the tire
+    /// load-sensitivity grip cap ([`GRIP_LOAD_FACTOR`]). Set by [`assemble_rover`]; zero on the legacy
+    /// path (no cap, so hand-built fixtures are unchanged).
+    pub static_load: f64,
 }
 
 impl Wheel {
@@ -150,6 +209,13 @@ impl Wheel {
             // (no behaviour change for the hand-built wheels used by the stability tests).
             tire_stiffness: 1.0e9,
             rigid_suspension: false,
+            // Zero unsprung mass ⇒ the legacy series-spring path, so hand-built `Wheel::new` fixtures
+            // (and the stability suite built on them) keep the exact WI 630 behaviour (WI 631a).
+            unsprung_mass: 0.0,
+            suspension_travel: 0.35,
+            axle_drop: 0.35,
+            axle_drop_vel: 0.0,
+            static_load: 0.0,
         }
     }
 }
@@ -218,31 +284,108 @@ impl Rover {
             let hub = self.body.position + r * w.mount;
             let hub_vel =
                 self.body.velocity + self.body.angular_velocity().cross(hub - self.body.position);
-
             let ground = terrain.height(hub.x, hub.z);
-            let clearance = hub.y - ground;
-            let target = w.rest_length + w.radius;
-            let compression = (target - clearance).clamp(0.0, target);
-
-            if compression <= 0.0 {
-                // Airborne: the wheel spins freely under drive/brake, no contact force.
-                w.spin += motor_torque(w) / w.wheel_inertia * dt;
-                w.spin = apply_brake(w.spin, w.brake, w.wheel_inertia, dt);
-                continue;
-            }
-
             let normal = terrain.normal(hub.x, hub.z);
-            // Closing speed along the contact normal — positive when the hub
-            // approaches the surface. This captures both vertical motion and the
-            // compression induced by driving forward over a slope (∇h · v), so the
-            // damping sees the forward-over-bump rate and the contact stays stable.
-            let compression_rate = -hub_vel.dot(normal);
-            // Effective contact spring: the suspension and tire springs in series (WI 630), so a
-            // softer tire (or a rigid strut riding on the tire) yields a softer ride. With the default
-            // (rigid) tire this equals `w.stiffness`, the pre-split behaviour.
-            let k_eff = series_stiffness(w.stiffness, w.tire_stiffness);
-            let n = (k_eff * compression + w.damping * compression_rate).clamp(0.0, w.max_force);
-            total_normal += n;
+
+            // The ground normal load `n_ground` (which scales tire grip) and the vertical `support`
+            // force the chassis receives. One contact model — the unsprung-mass quarter-car (WI 631a) —
+            // for every wheel that has mass; the single series spring is its analytic **massless limit**
+            // (`m_unsprung → 0`), used only by hand-built test fixtures and degenerate near-massless
+            // stations.
+            let (n_ground, support) = if w.unsprung_mass < MIN_UNSPRUNG_MASS {
+                let clearance = hub.y - ground;
+                let target = w.rest_length + w.radius;
+                let compression = (target - clearance).clamp(0.0, target);
+                if compression <= 0.0 {
+                    // Airborne: the wheel spins freely under drive/brake, no contact force.
+                    w.spin += motor_torque(w) / w.wheel_inertia * dt;
+                    w.spin = apply_brake(w.spin, w.brake, w.wheel_inertia, dt);
+                    continue;
+                }
+                // The massless-wheel limit: the suspension and tire springs reduce to one series
+                // spring on the body (the rigid-unsprung-mass limit of the quarter-car below).
+                let compression_rate = -hub_vel.dot(normal);
+                let k_eff = series_stiffness(w.stiffness, w.tire_stiffness);
+                let n =
+                    (k_eff * compression + w.damping * compression_rate).clamp(0.0, w.max_force);
+                (n, normal * n)
+            } else {
+                // Quarter-car (WI 631a): a suspension spring-damper between the chassis mount and the
+                // axle (unsprung mass), and a tire spring-damper between the axle and the ground. The
+                // tire force is the dynamic ground load (so grip follows load transfer); the chassis
+                // receives only the suspension reaction. The axle's 1-D vertical DOF is integrated
+                // **implicitly** (backward Euler): the scalar solve below divides by
+                // `1 + (dt/m)(C + K·dt) > 1`, so it is **unconditionally stable** — a soft strut, a
+                // stiff no-suspension strut (which simply locks the axle to the chassis, riding on the
+                // tire), and a zero-travel strut are all the *same* code, no stiffness ever launches.
+                // State is stored as a chassis-relative drop so it survives the caller repositioning
+                // the body before stepping.
+                let m_u = w.unsprung_mass.max(MIN_UNSPRUNG_MASS);
+                let axle_y = hub.y - w.axle_drop;
+                let axle_vy = hub_vel.y - w.axle_drop_vel;
+                let g_ground = ground + w.radius;
+
+                // Only compliant (sprung) wheels reach the quarter-car; a no-suspension wheel is the
+                // rigid limit handled by the tire-on-body branch above. The tyre damps the unsprung hop
+                // (the strut damps the body bounce). Rate capped to a mass-relative feel ceiling.
+                let tire_contact = axle_y < g_ground;
+                let (k_tire, c_tire) = if tire_contact {
+                    let k = w.tire_stiffness.min((TIRE_OMEGA_DT_MAX / dt).powi(2) * m_u);
+                    (k, 2.0 * TIRE_DAMPING_RATIO * (k * m_u).sqrt())
+                } else {
+                    (0.0, 0.0)
+                };
+                // Suspension spring (push-only, preloaded coilover): active only while compressed; a
+                // kinematic droop stop (below) holds the wheel when extended, so the spring never pulls.
+                let (k_susp, c_susp) = if hub.y - axle_y < w.rest_length {
+                    (w.stiffness, w.damping)
+                } else {
+                    (0.0, 0.0)
+                };
+
+                // Backward-Euler solve for the axle's vertical velocity. Up-positive axle forces:
+                //   tire    =  k_tire·(g_ground − y) − c_tire·v
+                //   susp    = −k_susp·(rest − hub.y + y) − c_susp·(v − hub_vy)
+                //   gravity = −m_u·g
+                // ⇒ F(y,v) = A − K·y − C·v; with y_{n+1} = y + dt·v_{n+1} the solve is scalar.
+                let big_k = k_tire + k_susp;
+                let big_c = c_tire + c_susp;
+                let a_const = k_tire * g_ground - k_susp * (w.rest_length - hub.y)
+                    + c_susp * hub_vel.y
+                    - m_u * self.gravity;
+                let inv_m = 1.0 / m_u;
+                let denom = 1.0 + dt * inv_m * (big_c + big_k * dt);
+                let axle_vy_new = (axle_vy + dt * inv_m * (a_const - big_k * axle_y)) / denom;
+                let mut axle_y_new = axle_y + axle_vy_new * dt;
+                let mut axle_vy_fin = axle_vy_new;
+                // Travel stops bound the axle to `[mount − (rest + travel), mount]`: a droop stop (the
+                // strap takes the hanging load — no tension in free fall) and a bump stop (full
+                // compression — a violent hit can never drive the axle above the mount).
+                let max_drop = w.rest_length + w.suspension_travel;
+                if hub.y - axle_y_new > max_drop {
+                    axle_y_new = hub.y - max_drop;
+                    axle_vy_fin = axle_vy_new.max(hub_vel.y); // don't drop faster than the chassis
+                } else if axle_y_new > hub.y {
+                    axle_y_new = hub.y;
+                    axle_vy_fin = axle_vy_new.min(hub_vel.y); // don't rise faster than the chassis
+                }
+                w.axle_drop = hub.y - axle_y_new;
+                w.axle_drop_vel = hub_vel.y - axle_vy_fin;
+
+                // Ground load (tyre force) and chassis support (suspension reaction), both push-only,
+                // at the resolved state.
+                let n_tire = (k_tire * (g_ground - axle_y_new) - c_tire * axle_vy_fin).max(0.0);
+                let susp_comp = w.rest_length - w.axle_drop;
+                let f_susp =
+                    (k_susp * susp_comp + c_susp * (-w.axle_drop_vel)).clamp(0.0, w.max_force);
+                (n_tire, DVec3::Y * f_susp)
+            };
+
+            // The ground (tire) load feeds the contact-jitter signal (WI 611): it carries the bump/
+            // landing spikes the jitter-selective angular damper cages. On the legacy path this equals
+            // the support magnitude (the single series spring); on the quarter-car path it is the
+            // spikier tire load (the suspension would over-smooth it and under-cage the kraken).
+            total_normal += n_ground;
 
             // Ground tangent basis: steered heading projected perpendicular to the normal.
             let steer_rot = DQuat::from_axis_angle(body_up, w.steer);
@@ -255,16 +398,31 @@ impl Rover {
             let wheel_speed = w.spin * w.radius;
 
             let material = terrain.material_at(hub.x, hub.z);
-            // Friction-ellipse limit scaled by the tire's grip multiplier (WI 630): grip_scale 1.0
-            // reproduces the pre-split surface-only grip.
-            let fmax = material.friction * w.grip_scale * n;
+            // Friction-ellipse limit scaled by the tire's grip multiplier (WI 630) and the dynamic
+            // ground load (WI 631a) — so grip follows load transfer — but the load feeding grip
+            // saturates at `GRIP_LOAD_FACTOR ×` the corner's static load (tire load-sensitivity), so a
+            // bump/landing spike cannot multiply into a tumbling force. On the legacy path
+            // (`static_load` 0) the cap is inert, reproducing the pre-split surface-only grip.
+            let n_grip = if w.static_load > 0.0 {
+                n_ground.min(GRIP_LOAD_FACTOR * w.static_load)
+            } else {
+                n_ground
+            };
+            let fmax = material.friction * w.grip_scale * n_grip;
             let slip_ratio = (wheel_speed - v_long) / (v_long.abs() + 1.0);
             let slip_angle = (-v_lat).atan2(v_long.abs() + EPS);
             let (fx, fy) = tire_forces(slip_ratio, slip_angle, fmax, w.slip_long, w.slip_lat);
-            let rolling = -material.rolling_resistance * n * v_long.signum();
+            let rolling = -material.rolling_resistance * n_ground * v_long.signum();
 
+            // Fade the tangential (drive/grip) forces only once the rover is **past upright** (tipped
+            // beyond 90°, on its side/back) (WI 631a): such a wheel is not underneath the vehicle and
+            // cannot lay down traction, so those forces — through a large moment arm at a bad attitude —
+            // would inject rotational energy and spin a tumbled, resting rover up. Full for any normal
+            // (sub-90°) attitude so bouncing/driving is unaffected, fading to zero as it inverts; the
+            // normal support is never faded (no tunnelling).
+            let upright = (body_up.dot(normal) * 2.0 + 1.0).clamp(0.0, 1.0);
             let contact = DVec3::new(hub.x, ground, hub.z);
-            let force = normal * n + forward * (fx + rolling) + lateral * fy;
+            let force = support + (forward * (fx + rolling) + lateral * fy) * upright;
             net_force += force;
             net_torque += (contact - self.body.position).cross(force);
 
@@ -285,12 +443,14 @@ impl Rover {
         // mass fraction each skid carries. Scaled to the mass so the penalty stays sub-step stable.
         let k = self.body.mass * self.gravity / 0.02 / n_belly;
         let c = 2.0 * 0.7 * (k * self.body.mass / n_belly).sqrt();
+        let mut belly_contact = false;
         for &bp in &self.belly_points {
             let p = self.body.position + r * bp;
             let ground = terrain.height(p.x, p.z);
             if p.y >= ground {
                 continue;
             }
+            belly_contact = true;
             let normal = terrain.normal(p.x, p.z);
             let pen = ground - p.y;
             let arm = p - self.body.position;
@@ -316,26 +476,33 @@ impl Rover {
         // Aerodynamic drag → a finite top speed, keeping the rover in the stable band.
         net_force -= DRAG * self.body.velocity * self.body.velocity.length();
 
-        // Jitter-selective angular drag (WI 611): scale the damper by the contact-jitter signal so
-        // the numerical kraken buzz (which rattles the total normal force every sub-step) is caged,
-        // while a genuine, smooth-contact rotation — an intentional flip from a sharp turn or an
-        // obstacle clip — passes nearly undamped. Replaces the old blanket angular damper.
+        // Jitter-selective angular drag (WI 611): a contact-stabilisation term (it cages the kraken buzz
+        // and gently rights the rover), not real aerodynamics. It scales with the contact-jitter signal
+        // so the per-substep buzz is caged while a genuine smooth-contact rotation (an intentional flip)
+        // passes nearly undamped — and it applies only under substantial contact (see below) so it never
+        // arrests a mid-air tumble.
         let jitter = (total_normal - self.last_total_normal).abs();
         let weight = self.body.mass * self.gravity;
-        let jitter_ratio = if weight > 1e-9 {
-            (jitter / weight).min(JITTER_RATIO_CAP)
-        } else {
-            0.0
-        };
-        // Scale the drag by the body's mean moment of inertia (trace/3, rotation-invariant) so the
-        // damping is a consistent *rate* across build sizes (WI 630): the same gentle restoring on a
-        // light editor build as on a heavy test rover, instead of an absolute torque that pinned light
-        // rovers upright.
-        let i = &self.body.inertia;
-        let i_mean = (i.x_axis.x + i.y_axis.y + i.z_axis.z) / 3.0;
-        let angular_drag =
-            i_mean * (BASELINE_ANGULAR_DRAG_RATE + JITTER_ANGULAR_DRAG_RATE * jitter_ratio);
-        net_torque -= angular_drag * self.body.angular_velocity();
+        // Apply the drag only under **substantial** ground contact — solidly supported (a good fraction
+        // of the rover's weight on the wheels) or resting on a belly skid. A mere graze (a low-hanging
+        // wheel brushing the ground while the rover is really airborne, e.g. just off the ramp) does not
+        // count, so a tumble keeps spinning until it truly lands (WI 631a). Inverted resting is caged
+        // instead by the past-upright tangential-force fade, not by this drag.
+        if total_normal > 0.1 * weight || belly_contact {
+            let jitter_ratio = if weight > 1e-9 {
+                (jitter / weight).min(JITTER_RATIO_CAP)
+            } else {
+                0.0
+            };
+            // Scale the drag by the body's mean moment of inertia (trace/3, rotation-invariant) so the
+            // damping is a consistent *rate* across build sizes (WI 630): the same gentle restoring on a
+            // light editor build as on a heavy test rover, not an absolute torque that pins light ones.
+            let i = &self.body.inertia;
+            let i_mean = (i.x_axis.x + i.y_axis.y + i.z_axis.z) / 3.0;
+            let angular_drag =
+                i_mean * (BASELINE_ANGULAR_DRAG_RATE + JITTER_ANGULAR_DRAG_RATE * jitter_ratio);
+            net_torque -= angular_drag * self.body.angular_velocity();
+        }
 
         // External contact wrench (WI 610): obstacle contacts accumulated by the caller this step.
         net_force += self.external_force;
@@ -554,6 +721,11 @@ fn compose_wheel(
     w.slip_lat = tire.slip_lat;
     w.tire_stiffness = tire.stiffness;
     w.rigid_suspension = susp.rigid;
+    // Quarter-car unsprung mass (WI 631a): the rim + tire mass becomes this corner's own vertical DOF.
+    // The axle starts at the suspension free length and settles under load over the first frames.
+    w.unsprung_mass = inertia_mass;
+    w.suspension_travel = susp.travel;
+    w.axle_drop = susp.rest_length;
     Some(w)
 }
 
@@ -569,39 +741,37 @@ fn compose_wheel(
 /// is the deterministic rocket-vs-rover discriminator: wheels ⇒ rover.
 pub fn assemble_rover(craft: &VoxelCraft, position: DVec3, gravity: f64) -> Option<RoverAssembly> {
     let mp = craft.mass_properties()?;
-    let com = mp.center_of_mass;
 
-    let mut wheels = Vec::new();
-    let mut drive = Vec::new();
-    let mut steer = Vec::new();
-    let mut push_wheel = |wheel: Wheel, rim: &RimSpec, wheels: &mut Vec<Wheel>| {
-        let i = wheels.len();
-        wheels.push(wheel);
-        if rim.drive {
-            drive.push(i);
-        }
-        if rim.steer {
-            steer.push(i);
-        }
-    };
+    // The component specs of one wheel gathered before composition (WI 631a): so the unsprung masses
+    // can be reclassified off the sprung body before wheels are mounted CoM-relative to it.
+    struct RawWheel {
+        susp: SuspensionSpec,
+        rim: RimSpec,
+        tire: TireSpec,
+        mount: DVec3,
+        unsprung: f64,
+    }
+    let mut raw: Vec<RawWheel> = Vec::new();
 
-    // Legacy monolithic wheels (still authored by the editor, and loaded from pre-630 saves) migrate
-    // to the three components and compose through the same path, so a pre-split build is unchanged
-    // (WI 630). Iterated in part order so wheel indices match the pre-split assembly.
+    // Pass 1a — legacy monolithic wheels (still authored by the editor, and loaded from pre-630 saves)
+    // migrate to the three components (WI 630). Iterated in part order so wheel indices are stable.
     for part in &craft.parts {
         if let PartKind::Wheel(spec) = part.kind {
             let (susp, rim, tire) = spec.to_components();
-            if let Some(w) = compose_wheel(susp, rim, tire, part.mount, part.mass, com, craft) {
-                push_wheel(w, &rim, &mut wheels);
-            }
+            raw.push(RawWheel {
+                susp,
+                rim,
+                tire,
+                mount: part.mount,
+                unsprung: part.mass,
+            });
         }
     }
 
-    // New component stations: group the components by station id. A station becomes a wheel when it has
-    // a **rim and a tire**; the **suspension is optional** — when absent the wheel rides on the tire's
-    // compliance via a rigid strut (WI 630, the user's no-suspension case). The station's mount (set by
-    // any component, which are co-located) is the wheel mount; inertia comes from the rim + tire mass.
-    // Sorted by id for a deterministic wheel order; incomplete stations (no rim or no tire) are skipped.
+    // Pass 1b — component stations: group the components by station id. A station becomes a wheel when
+    // it has a **rim and a tire**; the **suspension is optional** — when absent the wheel rides on the
+    // tire via a rigid strut (WI 630). Sorted by id for a deterministic wheel order; incomplete
+    // stations are skipped. The unsprung mass of each wheel is its rim + tire mass.
     let mut stations: std::collections::BTreeMap<u32, StationParts> =
         std::collections::BTreeMap::new();
     for part in &craft.parts {
@@ -619,43 +789,110 @@ pub fn assemble_rover(craft: &VoxelCraft, position: DVec3, gravity: f64) -> Opti
         let (Some((rim, rim_mass)), Some((tire, tire_mass))) = (rim, tire) else {
             continue; // incomplete station — needs at least a rim and a tire
         };
-        // Absent suspension ⇒ a rigid strut, so the wheel rides on the tire (ride height ~ the wheel).
         let susp = susp.unwrap_or_else(|| SuspensionSpec::rigid(0.3 * (rim.radius + tire.profile)));
-        if let Some(w) = compose_wheel(susp, rim, tire, mount, rim_mass + tire_mass, com, craft) {
-            push_wheel(w, &rim, &mut wheels);
-        }
+        raw.push(RawWheel {
+            susp,
+            rim,
+            tire,
+            mount,
+            unsprung: rim_mass + tire_mass,
+        });
     }
 
+    if raw.is_empty() {
+        return None; // a lattice without wheels is not a rover (the rocket path handles those)
+    }
+
+    // Reclassify the unsprung masses off the sprung chassis body (WI 631a): each corner's (capped)
+    // unsprung mass gains its own vertical DOF, so the chassis body's **translational** mass is reduced
+    // by the same amount — weight is then conserved (the axles carry their own gravity through the tire)
+    // rather than double-counted. The body keeps the **full** CoM and inertia tensor: the wheels are
+    // still rigidly mounted horizontally and resist body rotation, so stripping their inertia (they sit
+    // far out at the corners, contributing disproportionately) would make a heavy-wheel build tumble.
+    // Keeping full inertia is the conservative, stable choice and leaves wheel mounts as in WI 630.
+    // A **compliant** (sprung) wheel gets its own axle DOF, so its (capped) rim+tire mass is
+    // reclassified onto the axle. A **no-suspension** wheel is the rigid limit (`k_susp → ∞`): the axle
+    // is locked to the chassis and the body rides directly on the tyre, so there is no independent axle
+    // — its mass stays on the sprung body (contributes 0 unsprung).
+    let cap = UNSPRUNG_FRACTION * mp.mass / raw.len() as f64;
+    let unsprung: Vec<(f64, DVec3)> = raw
+        .iter()
+        .map(|r| {
+            let m = if r.susp.rigid {
+                0.0
+            } else {
+                r.unsprung.min(cap)
+            };
+            (m, r.mount)
+        })
+        .collect();
+    let total_unsprung: f64 = unsprung.iter().map(|(m, _)| *m).sum();
+    let sprung_mass = (mp.mass - total_unsprung).max(1e-9);
+    let com = mp.center_of_mass;
+    let sprung_inertia = mp.inertia;
+
+    // Pass 2 — compose each raw wheel into a runtime wheel; drive/steer membership from the rim flags.
+    let mut wheels = Vec::new();
+    let mut drive = Vec::new();
+    let mut steer = Vec::new();
+    for (rw, &(u_eff, _)) in raw.iter().zip(&unsprung) {
+        if let Some(mut w) =
+            compose_wheel(rw.susp, rw.rim, rw.tire, rw.mount, rw.unsprung, com, craft)
+        {
+            // The capped vertical unsprung mass (the spin inertia keeps the full rim+tire mass).
+            w.unsprung_mass = u_eff;
+            let i = wheels.len();
+            if rw.rim.drive {
+                drive.push(i);
+            }
+            if rw.rim.steer {
+                steer.push(i);
+            }
+            wheels.push(w);
+        }
+    }
     if wheels.is_empty() {
         return None;
     }
 
-    // Size each wheel's suspension to the assembled mass (WI 612 feedback): a spring stiff enough to
-    // carry its share of the weight at ~25% compression, damped near-critical, with headroom for
-    // bumps. Without this the fixed `WheelPart` springs were mismatched to the build (sagging or
-    // flinging), which read as "won't move / nose lifts".
+    // Size each wheel. Two regimes of the one quarter-car model:
+    //  - **Compliant** (has an axle DOF): the suspension spring carries the sprung corner at ~25%
+    //    compression (damped near-critical); the tire spring carries the rest.
+    //  - **No axle DOF** (`unsprung_mass` 0 — a no-suspension/rigid wheel, or a massless fixture): the
+    //    rigid limit. The axle is locked to the chassis and the body rides directly on the tyre, via the
+    //    tire-on-body contact (a `1e9` strut makes the series rate ≈ the tyre's). A no-suspension wheel
+    //    is **critically damped** for the load it carries (no spawn bounce) and grip-capped; a bare
+    //    fixture keeps the lighter legacy damping and no cap.
     let n = wheels.len() as f64;
-    let load = (mp.mass * gravity / n).max(1.0);
-    let m_wheel = mp.mass / n;
+    let load = (sprung_mass * gravity / n).max(1.0);
+    let m_corner = sprung_mass / n;
+    // Total static load each corner's tire carries at rest (the grip load-sensitivity reference).
+    let corner_static = (mp.mass * gravity / n).max(1.0);
     for w in &mut wheels {
-        // A rigid strut keeps a very stiff spring (it is not mass-sized): the wheel then rides on the
-        // tire's series compliance (WI 630). A normal strut is sized to carry its load share at ~25%
-        // compression, damped near-critical, as before.
-        if w.rigid_suspension {
+        w.max_force = (load * 6.0).max(1.0e3);
+        if w.unsprung_mass < MIN_UNSPRUNG_MASS {
             w.stiffness = 1.0e9;
+            let k_eff = series_stiffness(w.stiffness, w.tire_stiffness);
+            if w.rigid_suspension {
+                // No-suspension wheel: body on the tyre. Critical (ζ = 1) for the carried corner load.
+                w.damping = 2.0 * (k_eff * m_corner).sqrt();
+                w.static_load = corner_static;
+            } else {
+                w.damping = 2.0 * 0.7 * (k_eff * m_corner).sqrt(); // massless fixture
+                w.static_load = 0.0;
+            }
         } else {
             let target_comp = (0.25 * w.rest_length).max(1e-3);
-            w.stiffness = (load / target_comp).clamp(1.0e3, 5.0e5);
+            let k_ceiling = (TIRE_OMEGA_DT_MAX / SUBSTEP_DT).powi(2) * w.unsprung_mass;
+            w.stiffness = (load / target_comp).clamp(1.0e3, 5.0e5).min(k_ceiling);
+            w.damping = 2.0 * 0.7 * (w.stiffness * m_corner).sqrt();
+            w.static_load = corner_static;
         }
-        w.max_force = (load * 6.0).max(1.0e3);
-        // Damping is sized from the effective (series) contact stiffness so the ride stays
-        // near-critically damped whether the softness comes from the strut or the tire.
-        let k_eff = series_stiffness(w.stiffness, w.tire_stiffness);
-        w.damping = 2.0 * 0.7 * (k_eff * m_wheel).sqrt();
     }
 
     // Powertrain (WI 609): an `Engine` device is a combustion engine for the rover (drivetrain),
-    // not thrust; `Tank` feeds it, `Battery` + `SolarPanel` parts are the electric path.
+    // not thrust; `Tank` feeds it, `Battery` + `SolarPanel` parts are the electric path. Sized to the
+    // total assembled mass (the whole rover the drivetrain has to move), not the sprung fraction.
     let count_dev = |k: DeviceKind| craft.devices.iter().filter(|d| d.kind == k).count();
     let solar = craft
         .parts
@@ -671,7 +908,7 @@ pub fn assemble_rover(craft: &VoxelCraft, position: DVec3, gravity: f64) -> Opti
         drive.len(),
     );
 
-    let body = ActiveBody::from_mass_properties(position, DVec3::ZERO, &mp);
+    let body = ActiveBody::new(position, DVec3::ZERO, sprung_mass, sprung_inertia);
     Some(RoverAssembly {
         rover: Rover::new(body, wheels, gravity),
         drive,
@@ -1226,6 +1463,14 @@ mod tests {
             for dx in [-0.25, 0.25] {
                 let mount = DVec3::new(dx, -0.05, (cz as f64 + 0.5) * s);
                 let id = craft.parts.len() as u32;
+                // Sprung (suspended) wheels: a light, tall-narrow build on real suspension is the
+                // roll-prone case the WI 611 relaxed damper must still allow to tip.
+                craft.parts.push(Part {
+                    mount,
+                    mass: 1.0,
+                    kind: PartKind::Suspension(SuspensionSpec::for_cell_size(s)),
+                    station: Some(id),
+                });
                 craft.parts.push(Part {
                     mount,
                     mass: 1.0,
@@ -1342,6 +1587,671 @@ mod tests {
         );
     }
 
+    // ---- WI 631a: unsprung-mass quarter-car ----
+
+    /// A 0.1 m four-corner rover whose front and rear axles take the given (optional) suspension strut
+    /// — `None` ⇒ a no-suspension station (rim + tire only) — and the given tire `stiffness` (the
+    /// editor's off-road/road/slick presets). For the mixed / zero-travel stability tests.
+    fn corner_rover(
+        front: Option<SuspensionSpec>,
+        rear: Option<SuspensionSpec>,
+        stiffness: f64,
+    ) -> VoxelCraft {
+        let s = 0.1;
+        let mut craft = VoxelCraft::new(s);
+        for x in 0..4 {
+            for z in 0..6 {
+                craft.voxels.push(Voxel {
+                    cell: IVec3::new(x, 0, z),
+                    material: Material::COMPOSITE,
+                });
+            }
+        }
+        for (id, (cx, cz, st, susp)) in [
+            (0, 0, false, rear),
+            (3, 0, false, rear),
+            (0, 5, true, front),
+            (3, 5, true, front),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = id as u32;
+            let mount = DVec3::new((cx as f64 + 0.5) * s, -0.05, (cz as f64 + 0.5) * s);
+            if let Some(sp) = susp {
+                craft.parts.push(Part {
+                    mount,
+                    mass: 1.0,
+                    kind: PartKind::Suspension(sp),
+                    station: Some(id),
+                });
+            }
+            craft.parts.push(Part {
+                mount,
+                mass: 1.0,
+                kind: PartKind::Rim(RimSpec {
+                    radius: 0.1,
+                    drive: true,
+                    steer: st,
+                }),
+                station: Some(id),
+            });
+            craft.parts.push(Part {
+                mount,
+                mass: 1.0,
+                kind: PartKind::Tire(TireSpec {
+                    stiffness,
+                    ..TireSpec::new(0.05)
+                }),
+                station: Some(id),
+            });
+        }
+        craft
+    }
+
+    #[test]
+    fn mixed_and_zero_travel_suspension_stay_stable() {
+        // The implicit quarter-car is one model for every strut stiffness, so the configurations the
+        // two-path version got wrong are all stable: a vehicle with BOTH sprung and no-suspension axles,
+        // and a zero-travel suspension. None launches; all drive over bumps finite and untumbled.
+        let terrain = Terrain {
+            amplitude: 0.2,
+            ..Default::default()
+        };
+        let sprung = SuspensionSpec::for_cell_size(0.1);
+        let zero_travel = SuspensionSpec {
+            rest_length: 0.05,
+            travel: 0.0,
+            rigid: false,
+        };
+        // Off-road (5e4) and slick (4e5) — the editor's authored tire presets a player actually uses.
+        let cases = [
+            ("off-road, no suspension", corner_rover(None, None, 5.0e4)),
+            ("slick, no suspension", corner_rover(None, None, 4.0e5)),
+            (
+                "off-road, front sprung + rear rigid",
+                corner_rover(Some(sprung), None, 5.0e4),
+            ),
+            (
+                "off-road, front rigid + rear sprung",
+                corner_rover(None, Some(sprung), 5.0e4),
+            ),
+            (
+                "off-road, zero-travel front + rear",
+                corner_rover(Some(zero_travel), Some(zero_travel), 5.0e4),
+            ),
+        ];
+        for (name, craft) in cases {
+            let asm = assemble_rover(&craft, DVec3::ZERO, 9.81).unwrap();
+            let drop = asm
+                .rover
+                .wheels
+                .iter()
+                .map(|w| w.rest_length + w.radius - w.mount.y)
+                .fold(0.0_f64, f64::max);
+            let (mut rover, drive) = (asm.rover, asm.drive);
+            let spawn_y = terrain.height(0.0, 0.0) + drop;
+            rover.body.position = DVec3::new(0.0, spawn_y, 0.0);
+            for _ in 0..3_000 {
+                rover.step(&terrain, DT); // settle
+            }
+            // A governed, steady cruise (no-suspension can't safely be floored over bumps — that is
+            // the intentional high-speed-bump-fly regime — but at a sane speed it stays planted).
+            let target = 8.0;
+            let mut max_omega = 0.0_f64;
+            let mut min_up = 1.0_f64;
+            for step in 0..12_000 {
+                let throttle = if rover.body.velocity.length() < target {
+                    rover.body.mass * 1.5
+                } else {
+                    0.0
+                };
+                for &i in &drive {
+                    rover.wheels[i].drive_torque = throttle;
+                }
+                rover.step(&terrain, DT);
+                assert!(
+                    rover.body.position.is_finite(),
+                    "{name}: non-finite at step {step}"
+                );
+                if step > 1_000 {
+                    max_omega = max_omega.max(rover.body.angular_velocity().length());
+                    min_up = min_up.min(body_up(&rover).y);
+                }
+            }
+            assert!(
+                rover.height_above_terrain(&terrain) < 3.0,
+                "{name}: rover launched (height {:.1} m)",
+                rover.height_above_terrain(&terrain)
+            );
+            assert!(
+                rover.body.position.z > 0.5,
+                "{name}: did not drive forward (z {:.2})",
+                rover.body.position.z
+            );
+            assert!(
+                min_up > 0.6 && max_omega < 4.0,
+                "{name}: not planted at cruise (min up.y {min_up:.2}, max_omega {max_omega:.2})"
+            );
+        }
+    }
+
+    #[test]
+    fn asymmetric_mixed_rover_settles_after_a_drop() {
+        // The user's build: one rear-left suspension, three no-suspension corners, all off-road tires.
+        // Dropped, it must come to REST — no indefinite one-wheel hop (playtest bug).
+        let terrain = Terrain {
+            amplitude: 0.0,
+            ..Default::default()
+        };
+        let s = 0.1;
+        let mut craft = VoxelCraft::new(s);
+        for x in 0..4 {
+            for z in 0..6 {
+                craft.voxels.push(Voxel {
+                    cell: IVec3::new(x, 0, z),
+                    material: Material::COMPOSITE,
+                });
+            }
+        }
+        for (id, (cx, cz, st, has_susp)) in [
+            (0, 0, false, true),  // rear-left: the only suspension
+            (3, 0, false, false), // rear-right
+            (0, 5, true, false),  // front-left
+            (3, 5, true, false),  // front-right
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = id as u32;
+            let mount = DVec3::new((cx as f64 + 0.5) * s, -0.05, (cz as f64 + 0.5) * s);
+            if has_susp {
+                craft.parts.push(Part {
+                    mount,
+                    mass: 1.0,
+                    kind: PartKind::Suspension(SuspensionSpec::for_cell_size(s)),
+                    station: Some(id),
+                });
+            }
+            craft.parts.push(Part {
+                mount,
+                mass: 1.0,
+                kind: PartKind::Rim(RimSpec {
+                    radius: 0.1,
+                    drive: true,
+                    steer: st,
+                }),
+                station: Some(id),
+            });
+            craft.parts.push(Part {
+                mount,
+                mass: 1.0,
+                kind: PartKind::Tire(TireSpec {
+                    stiffness: 5.0e4,
+                    ..TireSpec::new(0.05)
+                }),
+                station: Some(id),
+            });
+        }
+        let asm = assemble_rover(&craft, DVec3::ZERO, 9.81).unwrap();
+        let drop = asm
+            .rover
+            .wheels
+            .iter()
+            .map(|w| w.rest_length + w.radius - w.mount.y)
+            .fold(0.0_f64, f64::max);
+        // Drop the rover from `orientation`, settle, and return the tail (vertical-hop, angular) speeds.
+        // The hop bug is a sustained *vertical* bounce and/or a building spin — a brakeless wheeled
+        // rover legitimately *coasts* horizontally, so horizontal speed is not the signal.
+        let run = |orientation: DQuat| {
+            let mut rover = asm.rover.clone();
+            rover.body.orientation = orientation.normalize();
+            rover.body.position = DVec3::new(0.0, terrain.height(0.0, 0.0) + drop + 0.3, 0.0);
+            let (mut tail_vy, mut tail_om) = (0.0_f64, 0.0_f64);
+            for step in 0..40_000 {
+                rover.step(&terrain, DT);
+                assert!(rover.body.position.is_finite(), "non-finite at step {step}");
+                if step > 36_000 {
+                    tail_vy = tail_vy.max(rover.body.velocity.y.abs());
+                    tail_om = tail_om.max(rover.body.angular_velocity().length());
+                }
+            }
+            (tail_vy, tail_om, rover.height_above_terrain(&terrain))
+        };
+
+        // Upright but tipped onto a front corner (the user's "hops on one front tire"): no sustained
+        // vertical hop, no rocking.
+        let (vy, om, _) = run(DQuat::from_euler(glam::EulerRot::XYZ, 0.25, 0.0, 0.15));
+        assert!(
+            vy < 0.1 && om < 0.3,
+            "tipped-upright rover keeps hopping/rocking: vy {vy:.3}, omega {om:.2}"
+        );
+
+        // Hard inverted (tumble off the ramp at an angle): must NOT spin up — rotation decays — and
+        // must not fall through the world. (A fully inverted rover can't self-right; the bugs were it
+        // accelerating its spin and sliding forever.)
+        let (vy, om, h) = run(DQuat::from_euler(glam::EulerRot::XYZ, 0.35, 0.2, 0.5));
+        assert!(
+            om < 0.3 && vy < 0.2,
+            "inverted rover spun up / keeps hopping: vy {vy:.3}, omega {om:.2}"
+        );
+        assert!(
+            h > -1.0,
+            "inverted rover tunnelled through the world: h {h:.2}"
+        );
+    }
+
+    #[test]
+    fn airborne_rover_conserves_its_spin() {
+        // Mid-air, a wheel exerts nothing on the chassis and the angular drag does not act — both are
+        // contact effects, not aerodynamics (WI 631a fix). A rover tumbling off the ramp keeps spinning
+        // until it lands. Tested on a **no-suspension** build (the playtest failure): its stiff strut
+        // would otherwise apply a large spurious force/torque to the chassis mid-air.
+        let terrain = Terrain::default();
+        let craft = corner_rover(None, None, 5.0e4); // all no-suspension, off-road tires
+        let asm = assemble_rover(&craft, DVec3::ZERO, 9.81).unwrap();
+        let mut rover = asm.rover;
+        rover.body.position = DVec3::new(0.0, terrain.height(0.0, 0.0) + 50.0, 0.0);
+        rover.body = rover.body.with_angular_velocity(DVec3::new(0.4, 0.0, 3.0));
+        let om0 = rover.body.angular_velocity().length();
+        let v0 = rover.body.velocity.length();
+        for _ in 0..2_000 {
+            rover.step(&terrain, DT); // ~1 s of fall — stays well airborne
+        }
+        assert!(
+            rover.height_above_terrain(&terrain) > 1.0,
+            "rover should still be airborne for this test"
+        );
+        let om1 = rover.body.angular_velocity().length();
+        assert!(
+            om1 > 0.95 * om0,
+            "airborne spin was damped (phantom aerodynamics): {om0:.3} -> {om1:.3}"
+        );
+        // Horizontal speed is conserved in free fall (only gravity adds downward) — no spurious slowing.
+        let v_horiz = (rover.body.velocity.x.powi(2) + rover.body.velocity.z.powi(2)).sqrt();
+        assert!(
+            v_horiz >= v0 - 0.05,
+            "airborne rover was slowed horizontally mid-air"
+        );
+    }
+
+    #[test]
+    fn no_suspension_wheels_ride_on_the_tire_without_launching() {
+        // A station with no suspension (rim + tire only) must rest on the tire's compliance and stay
+        // grounded — not launch. A no-suspension wheel has no quarter-car axle DOF (a 1e9 "rigid strut"
+        // between chassis and a light unsprung mass would ring past the explicit-integration limit); it
+        // rides the tire via the legacy series spring, with its mass on the sprung body.
+        let terrain = Terrain {
+            amplitude: 0.0,
+            ..Default::default()
+        };
+        for stiffness in [5.0e4, 4.0e5] {
+            // off-road, then slick (the presets the user drove)
+            let s = 0.1;
+            let mut craft = VoxelCraft::new(s);
+            for x in 0..4 {
+                for z in 0..6 {
+                    craft.voxels.push(Voxel {
+                        cell: IVec3::new(x, 0, z),
+                        material: Material::COMPOSITE,
+                    });
+                }
+            }
+            for (cx, cz, st) in [(0, 0, false), (3, 0, false), (0, 5, true), (3, 5, true)] {
+                let mount = DVec3::new((cx as f64 + 0.5) * s, -0.05, (cz as f64 + 0.5) * s);
+                let id = craft.parts.len() as u32;
+                // No suspension part — just rim + tire (the "no suspension" build).
+                craft.parts.push(Part {
+                    mount,
+                    mass: 1.0,
+                    kind: PartKind::Rim(RimSpec {
+                        radius: 0.1,
+                        drive: true,
+                        steer: st,
+                    }),
+                    station: Some(id),
+                });
+                craft.parts.push(Part {
+                    mount,
+                    mass: 1.0,
+                    kind: PartKind::Tire(TireSpec {
+                        stiffness,
+                        ..TireSpec::new(0.05)
+                    }),
+                    station: Some(id),
+                });
+            }
+            let asm = assemble_rover(&craft, DVec3::ZERO, 9.81).unwrap();
+            assert!(
+                asm.rover.wheels.iter().all(|w| w.rigid_suspension),
+                "no-suspension stations should be rigid struts"
+            );
+            let drop = asm
+                .rover
+                .wheels
+                .iter()
+                .map(|w| w.rest_length + w.radius - w.mount.y)
+                .fold(0.0_f64, f64::max);
+            let mut rover = asm.rover;
+            let spawn_y = terrain.height(0.0, 0.0) + drop;
+            rover.body.position = DVec3::new(0.0, spawn_y, 0.0);
+            let mut max_y = spawn_y;
+            let mut max_vy = 0.0_f64;
+            for step in 0..6_000 {
+                rover.step(&terrain, DT);
+                assert!(
+                    rover.body.position.is_finite(),
+                    "stiffness {stiffness}: non-finite at step {step}"
+                );
+                max_y = max_y.max(rover.body.position.y);
+                if step > 200 {
+                    max_vy = max_vy.max(rover.body.velocity.y.abs());
+                }
+            }
+            // It settles onto the tyre (sagging slightly *below* spawn), with **no bounce** — the tyre
+            // is critically damped, so it never rises above where it spawned and stops cleanly.
+            assert!(
+                max_y < spawn_y + 0.01,
+                "no-suspension rover bounced on spawn: spawn {spawn_y:.3} → max {max_y:.3} (stiffness {stiffness})"
+            );
+            assert!(
+                max_vy < 0.3,
+                "no-suspension rover did not settle on spawn (bouncing): max |vy| {max_vy:.2}"
+            );
+            assert!(
+                rover.height_above_terrain(&terrain) > 0.0,
+                "no-suspension rover sank through the ground"
+            );
+        }
+    }
+
+    /// A multi-axle rover: a `3 × (2·axle_pairs+1)` chassis with a left/right wheel station at each of
+    /// `axle_pairs` axles (front axle steers, all drive), assembled resting just above flat terrain.
+    /// Exercises how the quarter-car scales past four corners (6×6, 8×8, an 18-wheeler).
+    fn multi_axle_assembly(axle_pairs: usize, terrain: &Terrain) -> RoverAssembly {
+        let s = 0.5;
+        let mut craft = VoxelCraft::new(s);
+        let len = 2 * axle_pairs + 1;
+        for x in 0..3 {
+            for z in 0..len as i32 {
+                craft.voxels.push(Voxel {
+                    cell: IVec3::new(x, 0, z),
+                    material: Material::COMPOSITE,
+                });
+            }
+        }
+        let mut id = 0u32;
+        for a in 0..axle_pairs {
+            let cz = 1 + 2 * a;
+            let z = (cz as f64 + 0.5) * s;
+            let steer = a == 0; // front axle steers
+            for dx in [-0.5, 0.5] {
+                let mount = DVec3::new(0.75 + dx, -0.2, z); // outboard of the 3-wide chassis
+                craft.parts.push(Part {
+                    mount,
+                    mass: 0.0,
+                    kind: PartKind::Suspension(SuspensionSpec::new()),
+                    station: Some(id),
+                });
+                craft.parts.push(Part {
+                    mount,
+                    mass: 20.0,
+                    kind: PartKind::Rim(RimSpec {
+                        radius: 0.25,
+                        drive: true,
+                        steer,
+                    }),
+                    station: Some(id),
+                });
+                craft.parts.push(Part {
+                    mount,
+                    mass: 20.0,
+                    kind: PartKind::Tire(TireSpec::new(0.1)),
+                    station: Some(id),
+                });
+                id += 1;
+            }
+        }
+        let ground = terrain.height(0.0, 0.0);
+        assemble_rover(&craft, DVec3::new(0.0, ground + 0.9, 0.0), 9.81)
+            .expect("multi-axle ⇒ rover")
+    }
+
+    #[test]
+    fn many_axle_rovers_stay_stable_and_conserve_mass() {
+        // The quarter-car is per-wheel and N-invariant: a 6-wheel (3 axles), 8-wheel (4 axles), and
+        // 18-wheel (9 axles) rover all assemble, conserve mass (sprung + Σ unsprung == craft), settle
+        // roughly level, and drive over bumps finite and untumbled — no four-corner assumption.
+        let terrain = Terrain {
+            amplitude: 0.3,
+            ..Default::default()
+        };
+        for pairs in [3, 4, 9] {
+            let n_wheels = pairs * 2;
+            let flat = Terrain {
+                amplitude: 0.0,
+                ..Default::default()
+            };
+            let craft_mass = {
+                // Mass conservation on the flat-built rover (independent of the bumpy run below).
+                let asm = multi_axle_assembly(pairs, &flat);
+                assert_eq!(asm.rover.wheels.len(), n_wheels, "{n_wheels}-wheel count");
+                let unsprung: f64 = asm.rover.wheels.iter().map(|w| w.unsprung_mass).sum();
+                (asm.rover.body.mass + unsprung, unsprung)
+            };
+            assert!(
+                craft_mass.1 > 0.0 && craft_mass.0 > 0.0,
+                "{n_wheels}-wheel: positive masses"
+            );
+
+            // Settle on flat ground, then drive over bumps.
+            let asm = multi_axle_assembly(pairs, &terrain);
+            let (mut rover, drive) = (asm.rover, asm.drive);
+            for _ in 0..4_000 {
+                rover.step(&terrain, DT);
+            }
+            assert!(
+                body_up(&rover).y > 0.85,
+                "{n_wheels}-wheel rover did not rest level: up.y = {}",
+                body_up(&rover).y
+            );
+            for &i in &drive {
+                rover.wheels[i].drive_torque = rover.body.mass * 1.5;
+            }
+            let mut max_omega = 0.0_f64;
+            for step in 0..16_000 {
+                rover.step(&terrain, DT);
+                assert!(
+                    rover.body.position.is_finite() && rover.body.velocity.is_finite(),
+                    "{n_wheels}-wheel: non-finite at step {step}"
+                );
+                if step > 1_000 {
+                    max_omega = max_omega.max(rover.body.angular_velocity().length());
+                }
+            }
+            assert!(
+                max_omega < 6.0,
+                "{n_wheels}-wheel rover tumbled over bumps: max_omega = {max_omega}"
+            );
+            assert!(
+                rover.body.position.z > 0.5,
+                "{n_wheels}-wheel rover did not drive forward: z = {}",
+                rover.body.position.z
+            );
+        }
+    }
+
+    #[test]
+    fn quarter_car_reclassifies_unsprung_mass_conserving_total() {
+        // Each assembled wheel gains a quarter-car vertical DOF with its own (capped) unsprung mass,
+        // reclassified off the sprung body so the total is conserved: sprung + Σ unsprung == craft mass.
+        let craft = chassis_with_stations();
+        let mp = craft.mass_properties().unwrap();
+        let asm = assemble_rover(&craft, DVec3::new(0.0, 5.0, 0.0), 9.81).unwrap();
+        let total_unsprung: f64 = asm.rover.wheels.iter().map(|w| w.unsprung_mass).sum();
+        assert!(total_unsprung > 0.0, "wheels carry unsprung mass");
+        assert!(
+            (asm.rover.body.mass + total_unsprung - mp.mass).abs() < 1e-9,
+            "sprung {} + unsprung {} != craft {}",
+            asm.rover.body.mass,
+            total_unsprung,
+            mp.mass
+        );
+        // Every assembled wheel is on the quarter-car path (positive unsprung mass).
+        assert!(asm
+            .rover
+            .wheels
+            .iter()
+            .all(|w| w.unsprung_mass >= MIN_UNSPRUNG_MASS));
+    }
+
+    #[test]
+    fn quarter_car_settles_with_the_suspension_under_load() {
+        // At rest the suspension carries the sprung weight, so each axle sits compressed below its
+        // free length (axle_drop < rest_length) — the quarter-car bears load and settles finite.
+        let terrain = Terrain {
+            amplitude: 0.0,
+            ..Default::default()
+        };
+        let mut rover = station_assembly(SuspensionSpec::new(), TireSpec::new(0.1), &terrain).rover;
+        for _ in 0..6_000 {
+            rover.step(&terrain, DT);
+        }
+        assert!(rover.body.position.is_finite());
+        assert!(
+            rover.body.velocity.length() < 0.3,
+            "did not settle: {:?}",
+            rover.body.velocity
+        );
+        assert!(
+            body_up(&rover).y > 0.9,
+            "rover should rest roughly level: up.y = {}",
+            body_up(&rover).y
+        );
+        assert!(
+            rover.wheels.iter().all(|w| w.unsprung_mass > 0.0),
+            "expected the quarter-car path"
+        );
+        // The suspension bears the sprung weight, so on average each strut sits compressed below its
+        // free length (an individual corner may droop in the over-constrained four-spring equilibrium).
+        let mean_drop =
+            rover.wheels.iter().map(|w| w.axle_drop).sum::<f64>() / rover.wheels.len() as f64;
+        assert!(
+            mean_drop < rover.wheels[0].rest_length,
+            "suspension should carry load (mean compressed): mean drop {mean_drop:.3} vs rest {:.3}",
+            rover.wheels[0].rest_length
+        );
+    }
+
+    #[test]
+    fn the_axle_travels_over_bumps_real_wheel_hop() {
+        // The payoff: over bumps the wheels visibly travel (the axle compresses and rebounds) rather
+        // than tracking the chassis rigidly — real ride dynamics from the per-wheel vertical DOF.
+        let terrain = Terrain {
+            amplitude: 0.4,
+            ..Default::default()
+        };
+        let tire = TireSpec {
+            stiffness: 5.0e4,
+            ..TireSpec::new(0.1)
+        };
+        let asm = station_assembly(SuspensionSpec::new(), tire, &terrain);
+        let (mut rover, drive) = (asm.rover, asm.drive);
+        for _ in 0..2_000 {
+            rover.step(&terrain, DT); // settle
+        }
+        for &i in &drive {
+            rover.wheels[i].drive_torque = rover.body.mass * 2.0;
+        }
+        let mut min_drop = f64::INFINITY;
+        let mut max_drop = f64::NEG_INFINITY;
+        for _ in 0..10_000 {
+            rover.step(&terrain, DT);
+            for w in &rover.wheels {
+                min_drop = min_drop.min(w.axle_drop);
+                max_drop = max_drop.max(w.axle_drop);
+            }
+        }
+        assert!(rover.body.position.is_finite());
+        assert!(
+            max_drop - min_drop > 0.05,
+            "wheels did not travel over the bumps (glued shadow): range {:.3}",
+            max_drop - min_drop
+        );
+    }
+
+    #[test]
+    fn wheel_hop_settles_after_a_drop() {
+        // After a disturbance (a small drop) the body and the per-wheel axle hop both decay — no
+        // sustained self-excited oscillation.
+        let terrain = Terrain {
+            amplitude: 0.0,
+            ..Default::default()
+        };
+        let tire = TireSpec {
+            stiffness: 5.0e4,
+            ..TireSpec::new(0.1)
+        };
+        let asm = station_assembly(SuspensionSpec::new(), tire, &terrain);
+        let mut rover = asm.rover;
+        rover.body.position.y += 0.3; // drop it above its settled height
+        for _ in 0..8_000 {
+            rover.step(&terrain, DT);
+        }
+        assert!(rover.body.position.is_finite());
+        assert!(
+            rover.body.velocity.length() < 0.3,
+            "body did not settle after the drop: {:?}",
+            rover.body.velocity
+        );
+        assert!(
+            rover.wheels.iter().all(|w| w.axle_drop_vel.abs() < 0.2),
+            "axle hop did not settle: {:?}",
+            rover
+                .wheels
+                .iter()
+                .map(|w| w.axle_drop_vel)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn quarter_car_is_stable_across_tire_rates_at_editor_scale() {
+        // The scale-relative kraken guard: at a light editor scale, the quarter-car stays finite and
+        // bounded while driving hard over bumps across the whole tire-rate range — from a soft tire up
+        // to the effectively-rigid default (which the mass-relative ceiling caps to a stable rate).
+        let terrain = Terrain {
+            amplitude: 0.3,
+            ..Default::default()
+        };
+        for stiffness in [2.0e4, 1.0e5, 4.0e5, 1.0e9] {
+            let tire = TireSpec {
+                stiffness,
+                ..TireSpec::new(0.1)
+            };
+            let asm = station_assembly(SuspensionSpec::for_cell_size(0.5), tire, &terrain);
+            let (mut rover, drive) = (asm.rover, asm.drive);
+            for &i in &drive {
+                rover.wheels[i].drive_torque = rover.body.mass * 3.0;
+            }
+            let mut max_omega = 0.0_f64;
+            for step in 0..15_000 {
+                rover.step(&terrain, DT);
+                assert!(
+                    rover.body.position.is_finite() && rover.body.velocity.is_finite(),
+                    "stiffness {stiffness}: non-finite at step {step}"
+                );
+                if step > 1_000 {
+                    max_omega = max_omega.max(rover.body.angular_velocity().length());
+                }
+            }
+            assert!(
+                max_omega < 6.0,
+                "stiffness {stiffness}: tumbled over bumps, max_omega = {max_omega}"
+            );
+        }
+    }
+
     #[test]
     fn assemble_rover_builds_wheels_and_groups() {
         let craft = chassis_with_wheels();
@@ -1353,11 +2263,18 @@ mod tests {
         assert_eq!(asm.steer, vec![2, 3]); // only the front pair steer
                                            // No power devices ⇒ the default (electric) powertrain.
         assert_eq!(asm.powertrain.label(), "charge");
-        // Body mass equals the chassis-plus-parts mass.
-        assert!((asm.rover.body.mass - mp.mass).abs() < 1e-9);
-        // Wheel mounts are CoM-relative.
+        // The body is the **sprung** mass (WI 631a): the per-corner unsprung masses are reclassified
+        // off it onto the axles, conserving total mass (sprung + Σ unsprung == craft mass).
+        let total_unsprung: f64 = asm.rover.wheels.iter().map(|w| w.unsprung_mass).sum();
+        assert!(total_unsprung > 0.0, "wheels should carry unsprung mass");
+        assert!(
+            (asm.rover.body.mass + total_unsprung - mp.mass).abs() < 1e-9,
+            "sprung + unsprung must equal the craft mass"
+        );
+        // Wheel mounts are CoM-relative; the sprung CoM shifts only slightly off the full CoM once the
+        // low-mounted wheels are reclassified, so the mount is near the full-CoM-relative position.
         let expected = DVec3::new(-1.0, -0.2, -2.0) - mp.center_of_mass;
-        assert!((asm.rover.wheels[0].mount - expected).length() < 1e-12);
+        assert!((asm.rover.wheels[0].mount - expected).length() < 0.1);
     }
 
     #[test]
