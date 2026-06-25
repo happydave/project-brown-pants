@@ -40,8 +40,28 @@ python3 dev/mcp/test_bridge.py   # spins a stub bus, drives the bridge over stdi
 
 ## Register it with Claude — **user step (not done automatically)**
 
-Per project convention, registering tooling into your Claude config is left to you. Add to
-`~/.claude.json` (or the project `.mcp.json`) under `mcpServers`:
+Per project convention, registering tooling into your Claude config is left to you. Easiest is the CLI:
+
+```sh
+claude mcp add sounding --scope user \
+  --env SOUNDING_BUS_URL=http://127.0.0.1:8787 \
+  -- python3 /home/dave/Documents/projects/project_brown_pants/dev/mcp/sounding_mcp.py
+```
+
+(`--` separates Claude's own flags from the command to run.) Verify with `claude mcp list`.
+
+`claude mcp add-json` works too, but its payload is the **single server's config object** — *not* the
+`{"mcpServers": {...}}` wrapper, and the name is the positional arg:
+
+```sh
+claude mcp add-json sounding --scope user '{
+  "command": "python3",
+  "args": ["/home/dave/Documents/projects/project_brown_pants/dev/mcp/sounding_mcp.py"],
+  "env": { "SOUNDING_BUS_URL": "http://127.0.0.1:8787" }
+}'
+```
+
+Or edit `~/.claude.json` (or a project `.mcp.json`) by hand — *this* is where the full wrapper goes:
 
 ```json
 {
@@ -55,7 +75,8 @@ Per project convention, registering tooling into your Claude config is left to y
 }
 ```
 
-Then the assistant gets `get_telemetry` / `send_command` tools that act on whatever scene is running.
+After registering (and restarting the session), the assistant gets `get_telemetry` / `send_command`
+tools that act on whatever scene is running.
 
 ## Known gap (recommended follow-up)
 
