@@ -42,6 +42,11 @@ pub enum SasMode {
 pub const MIN_WARP: f64 = 0.25;
 pub const MAX_WARP: f64 = 256.0;
 
+/// Maximum step budget (sim-seconds) the executor will hold at once (WI 643): a single
+/// `Command::Step` is clamped into `[0, MAX_STEP_BUDGET]` and queued steps accumulate up to it, so a
+/// stray large request cannot run a frozen scene away.
+pub const MAX_STEP_BUDGET: f64 = 5.0;
+
 /// A command to the simulation. Serializable: it is both the in-process message
 /// and the bus's wire envelope (WI 502), and the basis for future replay.
 #[derive(Message, Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -89,6 +94,11 @@ pub enum Command {
     /// [`apply_command`] — it is control-system state, outside this function's
     /// `(clock, orbit)` reach.
     SetControlTier(Option<ControlTier>),
+    /// Advance a **paused** scene by `seconds` of sim time (WI 643): adds to the
+    /// [`SimClock::step_budget`], which the scene step loops consume (frame-bounded) so a frozen
+    /// scene can be stepped a known amount for inspection. Clamped to `[0, MAX_STEP_BUDGET]`; ignored
+    /// while running. Applied by [`apply_command`] (in the `clock` reach, like `SetPaused`).
+    Step { seconds: f64 },
 }
 
 /// Applies a single command to the simulation. Pure and deterministic — the only
@@ -102,6 +112,14 @@ pub fn apply_command(cmd: &Command, clock: &mut SimClock, orbit: Option<&mut Orb
         }
         Command::SetPaused(p) => {
             clock.paused = p;
+            // Toggling pause clears any pending step budget (WI 643) so a stale step can't auto-run
+            // the scene on the next pause.
+            clock.step_budget = 0.0;
+            true
+        }
+        Command::Step { seconds } => {
+            // Accrue the step budget (sim-seconds to advance while paused), bounded.
+            clock.step_budget = (clock.step_budget + seconds.max(0.0)).clamp(0.0, MAX_STEP_BUDGET);
             true
         }
         Command::ExecuteManeuver { delta_v } => {
@@ -126,6 +144,9 @@ pub fn apply_command(cmd: &Command, clock: &mut SimClock, orbit: Option<&mut Orb
         | Command::SetControlTier(_) => false,
     }
 }
+
+/// The default keyboard step interval (sim-seconds) emitted by the `.` key (WI 643).
+pub const KEY_STEP_SECONDS: f64 = 0.1;
 
 /// Registers the command message and the executor system.
 pub struct FlightControlPlugin;
@@ -159,6 +180,7 @@ fn execute_commands(
             Command::SetAutopilot(a) => info!("autopilot: {a:?}"),
             Command::SetSasGains(kp, kd) => info!("sas gains: kp={kp} kd={kd}"),
             Command::SetControlTier(t) => info!("control-tier selection: {t:?}"),
+            Command::Step { seconds } => info!("step: +{seconds}s (budget {})", clock.step_budget),
         }
     }
 }
@@ -226,6 +248,7 @@ mod tests {
             time: 2.3,
             warp: 1.0,
             paused: false,
+            ..Default::default()
         };
         let mut orbit = circular();
         let before = orbit.position(clock.time);
@@ -257,10 +280,28 @@ mod tests {
     }
 
     #[test]
+    fn step_accrues_clamps_and_clears_on_pause_toggle() {
+        let mut clock = SimClock::default();
+        // Accrues and clamps to MAX_STEP_BUDGET.
+        apply_command(&Command::Step { seconds: 0.1 }, &mut clock, None);
+        apply_command(&Command::Step { seconds: 0.2 }, &mut clock, None);
+        assert!((clock.step_budget - 0.3).abs() < 1e-12);
+        apply_command(&Command::Step { seconds: 100.0 }, &mut clock, None);
+        assert_eq!(clock.step_budget, MAX_STEP_BUDGET);
+        // A negative request never reduces the budget below the accrued value.
+        apply_command(&Command::Step { seconds: -10.0 }, &mut clock, None);
+        assert_eq!(clock.step_budget, MAX_STEP_BUDGET);
+        // Toggling pause clears the pending budget.
+        apply_command(&Command::SetPaused(true), &mut clock, None);
+        assert_eq!(clock.step_budget, 0.0);
+    }
+
+    #[test]
     fn command_json_round_trips() {
         for cmd in [
             Command::SetWarp(4.0),
             Command::SetPaused(true),
+            Command::Step { seconds: 0.25 },
             Command::ExecuteManeuver {
                 delta_v: DVec2::new(0.1, -0.2),
             },

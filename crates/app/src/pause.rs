@@ -9,8 +9,13 @@
 //! own `Update` and adds the guard + banner where it steps and draws.
 
 use bevy::prelude::*;
-use sounding_sim::command::Command;
+use sounding_sim::command::{Command, KEY_STEP_SECONDS};
 use sounding_sim::sim::SimClock;
+
+/// Per-frame chunk (sim-seconds) of the step budget a paused scene consumes (WI 643). Bounded so a
+/// large step plays out over several frames at roughly real-time rather than over-filling a scene's
+/// substep accumulator in one frame (which the substep cap would then drop).
+const STEP_CHUNK_SECONDS: f64 = 1.0 / 60.0;
 
 /// `P` emits the inverted [`Command::SetPaused`] (pause ↔ resume) onto the command bus.
 pub(crate) fn toggle_pause(
@@ -23,10 +28,41 @@ pub(crate) fn toggle_pause(
     }
 }
 
+/// `.` steps a **paused** scene forward a small fixed interval (WI 643), emitting the same
+/// [`Command::Step`] a bus/MCP client would — so keyboard and automation share one path. No-op while
+/// running (stepping only makes sense when frozen).
+pub(crate) fn step_scene(
+    keys: Res<ButtonInput<KeyCode>>,
+    clock: Res<SimClock>,
+    mut commands: MessageWriter<Command>,
+) {
+    if clock.paused && keys.just_pressed(KeyCode::Period) {
+        commands.write(Command::Step {
+            seconds: KEY_STEP_SECONDS,
+        });
+    }
+}
+
+/// The sim-time to advance this frame, honouring pause + the step budget (WI 643). `None` ⇒ the scene
+/// stays frozen (paused, no pending step); `Some(dt)` ⇒ advance by `dt` — the real frame delta while
+/// running, or a bounded chunk of the step budget while paused-and-stepping (consumed here). The
+/// scene replaces its `if clock.paused { return }` gate + `time.delta_secs_f64()` with this.
+pub(crate) fn frame_step_dt(clock: &mut SimClock, time: &Time) -> Option<f64> {
+    if !clock.paused {
+        return Some(time.delta_secs_f64());
+    }
+    if clock.step_budget <= 0.0 {
+        return None;
+    }
+    let chunk = clock.step_budget.min(STEP_CHUNK_SECONDS);
+    clock.step_budget -= chunk;
+    Some(chunk)
+}
+
 /// A HUD suffix marking the paused state (empty when running), so the freeze is unmistakable.
 pub(crate) fn paused_banner(clock: &SimClock) -> &'static str {
     if clock.paused {
-        "\n⏸ PAUSED (P)"
+        "\n⏸ PAUSED (P · . step)"
     } else {
         ""
     }
@@ -66,6 +102,36 @@ mod tests {
 
         assert_eq!(emit_for(false), vec![Command::SetPaused(true)]);
         assert_eq!(emit_for(true), vec![Command::SetPaused(false)]);
+    }
+
+    /// `frame_step_dt` (WI 643): running → real dt; paused+no budget → None; paused+budget → a bounded
+    /// chunk that decrements the budget; the budget drains to zero over enough calls.
+    #[test]
+    fn frame_step_dt_honours_pause_and_budget() {
+        // Running: returns the (zero, in a default Time) frame delta, never None.
+        let time = Time::default();
+        let mut running = SimClock::default();
+        assert!(frame_step_dt(&mut running, &time).is_some());
+
+        // Paused, no budget: frozen.
+        let mut paused = SimClock {
+            paused: true,
+            ..Default::default()
+        };
+        assert!(frame_step_dt(&mut paused, &time).is_none());
+
+        // Paused with a budget: consumes bounded chunks until drained.
+        paused.step_budget = STEP_CHUNK_SECONDS * 2.5;
+        let a = frame_step_dt(&mut paused, &time).unwrap();
+        assert!(
+            (a - STEP_CHUNK_SECONDS).abs() < 1e-12,
+            "first chunk is capped"
+        );
+        let _ = frame_step_dt(&mut paused, &time).unwrap();
+        let c = frame_step_dt(&mut paused, &time).unwrap();
+        assert!(c <= STEP_CHUNK_SECONDS && c > 0.0, "last partial chunk");
+        assert_eq!(paused.step_budget, 0.0, "budget fully drained");
+        assert!(frame_step_dt(&mut paused, &time).is_none(), "frozen again");
     }
 
     /// The banner reflects the clock and is empty while running.

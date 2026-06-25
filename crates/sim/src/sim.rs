@@ -21,6 +21,11 @@ pub struct SimClock {
     pub warp: f64,
     /// When true, simulated time does not advance.
     pub paused: bool,
+    /// Pending sim-seconds to advance **while paused** (WI 643): a step budget set by
+    /// [`crate::command::Command::Step`] and consumed by the scene step loops (frame-bounded) so a
+    /// frozen scene can be advanced a known amount for inspection. Zero when not stepping; ignored
+    /// while running.
+    pub step_budget: f64,
 }
 
 impl Default for SimClock {
@@ -29,6 +34,7 @@ impl Default for SimClock {
             time: 0.0,
             warp: 1.0,
             paused: false,
+            step_budget: 0.0,
         }
     }
 }
@@ -118,6 +124,7 @@ mod tests {
             time: 3.0,
             warp: 4.0,
             paused: true,
+            ..Default::default()
         };
         clock.advance(1.0);
         assert_eq!(clock.time, 3.0);

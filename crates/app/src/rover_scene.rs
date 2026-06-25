@@ -165,6 +165,7 @@ impl Plugin for RoverScenePlugin {
                 Update,
                 (
                     crate::pause::toggle_pause,
+                    crate::pause::step_scene,
                     drive_input,
                     step_rover,
                     publish_rover,
@@ -252,12 +253,13 @@ fn drive_input(time: Res<Time>, keys: Res<ButtonInput<KeyCode>>, mut world: ResM
     world.rover.set_steer(steer_input, max_angle, &steer);
 }
 
-fn step_rover(time: Res<Time>, clock: Res<SimClock>, mut world: ResMut<RoverWorld>) {
+fn step_rover(time: Res<Time>, mut clock: ResMut<SimClock>, mut world: ResMut<RoverWorld>) {
     // Paused (WI 638): freeze the rover physics; the accumulator does not grow, so resume is jump-free.
-    if clock.paused {
+    // While paused, a step (WI 643) advances a bounded chunk; `frame_step_dt` returns `None` to freeze.
+    let Some(dt) = crate::pause::frame_step_dt(&mut clock, &time) else {
         return;
-    }
-    world.accumulator += time.delta_secs_f64();
+    };
+    world.accumulator += dt;
     let mut substeps = 0;
     // The drive group is fixed while stepping (no obstacles shear a wheel in this scene), so clone once.
     let drive = world.drive.clone();

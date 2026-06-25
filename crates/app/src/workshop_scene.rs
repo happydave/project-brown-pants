@@ -868,7 +868,14 @@ impl Plugin for WorkshopScenePlugin {
                 OnExit(WorkshopMode::Test),
                 (exit_test, clear_rover_telemetry),
             )
-            .add_systems(Update, (toggle_mode, crate::pause::toggle_pause))
+            .add_systems(
+                Update,
+                (
+                    toggle_mode,
+                    crate::pause::toggle_pause,
+                    crate::pause::step_scene,
+                ),
+            )
             .add_systems(
                 Update,
                 (
@@ -1629,14 +1636,13 @@ fn clear_rover_telemetry(mut grounded: ResMut<GroundedRover>) {
     grounded.0 = None;
 }
 
-fn step_workshop(time: Res<Time>, clock: Res<SimClock>, mut world: ResMut<WorkshopWorld>) {
-    // Paused (WI 638): freeze the active physics. The accumulator is not advanced, so resume picks up
-    // from a single fresh frame's dt with no time-step jump. Camera, HUD, and inspection stay live.
-    if clock.paused {
+fn step_workshop(time: Res<Time>, mut clock: ResMut<SimClock>, mut world: ResMut<WorkshopWorld>) {
+    // Paused (WI 638): freeze the active physics. Camera, HUD, and inspection stay live. While paused,
+    // a step (WI 643) advances a bounded chunk; `frame_step_dt` returns `None` to stay frozen.
+    let Some(frame_dt) = crate::pause::frame_step_dt(&mut clock, &time) else {
         return;
-    }
+    };
     if world.rover.is_some() {
-        let frame_dt = time.delta_secs_f64();
         let rs = world.rover.as_mut().expect("rover present");
         // Route throttle through the powertrain (consumes fuel/charge over the frame); the realized
         // torque drives the drive-group wheels, brake applies to all.
@@ -1813,7 +1819,7 @@ fn step_workshop(time: Res<Time>, clock: Res<SimClock>, mut world: ResMut<Worksh
         }
         return;
     }
-    world.accumulator += time.delta_secs_f64() * world.warp;
+    world.accumulator += frame_dt * world.warp;
     let mut n = 0;
     while world.accumulator >= SUBSTEP_DT && n < MAX_SUBSTEPS {
         match world.state {

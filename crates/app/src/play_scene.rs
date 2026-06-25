@@ -225,6 +225,7 @@ impl Plugin for PlayScenePlugin {
                 Update,
                 (
                     crate::pause::toggle_pause,
+                    crate::pause::step_scene,
                     player_input,
                     step_play,
                     publish_active_flight,
@@ -492,12 +493,16 @@ fn player_input(time: Res<Time>, keys: Res<ButtonInput<KeyCode>>, mut world: Res
 }
 
 /// Sub-steps the flight (player time-warp), tracks G-force, advances the phase.
-fn step_play(time: Res<Time>, clock: Res<SimClock>, mut world: ResMut<PlayWorld>) {
-    // Paused (WI 638): freeze the flight physics; the accumulator does not grow, so resume is jump-free.
-    if clock.paused || world.session.is_terminal() {
+fn step_play(time: Res<Time>, mut clock: ResMut<SimClock>, mut world: ResMut<PlayWorld>) {
+    // Paused (WI 638): freeze the flight physics; resume is jump-free. While paused, a step (WI 643)
+    // advances a bounded chunk; `frame_step_dt` returns `None` to stay frozen.
+    if world.session.is_terminal() {
         return;
     }
-    world.accumulator += time.delta_secs_f64() * world.warp;
+    let Some(dt) = crate::pause::frame_step_dt(&mut clock, &time) else {
+        return;
+    };
+    world.accumulator += dt * world.warp;
     let mut n = 0;
     while world.accumulator >= SUBSTEP_DT && n < MAX_SUBSTEPS && !world.session.is_terminal() {
         let v0 = world.body.velocity;

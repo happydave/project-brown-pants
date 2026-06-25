@@ -10,7 +10,8 @@ scenario under test instead of reproducing it headlessly:
     active-flight autonomy, and — in a rover scene — a ``rover`` block with pose/contact/per-wheel
     state, WI 640).
   * ``send_command``  → ``POST /command``  — inject one JSON `Command` (e.g. ``{"SetPaused": true}``,
-    ``{"SetWarp": 4.0}``).
+    ``{"SetWarp": 4.0}``, or — while paused — ``{"Step": {"seconds": 0.1}}`` to advance a frozen scene
+    a known amount for inspection, WI 643).
 
 This is the **command-bus** path the spike recommends over BRP-generic ECS introspection: always-on
 (no `dev` rebuild), already JSON, already a versioned public surface. It is dev-only tooling and is
