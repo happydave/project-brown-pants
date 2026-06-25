@@ -12,6 +12,7 @@ use bevy::math::{DVec3, Isometry3d};
 use bevy::prelude::*;
 use sounding_sim::active::ActiveBody;
 use sounding_sim::rover::{Rover, Wheel, SUBSTEP_DT};
+use sounding_sim::sim::SimClock;
 use sounding_sim::terrain::Terrain;
 use sounding_sim::voxel::{Material, Voxel, VoxelCraft};
 
@@ -84,7 +85,14 @@ impl Plugin for RoverScenePlugin {
             .add_systems(Startup, setup_view)
             .add_systems(
                 Update,
-                (drive_input, step_rover, draw_rover, update_hud).chain(),
+                (
+                    crate::pause::toggle_pause,
+                    drive_input,
+                    step_rover,
+                    draw_rover,
+                    update_hud,
+                )
+                    .chain(),
             );
     }
 }
@@ -121,11 +129,12 @@ fn setup_view(mut commands: Commands) {
     ));
 }
 
-fn update_hud(world: Res<RoverWorld>, mut hud: Query<&mut Text, With<Hud>>) {
+fn update_hud(world: Res<RoverWorld>, clock: Res<SimClock>, mut hud: Query<&mut Text, With<Hud>>) {
     if let Ok(mut text) = hud.single_mut() {
         let speed = world.rover.body.velocity.length();
         let height = world.rover.height_above_terrain(&world.terrain);
-        text.0 = format!("speed: {speed:5.1} m/s\nheight: {height:5.2} m");
+        let paused = crate::pause::paused_banner(&clock);
+        text.0 = format!("speed: {speed:5.1} m/s\nheight: {height:5.2} m{paused}");
     }
 }
 
@@ -157,7 +166,11 @@ fn drive_input(keys: Res<ButtonInput<KeyCode>>, mut world: ResMut<RoverWorld>) {
     }
 }
 
-fn step_rover(time: Res<Time>, mut world: ResMut<RoverWorld>) {
+fn step_rover(time: Res<Time>, clock: Res<SimClock>, mut world: ResMut<RoverWorld>) {
+    // Paused (WI 638): freeze the rover physics; the accumulator does not grow, so resume is jump-free.
+    if clock.paused {
+        return;
+    }
     world.accumulator += time.delta_secs_f64();
     let mut substeps = 0;
     while world.accumulator >= SUBSTEP_DT && substeps < MAX_SUBSTEPS {

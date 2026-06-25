@@ -47,6 +47,7 @@ mod ground;
 mod land_scene;
 mod launch_scene;
 mod materials_scene;
+mod pause;
 mod planet;
 mod play_scene;
 mod rover_scene;

@@ -31,7 +31,7 @@ use sounding_sim::medium::max_cross_section;
 use sounding_sim::propulsion::{Engine, EngineCommand, Propulsion};
 use sounding_sim::resource::{Reservoir, ReservoirId, ResourceGraph, ResourceType};
 use sounding_sim::session::{GameSession, Outcome, Phase};
-use sounding_sim::sim::CentralBody;
+use sounding_sim::sim::{CentralBody, SimClock};
 use sounding_sim::voxel::{Device, Material, Voxel, VoxelCraft};
 
 use crate::bus::ActiveFlight;
@@ -224,6 +224,7 @@ impl Plugin for PlayScenePlugin {
             .add_systems(
                 Update,
                 (
+                    crate::pause::toggle_pause,
                     player_input,
                     step_play,
                     publish_active_flight,
@@ -491,8 +492,9 @@ fn player_input(time: Res<Time>, keys: Res<ButtonInput<KeyCode>>, mut world: Res
 }
 
 /// Sub-steps the flight (player time-warp), tracks G-force, advances the phase.
-fn step_play(time: Res<Time>, mut world: ResMut<PlayWorld>) {
-    if world.session.is_terminal() {
+fn step_play(time: Res<Time>, clock: Res<SimClock>, mut world: ResMut<PlayWorld>) {
+    // Paused (WI 638): freeze the flight physics; the accumulator does not grow, so resume is jump-free.
+    if clock.paused || world.session.is_terminal() {
         return;
     }
     world.accumulator += time.delta_secs_f64() * world.warp;
@@ -605,8 +607,9 @@ fn fmt_alt(m: f64) -> String {
     }
 }
 
-fn update_hud(world: Res<PlayWorld>, mut hud: Query<&mut Text, With<Hud>>) {
+fn update_hud(world: Res<PlayWorld>, clock: Res<SimClock>, mut hud: Query<&mut Text, With<Hud>>) {
     if let Ok(mut text) = hud.single_mut() {
+        let paused = crate::pause::paused_banner(&clock);
         let phase = match world.session.phase {
             Phase::Build => "BUILD",
             Phase::Launch => "LAUNCH",
@@ -699,7 +702,7 @@ fn update_hud(world: Res<PlayWorld>, mut hud: Query<&mut Text, With<Hud>>) {
             Some(a) => format!("{a:?}").to_lowercase(),
         };
         text.0 = format!(
-            "phase:    {phase}\nthrottle: {tbar} {pct:3.0}%{note}\nfuel:     {fbar} {fuel:6.0} kg\npower:    {pbar} {elec:5.0} / {elec_cap:.0}\n\u{0394}v:       {dv:6.0} m/s\nG-force:  {g:5.1} g\naltitude: {alt}\nv-speed:  {v_speed:+7.0} m/s\nspeed:    {speed:7.1} m/s\n{orbit_line}\nenergy:   {energy:8.2} MJ/kg\nmedium:   {medium}   tilt {tilt:.0}\u{00b0}   SAS {sas} ({recap})\ncontrol:  avail {ctrl}  sel {sel}  eff {eff}   autopilot {ap}   gains kp={kp:.0}/kd={kd:.0}{assist}",
+            "phase:    {phase}{paused}\nthrottle: {tbar} {pct:3.0}%{note}\nfuel:     {fbar} {fuel:6.0} kg\npower:    {pbar} {elec:5.0} / {elec_cap:.0}\n\u{0394}v:       {dv:6.0} m/s\nG-force:  {g:5.1} g\naltitude: {alt}\nv-speed:  {v_speed:+7.0} m/s\nspeed:    {speed:7.1} m/s\n{orbit_line}\nenergy:   {energy:8.2} MJ/kg\nmedium:   {medium}   tilt {tilt:.0}\u{00b0}   SAS {sas} ({recap})\ncontrol:  avail {ctrl}  sel {sel}  eff {eff}   autopilot {ap}   gains kp={kp:.0}/kd={kd:.0}{assist}",
             tbar = gauge(throttle),
             pct = throttle * 100.0,
             note = if flameout { "  FLAMEOUT" } else { "" },

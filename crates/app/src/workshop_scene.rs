@@ -23,7 +23,8 @@
 //!
 //! Test controls (rocket): Shift/Ctrl throttle · Z/X full/cut · W/S/A/D/Q/E attitude · T SAS ·
 //! F off · `,`/`.` warp · Backspace reset. Test controls (rover): W/S drive · A/D steer ·
-//! Space brake · Backspace reset. Build controls (WI 612): **mouse** — left-click places the active
+//! Space brake · Backspace reset. `P` pauses/resumes either mode (WI 638). `K` saves the build as a
+//! craft, `O` opens one back into Build (WI 637). Build controls (WI 612): **mouse** — left-click places the active
 //! brush on the hovered face, right-click removes, middle-drag orbits, scroll zooms. The brush is
 //! chosen with Tab (material) and 1-7 (1 control · 2 computer · 3 battery · 4 engine · 5 tank ·
 //! 6/7 wheel drive / drive+steer); the craft renders as a **solid** mesh, gizmos only overlay the
@@ -58,7 +59,7 @@ use sounding_sim::resource::{Reservoir, ReservoirId, ResourceGraph, ResourceType
 use sounding_sim::rover::{
     assemble_rover, Rover, RoverAssembly, Wheel, SUBSTEP_DT as ROVER_SUBSTEP_DT,
 };
-use sounding_sim::sim::CentralBody;
+use sounding_sim::sim::{CentralBody, SimClock};
 use sounding_sim::terrain::{Ramp, Terrain};
 use sounding_sim::voxel::{device_mass, Device, DeviceKind, Material, PartKind, Voxel, VoxelCraft};
 use sounding_sim::warp::safe_substep_dt;
@@ -862,7 +863,7 @@ impl Plugin for WorkshopScenePlugin {
             .add_systems(OnExit(WorkshopMode::Build), exit_build)
             .add_systems(OnEnter(WorkshopMode::Test), enter_test)
             .add_systems(OnExit(WorkshopMode::Test), exit_test)
-            .add_systems(Update, toggle_mode)
+            .add_systems(Update, (toggle_mode, crate::pause::toggle_pause))
             .add_systems(
                 Update,
                 (
@@ -957,7 +958,7 @@ fn enter_build(mut commands: Commands) {
     ));
     commands.spawn((
         Text::new(
-            "left-click place · right-click remove · middle-drag orbit · scroll zoom · Tab cycles material · Enter → TEST (4 wheels ⇒ drive it)",
+            "left-click place · right-click remove · middle-drag orbit · scroll zoom · Tab material · K save · O open craft · P pause · Enter → TEST (4 wheels ⇒ drive it)",
         ),
         TextFont {
             font_size: 14.0,
@@ -1607,7 +1608,12 @@ fn drive_rover(keys: &ButtonInput<KeyCode>, world: &mut WorkshopWorld, dt: f64) 
     rs.rover.set_steer(steer_input, max_angle, &steer);
 }
 
-fn step_workshop(time: Res<Time>, mut world: ResMut<WorkshopWorld>) {
+fn step_workshop(time: Res<Time>, clock: Res<SimClock>, mut world: ResMut<WorkshopWorld>) {
+    // Paused (WI 638): freeze the active physics. The accumulator is not advanced, so resume picks up
+    // from a single fresh frame's dt with no time-step jump. Camera, HUD, and inspection stay live.
+    if clock.paused {
+        return;
+    }
     if world.rover.is_some() {
         let frame_dt = time.delta_secs_f64();
         let rs = world.rover.as_mut().expect("rover present");
@@ -2194,7 +2200,13 @@ fn draw_rover(mut gizmos: Gizmos, world: Res<WorkshopWorld>) {
     }
 }
 
-fn update_test_hud(world: Res<WorkshopWorld>, mut hud: Query<&mut Text, With<TestHud>>) {
+fn update_test_hud(
+    world: Res<WorkshopWorld>,
+    clock: Res<SimClock>,
+    mut hud: Query<&mut Text, With<TestHud>>,
+) {
+    // A clear paused banner (WI 638): the physics is frozen but the scene stays inspectable.
+    let paused = crate::pause::paused_banner(&clock);
     if let Ok(mut text) = hud.single_mut() {
         if let Some(rs) = &world.rover {
             let speed = rs.rover.body.velocity.length();
@@ -2220,7 +2232,7 @@ fn update_test_hud(world: Res<WorkshopWorld>, mut hud: Query<&mut Text, With<Tes
                 })
                 .unwrap_or_default();
             text.0 = format!(
-                "workshop · TEST (rover)\nspeed:  {speed:6.2} m/s\nheight: {height:6.2} m\nwheels: {live}/{}{tires}\n{}:  {:3.0}%{impact}",
+                "workshop · TEST (rover){paused}\nspeed:  {speed:6.2} m/s\nheight: {height:6.2} m\nwheels: {live}/{}{tires}\n{}:  {:3.0}%{impact}",
                 rs.rover.wheels.len(),
                 rs.powertrain.label(),
                 rs.powertrain.fraction() * 100.0,
@@ -2239,7 +2251,7 @@ fn update_test_hud(world: Res<WorkshopWorld>, mut hud: Query<&mut Text, With<Tes
                     SasMode::Point(_) => "point",
                 };
                 text.0 = format!(
-                    "workshop · TEST: {state}\nthrottle: {:3.0}%\naltitude: {:6.2} m\nv-speed:  {:+6.2} m/s\nspeed:    {:6.2} m/s\nSAS {sas}   warp {:.0}x",
+                    "workshop · TEST: {state}{paused}\nthrottle: {:3.0}%\naltitude: {:6.2} m\nv-speed:  {:+6.2} m/s\nspeed:    {:6.2} m/s\nSAS {sas}   warp {:.0}x",
                     world.throttle * 100.0,
                     world.altitude(),
                     world.body.velocity.y,
@@ -2249,7 +2261,7 @@ fn update_test_hud(world: Res<WorkshopWorld>, mut hud: Query<&mut Text, With<Tes
             }
             CraftState::Fractured => {
                 text.0 = format!(
-                    "workshop · TEST: CRASHED — fractured into {} pieces\nBackspace to rebuild",
+                    "workshop · TEST: CRASHED — fractured into {} pieces{paused}\nBackspace to rebuild",
                     world.fragments.len()
                 );
             }
