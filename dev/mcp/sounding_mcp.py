@@ -7,7 +7,8 @@ A thin, **stdlib-only** Model Context Protocol server (stdio transport, newline-
 scenario under test instead of reproducing it headlessly:
 
   * ``get_telemetry`` → ``GET /telemetry`` — the versioned `Telemetry` snapshot (clock, orbit,
-    active-flight autonomy).
+    active-flight autonomy, and — in a rover scene — a ``rover`` block with pose/contact/per-wheel
+    state, WI 640).
   * ``send_command``  → ``POST /command``  — inject one JSON `Command` (e.g. ``{"SetPaused": true}``,
     ``{"SetWarp": 4.0}``).
 

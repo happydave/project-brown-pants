@@ -60,10 +60,12 @@ use sounding_sim::rover::{
     assemble_rover, Rover, RoverAssembly, Wheel, SUBSTEP_DT as ROVER_SUBSTEP_DT,
 };
 use sounding_sim::sim::{CentralBody, SimClock};
+use sounding_sim::telemetry::RoverTelemetry;
 use sounding_sim::terrain::{Ramp, Terrain};
 use sounding_sim::voxel::{device_mass, Device, DeviceKind, Material, PartKind, Voxel, VoxelCraft};
 use sounding_sim::warp::safe_substep_dt;
 
+use crate::bus::GroundedRover;
 use crate::editor::{
     editor_input, material_label, mouse_build, mouse_orbit_input, orbit_camera, update_hover,
     Brush, EditorState, HoverState, OrbitCam, PaletteEntry, PointerOnPalette, PALETTE_GROUPS,
@@ -862,7 +864,10 @@ impl Plugin for WorkshopScenePlugin {
             .add_systems(OnEnter(WorkshopMode::Build), enter_build)
             .add_systems(OnExit(WorkshopMode::Build), exit_build)
             .add_systems(OnEnter(WorkshopMode::Test), enter_test)
-            .add_systems(OnExit(WorkshopMode::Test), exit_test)
+            .add_systems(
+                OnExit(WorkshopMode::Test),
+                (exit_test, clear_rover_telemetry),
+            )
             .add_systems(Update, (toggle_mode, crate::pause::toggle_pause))
             .add_systems(
                 Update,
@@ -887,6 +892,7 @@ impl Plugin for WorkshopScenePlugin {
                 (
                     workshop_input,
                     step_workshop,
+                    publish_rover,
                     reconcile_meshes,
                     track_meshes,
                     track_rover_meshes,
@@ -1606,6 +1612,21 @@ fn drive_rover(keys: &ButtonInput<KeyCode>, world: &mut WorkshopWorld, dt: f64) 
     let steer = rs.steer.clone();
     let steer_input = rs.steer_input;
     rs.rover.set_steer(steer_input, max_angle, &steer);
+}
+
+/// Publishes the Test rover's live state onto the bus bridge each frame (WI 640), so
+/// `GET /telemetry` and the dev-MCP bridge can introspect a workshop rover. Carries `None`
+/// when Test is flying a rocket (no assembled rover); cleared on leaving Test.
+fn publish_rover(world: Res<WorkshopWorld>, mut grounded: ResMut<GroundedRover>) {
+    grounded.0 = world
+        .rover
+        .as_ref()
+        .map(|rs| RoverTelemetry::from_rover(&rs.rover));
+}
+
+/// Clears the rover bridge when leaving Test (WI 640) so Build mode publishes no stale rover.
+fn clear_rover_telemetry(mut grounded: ResMut<GroundedRover>) {
+    grounded.0 = None;
 }
 
 fn step_workshop(time: Res<Time>, clock: Res<SimClock>, mut world: ResMut<WorkshopWorld>) {

@@ -11,7 +11,7 @@ use bevy::prelude::*;
 use sounding_sim::command::Command;
 use sounding_sim::diagnostics::ENERGY_DRIFT;
 use sounding_sim::sim::{CentralBody, Craft, SimClock};
-use sounding_sim::telemetry::{ActiveFlightTelemetry, Telemetry};
+use sounding_sim::telemetry::{ActiveFlightTelemetry, RoverTelemetry, Telemetry};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -33,6 +33,12 @@ struct BusCommandRx(Mutex<Receiver<Command>>);
 /// writes it each frame; `publish_telemetry` attaches it. `None` ⇒ orbit-only telemetry.
 #[derive(Resource, Default)]
 pub struct ActiveFlight(pub Option<ActiveFlightTelemetry>);
+
+/// Bridge from a grounded scene to the bus publisher (WI 640): the latest rover snapshot.
+/// A scene that owns a `Rover` (`-- rover`, or the workshop Test driving an assembled rover)
+/// writes it each frame; `publish_telemetry` attaches it. `None` ⇒ no rover block.
+#[derive(Resource, Default)]
+pub struct GroundedRover(pub Option<RoverTelemetry>);
 
 /// Serves the runtime bus on `port`.
 pub struct BusPlugin {
@@ -65,6 +71,7 @@ impl Plugin for BusPlugin {
         app.insert_resource(BusTelemetry(telemetry))
             .insert_resource(BusCommandRx(Mutex::new(rx)))
             .init_resource::<ActiveFlight>()
+            .init_resource::<GroundedRover>()
             .add_systems(Update, (publish_telemetry, drain_commands));
     }
 }
@@ -110,6 +117,7 @@ fn publish_telemetry(
     craft: Query<&Craft>,
     diagnostics: Res<DiagnosticsStore>,
     active: Res<ActiveFlight>,
+    rover: Res<GroundedRover>,
 ) {
     let orbit = craft.single().ok().map(|c| c.orbit);
     let energy_drift = diagnostics.get(&ENERGY_DRIFT).and_then(|d| d.value());
@@ -117,6 +125,10 @@ fn publish_telemetry(
     // Attach the active craft's autonomy state when a scene has published one (WI 569).
     if let Some(a) = active.0 {
         snapshot = snapshot.with_active_flight(a);
+    }
+    // Attach the grounded rover's state when a rover scene has published one (WI 640).
+    if let Some(r) = rover.0.clone() {
+        snapshot = snapshot.with_rover(r);
     }
     if let (Ok(json), Ok(mut slot)) = (serde_json::to_string(&snapshot), bus.0.lock()) {
         *slot = json;

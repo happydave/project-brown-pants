@@ -8,11 +8,13 @@
 //!
 //! Controls: `W`/`S` throttle/reverse · `A`/`D` steer · `Space` brake.
 
+use crate::bus::GroundedRover;
 use bevy::math::{DVec3, Isometry3d};
 use bevy::prelude::*;
 use sounding_sim::active::ActiveBody;
 use sounding_sim::rover::{Rover, Wheel, SUBSTEP_DT};
 use sounding_sim::sim::SimClock;
+use sounding_sim::telemetry::RoverTelemetry;
 use sounding_sim::terrain::Terrain;
 use sounding_sim::voxel::{Material, Voxel, VoxelCraft};
 
@@ -89,6 +91,7 @@ impl Plugin for RoverScenePlugin {
                     crate::pause::toggle_pause,
                     drive_input,
                     step_rover,
+                    publish_rover,
                     draw_rover,
                     update_hud,
                 )
@@ -189,6 +192,12 @@ fn step_rover(time: Res<Time>, clock: Res<SimClock>, mut world: ResMut<RoverWorl
             }
         }
     }
+}
+
+/// Publishes the rover's live state onto the bus bridge each frame (WI 640), so
+/// `GET /telemetry` and the dev-MCP bridge can introspect the running rover.
+fn publish_rover(world: Res<RoverWorld>, mut grounded: ResMut<GroundedRover>) {
+    grounded.0 = Some(RoverTelemetry::from_rover(&world.rover));
 }
 
 fn draw_rover(mut gizmos: Gizmos, world: Res<RoverWorld>) {
