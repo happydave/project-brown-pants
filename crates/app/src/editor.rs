@@ -63,7 +63,7 @@ impl WheelPreset {
     }
 
     /// The rim component for this preset, carrying the drivetrain flags (drive is always on, as before).
-    fn rim(self, cell_size: f64, steer: bool) -> RimSpec {
+    pub(crate) fn rim(self, cell_size: f64, steer: bool) -> RimSpec {
         let total = self.total_radius(cell_size);
         RimSpec {
             radius: total - self.profile_frac() * total,
@@ -74,7 +74,7 @@ impl WheelPreset {
 
     /// The tire component for this preset: grip (compound), compliance (rubber/air spring), slip
     /// stiffness (response), and profile (with the rim → effective radius).
-    fn tire(self, cell_size: f64) -> TireSpec {
+    pub(crate) fn tire(self, cell_size: f64) -> TireSpec {
         let total = self.total_radius(cell_size);
         let (grip_scale, stiffness, slip_long, slip_lat) = match self {
             WheelPreset::OffRoad => (1.35, 5.0e4, 4.5, 3.5),

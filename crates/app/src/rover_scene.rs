@@ -1,4 +1,4 @@
-//! Toy 6 rover scene (WI 506).
+//! Toy 6 rover scene (WI 506; modernised WI 641).
 //!
 //! Drives the headless rover (`sounding_sim::rover`) over the analytic terrain and
 //! visualizes it. Rendering is **rover-anchored floating origin**: the rover sits
@@ -6,26 +6,63 @@
 //! origin) while everything is drawn relative to the rover, keeping f32 render
 //! coordinates near zero. The wheels write a track trail.
 //!
-//! Controls: `W`/`S` throttle/reverse · `A`/`D` steer · `Space` brake.
+//! The rover is built through the **same `assemble_rover` component path as the
+//! workshop Test** (WI 641): four `OffRoad`-preset wheel stations (rim + tire +
+//! suspension) on a voxel chassis, so it exercises the current drivetrain —
+//! quarter-car unsprung mass (WI 631a), tire grip/slip presets (WI 630), the
+//! failure ladder (WI 631b), drive/steer groups, and the powertrain (WI 609) — and
+//! its WI 640 telemetry reports live `axle_drop`/`static_load`/`grip_scale`. This
+//! stays a minimal fixed-rover sandbox: no build/edit UI, gizmo render.
+//!
+//! Controls: `W`/`S` throttle/reverse · `A`/`D` steer · `Space` brake · `P` pause.
 
 use crate::bus::GroundedRover;
+use crate::editor::WheelPreset;
 use bevy::math::{DVec3, Isometry3d};
 use bevy::prelude::*;
-use sounding_sim::active::ActiveBody;
-use sounding_sim::rover::{Rover, Wheel, SUBSTEP_DT};
+use sounding_sim::powertrain::RoverPowertrain;
+use sounding_sim::rover::{assemble_rover, Rover, SUBSTEP_DT};
 use sounding_sim::sim::SimClock;
 use sounding_sim::telemetry::RoverTelemetry;
 use sounding_sim::terrain::Terrain;
-use sounding_sim::voxel::{Material, Voxel, VoxelCraft};
+use sounding_sim::voxel::{Material, Part, PartKind, SuspensionSpec, Voxel, VoxelCraft};
 
 /// Maximum physics sub-steps per frame (keeps up at 60 fps with headroom).
 const MAX_SUBSTEPS: u32 = 64;
 const MAX_TRACK: usize = 600;
 
-/// The rover, its terrain, the track trail, and the sub-step accumulator.
+/// Rover acceleration gravity (m/s²).
+const ROVER_GRAVITY: f64 = 9.81;
+/// Voxel cell size (m) of the fixed sandbox chassis (WI 641). Editor-scale so the rover is a light
+/// buggy, not a 3-tonne solid-composite brick that the hills throw around. Wheel size, mounts, spawn,
+/// and the chase camera all scale from this.
+const ROVER_CELL: f64 = 0.3;
+// Drive feel — mirrors the workshop Test (`workshop_scene.rs`) so the standalone scene drives the same.
+/// Brake torque per kg of rover mass (so braking scales with the build).
+const ROVER_BRAKE_PER_KG: f64 = 35.0;
+/// Steering lock (rad) at a standstill; tapers with speed (see [`STEER_SPEED_REF`]).
+const ROVER_STEER: f64 = 0.35;
+/// Steer-input slew rate (per second) — a tap is a small correction, not instant full lock.
+const STEER_RATE: f64 = 3.0;
+/// Speed (m/s) at which steering authority halves: `ROVER_STEER / (1 + v/ref)`.
+const STEER_SPEED_REF: f64 = 7.0;
+
+/// The rover, its drivetrain groups + powertrain, drive intent, terrain, track trail, and accumulator.
 #[derive(Resource)]
 struct RoverWorld {
     rover: Rover,
+    /// Wheel indices that receive drive torque (from the assembly).
+    drive: Vec<usize>,
+    /// Wheel indices that turn with steering (from the assembly).
+    steer: Vec<usize>,
+    /// Drive power source derived from the build (a self-sustaining default here).
+    powertrain: RoverPowertrain,
+    /// Throttle intent in [-1, 1]; the powertrain turns it into torque each frame.
+    throttle: f64,
+    /// Smoothed steering input in [-1, 1].
+    steer_input: f64,
+    /// Brake torque magnitude (N·m) applied to all wheels.
+    brake: f64,
     terrain: Terrain,
     track: Vec<DVec3>,
     accumulator: f64,
@@ -44,7 +81,12 @@ impl RoverWorld {
         // Place the rover at a large world offset so rendering rebases and contact
         // stability is exercised away from the origin (the kraken condition).
         let (ox, oz) = (6_378_000.0, -1_200_000.0);
-        let mut craft = VoxelCraft::new(0.5);
+        // Editor-scale cell (WI 641): a solid COMPOSITE 3×5 slab at 0.5 m is a ~3-tonne brick that
+        // catches air on the hills and slams down (the heavy-fixture instability our convention warns
+        // about). A 0.3 m cell makes a ~0.65-tonne buggy — a stable demonstrator of the current
+        // drivetrain — while everything below stays cell-relative.
+        let cell = ROVER_CELL;
+        let mut craft = VoxelCraft::new(cell);
         for x in 0..3 {
             for z in 0..5 {
                 craft.voxels.push(Voxel {
@@ -53,20 +95,54 @@ impl RoverWorld {
                 });
             }
         }
-        let mp = craft.mass_properties().unwrap();
-        let ground = terrain.height(ox, oz);
-        // Spawn essentially on the ground (a 1 m drop lands violently on the short
-        // suspension and can kick the rover into a spin).
-        let body =
-            ActiveBody::from_mass_properties(DVec3::new(ox, ground + 0.9, oz), DVec3::ZERO, &mp);
-        let wheels = vec![
-            Wheel::new(DVec3::new(-1.0, -0.2, -2.0)),
-            Wheel::new(DVec3::new(1.0, -0.2, -2.0)),
-            Wheel::new(DVec3::new(-1.0, -0.2, 2.0)),
-            Wheel::new(DVec3::new(1.0, -0.2, 2.0)),
+        // Four wheel stations (rim + tire + suspension), the OffRoad preset — the same component path
+        // the workshop authors (WI 630/641). Mount at the four bottom corners of the slab footprint
+        // (lattice metres: x∈[0, 3·cell], z∈[0, 5·cell]), just below it. The +z (front) pair steers;
+        // all drive.
+        let preset = WheelPreset::OffRoad;
+        let (fx, fz, drop) = (3.0 * cell, 5.0 * cell, 0.2 * cell);
+        let mounts = [
+            (DVec3::new(0.0, -drop, 0.0), false),
+            (DVec3::new(fx, -drop, 0.0), false),
+            (DVec3::new(0.0, -drop, fz), true),
+            (DVec3::new(fx, -drop, fz), true),
         ];
+        for (station, (mount, steer)) in mounts.into_iter().enumerate() {
+            let id = station as u32;
+            let wheel_mass = (8.0 * cell).max(0.5);
+            craft.parts.push(Part {
+                mount,
+                mass: wheel_mass,
+                kind: PartKind::Rim(preset.rim(cell, steer)),
+                station: Some(id),
+            });
+            craft.parts.push(Part {
+                mount,
+                mass: wheel_mass,
+                kind: PartKind::Tire(preset.tire(cell)),
+                station: Some(id),
+            });
+            craft.parts.push(Part {
+                mount,
+                mass: (4.0 * cell).max(0.3),
+                kind: PartKind::Suspension(SuspensionSpec::for_cell_size(cell)),
+                station: Some(id),
+            });
+        }
+        // Assemble at the CoM-relative spawn: drop a little so the rover settles on its suspension.
+        // Clearance is cell-relative so it tracks the build scale.
+        let ground = terrain.height(ox, oz);
+        let spawn = DVec3::new(ox, ground + 3.0 * cell, oz);
+        let asm = assemble_rover(&craft, spawn, ROVER_GRAVITY)
+            .expect("the fixed rover craft has voxels + four complete wheel stations");
         Self {
-            rover: Rover::new(body, wheels, 9.81),
+            rover: asm.rover,
+            drive: asm.drive,
+            steer: asm.steer,
+            powertrain: asm.powertrain,
+            throttle: 0.0,
+            steer_input: 0.0,
+            brake: 0.0,
             terrain,
             track: Vec::new(),
             accumulator: 0.0,
@@ -102,10 +178,13 @@ impl Plugin for RoverScenePlugin {
 
 fn setup_view(mut commands: Commands) {
     // The rover is rendered at the origin (rover-anchored), so a fixed chase
-    // camera behind and above it works without tracking.
+    // camera behind and above it works without tracking. The framing was tuned at a 0.5 m cell, so
+    // scale it to the current cell to keep the (smaller, editor-scale) rover framed (WI 641).
+    let s = (ROVER_CELL / 0.5) as f32;
     commands.spawn((
         Camera3d::default(),
-        Transform::from_xyz(0.0, 7.0, -16.0).looking_at(Vec3::new(0.0, 1.0, 4.0), Vec3::Y),
+        Transform::from_xyz(0.0, 7.0 * s, -16.0 * s)
+            .looking_at(Vec3::new(0.0, 1.0 * s, 4.0 * s), Vec3::Y),
     ));
     commands.spawn((
         DirectionalLight {
@@ -141,32 +220,36 @@ fn update_hud(world: Res<RoverWorld>, clock: Res<SimClock>, mut hud: Query<&mut 
     }
 }
 
-fn drive_input(keys: Res<ButtonInput<KeyCode>>, mut world: ResMut<RoverWorld>) {
-    let throttle = if keys.pressed(KeyCode::KeyW) {
-        2_500.0
+/// Set the drive **intent** by group (WI 641, mirroring the workshop Test): throttle the drive wheels,
+/// steer the steer wheels (speed-sensitive, smoothed), brake all. The powertrain turns throttle into
+/// torque in `step_rover`; `set_steer` applies coordinated counter-steer (WI 616).
+fn drive_input(time: Res<Time>, keys: Res<ButtonInput<KeyCode>>, mut world: ResMut<RoverWorld>) {
+    world.throttle = if keys.pressed(KeyCode::KeyW) {
+        1.0
     } else if keys.pressed(KeyCode::KeyS) {
-        -2_500.0
+        -1.0
     } else {
         0.0
     };
-    let brake = if keys.pressed(KeyCode::Space) {
-        3_000.0
+    world.brake = if keys.pressed(KeyCode::Space) {
+        world.rover.body.mass * ROVER_BRAKE_PER_KG
     } else {
         0.0
     };
-    let steer = if keys.pressed(KeyCode::KeyA) {
-        0.4
+    let target = if keys.pressed(KeyCode::KeyA) {
+        1.0
     } else if keys.pressed(KeyCode::KeyD) {
-        -0.4
+        -1.0
     } else {
         0.0
     };
-    for (i, w) in world.rover.wheels.iter_mut().enumerate() {
-        w.drive_torque = throttle;
-        w.brake = brake;
-        // Steer the front wheels (the +z pair).
-        w.steer = if i >= 2 { steer } else { 0.0 };
-    }
+    let step = STEER_RATE * time.delta_secs_f64();
+    world.steer_input += (target - world.steer_input).clamp(-step, step);
+    let speed = world.rover.body.velocity.length();
+    let max_angle = ROVER_STEER / (1.0 + speed / STEER_SPEED_REF);
+    let steer = world.steer.clone();
+    let steer_input = world.steer_input;
+    world.rover.set_steer(steer_input, max_angle, &steer);
 }
 
 fn step_rover(time: Res<Time>, clock: Res<SimClock>, mut world: ResMut<RoverWorld>) {
@@ -176,8 +259,18 @@ fn step_rover(time: Res<Time>, clock: Res<SimClock>, mut world: ResMut<RoverWorl
     }
     world.accumulator += time.delta_secs_f64();
     let mut substeps = 0;
+    // The drive group is fixed while stepping (no obstacles shear a wheel in this scene), so clone once.
+    let drive = world.drive.clone();
     while world.accumulator >= SUBSTEP_DT && substeps < MAX_SUBSTEPS {
         let terrain = world.terrain;
+        // The powertrain turns throttle into (default self-sustaining) drive torque each step (WI 609).
+        let throttle = world.throttle;
+        let torque = world.powertrain.drive_torque(throttle, SUBSTEP_DT);
+        let brake = world.brake;
+        for (i, w) in world.rover.wheels.iter_mut().enumerate() {
+            w.drive_torque = if drive.contains(&i) { torque } else { 0.0 };
+            w.brake = brake;
+        }
         world.rover.step(&terrain, SUBSTEP_DT);
         world.accumulator -= SUBSTEP_DT;
         substeps += 1;
@@ -240,20 +333,25 @@ fn draw_rover(mut gizmos: Gizmos, world: Res<RoverWorld>) {
         Color::srgb(0.80, 0.81, 0.86),
     );
 
-    // Wheels and suspension legs.
+    // Wheels and suspension legs. Each wheel renders at its **true axle height** (`hub.y − axle_drop`
+    // on the quarter-car path, WI 631a/641) so suspension travel and hop are visible; a sheared wheel
+    // (inert) is skipped. The leg runs from the hub down to the axle.
     for w in &world.rover.wheels {
+        if w.inert {
+            continue;
+        }
         let hub = body.position + body.orientation * w.mount;
-        let ground = terrain.height(hub.x, hub.z);
-        let contact = DVec3::new(hub.x, ground, hub.z);
-        gizmos.line(
-            to_render(hub),
-            to_render(contact),
-            Color::srgb(0.5, 0.5, 0.55),
-        );
+        let axle = DVec3::new(hub.x, hub.y - w.axle_drop, hub.z);
+        let wheel_color = if w.tire_blown || w.rim_bent {
+            Color::srgb(0.45, 0.20, 0.15) // damaged corner reads warmer
+        } else {
+            Color::srgb(0.15, 0.15, 0.18)
+        };
+        gizmos.line(to_render(hub), to_render(axle), Color::srgb(0.5, 0.5, 0.55));
         gizmos.sphere(
-            Isometry3d::from_translation(to_render(contact)),
+            Isometry3d::from_translation(to_render(axle)),
             w.radius as f32,
-            Color::srgb(0.15, 0.15, 0.18),
+            wheel_color,
         );
     }
 }
