@@ -12,7 +12,7 @@ use bevy::math::DVec3;
 use bevy::prelude::*;
 use sounding_sim::control::{BatterySpec, ControlComputer};
 use sounding_sim::frame::{FrameId, WorldPos};
-use sounding_sim::persist::{CraftSubgraph, Kind, Payload, SavedDocument};
+use sounding_sim::persist::{CraftSubgraph, FormatError, Kind, Payload, SavedDocument};
 use sounding_sim::voxel::{
     device_mass, AttachmentPoint, Axis, Device, DeviceKind, Face, Material, Part, PartKind,
     RimSpec, SuspensionSpec, TireSpec, Voxel, VoxelCraft,
@@ -29,6 +29,8 @@ const PALETTE: [(&str, Material); 4] = [
 
 const BLUEPRINT_PATH: &str = "blueprint.json";
 const SUBASSEMBLY_PATH: &str = "subassembly.json";
+/// Where the whole current build is saved/loaded as a craft (WI 637).
+const CRAFT_PATH: &str = "craft.json";
 
 /// A rim+tire combination the player picks as a unit (WI 630). Each preset is a coherent
 /// rim+tire character — the felt difference of "change the tires" — while the underlying suspension /
@@ -652,6 +654,20 @@ pub(crate) fn editor_input(keys: Res<ButtonInput<KeyCode>>, mut state: ResMut<Ed
             .retain(|p| (p.mount - center).length() > 1e-6);
     }
 
+    // Save the whole build as a craft / load one back into Build (WI 637). Unlike a subassembly
+    // (which loads into the insert buffer), opening a craft *replaces* the current build.
+    if keys.just_pressed(KeyCode::KeyK) {
+        save(&state.craft, Kind::Craft, CRAFT_PATH);
+    }
+    if keys.just_pressed(KeyCode::KeyO) {
+        match load(CRAFT_PATH) {
+            Some(c) => {
+                info!("loaded craft ({} voxels) into Build", c.voxels.len());
+                state.craft = c;
+            }
+            None => warn!("no craft to load at {CRAFT_PATH}"),
+        }
+    }
     // Save as a blueprint / a reusable subassembly.
     if keys.just_pressed(KeyCode::KeyB) {
         save(&state.craft, Kind::Blueprint, BLUEPRINT_PATH);
@@ -877,14 +893,27 @@ fn craft_subgraph(craft: &VoxelCraft) -> CraftSubgraph {
     )
 }
 
-fn save(craft: &VoxelCraft, kind: Kind, path: &str) {
+/// Serializes a craft as a `kind`-tagged document. Pure (no I/O), so the save/load round-trip is
+/// unit-testable without touching the filesystem (WI 637).
+fn craft_to_json(craft: &VoxelCraft, kind: Kind) -> Result<String, FormatError> {
     let payload = match kind {
         Kind::Subassembly => Payload::Subassembly(craft_subgraph(craft)),
         Kind::Blueprint => Payload::Blueprint(craft_subgraph(craft)),
         _ => Payload::Craft(craft_subgraph(craft)),
     };
-    let result = SavedDocument::new(payload)
-        .to_json()
+    SavedDocument::new(payload).to_json()
+}
+
+/// Deserializes any craft-scope document back into its craft. Pure counterpart to [`craft_to_json`].
+fn craft_from_json(json: &str) -> Option<VoxelCraft> {
+    match SavedDocument::from_json(json).ok()?.payload {
+        Payload::Craft(c) | Payload::Subassembly(c) | Payload::Blueprint(c) => Some(c.craft),
+        Payload::WorldSave(_) => None,
+    }
+}
+
+fn save(craft: &VoxelCraft, kind: Kind, path: &str) {
+    let result = craft_to_json(craft, kind)
         .map_err(|e| e.to_string())
         .and_then(|json| fs::write(path, json).map_err(|e| e.to_string()));
     match result {
@@ -913,12 +942,7 @@ fn save_subassembly(craft: &VoxelCraft, path: &str) {
 }
 
 fn load(path: &str) -> Option<VoxelCraft> {
-    let json = fs::read_to_string(path).ok()?;
-    let doc = SavedDocument::from_json(&json).ok()?;
-    match doc.payload {
-        Payload::Craft(c) | Payload::Subassembly(c) | Payload::Blueprint(c) => Some(c.craft),
-        Payload::WorldSave(_) => None,
-    }
+    craft_from_json(&fs::read_to_string(path).ok()?)
 }
 
 fn cell_center(c: IVec3, cell_size: f64) -> Vec3 {
@@ -1215,6 +1239,52 @@ mod tests {
         };
         assert!(PaletteEntry::Material(2).is_active(&state));
         assert!(!PaletteEntry::Material(0).is_active(&state));
+    }
+
+    #[test]
+    fn craft_save_load_round_trips_a_full_build() {
+        // A full build — chassis voxels + a device + a complete wheel station — survives the craft
+        // save/load path identically (WI 637). Whole-craft equality covers mass/inertia/parts/stations.
+        let mut craft = chassis();
+        craft.devices.push(Device::battery(
+            IVec3::new(0, 0, 0),
+            device_mass(DeviceKind::Battery, craft.cell_size),
+            BatterySpec::full(20.0),
+        ));
+        place_brush(
+            &mut craft,
+            Brush::Wheel {
+                preset: WheelPreset::Road,
+                steer: true,
+            },
+            Material::COMPOSITE,
+            IVec3::ZERO,
+            IVec3::ZERO,
+            DVec3::new(0.5, -0.2, 0.5),
+        );
+
+        let json = craft_to_json(&craft, Kind::Craft).expect("serialize");
+        let back = craft_from_json(&json).expect("a craft document loads back");
+
+        // Structural identity: voxels and devices survive exactly; the wheel station (rim + tire,
+        // same station id) and cell size are preserved.
+        assert_eq!(back.voxels, craft.voxels);
+        assert_eq!(back.devices, craft.devices);
+        assert_eq!(back.cell_size, craft.cell_size);
+        assert_eq!(back.parts.len(), craft.parts.len());
+        let stations: Vec<_> = back.parts.iter().map(|p| p.station).collect();
+        assert_eq!(
+            stations,
+            vec![Some(0), Some(0)],
+            "rim + tire share one station"
+        );
+        // Mass/inertia are preserved (the acceptance phrasing) to within float tolerance.
+        let mp0 = craft.mass_properties().unwrap();
+        let mp1 = back.mass_properties().unwrap();
+        assert!((mp0.mass - mp1.mass).abs() < 1e-9);
+        assert!((mp0.center_of_mass - mp1.center_of_mass).length() < 1e-9);
+        // It is specifically a craft-kind document (not a blueprint/subassembly).
+        assert_eq!(SavedDocument::from_json(&json).unwrap().kind(), Kind::Craft);
     }
 
     #[test]
