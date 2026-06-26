@@ -52,6 +52,7 @@ mod planet;
 mod play_scene;
 mod rover_scene;
 mod skins_scene;
+mod sparkline;
 mod terrain_mesh_scene;
 mod voxel_skin;
 mod wind_tunnel_scene;

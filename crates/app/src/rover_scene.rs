@@ -18,6 +18,9 @@
 
 use crate::bus::GroundedRover;
 use crate::editor::WheelPreset;
+use crate::sparkline::{
+    apply_bars, spawn_sparkline, SparkBar, Sparkline, SparklineLabel, SPARK_BARS,
+};
 use bevy::math::{DVec3, Isometry3d};
 use bevy::prelude::*;
 use sounding_sim::powertrain::RoverPowertrain;
@@ -155,11 +158,16 @@ impl RoverWorld {
 #[derive(Component)]
 struct Hud;
 
+/// The `contact_jitter` sparkline's sample ring (WI 645).
+#[derive(Resource)]
+struct JitterSpark(Sparkline);
+
 pub struct RoverScenePlugin;
 
 impl Plugin for RoverScenePlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(RoverWorld::new())
+            .insert_resource(JitterSpark(Sparkline::new(SPARK_BARS)))
             .add_systems(Startup, setup_view)
             .add_systems(
                 Update,
@@ -171,9 +179,33 @@ impl Plugin for RoverScenePlugin {
                     publish_rover,
                     draw_rover,
                     update_hud,
+                    update_jitter_spark,
                 )
                     .chain(),
             );
+    }
+}
+
+/// Samples `contact_jitter` from the published rover telemetry into the sparkline each frame (WI 645).
+fn update_jitter_spark(
+    grounded: Res<GroundedRover>,
+    mut spark: ResMut<JitterSpark>,
+    mut bars: Query<(&SparkBar, &mut Node, &mut BackgroundColor)>,
+    mut label: Query<&mut Text, With<SparklineLabel>>,
+) {
+    let v = grounded
+        .0
+        .as_ref()
+        .map(|r| r.contact_jitter as f32)
+        .unwrap_or(0.0);
+    spark.0.push(v);
+    apply_bars(&spark.0.bars(), &mut bars);
+    if let Ok(mut text) = label.single_mut() {
+        text.0 = format!(
+            "contact_jitter {:.2} (max {:.1})",
+            spark.0.latest(),
+            spark.0.window_max()
+        );
     }
 }
 
@@ -210,6 +242,8 @@ fn setup_view(mut commands: Commands) {
         },
         Hud,
     ));
+    // Live contact-jitter sparkline (WI 645): the spike-and-decay shape a single readout can't show.
+    spawn_sparkline(&mut commands, 70.0, 12.0, "contact_jitter");
 }
 
 fn update_hud(world: Res<RoverWorld>, clock: Res<SimClock>, mut hud: Query<&mut Text, With<Hud>>) {
