@@ -11,11 +11,13 @@ Run: ``python3 dev/mcp/test_bridge.py`` (stdlib only; exits non-zero on failure)
 import json
 import subprocess
 import sys
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 BRIDGE = Path(__file__).with_name("sounding_mcp.py")
+SHOT_PATH = str(Path(tempfile.gettempdir()) / "sounding-mcp-selftest-shot.png")
 
 received = {"posts": []}
 
@@ -32,6 +34,14 @@ class StubBus(BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif self.path == "/telemetry/history":
             body = b'[{"t":1.0},{"t":2.0}]'
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/screenshot":
+            # Write a fake PNG so the bridge's poll-and-read path can be exercised without a window.
+            with open(SHOT_PATH, "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\nfake")
+            body = json.dumps({"ok": True, "path": SHOT_PATH}).encode("utf-8")
             self.send_response(200)
             self.end_headers()
             self.wfile.write(body)
@@ -72,7 +82,24 @@ def main():
 
         tools = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         names = {t["name"] for t in tools["result"]["tools"]}
-        assert names == {"get_telemetry", "get_telemetry_history", "send_command"}, names
+        assert names == {
+            "get_telemetry",
+            "get_telemetry_history",
+            "get_screenshot",
+            "send_command",
+        }, names
+
+        shot = rpc(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {"name": "get_screenshot", "arguments": {}},
+            },
+        )
+        block = shot["result"]["content"][0]
+        assert block["type"] == "image" and block["mimeType"] == "image/png", block
 
         hist = rpc(
             proc,

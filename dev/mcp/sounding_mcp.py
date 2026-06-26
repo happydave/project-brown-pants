@@ -11,6 +11,8 @@ scenario under test instead of reproducing it headlessly:
     state, WI 640).
   * ``get_telemetry_history`` → ``GET /telemetry/history`` — a JSON array of the last few seconds of
     snapshots, oldest-first (WI 644); a time series for spiky signals (pair with a paused ``Step``).
+  * ``get_screenshot`` → ``GET /screenshot`` — capture the window and return it as an image (WI 647);
+    a gestalt read of the scene / cockpit overlay (the image arrives as a file the bridge reads back).
   * ``send_command``  → ``POST /command``  — inject one JSON `Command` (e.g. ``{"SetPaused": true}``,
     ``{"SetWarp": 4.0}``, or — while paused — ``{"Step": {"seconds": 0.1}}`` to advance a frozen scene
     a known amount for inspection, WI 643).
@@ -25,9 +27,11 @@ itself.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -47,6 +51,14 @@ TOOLS = [
             "Read the recent telemetry history (GET /telemetry/history): a JSON array of the last few "
             "seconds of snapshots, oldest-first — a time series for inspecting how a signal evolves "
             "(pair with a paused Step). Prefer this over polling get_telemetry for spiky signals."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "get_screenshot",
+        "description": (
+            "Capture the running game's window and return it as an image (GET /screenshot, WI 647). "
+            "Prefer this over raw telemetry for a gestalt read of the scene / cockpit overlay."
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
@@ -87,6 +99,29 @@ def _http_post(path: str, body: str) -> str:
         return resp.read().decode("utf-8")
 
 
+def _capture_screenshot() -> dict:
+    """Trigger a capture (GET /screenshot deletes the stale file + asks Bevy to recapture), then poll
+    for the PNG to reappear and return it as an MCP image content block. The bus and this bridge share
+    a machine, so the file path in the response is directly readable."""
+    info = json.loads(_http_get("/screenshot"))
+    path = info.get("path")
+    if not path:
+        raise ValueError("screenshot response had no path")
+    # Poll for the freshly-written file (capture lands a frame or two later, on the render thread).
+    deadline = time.time() + 5.0
+    last_size = -1
+    while time.time() < deadline:
+        time.sleep(0.1)
+        if not os.path.exists(path):
+            continue
+        size = os.path.getsize(path)
+        if size > 0 and size == last_size:  # stable across two polls → write finished
+            data = base64.b64encode(open(path, "rb").read()).decode("ascii")
+            return {"content": [{"type": "image", "data": data, "mimeType": "image/png"}]}
+        last_size = size
+    raise TimeoutError("screenshot did not appear (is the windowed game running?)")
+
+
 def _call_tool(name: str, arguments: dict) -> dict:
     """Dispatch a tool call, returning an MCP `tools/call` result. Bus/IO errors are surfaced as
     `isError` tool results (not transport errors) so the assistant sees what failed."""
@@ -95,6 +130,8 @@ def _call_tool(name: str, arguments: dict) -> dict:
             text = _http_get("/telemetry")
         elif name == "get_telemetry_history":
             text = _http_get("/telemetry/history")
+        elif name == "get_screenshot":
+            return _capture_screenshot()
         elif name == "send_command":
             command = arguments.get("command")
             if command is None:
