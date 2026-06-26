@@ -40,7 +40,7 @@ use bevy::prelude::*;
 
 use sounding_sim::active::ActiveBody;
 use sounding_sim::attitude::{AttitudeControl, AttitudePilot, ReactionWheels, Sas};
-use sounding_sim::breakage::{fracture_on_impact, step_debris};
+use sounding_sim::breakage::{fracture_on_impact, step_debris, StaticCollider};
 use sounding_sim::collision::{
     craft_bounding_radius, craft_bounds, craft_collision_shape, ground_half_space, Bounds,
     BoxShape, CollisionShape,
@@ -137,6 +137,9 @@ const IMPACT_MIN_CLOSING: f64 = 1.0;
 /// wheels stay the fuse at any build scale/material. Scale-relative (tied to `Wheel::shear_speed`),
 /// not an absolute constant. Tunable by feel.
 const ROVER_FRACTURE_SHEAR_FACTOR: f64 = 1.5;
+/// Fraction of the rover's impact velocity the debris keeps at the moment of fracture (WI 674): the
+/// break absorbs energy, so the pieces don't rocket off at the full ram speed. Tunable by feel.
+const FRACTURE_MOMENTUM_KEEP: f64 = 0.4;
 /// Duration of the post-impact watch (s): how long after an impact to watch for a kraken / fall-through.
 const IMPACT_WATCH_SECONDS: f64 = 2.5;
 /// Post-impact kraken thresholds (WI 618): angular speed (rad/s) and vertical bounce (m/s) above which
@@ -1809,11 +1812,23 @@ fn step_workshop(time: Res<Time>, mut clock: ResMut<SimClock>, mut world: ResMut
             };
             let gravity = DVec3::new(0.0, -ROVER_GRAVITY, 0.0);
             let contact = ContactParams::default();
+            // The pad obstacles are static colliders the debris stops against (WI 674) — no more
+            // ghosting through the wall.
+            let colliders: Vec<StaticCollider> = rs
+                .obstacles
+                .iter()
+                .map(|o| StaticCollider {
+                    body: &o.body,
+                    shape: &o.shape,
+                    bounds: o.bounds,
+                })
+                .collect();
             let mut n = 0;
             while rs.accumulator >= ROVER_SUBSTEP_DT && n < ROVER_MAX_SUBSTEPS {
                 step_debris(
                     &mut rs.fragments,
                     &ground,
+                    &colliders,
                     gravity,
                     &contact,
                     ROVER_SUBSTEP_DT,
@@ -1938,9 +1953,14 @@ fn step_workshop(time: Res<Time>, mut clock: ResMut<SimClock>, mut world: ResMut
             }
             // Apply a pending chassis fracture (WI 629): switch to debris on the flat pad ground under
             // the rover, end driving, and stop stepping the (now-gone) rover this frame.
-            if let Some(frags) = fracture_pending.take() {
+            if let Some(mut frags) = fracture_pending.take() {
                 let bp = rs.rover.body.position;
                 rs.debris_ground_y = rs.terrain.height(bp.x, bp.z);
+                // Bleed momentum (WI 674): the break absorbs energy, so the pieces keep only a
+                // fraction of the impact velocity rather than rocketing off at the full ram speed.
+                for (_, b) in &mut frags {
+                    b.velocity *= FRACTURE_MOMENTUM_KEEP;
+                }
                 rs.fragments = frags;
                 rs.fractured = true;
                 rs.throttle = 0.0;

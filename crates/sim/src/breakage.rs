@@ -296,6 +296,15 @@ pub fn fracture_on_impact(
     fracture(craft, body, contact_force / body.mass)
 }
 
+/// A static (immovable) collider the debris stepper resolves fragments against — e.g. a pad obstacle
+/// (WI 674). Borrows the collider's authoritative body/shape so the caller's own obstacle type need
+/// not be visible here; the collider does not move (its contact reaction is discarded).
+pub struct StaticCollider<'a> {
+    pub body: &'a ActiveBody,
+    pub shape: &'a CollisionShape,
+    pub bounds: Option<Bounds>,
+}
+
 /// Advance a set of fracture fragments one substep in a **local frame** (WI 629): each fragment is a
 /// rigid body under a constant gravity acceleration, a static `ground`, and pairwise inter-fragment
 /// contact, integrated via [`ActiveBody::integrate_wrench`]. This is the headless, rover-frame
@@ -305,6 +314,7 @@ pub fn fracture_on_impact(
 pub fn step_debris(
     fragments: &mut [(VoxelCraft, ActiveBody)],
     ground: &CollisionShape,
+    obstacles: &[StaticCollider<'_>],
     gravity: DVec3,
     params: &ContactParams,
     dt: f64,
@@ -331,6 +341,24 @@ pub fn step_debris(
         let (gf, gt) = ground_contact_wrench(b, &shapes[i], bounds[i], coms[i], ground, params);
         item.0 += gf;
         item.1 += gt;
+        // Static obstacle contact (WI 674): each fragment is pushed out of the pad obstacles so the
+        // debris piles up against a wall instead of ghosting through it. The obstacle is immovable —
+        // its equal-and-opposite reaction is discarded.
+        for ob in obstacles {
+            let ((f, t), _) = body_contact_wrench(
+                b,
+                &shapes[i],
+                bounds[i],
+                coms[i],
+                ob.body,
+                ob.shape,
+                ob.bounds,
+                DVec3::ZERO,
+                params,
+            );
+            item.0 += f;
+            item.1 += t;
+        }
     }
     for i in 0..n {
         for j in (i + 1)..n {
@@ -403,7 +431,7 @@ mod tests {
         let params = ContactParams::default();
         let g = DVec3::new(0.0, -9.81, 0.0);
         for _ in 0..3000 {
-            step_debris(&mut frags, &ground, g, &params, 0.004);
+            step_debris(&mut frags, &ground, &[], g, &params, 0.004);
         }
         let b = &frags[0].1;
         assert!(b.position.is_finite(), "position went non-finite");
@@ -438,7 +466,7 @@ mod tests {
         let params = ContactParams::default();
         let sep0 = (frags[1].1.position - frags[0].1.position).length();
         for _ in 0..50 {
-            step_debris(&mut frags, &ground, DVec3::ZERO, &params, 0.004);
+            step_debris(&mut frags, &ground, &[], DVec3::ZERO, &params, 0.004);
         }
         let sep1 = (frags[1].1.position - frags[0].1.position).length();
         assert!(
@@ -461,6 +489,7 @@ mod tests {
         step_debris(
             &mut frags,
             &ground,
+            &[],
             DVec3::new(0.0, -9.81, 0.0),
             &params,
             dt,
@@ -475,6 +504,54 @@ mod tests {
         assert!(
             b.velocity.x.abs() < 1e-12 && b.velocity.z.abs() < 1e-12,
             "free fall gained lateral velocity"
+        );
+    }
+
+    #[test]
+    fn debris_is_stopped_by_a_static_obstacle() {
+        // A fragment sliding toward a static box (ground far below, no gravity) is pushed back, not
+        // through it. Mirrors the app's `Obstacle` setup — box centred at the body via `shape_pose`
+        // (local centre ZERO, dry_com ZERO), with broad-phase bounds.
+        use crate::collision::BoxShape;
+        use glam::DMat3;
+        let mut frags = vec![cube_fragment(
+            DVec3::new(0.0, 0.5, 0.0),
+            DVec3::new(8.0, 0.0, 0.0),
+        )];
+        // A wall centred at x=3, spanning x∈[2.5,3.5].
+        let half = DVec3::new(0.5, 1.0, 1.0);
+        let wall_body = ActiveBody::new(
+            DVec3::new(3.0, 0.5, 0.0),
+            DVec3::ZERO,
+            1.0e12,
+            DMat3::IDENTITY,
+        );
+        let wall_shape = CollisionShape::CuboidCompound(vec![BoxShape {
+            center: DVec3::ZERO,
+            half_extents: half,
+        }]);
+        let obstacles = [StaticCollider {
+            body: &wall_body,
+            shape: &wall_shape,
+            bounds: Some(Bounds {
+                aabb_min: -half,
+                aabb_max: half,
+                sphere_center: DVec3::ZERO,
+                sphere_radius: half.length(),
+            }),
+        }];
+        let ground = flat_ground(-1000.0);
+        let params = ContactParams::default();
+        for _ in 0..400 {
+            step_debris(&mut frags, &ground, &obstacles, DVec3::ZERO, &params, 0.004);
+        }
+        let b = &frags[0].1;
+        assert!(b.position.is_finite());
+        // The fragment (half-width 0.5) cannot have crossed to the wall's far face (x ≥ 3.5 − 0.5).
+        assert!(
+            b.position.x < 3.0,
+            "fragment ghosted through the wall: x={}",
+            b.position.x
         );
     }
 
