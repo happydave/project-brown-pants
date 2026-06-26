@@ -48,7 +48,22 @@ impl RoverSignal {
         };
         x as f32
     }
+
+    /// A sane default visual max for the sparkline (WI 645/646): the scale floor below which a quiet
+    /// signal reads low (so 0/0 isn't full), growing dynamically above it when the signal spikes.
+    pub fn default_max(self) -> f32 {
+        match self {
+            RoverSignal::ContactJitter => 30.0, // resting ~0.006; a real bump fills, a kraken spike rescales
+            RoverSignal::Speed => 20.0,         // m/s
+            RoverSignal::AngularSpeed => 5.0,   // rad/s
+            RoverSignal::HullPenetration => 0.1, // m
+        }
+    }
 }
+
+/// Sample the overlay roughly every Nth frame (WI 645/646 fix): at 60 fps this spans the 48-bar window
+/// over ~5 s instead of <1 s, so the sparklines scroll at a readable pace.
+const SAMPLE_EVERY: u32 = 8;
 
 /// The cockpit overlay state: one sample ring per [`RoverSignal`].
 #[derive(Resource)]
@@ -105,15 +120,19 @@ pub fn spawn_overlay(commands: &mut Commands) -> Entity {
         .id()
 }
 
-/// Toggle the overlay on `G`, then sample every signal from the published rover telemetry into its
-/// ring and update its panel + label. Shared by the rover and workshop scenes.
+/// Toggle the overlay on `G` (always, even while paused so it can be read frozen), then — only while
+/// the sim is **running**, decimated to a readable rate — sample every signal from the published rover
+/// telemetry into its ring and update its panel + label. So the sparklines **freeze with the game**
+/// (pause / replay) and scroll at a sane pace. Shared by the rover and workshop scenes.
 pub fn update_overlay(
     keys: Res<ButtonInput<KeyCode>>,
+    clock: Res<sounding_sim::sim::SimClock>,
     grounded: Res<GroundedRover>,
     mut overlay: ResMut<CockpitOverlay>,
     mut root: Query<&mut Visibility, With<OverlayRoot>>,
     mut bars: Query<(&SparkBar, &mut Node, &mut BackgroundColor)>,
     mut labels: Query<(&SparklineLabel, &mut Text)>,
+    mut frame: Local<u32>,
 ) {
     if keys.just_pressed(KeyCode::KeyG) {
         for mut vis in &mut root {
@@ -124,18 +143,28 @@ pub fn update_overlay(
         }
     }
 
+    // Freeze the sparklines while the sim is paused (or scrubbing a replay), and decimate so the
+    // window spans a few seconds rather than a fraction of one.
+    if clock.paused {
+        return;
+    }
+    *frame = frame.wrapping_add(1);
+    if !frame.is_multiple_of(SAMPLE_EVERY) {
+        return;
+    }
+
     for (panel, sig) in RoverSignal::ALL.iter().enumerate() {
         let v = grounded.0.as_ref().map(|r| sig.sample(r)).unwrap_or(0.0);
         let spark = &mut overlay.sparks[panel];
         spark.push(v);
-        apply_panel(panel, &spark.bars(), &mut bars);
+        apply_panel(panel, &spark.bars(sig.default_max()), &mut bars);
         for (label, mut text) in &mut labels {
             if label.panel == panel {
                 text.0 = format!(
                     "{}: {:.2} (max {:.1})",
                     sig.label(),
                     spark.latest(),
-                    spark.window_max()
+                    spark.window_max().max(sig.default_max())
                 );
             }
         }

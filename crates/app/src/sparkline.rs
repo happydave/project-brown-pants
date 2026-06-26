@@ -15,9 +15,9 @@ pub const PANEL_HEIGHT: f32 = 44.0;
 pub const BAR_WIDTH: f32 = 3.0;
 const EPS: f32 = 1e-6;
 
-/// A bounded ring of recent samples with autoscaled bar heights. Pure — no rendering. Autoscaling is
-/// **relative** (to the window max), so the *shape* is always visible; the absolute scale is carried
-/// by the numeric label a scene draws beside it, so a quiet signal reads honestly.
+/// A bounded ring of recent samples with autoscaled bar heights. Pure — no rendering. The scale is
+/// `max(window_max, floor)`: a per-signal **floor** keeps a quiet/zero signal reading low (not full),
+/// and it grows above the floor on a spike. The numeric label carries the absolute scale alongside.
 #[derive(Clone)]
 pub struct Sparkline {
     samples: VecDeque<f32>,
@@ -53,17 +53,19 @@ impl Sparkline {
         self.samples.iter().copied().fold(0.0, f32::max)
     }
 
-    /// `cap` normalised heights in `[0, 1]`, oldest→newest, scaled to the window max. Not-yet-filled
-    /// leading slots are zero; a near-zero window returns all zeros (no divide-by-tiny blow-up).
-    pub fn bars(&self) -> Vec<f32> {
+    /// `cap` normalised heights in `[0, 1]`, oldest→newest, scaled to `max(window_max, floor)`. The
+    /// `floor` is a **sane default visual max**: a quiet signal (everything below the floor) reads
+    /// low instead of filling the bars, while a spike above the floor grows the scale dynamically.
+    /// Not-yet-filled leading slots are zero.
+    pub fn bars(&self, floor: f32) -> Vec<f32> {
         let mut out = vec![0.0; self.cap];
-        let m = self.window_max();
-        if m < EPS {
+        let denom = self.window_max().max(floor.max(0.0));
+        if denom < EPS {
             return out;
         }
         let start = self.cap - self.samples.len();
         for (i, v) in self.samples.iter().enumerate() {
-            out[start + i] = (v / m).clamp(0.0, 1.0);
+            out[start + i] = (v / denom).clamp(0.0, 1.0);
         }
         out
     }
@@ -154,11 +156,33 @@ mod tests {
     #[test]
     fn empty_and_nearzero_bars_are_zero() {
         let mut s = Sparkline::new(4);
-        assert!(s.bars().iter().all(|&b| b == 0.0));
+        assert!(s.bars(0.0).iter().all(|&b| b == 0.0));
         for _ in 0..4 {
             s.push(0.0);
         }
-        assert!(s.bars().iter().all(|&b| b == 0.0), "flat-zero → no bars");
+        assert!(s.bars(0.0).iter().all(|&b| b == 0.0), "flat-zero → no bars");
+    }
+
+    #[test]
+    fn floor_keeps_a_quiet_signal_low_then_a_spike_grows_the_scale() {
+        // A sane default visual max: values well below the floor read near-empty (not full), so 0/0
+        // doesn't look maxed. A spike above the floor rescales to it.
+        let mut s = Sparkline::new(3);
+        s.push(1.0);
+        s.push(1.0);
+        s.push(1.0);
+        let quiet = s.bars(100.0); // floor 100 ≫ samples → ~1% height
+        assert!(
+            quiet.iter().all(|&b| b < 0.05),
+            "quiet signal reads low: {quiet:?}"
+        );
+        s.push(200.0); // a spike above the floor
+        let spiked = s.bars(100.0); // denom = max(200, 100) = 200
+        assert!(
+            (spiked[2] - 1.0).abs() < 1e-6,
+            "the spike fills to the new max"
+        );
+        assert!(spiked[1] < 0.02, "the quiet samples shrink under the spike");
     }
 
     #[test]
@@ -168,7 +192,7 @@ mod tests {
         s.push(2.0);
         s.push(1.0);
         s.push(1000.0); // a big spike
-        let bars = s.bars();
+        let bars = s.bars(0.0);
         assert_eq!(bars.len(), 4);
         assert!((bars[3] - 1.0).abs() < 1e-6, "the spike is full height");
         assert!(
@@ -185,7 +209,7 @@ mod tests {
         s.push(10.0);
         s.push(20.0);
         s.push(40.0); // pushes out the 5.0
-        let bars = s.bars(); // window max 40 → [10/40, 20/40, 40/40]
+        let bars = s.bars(0.0); // window max 40 → [10/40, 20/40, 40/40]
         assert!((bars[0] - 0.25).abs() < 1e-6);
         assert!((bars[1] - 0.5).abs() < 1e-6);
         assert!((bars[2] - 1.0).abs() < 1e-6);
@@ -196,7 +220,7 @@ mod tests {
         let mut s = Sparkline::new(4);
         s.push(10.0);
         s.push(20.0);
-        let bars = s.bars(); // two leading zeros, then 0.5, 1.0
+        let bars = s.bars(0.0); // two leading zeros, then 0.5, 1.0
         assert_eq!(bars[0], 0.0);
         assert_eq!(bars[1], 0.0);
         assert!((bars[2] - 0.5).abs() < 1e-6);
@@ -208,7 +232,7 @@ mod tests {
         let mut s = Sparkline::new(2);
         s.push(f32::NAN);
         s.push(f32::INFINITY);
-        assert!(s.bars().iter().all(|&b| b == 0.0));
+        assert!(s.bars(0.0).iter().all(|&b| b == 0.0));
         assert_eq!(s.window_max(), 0.0);
     }
 }
