@@ -199,7 +199,10 @@ mod tests {
         // back to the shared default.
         let sets: Vec<&str> = STRUCTURAL.iter().map(|m| material_set_for(*m)).collect();
         for (i, a) in sets.iter().enumerate() {
-            assert_ne!(*a, "hull_panel", "a structural material fell back to the shared set");
+            assert_ne!(
+                *a, "hull_panel",
+                "a structural material fell back to the shared set"
+            );
             for b in sets.iter().skip(i + 1) {
                 assert_ne!(a, b, "two structural materials share a set name");
             }

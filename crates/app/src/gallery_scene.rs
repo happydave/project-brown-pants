@@ -30,7 +30,10 @@ impl Plugin for GalleryScenePlugin {
             .insert_resource(Selected(None))
             .insert_resource(SpinOn(true))
             .add_systems(Startup, setup)
-            .add_systems(Update, (camera_input, orbit_camera, spin_parts, update_inspector));
+            .add_systems(
+                Update,
+                (camera_input, orbit_camera, spin_parts, update_inspector),
+            );
     }
 }
 
@@ -256,10 +259,7 @@ fn spin_parts(spin: Res<SpinOn>, time: Res<Time>, mut q: Query<&mut Transform, W
     }
 }
 
-fn update_inspector(
-    sel: Res<Selected>,
-    mut q: Query<&mut Text, With<InspectorText>>,
-) {
+fn update_inspector(sel: Res<Selected>, mut q: Query<&mut Text, With<InspectorText>>) {
     if !sel.is_changed() {
         return;
     }

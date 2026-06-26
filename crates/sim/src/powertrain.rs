@@ -61,10 +61,30 @@ impl MotorTier {
     /// The stats for this tier.
     pub fn spec(self) -> MotorSpec {
         match self {
-            MotorTier::Economy => MotorSpec { max_torque: 1.2e3, top_speed: 600.0, mass: 30.0, draw: 0.8 },
-            MotorTier::Standard => MotorSpec { max_torque: 2.5e3, top_speed: 850.0, mass: 60.0, draw: 1.0 },
-            MotorTier::Performance => MotorSpec { max_torque: 4.0e3, top_speed: 1200.0, mass: 90.0, draw: 1.4 },
-            MotorTier::Heavy => MotorSpec { max_torque: 6.0e3, top_speed: 500.0, mass: 160.0, draw: 1.6 },
+            MotorTier::Economy => MotorSpec {
+                max_torque: 1.2e3,
+                top_speed: 600.0,
+                mass: 30.0,
+                draw: 0.8,
+            },
+            MotorTier::Standard => MotorSpec {
+                max_torque: 2.5e3,
+                top_speed: 850.0,
+                mass: 60.0,
+                draw: 1.0,
+            },
+            MotorTier::Performance => MotorSpec {
+                max_torque: 4.0e3,
+                top_speed: 1200.0,
+                mass: 90.0,
+                draw: 1.4,
+            },
+            MotorTier::Heavy => MotorSpec {
+                max_torque: 6.0e3,
+                top_speed: 500.0,
+                mass: 160.0,
+                draw: 1.6,
+            },
         }
     }
 
@@ -276,7 +296,10 @@ mod tests {
         assert_eq!(perf.top_speed, MotorTier::Performance.spec().top_speed);
         // Two engines run parallel motors → double torque.
         let twin = build_powertrain(Some(MotorTier::Performance), 2, 1, 0, 0, 100.0, 4);
-        assert_eq!(twin.max_torque, 2.0 * MotorTier::Performance.spec().max_torque);
+        assert_eq!(
+            twin.max_torque,
+            2.0 * MotorTier::Performance.spec().max_torque
+        );
     }
 
     #[test]

@@ -67,34 +67,188 @@ pub struct CatalogPart {
 /// The shipped part catalog (mirrors `mechanical-kit/parts/manifest.json`).
 pub const CATALOG: &[CatalogPart] = &[
     // Drivetrain
-    CatalogPart { name: "tire", category: PartCategory::Drivetrain, material_set: "rubber", orientation: "+X axle; rolls +Z", verts: 192, device: None },
-    CatalogPart { name: "rim", category: PartCategory::Drivetrain, material_set: "metal_panel", orientation: "+X axle", verts: 256, device: None },
-    CatalogPart { name: "suspension", category: PartCategory::Drivetrain, material_set: "metal_panel", orientation: "strut +Y to chassis", verts: 152, device: None },
-    CatalogPart { name: "motor", category: PartCategory::Drivetrain, material_set: "motor_casing", orientation: "+X axle; shaft +X", verts: 792, device: Some(DeviceKind::Engine) },
+    CatalogPart {
+        name: "tire",
+        category: PartCategory::Drivetrain,
+        material_set: "rubber",
+        orientation: "+X axle; rolls +Z",
+        verts: 192,
+        device: None,
+    },
+    CatalogPart {
+        name: "rim",
+        category: PartCategory::Drivetrain,
+        material_set: "metal_panel",
+        orientation: "+X axle",
+        verts: 256,
+        device: None,
+    },
+    CatalogPart {
+        name: "suspension",
+        category: PartCategory::Drivetrain,
+        material_set: "metal_panel",
+        orientation: "strut +Y to chassis",
+        verts: 152,
+        device: None,
+    },
+    CatalogPart {
+        name: "motor",
+        category: PartCategory::Drivetrain,
+        material_set: "motor_casing",
+        orientation: "+X axle; shaft +X",
+        verts: 792,
+        device: Some(DeviceKind::Engine),
+    },
     // Power
-    CatalogPart { name: "battery", category: PartCategory::Power, material_set: "battery", orientation: "upright; terminals +Y", verts: 304, device: Some(DeviceKind::Battery) },
-    CatalogPart { name: "solar_panel", category: PartCategory::Power, material_set: "solar_cells", orientation: "panel in XZ, normal +Y", verts: 80, device: None },
-    CatalogPart { name: "solar_panel_2x1", category: PartCategory::Power, material_set: "solar_cells_2x1", orientation: "panel in XZ, normal +Y", verts: 80, device: None },
+    CatalogPart {
+        name: "battery",
+        category: PartCategory::Power,
+        material_set: "battery",
+        orientation: "upright; terminals +Y",
+        verts: 304,
+        device: Some(DeviceKind::Battery),
+    },
+    CatalogPart {
+        name: "solar_panel",
+        category: PartCategory::Power,
+        material_set: "solar_cells",
+        orientation: "panel in XZ, normal +Y",
+        verts: 80,
+        device: None,
+    },
+    CatalogPart {
+        name: "solar_panel_2x1",
+        category: PartCategory::Power,
+        material_set: "solar_cells_2x1",
+        orientation: "panel in XZ, normal +Y",
+        verts: 80,
+        device: None,
+    },
     // Cockpit
-    CatalogPart { name: "seat", category: PartCategory::Cockpit, material_set: "seat_fabric", orientation: "faces +Z, up +Y", verts: 48, device: Some(DeviceKind::Command) },
-    CatalogPart { name: "seat_leather", category: PartCategory::Cockpit, material_set: "leather_light", orientation: "faces +Z, up +Y", verts: 48, device: Some(DeviceKind::Command) },
-    CatalogPart { name: "steering_wheel", category: PartCategory::Cockpit, material_set: "leather_light", orientation: "rim in XY, faces +Z", verts: 664, device: None },
-    CatalogPart { name: "tablet", category: PartCategory::Cockpit, material_set: "screen_ui", orientation: "screen faces +Z", verts: 56, device: Some(DeviceKind::Computer) },
+    CatalogPart {
+        name: "seat",
+        category: PartCategory::Cockpit,
+        material_set: "seat_fabric",
+        orientation: "faces +Z, up +Y",
+        verts: 48,
+        device: Some(DeviceKind::Command),
+    },
+    CatalogPart {
+        name: "seat_leather",
+        category: PartCategory::Cockpit,
+        material_set: "leather_light",
+        orientation: "faces +Z, up +Y",
+        verts: 48,
+        device: Some(DeviceKind::Command),
+    },
+    CatalogPart {
+        name: "steering_wheel",
+        category: PartCategory::Cockpit,
+        material_set: "leather_light",
+        orientation: "rim in XY, faces +Z",
+        verts: 664,
+        device: None,
+    },
+    CatalogPart {
+        name: "tablet",
+        category: PartCategory::Cockpit,
+        material_set: "screen_ui",
+        orientation: "screen faces +Z",
+        verts: 56,
+        device: Some(DeviceKind::Computer),
+    },
     // Structure
-    CatalogPart { name: "bumper", category: PartCategory::Structure, material_set: "metal_panel", orientation: "long axis +X, front +Z", verts: 56, device: None },
+    CatalogPart {
+        name: "bumper",
+        category: PartCategory::Structure,
+        material_set: "metal_panel",
+        orientation: "long axis +X, front +Z",
+        verts: 56,
+        device: None,
+    },
     // Comms
-    CatalogPart { name: "antenna", category: PartCategory::Comms, material_set: "metal_panel", orientation: "mast along +Y", verts: 610, device: None },
-    CatalogPart { name: "dish_small", category: PartCategory::Comms, material_set: "white_hull", orientation: "opens +Z", verts: 610, device: None },
-    CatalogPart { name: "dish_large", category: PartCategory::Comms, material_set: "white_hull", orientation: "opens +Z", verts: 610, device: None },
+    CatalogPart {
+        name: "antenna",
+        category: PartCategory::Comms,
+        material_set: "metal_panel",
+        orientation: "mast along +Y",
+        verts: 610,
+        device: None,
+    },
+    CatalogPart {
+        name: "dish_small",
+        category: PartCategory::Comms,
+        material_set: "white_hull",
+        orientation: "opens +Z",
+        verts: 610,
+        device: None,
+    },
+    CatalogPart {
+        name: "dish_large",
+        category: PartCategory::Comms,
+        material_set: "white_hull",
+        orientation: "opens +Z",
+        verts: 610,
+        device: None,
+    },
     // Rocket
-    CatalogPart { name: "fuel_tank", category: PartCategory::Rocket, material_set: "white_hull", orientation: "axis +Y; stacks up", verts: 128, device: Some(DeviceKind::Tank) },
-    CatalogPart { name: "nose_cone", category: PartCategory::Rocket, material_set: "white_hull", orientation: "axis +Y; tip up", verts: 33, device: None },
-    CatalogPart { name: "engine_bell", category: PartCategory::Rocket, material_set: "heat_metal", orientation: "axis +Y; exit -Y", verts: 64, device: Some(DeviceKind::Engine) },
-    CatalogPart { name: "decoupler", category: PartCategory::Rocket, material_set: "metal_panel", orientation: "axis +Y; band", verts: 128, device: None },
-    CatalogPart { name: "fin", category: PartCategory::Rocket, material_set: "metal_panel", orientation: "blade +X, up +Y", verts: 24, device: None },
+    CatalogPart {
+        name: "fuel_tank",
+        category: PartCategory::Rocket,
+        material_set: "white_hull",
+        orientation: "axis +Y; stacks up",
+        verts: 128,
+        device: Some(DeviceKind::Tank),
+    },
+    CatalogPart {
+        name: "nose_cone",
+        category: PartCategory::Rocket,
+        material_set: "white_hull",
+        orientation: "axis +Y; tip up",
+        verts: 33,
+        device: None,
+    },
+    CatalogPart {
+        name: "engine_bell",
+        category: PartCategory::Rocket,
+        material_set: "heat_metal",
+        orientation: "axis +Y; exit -Y",
+        verts: 64,
+        device: Some(DeviceKind::Engine),
+    },
+    CatalogPart {
+        name: "decoupler",
+        category: PartCategory::Rocket,
+        material_set: "metal_panel",
+        orientation: "axis +Y; band",
+        verts: 128,
+        device: None,
+    },
+    CatalogPart {
+        name: "fin",
+        category: PartCategory::Rocket,
+        material_set: "metal_panel",
+        orientation: "blade +X, up +Y",
+        verts: 24,
+        device: None,
+    },
     // Fittings
-    CatalogPart { name: "hatch_round", category: PartCategory::Fitting, material_set: "metal_panel", orientation: "disc in XY, faces +Z", verts: 328, device: None },
-    CatalogPart { name: "hatch_rect", category: PartCategory::Fitting, material_set: "metal_panel", orientation: "panel in XY, faces +Z", verts: 72, device: None },
+    CatalogPart {
+        name: "hatch_round",
+        category: PartCategory::Fitting,
+        material_set: "metal_panel",
+        orientation: "disc in XY, faces +Z",
+        verts: 328,
+        device: None,
+    },
+    CatalogPart {
+        name: "hatch_rect",
+        category: PartCategory::Fitting,
+        material_set: "metal_panel",
+        orientation: "panel in XY, faces +Z",
+        verts: 72,
+        device: None,
+    },
 ];
 
 /// The catalog entry for `name`, if any.
@@ -197,7 +351,11 @@ pub fn part_build_pose(kind: PartKind, mount: Vec3, normal: Vec3, cell: f32) -> 
         _ => (Vec3::Y, true),
     };
     let rotation = Quat::from_rotation_arc(axis, n);
-    let translation = if at_face { mount - n * (cell * 0.5) } else { mount };
+    let translation = if at_face {
+        mount - n * (cell * 0.5)
+    } else {
+        mount
+    };
     (translation, rotation)
 }
 
@@ -292,7 +450,10 @@ mod tests {
             DeviceKind::Battery,
         ] {
             if let Some(name) = device_part_name(k) {
-                assert!(catalog_part(name).is_some(), "{name} not in catalog for {k:?}");
+                assert!(
+                    catalog_part(name).is_some(),
+                    "{name} not in catalog for {k:?}"
+                );
             }
         }
     }
@@ -301,7 +462,10 @@ mod tests {
     fn face_normal_reads_top_and_side_and_falls_back() {
         use sounding_sim::voxel::{Material, Voxel};
         let mut craft = VoxelCraft::new(1.0);
-        craft.voxels.push(Voxel { cell: IVec3::new(0, 0, 0), material: Material::ALUMINIUM });
+        craft.voxels.push(Voxel {
+            cell: IVec3::new(0, 0, 0),
+            material: Material::ALUMINIUM,
+        });
         // A part placed on the top face sits in the empty cell above → normal +Y.
         let top = (IVec3::new(0, 1, 0).as_dvec3() + DVec3::splat(0.5)) * 1.0;
         assert_eq!(part_face_normal(&craft, top), Vec3::Y);
@@ -329,7 +493,11 @@ mod tests {
     #[test]
     fn catalog_covers_all_categories() {
         for c in PartCategory::ORDER {
-            assert!(CATALOG.iter().any(|p| p.category == c), "no parts in {:?}", c);
+            assert!(
+                CATALOG.iter().any(|p| p.category == c),
+                "no parts in {:?}",
+                c
+            );
         }
     }
 }
