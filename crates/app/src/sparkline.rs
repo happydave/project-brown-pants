@@ -69,58 +69,50 @@ impl Sparkline {
     }
 }
 
-/// The bar-row container of one sparkline panel.
+/// One bar of a sparkline, identified by its owning `panel` and left→right `index` (WI 645/646): the
+/// `panel` id scopes updates so the overlay (WI 646) can host several sparklines at once.
 #[derive(Component)]
-pub struct SparklinePanel;
+pub struct SparkBar {
+    pub panel: usize,
+    pub index: usize,
+}
 
-/// One bar in a sparkline panel, by left→right index.
+/// The numeric label above a sparkline, by owning `panel` (current value + window max).
 #[derive(Component)]
-pub struct SparkBar(pub usize);
+pub struct SparklineLabel {
+    pub panel: usize,
+}
 
-/// The numeric label drawn above a sparkline (current value + window max).
-#[derive(Component)]
-pub struct SparklineLabel;
-
-/// Spawn a sparkline widget (label + bar row) at an absolute screen position, returning the root
-/// entity. `title` names the signal; the label text is updated each frame by the scene. Designed so a
-/// scene spawns one (WI 645) and the overlay (WI 646) can spawn several at different anchors.
-pub fn spawn_sparkline(commands: &mut Commands, top_px: f32, left_px: f32, title: &str) -> Entity {
-    commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                top: Val::Px(top_px),
-                left: Val::Px(left_px),
-                flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(2.0),
-                ..default()
-            },
-            // Faint backdrop so bars read over any scene.
-            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.35)),
-        ))
-        .with_children(|root| {
-            root.spawn((
+/// Spawn one sparkline widget (label + bar row) for `panel` as a child of the current builder (WI 646
+/// stacks several in a box; WI 645 a single one). `title` names the signal; the label is updated each
+/// frame via [`apply_panel`].
+pub fn spawn_panel(parent: &mut ChildSpawnerCommands, panel: usize, title: &str) {
+    parent
+        .spawn(Node {
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(1.0),
+            margin: UiRect::bottom(Val::Px(4.0)),
+            ..default()
+        })
+        .with_children(|w| {
+            w.spawn((
                 Text::new(format!("{title}: --")),
                 TextFont {
-                    font_size: 13.0,
+                    font_size: 12.0,
                     ..default()
                 },
                 TextColor(Color::srgb(0.8, 0.9, 1.0)),
-                SparklineLabel,
+                SparklineLabel { panel },
             ));
-            root.spawn((
-                Node {
-                    width: Val::Px(SPARK_BARS as f32 * BAR_WIDTH),
-                    height: Val::Px(PANEL_HEIGHT),
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::FlexEnd, // bars grow up from the baseline
-                    column_gap: Val::Px(0.0),
-                    ..default()
-                },
-                SparklinePanel,
-            ))
+            w.spawn(Node {
+                width: Val::Px(SPARK_BARS as f32 * BAR_WIDTH),
+                height: Val::Px(PANEL_HEIGHT),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::FlexEnd, // bars grow up from the baseline
+                ..default()
+            })
             .with_children(|row| {
-                for i in 0..SPARK_BARS {
+                for index in 0..SPARK_BARS {
                     row.spawn((
                         Node {
                             width: Val::Px(BAR_WIDTH - 1.0),
@@ -129,24 +121,28 @@ pub fn spawn_sparkline(commands: &mut Commands, top_px: f32, left_px: f32, title
                             ..default()
                         },
                         BackgroundColor(Color::srgb(0.25, 0.85, 0.95)),
-                        SparkBar(i),
+                        SparkBar { panel, index },
                     ));
                 }
             });
-        })
-        .id()
+        });
 }
 
-/// Apply normalised `bars` to the bar nodes (height = `bars[i] · PANEL_HEIGHT`) and tint the newest
-/// bar warmer the closer it is to the window peak, so a fresh spike pops. The caller filters the
-/// query to one panel's bars when several exist (WI 646).
-pub fn apply_bars(bars: &[f32], query: &mut Query<(&SparkBar, &mut Node, &mut BackgroundColor)>) {
+/// Apply normalised `bars` to one `panel`'s bar nodes (height = `bars[i] · PANEL_HEIGHT`), tinting
+/// cool→hot by height so a fresh spike pops. Other panels' bars are left untouched.
+pub fn apply_panel(
+    panel: usize,
+    bars: &[f32],
+    query: &mut Query<(&SparkBar, &mut Node, &mut BackgroundColor)>,
+) {
     let cool = Color::srgb(0.25, 0.85, 0.95);
     let hot = Color::srgb(0.95, 0.45, 0.25);
     for (bar, mut node, mut color) in query.iter_mut() {
-        let h = bars.get(bar.0).copied().unwrap_or(0.0);
+        if bar.panel != panel {
+            continue;
+        }
+        let h = bars.get(bar.index).copied().unwrap_or(0.0);
         node.height = Val::Px(h * PANEL_HEIGHT);
-        // Mix cool→hot by height so tall (near-peak) bars read warm.
         *color = BackgroundColor(cool.mix(&hot, h));
     }
 }

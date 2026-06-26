@@ -71,9 +71,7 @@ use crate::editor::{
     Brush, EditorState, HoverState, OrbitCam, PaletteEntry, PointerOnPalette, PALETTE_GROUPS,
 };
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
-use crate::sparkline::{
-    apply_bars, spawn_sparkline, SparkBar, Sparkline, SparklineLabel, SPARK_BARS,
-};
+use crate::overlay::{spawn_overlay, update_overlay, CockpitOverlay};
 use crate::voxel_skin::{pbr_material, skin_submeshes, VoxelSkin};
 
 const BODY: CentralBody = CentralBody::EARTHLIKE;
@@ -864,7 +862,7 @@ impl Plugin for WorkshopScenePlugin {
             .init_resource::<OrbitCam>()
             .init_resource::<HoverState>()
             .init_resource::<PointerOnPalette>()
-            .insert_resource(JitterSpark(Sparkline::new(SPARK_BARS)))
+            .init_resource::<CockpitOverlay>()
             .add_systems(OnEnter(WorkshopMode::Build), enter_build)
             .add_systems(OnExit(WorkshopMode::Build), exit_build)
             .add_systems(OnEnter(WorkshopMode::Test), enter_test)
@@ -911,7 +909,7 @@ impl Plugin for WorkshopScenePlugin {
                     follow_camera,
                     draw_rover,
                     update_test_hud,
-                    update_jitter_spark,
+                    update_overlay,
                 )
                     .chain()
                     .run_if(in_state(WorkshopMode::Test)),
@@ -1339,11 +1337,11 @@ fn enter_test(
             },
             TestEntity,
         ));
-        // Live contact-jitter sparkline (WI 645), fresh each Test session; TestEntity-tagged so it is
-        // cleaned up on exit (recursive despawn covers its label + bars).
-        commands.insert_resource(JitterSpark(Sparkline::new(SPARK_BARS)));
-        let spark = spawn_sparkline(&mut commands, 70.0, 12.0, "contact_jitter");
-        commands.entity(spark).insert(TestEntity);
+        // Cockpit overlay (WI 646), fresh each Test session; TestEntity-tagged so it is cleaned up on
+        // exit (recursive despawn covers its panels). `G` toggles it.
+        commands.insert_resource(CockpitOverlay::default());
+        let overlay = spawn_overlay(&mut commands);
+        commands.entity(overlay).insert(TestEntity);
 
         // Solid render (WI 608): chassis skin mesh + a tyre mesh per wheel + cosmetic part meshes,
         // all positioned each frame by `track_rover_meshes`. Replaces the gizmo cuboid + spheres.
@@ -1629,33 +1627,6 @@ fn drive_rover(keys: &ButtonInput<KeyCode>, world: &mut WorkshopWorld, dt: f64) 
     let steer = rs.steer.clone();
     let steer_input = rs.steer_input;
     rs.rover.set_steer(steer_input, max_angle, &steer);
-}
-
-/// The `contact_jitter` sparkline's sample ring for the workshop Test (WI 645).
-#[derive(Resource)]
-struct JitterSpark(Sparkline);
-
-/// Samples `contact_jitter` from the published rover telemetry into the Test sparkline (WI 645).
-fn update_jitter_spark(
-    grounded: Res<GroundedRover>,
-    mut spark: ResMut<JitterSpark>,
-    mut bars: Query<(&SparkBar, &mut Node, &mut BackgroundColor)>,
-    mut label: Query<&mut Text, With<SparklineLabel>>,
-) {
-    let v = grounded
-        .0
-        .as_ref()
-        .map(|r| r.contact_jitter as f32)
-        .unwrap_or(0.0);
-    spark.0.push(v);
-    apply_bars(&spark.0.bars(), &mut bars);
-    if let Ok(mut text) = label.single_mut() {
-        text.0 = format!(
-            "contact_jitter {:.2} (max {:.1})",
-            spark.0.latest(),
-            spark.0.window_max()
-        );
-    }
 }
 
 /// Publishes the Test rover's live state onto the bus bridge each frame (WI 640), so
