@@ -132,6 +132,11 @@ const OBSTACLE_CONTACT_DAMP: f64 = 40.0;
 /// Minimum closing speed (m/s) for an obstacle contact to count as an "impact" for the diagnostic
 /// (WI 618) — filters out resting/leaning/sliding contact so only real knocks are reported.
 const IMPACT_MIN_CLOSING: f64 = 1.0;
+/// Chassis fracture (WI 629/672) requires a closing speed above this multiple of the build's toughest
+/// wheel shear rating, so the chassis only fractures on a hit clearly harder than any wheel's shear —
+/// wheels stay the fuse at any build scale/material. Scale-relative (tied to `Wheel::shear_speed`),
+/// not an absolute constant. Tunable by feel.
+const ROVER_FRACTURE_SHEAR_FACTOR: f64 = 1.5;
 /// Duration of the post-impact watch (s): how long after an impact to watch for a kraken / fall-through.
 const IMPACT_WATCH_SECONDS: f64 = 2.5;
 /// Post-impact kraken thresholds (WI 618): angular speed (rad/s) and vertical bounce (m/s) above which
@@ -1817,6 +1822,15 @@ fn step_workshop(time: Res<Time>, mut clock: ResMut<SimClock>, mut world: ResMut
         let rover_bounds = craft_bounds(&rs.lattice);
         let com = rs.com;
         let contact = ContactParams::default();
+        // Chassis fracture gate (WI 672): a closing speed above this — clearly harder than the
+        // toughest wheel's shear rating — is what fractures the chassis, so wheels shear first and a
+        // gentle/leaning contact never fractures.
+        let fracture_closing = ROVER_FRACTURE_SHEAR_FACTOR
+            * rs.rover
+                .wheels
+                .iter()
+                .map(|w| w.shear_speed)
+                .fold(0.0_f64, f64::max);
         let mut n = 0;
         while rs.accumulator >= ROVER_SUBSTEP_DT && n < ROVER_MAX_SUBSTEPS {
             let mut any_contact = false;
@@ -1836,6 +1850,9 @@ fn step_workshop(time: Res<Time>, mut clock: ResMut<SimClock>, mut world: ResMut
                     DVec3::ZERO,
                     &contact,
                 );
+                // The genuine structural contact load, before the rebound-kill damping is layered on
+                // for motion (WI 672): fracture is decided from this, not the ×40 damped force.
+                let raw_force = force;
                 // Kill the elastic rebound: when in contact and still moving *into* the obstacle,
                 // add unclamped damping along the contact normal so it thuds and stops.
                 if force.length_squared() > 1e-9 {
@@ -1861,11 +1878,12 @@ fn step_workshop(time: Res<Time>, mut clock: ResMut<SimClock>, mut world: ResMut
                     rs.drive.retain(|&x| x != idx);
                     rs.steer.retain(|&x| x != idx);
                 }
-                // Chassis fracture (WI 629): the transmitted obstacle contact force, run through the
-                // material-strength proxy — a hard enough hit splits the chassis into debris. Recorded
+                // Chassis fracture (WI 629, gated WI 672): only a hit clearly harder than the wheels'
+                // shear rating runs the chassis through the material-strength proxy — keyed on closing
+                // speed (so leaning/slow contact never fractures) with the *raw* contact load. Recorded
                 // here, applied after the obstacle loop (keeps `&rs.obstacles` borrowed immutably).
-                if fracture_pending.is_none() {
-                    fracture_pending = fracture_on_impact(&rs.lattice, &rs.rover.body, force);
+                if closing > fracture_closing && fracture_pending.is_none() {
+                    fracture_pending = fracture_on_impact(&rs.lattice, &rs.rover.body, raw_force);
                 }
                 // Diagnostic: build a report for a notable impact; log shears immediately (so a
                 // sustained square-on hit still reports), and remember a non-shearing episode's peak
