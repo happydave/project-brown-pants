@@ -116,6 +116,9 @@ pub struct WheelTelemetry {
     /// sheared. Additive/serde-defaulted. Lets a reader tell a grazing wheel from a loaded one.
     #[serde(default)]
     pub tire_contact: bool,
+    /// Longitudinal slip ratio (WI 650): large magnitude ⇒ wheelspin/lock-up. Additive/serde-defaulted.
+    #[serde(default)]
+    pub slip_ratio: f64,
 }
 
 impl RoverTelemetry {
@@ -154,6 +157,7 @@ impl RoverTelemetry {
                     rim_bent: w.rim_bent,
                     damper_blown: w.damper_blown,
                     tire_contact: w.tire_contact,
+                    slip_ratio: w.slip_ratio,
                 })
                 .collect(),
         }

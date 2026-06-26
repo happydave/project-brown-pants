@@ -255,6 +255,10 @@ pub struct Wheel {
     /// An observability signal (telemetry) that disambiguates `contact_jitter` — airborne vs slamming
     /// vs resting; an inert/sheared or airborne wheel is `false`. Not used by the physics.
     pub tire_contact: bool,
+    /// Longitudinal slip ratio on the last [`step`] (WI 650): `(wheel_speed − v_long) / (|v_long| + 1)`.
+    /// Large magnitude ⇒ wheelspin (driving) or lock-up (braking). An observability signal; 0 for an
+    /// inert/airborne wheel. Surfaced in telemetry and used by the WI 651 traction control.
+    pub slip_ratio: f64,
 }
 
 impl Wheel {
@@ -301,6 +305,7 @@ impl Wheel {
             rim_bent: false,
             damper_blown: false,
             tire_contact: false,
+            slip_ratio: 0.0,
         }
     }
 
@@ -441,6 +446,8 @@ impl Rover {
             // Contact observability (WI 642): reset each step; set true below once the wheel is found to
             // carry ground load. A sheared/airborne wheel leaves it false.
             w.tire_contact = false;
+            // Slip observability (WI 650): reset each step; set below for a contacting wheel.
+            w.slip_ratio = 0.0;
             // A sheared-off wheel (WI 618) exerts nothing and does not spin.
             if w.inert {
                 continue;
@@ -577,6 +584,7 @@ impl Rover {
             };
             let fmax = material.friction * w.grip_scale * n_grip;
             let slip_ratio = (wheel_speed - v_long) / (v_long.abs() + 1.0);
+            w.slip_ratio = slip_ratio; // observability (WI 650)
             let slip_angle = (-v_lat).atan2(v_long.abs() + EPS);
             let (fx, fy) = tire_forces(slip_ratio, slip_angle, fmax, w.slip_long, w.slip_lat);
             // Rolling resistance, scaled up for a damaged corner (blown tire / bent rim, WI 631b).
@@ -1539,6 +1547,45 @@ mod tests {
         assert!(
             rover.wheels.iter().all(|w| !w.tire_contact),
             "a high-airborne rover should have no wheel in contact"
+        );
+    }
+
+    #[test]
+    fn slip_ratio_reflects_wheelspin() {
+        // WI 650: a settled rover with a huge drive torque spins its wheels far faster than it moves,
+        // so the slip ratio runs high (wheelspin); a freshly settled, undriven rover has ~no slip.
+        let terrain = Terrain {
+            amplitude: 0.0,
+            ..Default::default()
+        };
+        let mut rover = station_assembly(SuspensionSpec::new(), TireSpec::new(0.1), &terrain).rover;
+        for _ in 0..6_000 {
+            rover.step(&terrain, DT);
+        }
+        assert!(
+            rover.wheels.iter().all(|w| w.slip_ratio.abs() < 0.2),
+            "an idle settled rover barely slips: {:?}",
+            rover
+                .wheels
+                .iter()
+                .map(|w| w.slip_ratio)
+                .collect::<Vec<_>>()
+        );
+        // Floor it: a large torque spins the wheels out.
+        for _ in 0..400 {
+            for w in &mut rover.wheels {
+                w.drive_torque = 5.0e4;
+            }
+            rover.step(&terrain, DT);
+        }
+        assert!(
+            rover.wheels.iter().any(|w| w.slip_ratio > 0.5),
+            "a hard launch spins the wheels (high slip): {:?}",
+            rover
+                .wheels
+                .iter()
+                .map(|w| w.slip_ratio)
+                .collect::<Vec<_>>()
         );
     }
 

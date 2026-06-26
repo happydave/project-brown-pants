@@ -2241,7 +2241,10 @@ fn draw_rover(mut gizmos: Gizmos, world: Res<WorkshopWorld>) {
         let spin = DQuat::from_axis_angle(axle, rs.spin_angle[i]);
         let a = spin * forward * (w.radius * 0.85);
         let b = spin * axle.cross(forward) * (w.radius * 0.85);
-        let spoke = Color::srgb(0.55, 0.55, 0.6);
+        // Spin-out indicator (WI 650): tint the spokes cool→hot by |slip| so wheelspin (which at high
+        // spin aliases into a static-looking blur) reads at a glance — grippy is grey, lit-up is red.
+        let slip = (w.slip_ratio.abs() / 1.0).clamp(0.0, 1.0) as f32;
+        let spoke = Color::srgb(0.55, 0.55, 0.6).mix(&Color::srgb(1.0, 0.25, 0.1), slip);
         gizmos.line(to_render(face - a), to_render(face + a), spoke);
         gizmos.line(to_render(face - b), to_render(face + b), spoke);
     }

@@ -14,15 +14,17 @@ use sounding_sim::telemetry::RoverTelemetry;
 pub enum RoverSignal {
     ContactJitter,
     Speed,
+    WheelSlip,
     AngularSpeed,
     HullPenetration,
 }
 
 impl RoverSignal {
     /// The cockpit's signal set, in display order.
-    pub const ALL: [RoverSignal; 4] = [
+    pub const ALL: [RoverSignal; 5] = [
         RoverSignal::ContactJitter,
         RoverSignal::Speed,
+        RoverSignal::WheelSlip,
         RoverSignal::AngularSpeed,
         RoverSignal::HullPenetration,
     ];
@@ -32,6 +34,7 @@ impl RoverSignal {
         match self {
             RoverSignal::ContactJitter => "contact_jitter",
             RoverSignal::Speed => "speed m/s",
+            RoverSignal::WheelSlip => "wheel slip",
             RoverSignal::AngularSpeed => "ang.vel rad/s",
             RoverSignal::HullPenetration => "hull_pen m",
         }
@@ -43,6 +46,12 @@ impl RoverSignal {
         let x = match self {
             RoverSignal::ContactJitter => r.contact_jitter,
             RoverSignal::Speed => mag(r.velocity),
+            // Peak |slip ratio| across the wheels — wheelspin (or lock-up) reads as a spike (WI 650).
+            RoverSignal::WheelSlip => r
+                .wheels
+                .iter()
+                .map(|w| w.slip_ratio.abs())
+                .fold(0.0, f64::max),
             RoverSignal::AngularSpeed => mag(r.angular_velocity),
             RoverSignal::HullPenetration => r.hull_penetration,
         };
@@ -55,7 +64,8 @@ impl RoverSignal {
         match self {
             RoverSignal::ContactJitter => 30.0, // resting ~0.006; a real bump fills, a kraken spike rescales
             RoverSignal::Speed => 20.0,         // m/s
-            RoverSignal::AngularSpeed => 5.0,   // rad/s
+            RoverSignal::WheelSlip => 1.0, // slip ratio; ~0.1–0.2 is grip, >0.5 is spinning out
+            RoverSignal::AngularSpeed => 5.0, // rad/s
             RoverSignal::HullPenetration => 0.1, // m
         }
     }
@@ -124,6 +134,7 @@ pub fn spawn_overlay(commands: &mut Commands) -> Entity {
 /// the sim is **running**, decimated to a readable rate — sample every signal from the published rover
 /// telemetry into its ring and update its panel + label. So the sparklines **freeze with the game**
 /// (pause / replay) and scroll at a sane pace. Shared by the rover and workshop scenes.
+#[allow(clippy::too_many_arguments)]
 pub fn update_overlay(
     keys: Res<ButtonInput<KeyCode>>,
     clock: Res<sounding_sim::sim::SimClock>,
