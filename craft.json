@@ -1,0 +1,659 @@
+{
+  "format_version": 1,
+  "payload": {
+    "kind": "craft",
+    "id": "editor-craft",
+    "name": "Editor Craft",
+    "reference_position": {
+      "frame": 0,
+      "pos": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "craft": {
+      "cell_size": 0.1,
+      "voxels": [
+        {
+          "cell": [
+            0,
+            0,
+            0
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 3000000.0
+          }
+        },
+        {
+          "cell": [
+            0,
+            0,
+            1
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 3000000.0
+          }
+        },
+        {
+          "cell": [
+            1,
+            0,
+            0
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 3000000.0
+          }
+        },
+        {
+          "cell": [
+            1,
+            0,
+            1
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 3000000.0
+          }
+        },
+        {
+          "cell": [
+            0,
+            0,
+            2
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            0,
+            0,
+            3
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            0,
+            0,
+            4
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            0,
+            0,
+            5
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            0,
+            0,
+            6
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            0,
+            0,
+            7
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            0,
+            0,
+            8
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            1,
+            0,
+            2
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            1,
+            0,
+            3
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            1,
+            0,
+            4
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            1,
+            0,
+            5
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            1,
+            0,
+            6
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            1,
+            0,
+            7
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            1,
+            0,
+            8
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            2,
+            0,
+            8
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            2,
+            0,
+            7
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            3,
+            0,
+            7
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            -1,
+            0,
+            7
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            -1,
+            0,
+            8
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            -2,
+            0,
+            7
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            1,
+            0,
+            -1
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            1,
+            0,
+            -2
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            1,
+            0,
+            -3
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            1,
+            0,
+            -4
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            0,
+            0,
+            -1
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            0,
+            0,
+            -2
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            0,
+            0,
+            -3
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            0,
+            0,
+            -4
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            -1,
+            0,
+            -4
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            -2,
+            0,
+            -4
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            2,
+            0,
+            -4
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        },
+        {
+          "cell": [
+            3,
+            0,
+            -4
+          ],
+          "material": {
+            "density": 7850.0,
+            "strength": 500000000.0
+          }
+        }
+      ],
+      "devices": [
+        {
+          "cell": [
+            0,
+            0,
+            0
+          ],
+          "mass": 0.8,
+          "kind": "command",
+          "function": {
+            "control_point": {
+              "crewed": true
+            }
+          }
+        },
+        {
+          "cell": [
+            1,
+            0,
+            1
+          ],
+          "mass": 3.0,
+          "kind": "engine",
+          "function": null
+        },
+        {
+          "cell": [
+            0,
+            0,
+            1
+          ],
+          "mass": 0.6000000000000001,
+          "kind": "tank",
+          "function": null
+        }
+      ],
+      "attachments": [],
+      "doors": [],
+      "parts": [
+        {
+          "mount": [
+            0.45,
+            0.05,
+            0.75
+          ],
+          "mass": 0.4,
+          "kind": {
+            "suspension": {
+              "rest_length": 0.034999999999999996,
+              "travel": 0.025,
+              "rigid": false
+            }
+          },
+          "station": 0
+        },
+        {
+          "mount": [
+            0.45,
+            0.05,
+            -0.35000000000000003
+          ],
+          "mass": 0.4,
+          "kind": {
+            "suspension": {
+              "rest_length": 0.034999999999999996,
+              "travel": 0.025,
+              "rigid": false
+            }
+          },
+          "station": 1
+        },
+        {
+          "mount": [
+            -0.25,
+            0.05,
+            -0.35000000000000003
+          ],
+          "mass": 0.4,
+          "kind": {
+            "suspension": {
+              "rest_length": 0.034999999999999996,
+              "travel": 0.025,
+              "rigid": false
+            }
+          },
+          "station": 2
+        },
+        {
+          "mount": [
+            -0.25,
+            0.05,
+            0.75
+          ],
+          "mass": 0.4,
+          "kind": {
+            "suspension": {
+              "rest_length": 0.034999999999999996,
+              "travel": 0.025,
+              "rigid": false
+            }
+          },
+          "station": 3
+        },
+        {
+          "mount": [
+            -0.25,
+            0.05,
+            -0.35000000000000003
+          ],
+          "mass": 0.8,
+          "kind": {
+            "rim": {
+              "radius": 0.0825,
+              "drive": true,
+              "steer": true
+            }
+          },
+          "station": 2
+        },
+        {
+          "mount": [
+            -0.25,
+            0.05,
+            -0.35000000000000003
+          ],
+          "mass": 0.8,
+          "kind": {
+            "tire": {
+              "profile": 0.06750000000000002,
+              "grip_scale": 1.35,
+              "slip_long": 4.5,
+              "slip_lat": 3.5,
+              "stiffness": 50000.0
+            }
+          },
+          "station": 2
+        },
+        {
+          "mount": [
+            -0.25,
+            0.05,
+            0.75
+          ],
+          "mass": 0.8,
+          "kind": {
+            "rim": {
+              "radius": 0.0825,
+              "drive": true,
+              "steer": true
+            }
+          },
+          "station": 3
+        },
+        {
+          "mount": [
+            -0.25,
+            0.05,
+            0.75
+          ],
+          "mass": 0.8,
+          "kind": {
+            "tire": {
+              "profile": 0.06750000000000002,
+              "grip_scale": 1.35,
+              "slip_long": 4.5,
+              "slip_lat": 3.5,
+              "stiffness": 50000.0
+            }
+          },
+          "station": 3
+        },
+        {
+          "mount": [
+            0.45,
+            0.05,
+            0.75
+          ],
+          "mass": 0.8,
+          "kind": {
+            "rim": {
+              "radius": 0.0825,
+              "drive": true,
+              "steer": true
+            }
+          },
+          "station": 0
+        },
+        {
+          "mount": [
+            0.45,
+            0.05,
+            0.75
+          ],
+          "mass": 0.8,
+          "kind": {
+            "tire": {
+              "profile": 0.06750000000000002,
+              "grip_scale": 1.35,
+              "slip_long": 4.5,
+              "slip_lat": 3.5,
+              "stiffness": 50000.0
+            }
+          },
+          "station": 0
+        },
+        {
+          "mount": [
+            0.45,
+            0.05,
+            -0.35000000000000003
+          ],
+          "mass": 0.8,
+          "kind": {
+            "rim": {
+              "radius": 0.0825,
+              "drive": true,
+              "steer": true
+            }
+          },
+          "station": 1
+        },
+        {
+          "mount": [
+            0.45,
+            0.05,
+            -0.35000000000000003
+          ],
+          "mass": 0.8,
+          "kind": {
+            "tire": {
+              "profile": 0.06750000000000002,
+              "grip_scale": 1.35,
+              "slip_long": 4.5,
+              "slip_lat": 3.5,
+              "stiffness": 50000.0
+            }
+          },
+          "station": 1
+        }
+      ]
+    },
+    "resources": [],
+    "crew": []
+  }
+}
