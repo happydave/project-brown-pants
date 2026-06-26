@@ -126,6 +126,11 @@ pub struct Device {
     /// Optional flight function (WI 570). Defaulted absent so pre-570 saves load.
     #[serde(default)]
     pub function: Option<crate::control::DeviceFunction>,
+    /// Selected motor tier (WI 652) — only meaningful on an `Engine` device; sizes the rover
+    /// drivetrain (torque / top-speed / draw). Defaulted absent so the mass-derived default applies
+    /// and pre-652 saves load.
+    #[serde(default)]
+    pub motor: Option<crate::powertrain::MotorTier>,
 }
 
 impl Device {
@@ -137,6 +142,19 @@ impl Device {
             mass,
             kind,
             function: None,
+            motor: None,
+        }
+    }
+
+    /// A rover drive motor (kind `Engine` + a selected [`MotorTier`], WI 652): its mass is the
+    /// motor's, and the assembly sizes the drivetrain torque/top-speed/draw from the tier.
+    pub fn engine(cell: IVec3, motor: crate::powertrain::MotorTier) -> Self {
+        Self {
+            cell,
+            mass: motor.spec().mass,
+            kind: DeviceKind::Engine,
+            function: None,
+            motor: Some(motor),
         }
     }
 
@@ -154,6 +172,7 @@ impl Device {
             mass,
             kind: DeviceKind::Command,
             function: Some(DeviceFunction::ControlPoint(point)),
+            motor: None,
         }
     }
 
@@ -166,6 +185,7 @@ impl Device {
             mass,
             kind: DeviceKind::Computer,
             function: Some(DeviceFunction::Computer(computer)),
+            motor: None,
         }
     }
 
@@ -178,6 +198,7 @@ impl Device {
             mass,
             kind: DeviceKind::Battery,
             function: Some(DeviceFunction::Battery(spec)),
+            motor: None,
         }
     }
 }

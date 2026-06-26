@@ -13,6 +13,7 @@ use bevy::prelude::*;
 use sounding_sim::control::{BatterySpec, ControlComputer};
 use sounding_sim::frame::{FrameId, WorldPos};
 use sounding_sim::persist::{CraftSubgraph, FormatError, Kind, Payload, SavedDocument};
+use sounding_sim::powertrain::MotorTier;
 use sounding_sim::voxel::{
     device_mass, AttachmentPoint, Axis, Device, DeviceKind, Face, Material, Part, PartKind,
     RimSpec, SuspensionSpec, TireSpec, Voxel, VoxelCraft,
@@ -179,6 +180,8 @@ pub struct EditorState {
     pub material: usize,
     pub(crate) brush: Brush,
     pub subassembly: Option<VoxelCraft>,
+    /// The motor tier a placed Engine device gets (WI 652); cycled with `M`.
+    pub(crate) motor: MotorTier,
 }
 
 impl Default for EditorState {
@@ -200,6 +203,7 @@ impl Default for EditorState {
             material: 0,
             brush: Brush::Voxel,
             subassembly: None,
+            motor: MotorTier::Standard,
         }
     }
 }
@@ -234,6 +238,7 @@ fn place_brush(
     voxel_cell: IVec3,
     device_cell: IVec3,
     wheel_mount: DVec3,
+    motor: MotorTier,
 ) {
     match brush {
         Brush::Voxel => {
@@ -317,11 +322,8 @@ fn place_brush(
                     device_mass(DeviceKind::Battery, s),
                     BatterySpec::full(120.0),
                 ),
-                Brush::Engine => Device::structural(
-                    device_cell,
-                    device_mass(DeviceKind::Engine, s),
-                    DeviceKind::Engine,
-                ),
+                // An Engine is a selectable motor (WI 652): its mass + drivetrain come from the tier.
+                Brush::Engine => Device::engine(device_cell, motor),
                 Brush::Tank => Device::structural(
                     device_cell,
                     device_mass(DeviceKind::Tank, s),
@@ -634,13 +636,23 @@ pub(crate) fn editor_input(keys: Res<ButtonInput<KeyCode>>, mut state: ResMut<Ed
         state.brush = Brush::Bumper;
     }
 
+    // Cycle the motor tier a placed Engine gets (WI 652).
+    if keys.just_pressed(KeyCode::KeyM) {
+        let i = MotorTier::ALL
+            .iter()
+            .position(|&t| t == state.motor)
+            .unwrap_or(0);
+        state.motor = MotorTier::ALL[(i + 1) % MotorTier::ALL.len()];
+    }
+
     // Place the active brush at the cursor (keyboard fallback; the mouse is the primary path).
     if keys.just_pressed(KeyCode::Space) {
         let cell = state.cursor;
         let material = PALETTE[state.material].1;
         let brush = state.brush;
         let mount = (cell.as_dvec3() + DVec3::splat(0.5)) * state.craft.cell_size;
-        place_brush(&mut state.craft, brush, material, cell, cell, mount);
+        let motor = state.motor;
+        place_brush(&mut state.craft, brush, material, cell, cell, mount, motor);
     }
     // Remove any voxel, device, or attached part at the cursor.
     if keys.just_pressed(KeyCode::Backspace) {
@@ -854,6 +866,7 @@ pub(crate) fn mouse_build(
         // hovered solid cell.
         let device_cell = h.remove_cell.unwrap_or(h.add_cell);
         let wheel_mount = (h.add_cell.as_dvec3() + DVec3::splat(0.5)) * state.craft.cell_size;
+        let motor = state.motor;
         place_brush(
             &mut state.craft,
             brush,
@@ -861,6 +874,7 @@ pub(crate) fn mouse_build(
             h.add_cell,
             device_cell,
             wheel_mount,
+            motor,
         );
     }
     if buttons.just_pressed(MouseButton::Right) {
@@ -1143,6 +1157,7 @@ mod tests {
             IVec3::ZERO,
             IVec3::ZERO,
             mount,
+            MotorTier::Standard,
         );
         let rim = craft
             .parts
@@ -1178,6 +1193,7 @@ mod tests {
             IVec3::ZERO,
             IVec3::ZERO,
             mount,
+            MotorTier::Standard,
         );
         place_brush(
             &mut craft,
@@ -1186,6 +1202,7 @@ mod tests {
             IVec3::ZERO,
             IVec3::ZERO,
             mount,
+            MotorTier::Standard,
         );
         let ids: std::collections::BTreeSet<_> =
             craft.parts.iter().filter_map(|p| p.station).collect();
@@ -1216,6 +1233,7 @@ mod tests {
                 IVec3::ZERO,
                 IVec3::ZERO,
                 mount,
+                MotorTier::Standard,
             );
         };
         place(&mut craft, WheelPreset::Road);
@@ -1261,6 +1279,7 @@ mod tests {
             IVec3::ZERO,
             IVec3::ZERO,
             DVec3::new(0.5, -0.2, 0.5),
+            MotorTier::Standard,
         );
 
         let json = craft_to_json(&craft, Kind::Craft).expect("serialize");

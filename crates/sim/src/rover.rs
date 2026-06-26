@@ -259,6 +259,10 @@ pub struct Wheel {
     /// Large magnitude ⇒ wheelspin (driving) or lock-up (braking). An observability signal; 0 for an
     /// inert/airborne wheel. Surfaced in telemetry and used by the WI 651 traction control.
     pub slip_ratio: f64,
+    /// Wheel-spin top-speed cap (rad/s, WI 652): drive torque rolls off toward this in
+    /// [`motor_torque`]. Set from the selected motor at [`assemble_rover`]; defaults to the legacy
+    /// [`MAX_WHEEL_SPIN`] so hand-built fixtures are unchanged.
+    pub max_spin: f64,
 }
 
 impl Wheel {
@@ -306,6 +310,7 @@ impl Wheel {
             damper_blown: false,
             tire_contact: false,
             slip_ratio: 0.0,
+            max_spin: MAX_WHEEL_SPIN,
         }
     }
 
@@ -1104,7 +1109,15 @@ pub fn assemble_rover(craft: &VoxelCraft, position: DVec3, gravity: f64) -> Opti
         .iter()
         .filter(|p| matches!(p.kind, PartKind::SolarPanel))
         .count();
+    // The selected motor (WI 652): the first Engine device's tier sizes torque + top-speed; `None`
+    // keeps the mass-derived default. Each drive wheel's spin cap follows the motor's top-speed.
+    let motor = craft
+        .devices
+        .iter()
+        .find(|d| d.kind == DeviceKind::Engine)
+        .and_then(|d| d.motor);
     let powertrain = build_powertrain(
+        motor,
         count_dev(DeviceKind::Engine),
         count_dev(DeviceKind::Tank),
         count_dev(DeviceKind::Battery),
@@ -1112,6 +1125,11 @@ pub fn assemble_rover(craft: &VoxelCraft, position: DVec3, gravity: f64) -> Opti
         mp.mass,
         drive.len(),
     );
+    for &i in &drive {
+        if let Some(w) = wheels.get_mut(i) {
+            w.max_spin = powertrain.top_speed;
+        }
+    }
 
     let body = ActiveBody::new(position, DVec3::ZERO, sprung_mass, sprung_inertia);
     let mut rover = Rover::new(body, wheels, gravity);
@@ -1180,7 +1198,7 @@ fn series_stiffness(ks: f64, kt: f64) -> f64 {
 /// Drive torque after the motor's speed limit: it falls to zero as the wheel
 /// approaches [`MAX_WHEEL_SPIN`], so the wheels cannot spin up without bound.
 fn motor_torque(w: &Wheel) -> f64 {
-    let scale = (1.0 - w.spin.abs() / MAX_WHEEL_SPIN).clamp(0.0, 1.0);
+    let scale = (1.0 - w.spin.abs() / w.max_spin).clamp(0.0, 1.0);
     w.drive_torque * scale
 }
 

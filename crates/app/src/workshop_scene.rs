@@ -863,6 +863,7 @@ impl Plugin for WorkshopScenePlugin {
                 material: 0,
                 brush: Brush::default(),
                 subassembly: None,
+                motor: sounding_sim::powertrain::MotorTier::Standard,
             })
             .init_resource::<OrbitCam>()
             .init_resource::<HoverState>()
@@ -1133,11 +1134,15 @@ fn update_build_hud(editor: Res<EditorState>, mut hud: Query<&mut Text, With<Bui
             Brush::Voxel => format!("voxel ({})", material_label(editor.material)),
             other => other.label().to_string(),
         };
+        let m = editor.motor.spec();
         text.0 = format!(
-            "workshop · BUILD\nbrush:   {brush}\nvoxels:  {}\ndevices: {}\nwheels:  {}\nmass:    {mass:.0} kg",
+            "workshop · BUILD\nbrush:   {brush}\nvoxels:  {}\ndevices: {}\nwheels:  {}\nmass:    {mass:.0} kg\nmotor:   {} ({:.0} N·m, top {:.0}) [M]",
             editor.craft.voxels.len(),
             editor.craft.devices.len(),
             editor.craft.parts.len(),
+            editor.motor.label(),
+            m.max_torque,
+            m.top_speed,
         );
     }
 }
