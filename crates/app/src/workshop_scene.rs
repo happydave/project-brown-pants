@@ -74,8 +74,8 @@ use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement}
 use crate::overlay::{spawn_overlay, update_overlay, CockpitOverlay};
 use crate::replay::Replayable;
 use crate::parts::{
-    device_part_name, part_build_pose, part_face_normal, part_glb_scale, part_kind_name,
-    part_up_correction, spawn_part_mesh, REFERENCE_CELL,
+    device_face_normal, device_part_name, part_build_pose, part_face_normal, part_glb_scale,
+    part_kind_name, part_up_correction, spawn_part_mesh, REFERENCE_CELL,
 };
 use crate::voxel_skin::{pbr_material, skin_submeshes, VoxelSkin};
 
@@ -840,6 +840,9 @@ struct RoverWheelMesh(usize, f32);
 /// A rover Test cosmetic part (seat/antenna/solar/bumper) mesh by part index (WI 608).
 #[derive(Component)]
 struct RoverPartMesh(usize);
+/// A rover Test device (motor/battery/tank/…) mesh by device index (WI 655) — visible while driving.
+#[derive(Component)]
+struct RoverDeviceMesh(usize);
 /// A rover Test obstacle box mesh by obstacle index (WI 610).
 #[derive(Component)]
 struct RoverObstacleMesh(usize);
@@ -911,6 +914,7 @@ impl Plugin for WorkshopScenePlugin {
                     reconcile_meshes,
                     track_meshes,
                     track_rover_meshes,
+                    track_device_meshes,
                     track_ramp_mesh,
                     follow_camera,
                     draw_rover,
@@ -1189,15 +1193,18 @@ fn sync_build_meshes(
     for d in &editor.craft.devices {
         let c = ((d.cell.as_dvec3() + DVec3::splat(0.5)) * editor.craft.cell_size).as_vec3();
         if let Some(name) = device_part_name(d.kind) {
-            // Anchor the device's base at the cell floor (it sits in its chassis cell), upright.
-            let base = c - Vec3::Y * (s * 0.5);
+            // The device sits on an exposed face of its chassis cell, protruding outward (WI 655), so
+            // it reads as mounted on the block instead of buried in it.
+            let normal = device_face_normal(&editor.craft, d.cell);
+            let anchor = c + normal * (s * 0.5);
+            let rot = Quat::from_rotation_arc(Vec3::Y, normal);
             let e = spawn_part_mesh(
                 &mut commands,
                 &asset_server,
                 name,
                 (editor.craft.cell_size / REFERENCE_CELL) as f32,
-                base,
-                Quat::IDENTITY,
+                anchor,
+                rot,
             );
             commands.entity(e).insert((BuildMesh, BuildEntity));
         } else {
@@ -1401,6 +1408,23 @@ fn enter_test(
                 commands
                     .entity(e)
                     .insert((RoverPartMesh(j), Replayable, TestEntity));
+            }
+            // Devices that have a mesh (motor/battery/tank/…) render too (WI 655), posed each frame by
+            // `track_device_meshes`; the scale set here is preserved.
+            for (k, dev) in rs.lattice.devices.iter().enumerate() {
+                if let Some(name) = device_part_name(dev.kind) {
+                    let e = spawn_part_mesh(
+                        &mut commands,
+                        &asset_server,
+                        name,
+                        (rs.lattice.cell_size / REFERENCE_CELL) as f32,
+                        Vec3::ZERO,
+                        Quat::IDENTITY,
+                    );
+                    commands
+                        .entity(e)
+                        .insert((RoverDeviceMesh(k), Replayable, TestEntity));
+                }
             }
             // Obstacles (WI 610): solid boxes to drive into.
             let obs_mat = materials.add(StandardMaterial {
@@ -2112,6 +2136,36 @@ fn track_rover_meshes(
         if let Some(obs) = rs.obstacles.get(tag.0) {
             tf.translation = (obs.body.position - anchor).as_vec3();
             tf.rotation = Quat::IDENTITY;
+        }
+    }
+}
+
+/// Poses the rover's device meshes (motor/battery/tank/…, WI 655) each frame: base-anchored in the
+/// device cell (as Build does), carried with the body, with the glb up-correction. A separate system
+/// from `track_rover_meshes` so it needs no shared-`Transform` query disjointness with it.
+fn track_device_meshes(
+    world: Res<WorkshopWorld>,
+    cam: Res<crate::replay::ReplayCam>,
+    mut device_q: Query<(&RoverDeviceMesh, &mut Transform)>,
+) {
+    if cam.is_playback() {
+        return; // replay drives the meshes (WI 648)
+    }
+    let Some(rs) = &world.rover else {
+        return;
+    };
+    let body = &rs.rover.body;
+    let q = body.orientation;
+    let half = rs.lattice.cell_size * 0.5;
+    for (tag, mut tf) in &mut device_q {
+        if let Some(d) = rs.lattice.devices.get(tag.0) {
+            // Sit on the cell's exposed face, protruding outward (WI 655) — as Build does.
+            let normal = device_face_normal(&rs.lattice, d.cell);
+            let cell_center = (d.cell.as_dvec3() + DVec3::splat(0.5)) * rs.lattice.cell_size;
+            let anchor = cell_center + normal.as_dvec3() * half;
+            tf.translation = (q * (anchor - rs.com)).as_vec3();
+            tf.rotation =
+                q.as_quat() * Quat::from_rotation_arc(Vec3::Y, normal) * part_up_correction();
         }
     }
 }

@@ -165,6 +165,25 @@ pub fn part_face_normal(craft: &VoxelCraft, mount: DVec3) -> Vec3 {
     Vec3::Y
 }
 
+/// The exposed face of a **device** cell (WI 655): a device occupies a solid chassis cell, so its
+/// mesh should sit on an exposed face (an empty neighbour), protruding outward, rather than embedded
+/// in the block. Prefers the top (+Y); falls back to +Y when the cell is fully buried.
+pub fn device_face_normal(craft: &VoxelCraft, cell: IVec3) -> Vec3 {
+    for n in [
+        IVec3::Y,
+        IVec3::X,
+        IVec3::NEG_X,
+        IVec3::Z,
+        IVec3::NEG_Z,
+        IVec3::NEG_Y,
+    ] {
+        if !craft.voxels.iter().any(|v| v.cell == cell + n) {
+            return n.as_vec3();
+        }
+    }
+    Vec3::Y
+}
+
 /// The build pose (translation, rotation) for a part of `kind` mounted at `mount` against face
 /// `normal`, at `cell` size (WI 654). Cosmetic parts + suspension anchor their base on the face
 /// (`mount − normal·½cell`) with their up (+Y) aligned to the normal — so a seat sits on the face and
