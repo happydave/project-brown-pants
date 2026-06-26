@@ -610,7 +610,10 @@ impl Rover {
             // burns out); ground longitudinal reaction decelerates; the brake then clamps toward zero
             // (it can lock a wheel, not reverse it — a locked wheel then brakes at the tire-grip limit).
             let ground_torque = -fx * w.radius;
-            w.spin += (motor_torque(w) + ground_torque) / w.wheel_inertia * dt;
+            // Soft traction control (WI 651): roll off the drive torque once the wheel slips past the
+            // grip peak, so a floored launch hooks up instead of spinning to MAX_WHEEL_SPIN.
+            let drive = motor_torque(w) * traction_control(slip_ratio);
+            w.spin += (drive + ground_torque) / w.wheel_inertia * dt;
             w.spin = apply_brake(w.spin, w.brake, w.wheel_inertia, dt);
         }
 
@@ -1181,6 +1184,23 @@ fn motor_torque(w: &Wheel) -> f64 {
     w.drive_torque * scale
 }
 
+/// Slip ratio at which traction control begins rolling off the drive torque (WI 651): peak grip is
+/// near here, so above it the extra torque only spins the wheel.
+const TC_SLIP_TARGET: f64 = 0.15;
+/// Roll-off width (WI 651): how quickly the torque factor falls past the target. Smaller ⇒ firmer.
+const TC_SLIP_WIDTH: f64 = 0.15;
+
+/// Soft traction-control factor in `(0, 1]` for the applied drive torque (WI 651): `1` at or below the
+/// target slip, then a smooth Lorentzian roll-off above it, so a floored throttle settles near the
+/// grip limit (hooks up) instead of spinning the wheel out. **Non-increasing** — it never raises
+/// torque, so it cannot destabilise the integrator. Below the target it is exactly `1`, leaving the
+/// hand-built low-slip stability fixtures unchanged.
+fn traction_control(slip_ratio: f64) -> f64 {
+    let excess = (slip_ratio.abs() - TC_SLIP_TARGET).max(0.0);
+    let x = excess / TC_SLIP_WIDTH;
+    1.0 / (1.0 + x * x)
+}
+
 /// Apply `brake` torque to a wheel's `spin` over `dt` **without overshooting zero** (WI 618). A brake
 /// can stop a wheel, not spin it backwards — clamping at zero avoids the huge-brake / low-inertia
 /// chatter (spin flipping sign every sub-step) that made straight-line braking feel mushy. Once the
@@ -1551,6 +1571,62 @@ mod tests {
     }
 
     #[test]
+    fn traction_control_rolls_off_above_target() {
+        // WI 651: full torque at/below the target slip, a smooth roll-off above, symmetric in sign.
+        assert_eq!(traction_control(0.0), 1.0);
+        assert_eq!(traction_control(TC_SLIP_TARGET), 1.0);
+        let mid = traction_control(TC_SLIP_TARGET + TC_SLIP_WIDTH);
+        assert!(
+            (mid - 0.5).abs() < 1e-6,
+            "one width past target halves the torque"
+        );
+        assert!(
+            traction_control(1.0) < mid,
+            "rolls off further with more slip"
+        );
+        assert!(
+            traction_control(10.0) < 0.05,
+            "huge slip → almost no drive torque"
+        );
+        assert_eq!(
+            traction_control(-0.5),
+            traction_control(0.5),
+            "lock-up symmetric"
+        );
+    }
+
+    #[test]
+    fn traction_control_hooks_up_a_floored_launch() {
+        // WI 651: a torque far above the traction limit accelerates the rover (hooks up) with bounded
+        // slip, instead of spinning the wheel out toward MAX_WHEEL_SPIN.
+        let terrain = Terrain {
+            amplitude: 0.0,
+            ..Default::default()
+        };
+        let mut rover = station_assembly(SuspensionSpec::new(), TireSpec::new(0.1), &terrain).rover;
+        for _ in 0..6_000 {
+            rover.step(&terrain, DT);
+        }
+        for _ in 0..1_500 {
+            for w in &mut rover.wheels {
+                w.drive_torque = 3.0e3;
+            }
+            rover.step(&terrain, DT);
+        }
+        let speed = rover.body.velocity.length();
+        let peak_slip = rover
+            .wheels
+            .iter()
+            .map(|w| w.slip_ratio.abs())
+            .fold(0.0, f64::max);
+        assert!(speed > 1.0, "it hooks up and accelerates: speed {speed:.2}");
+        assert!(
+            peak_slip < 3.0,
+            "traction control caps the wheelspin: slip {peak_slip:.2}"
+        );
+    }
+
+    #[test]
     fn slip_ratio_reflects_wheelspin() {
         // WI 650: a settled rover with a huge drive torque spins its wheels far faster than it moves,
         // so the slip ratio runs high (wheelspin); a freshly settled, undriven rover has ~no slip.
@@ -1698,8 +1774,11 @@ mod tests {
             };
             let asm = station_assembly(SuspensionSpec::new(), tire, &terrain);
             let (mut rover, drive) = (asm.rover, asm.drive);
+            // Moderate drive (WI 651): traction control lets the rover reach real speed, so the prior
+            // 2500 N·m (which spun the wheels out and crawled) now flings it over the bumps. A gentler
+            // torque keeps it driving hard-but-bounded — the kraken gate this test guards.
             for &i in &drive {
-                rover.wheels[i].drive_torque = 2_500.0;
+                rover.wheels[i].drive_torque = 600.0;
             }
             let mut max_omega = 0.0_f64;
             for step in 0..20_000 {
@@ -2218,8 +2297,11 @@ mod tests {
         );
         let (mut rover, drive) = (asm.rover, asm.drive);
         let m = rover.body.mass;
+        // A moderate drive (WI 651): with traction control the rover now actually accelerates to a
+        // real speed instead of crawling on spun-out wheels, so a gentler torque exercises *driving*
+        // over the slopes rather than wheelspin-limited crawling (which the old high torque relied on).
         for &i in &drive {
-            rover.wheels[i].drive_torque = m * 2.0;
+            rover.wheels[i].drive_torque = m * 0.5;
         }
         let mut max_pen = 0.0_f64;
         let mut min_up = 1.0_f64;
