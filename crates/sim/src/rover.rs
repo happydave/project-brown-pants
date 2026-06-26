@@ -1186,9 +1186,10 @@ fn motor_torque(w: &Wheel) -> f64 {
 
 /// Slip ratio at which traction control begins rolling off the drive torque (WI 651): peak grip is
 /// near here, so above it the extra torque only spins the wheel.
-const TC_SLIP_TARGET: f64 = 0.15;
+const TC_SLIP_TARGET: f64 = 0.10;
 /// Roll-off width (WI 651): how quickly the torque factor falls past the target. Smaller ⇒ firmer.
-const TC_SLIP_WIDTH: f64 = 0.15;
+/// Tuned (visual pass) so a floored launch settles near the grip peak (~0.2 slip) rather than ~0.7.
+const TC_SLIP_WIDTH: f64 = 0.06;
 
 /// Soft traction-control factor in `(0, 1]` for the applied drive torque (WI 651): `1` at or below the
 /// target slip, then a smooth Lorentzian roll-off above it, so a floored throttle settles near the
@@ -3667,8 +3668,10 @@ mod tests {
                 top_speed = top_speed.max(rover.body.velocity.length());
             }
         }
-        // It reaches a high speed and catches real air over the crests…
-        assert!(top_speed > 75.0, "top speed too low: {top_speed}");
+        // It reaches a high speed and catches real air over the crests… (WI 651: traction control
+        // holds the wheels near the grip peak instead of riding the friction plateau at huge slip, so
+        // the top speed is lower than the old spin-out-era ~75 m/s — but still fast enough to fly.)
+        assert!(top_speed > 45.0, "top speed too low: {top_speed}");
         assert!(max_air > 0.8, "rover did not catch air: {max_air}");
         // …but stays finite and recovers rather than spinning endlessly: the jitter-selective damper
         // (WI 611) still caps the rough-landing buzz, so even reckless straight-line bump-flying keeps
