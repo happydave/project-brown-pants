@@ -206,6 +206,67 @@ pub fn apply_deadzone(value: f32, deadzone: f32) -> f32 {
     scaled.min(1.0).copysign(value)
 }
 
+/// Shared free-look offset for the Test/flight chase cameras (WI 665): yaw about world up and pitch
+/// about the camera's horizontal axis, both **deltas from the default view** so `(0, 0)` reproduces
+/// the existing framing. The right stick accumulates it (hold model); it resets to default on
+/// entering Test / `-- play`.
+#[derive(Resource, Default, Clone, Copy, Debug)]
+pub struct ChaseLook {
+    /// Orbit yaw delta (rad), wraps freely.
+    pub yaw: f32,
+    /// Orbit pitch delta (rad), clamped to [`ChaseLook::PITCH_LIMIT`].
+    pub pitch: f32,
+}
+
+impl ChaseLook {
+    /// Pitch clamp (rad) — short of straight up/down so the eye never flips through the target.
+    pub const PITCH_LIMIT: f32 = 1.2;
+    /// Stick → orbit rate (rad/s).
+    pub const RATE: f32 = 2.5;
+
+    /// Accumulate one frame of right-stick input (already deadzoned), clamping pitch.
+    pub fn accumulate(&mut self, cam_yaw: f32, cam_pitch: f32, dt: f32) {
+        self.yaw += cam_yaw * Self::RATE * dt;
+        self.pitch =
+            (self.pitch - cam_pitch * Self::RATE * dt).clamp(-Self::PITCH_LIMIT, Self::PITCH_LIMIT);
+    }
+
+    /// Reset to the default view.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Accumulate the right-stick free-look into the shared [`ChaseLook`] each frame (WI 665). Added to
+/// the workshop Test and `-- play` schedules ahead of the chase-camera systems that read it; inert
+/// with no controller (the sample is zero), so the held offset simply stops changing.
+pub fn accumulate_chase_look(
+    time: Res<Time>,
+    gamepads: Query<&Gamepad>,
+    pad_map: Res<GamepadMap>,
+    mut look: ResMut<ChaseLook>,
+) {
+    let pad = pad_map.sample(&gamepads);
+    if pad.cam_yaw != 0.0 || pad.cam_pitch != 0.0 {
+        look.accumulate(pad.cam_yaw, pad.cam_pitch, time.delta_secs());
+    }
+}
+
+/// Rotate a chase camera's default eye-offset (target → eye) by the free-look yaw/pitch, orbiting
+/// around the target. `(0, 0)` returns `base` unchanged; the offset magnitude (distance to target) is
+/// preserved, so only the viewing angle changes (WI 665).
+pub fn orbit_offset(base: Vec3, yaw: f32, pitch: f32) -> Vec3 {
+    // Yaw about world up.
+    let yawed = Quat::from_axis_angle(Vec3::Y, yaw) * base;
+    // Pitch about the horizontal axis perpendicular to the (yawed) offset, oriented so that a
+    // positive pitch raises the eye (`+Y`) regardless of which way the offset faces.
+    let axis = yawed.cross(Vec3::Y).normalize_or_zero();
+    if axis == Vec3::ZERO {
+        return yawed; // offset is vertical; pitch is ill-defined, leave it
+    }
+    Quat::from_axis_angle(axis, pitch) * yawed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +319,40 @@ mod tests {
         assert_ne!(m.brake, m.sas_toggle);
         assert_ne!(m.steer, m.pitch);
         assert_ne!(m.pause, m.back);
+    }
+
+    #[test]
+    fn orbit_offset_identity_side_and_magnitude() {
+        let base = Vec3::new(0.0, 6.0, -20.0); // a behind-and-above chase offset
+                                               // Zero yaw/pitch returns the base unchanged (default framing preserved).
+        let id = orbit_offset(base, 0.0, 0.0);
+        assert!((id - base).length() < 1e-5, "got {id:?}");
+        // A +90° yaw rotates a behind-offset to the side; magnitude (distance to target) preserved.
+        let side = orbit_offset(base, std::f32::consts::FRAC_PI_2, 0.0);
+        assert!((side.length() - base.length()).abs() < 1e-4);
+        assert!(
+            side.x.abs() > 1.0,
+            "yaw should move the eye sideways: {side:?}"
+        );
+        // Pitch raises the eye (more +Y) while preserving magnitude.
+        let up = orbit_offset(base, 0.0, 0.5);
+        assert!((up.length() - base.length()).abs() < 1e-4);
+        assert!(up.y > base.y, "positive pitch should raise the eye: {up:?}");
+    }
+
+    #[test]
+    fn chase_look_accumulates_and_clamps_pitch() {
+        let mut look = ChaseLook::default();
+        look.accumulate(1.0, 0.0, 0.1);
+        assert!(look.yaw > 0.0 && look.pitch == 0.0);
+        // Drive pitch hard and long; it saturates at the clamp, not beyond.
+        for _ in 0..100 {
+            look.accumulate(0.0, 1.0, 0.1);
+        }
+        assert!((look.pitch + ChaseLook::PITCH_LIMIT).abs() < 1e-5);
+        look.reset();
+        assert_eq!(look.yaw, 0.0);
+        assert_eq!(look.pitch, 0.0);
     }
 
     #[test]

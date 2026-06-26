@@ -36,7 +36,7 @@ use sounding_sim::voxel::{Device, Material, Voxel, VoxelCraft};
 
 use crate::bus::ActiveFlight;
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
-use crate::gamepad::{GamepadMap, PadSample};
+use crate::gamepad::{accumulate_chase_look, orbit_offset, ChaseLook, GamepadMap, PadSample};
 use sounding_sim::telemetry::ActiveFlightTelemetry;
 
 const BODY: CentralBody = CentralBody::EARTHLIKE;
@@ -231,6 +231,7 @@ impl Plugin for PlayScenePlugin {
                     step_play,
                     publish_active_flight,
                     track_craft,
+                    accumulate_chase_look,
                     follow_camera,
                     update_hud,
                     draw_attitude_gizmo,
@@ -246,8 +247,10 @@ fn setup_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut scattering: ResMut<Assets<ScatteringMedium>>,
+    mut look: ResMut<ChaseLook>,
     world: Res<PlayWorld>,
 ) {
+    look.reset(); // start each session at the default view (WI 665)
     crate::ground::spawn_ground(&mut commands, &mut meshes, &mut materials, &asset_server);
     commands.spawn((
         Mesh3d(meshes.add(Mesh::from(Sphere {
@@ -581,11 +584,14 @@ fn track_craft(
 
 fn follow_camera(
     world: Res<PlayWorld>,
+    look: Res<ChaseLook>,
     mut camera: Query<(&mut Transform, &mut WorldPlacement), With<AnchorCamera>>,
 ) {
     if let Ok((mut tf, mut placement)) = camera.single_mut() {
         let target = world.render_world();
-        let eye = target + DVec3::new(16.0, 7.0, 16.0);
+        // Default chase offset, orbited by the gamepad free-look (WI 665); (0,0) keeps the old view.
+        let off = orbit_offset(Vec3::new(16.0, 7.0, 16.0), look.yaw, look.pitch);
+        let eye = target + off.as_dvec3();
         placement.0 = WorldPos::new(FrameId::CENTRAL_BODY, eye);
         let look_dir = (target - eye).as_vec3().normalize_or_zero();
         if look_dir != Vec3::ZERO {

@@ -150,6 +150,8 @@ fn main() {
     // Gamepad mapping table (WI 617): one rebindable resource read by the keyboard input systems
     // (rover/rocket/flight/build-camera) as an additive controller source.
     app.init_resource::<gamepad::GamepadMap>();
+    // Shared chase-camera free-look offset (WI 665), driven by the right stick in Test / -- play.
+    app.init_resource::<gamepad::ChaseLook>();
     app.add_plugins(DefaultPlugins)
         .add_plugins(OrbitPlugin {
             central_body,

@@ -71,7 +71,7 @@ use crate::editor::{
     Brush, EditorState, HoverState, OrbitCam, PaletteEntry, PointerOnPalette, PALETTE_GROUPS,
 };
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
-use crate::gamepad::{GamepadMap, PadSample};
+use crate::gamepad::{accumulate_chase_look, orbit_offset, ChaseLook, GamepadMap, PadSample};
 use crate::overlay::{spawn_overlay, update_overlay, CockpitOverlay};
 use crate::parts::{
     device_face_normal, device_part_name, part_build_pose, part_face_normal, part_glb_scale,
@@ -809,6 +809,9 @@ impl WorkshopWorld {
 /// Tags every entity owned by Test mode (despawned on leaving Test).
 #[derive(Component)]
 struct TestEntity;
+/// The rover Test chase camera, orbited by the gamepad free-look (WI 665).
+#[derive(Component)]
+struct RoverTestCam;
 /// Tags every entity owned by Build mode (despawned on leaving Build).
 #[derive(Component)]
 struct BuildEntity;
@@ -875,7 +878,7 @@ impl Plugin for WorkshopScenePlugin {
             .init_resource::<CockpitOverlay>()
             .add_systems(OnEnter(WorkshopMode::Build), enter_build)
             .add_systems(OnExit(WorkshopMode::Build), exit_build)
-            .add_systems(OnEnter(WorkshopMode::Test), enter_test)
+            .add_systems(OnEnter(WorkshopMode::Test), (enter_test, reset_chase_look))
             .add_systems(
                 OnExit(WorkshopMode::Test),
                 (exit_test, clear_rover_telemetry),
@@ -917,7 +920,9 @@ impl Plugin for WorkshopScenePlugin {
                     track_rover_meshes,
                     track_device_meshes,
                     track_ramp_mesh,
+                    accumulate_chase_look,
                     follow_camera,
+                    rover_chase_camera,
                     draw_rover,
                     update_test_hud,
                     update_overlay,
@@ -1330,6 +1335,7 @@ fn enter_test(
         commands.spawn((
             Camera3d::default(),
             Transform::from_xyz(0.0, 7.0, -16.0).looking_at(Vec3::new(0.0, 1.0, 4.0), Vec3::Y),
+            RoverTestCam,
             TestEntity,
         ));
         commands.spawn((
@@ -1358,7 +1364,7 @@ fn enter_test(
         ));
         commands.spawn((
             Text::new(
-                "W/S drive · A/D steer · Space brake · pad: stick steer / triggers throttle / LB brake / Start pause / Back → BUILD · P pause · R replay [/] scrub · G cockpit · Backspace reset · Enter → BUILD",
+                "W/S drive · A/D steer · Space brake · pad: stick steer / triggers throttle / LB brake / right-stick look / Start pause / Back → BUILD · P pause · R replay [/] scrub · G cockpit · Backspace reset · Enter → BUILD",
             ),
             TextFont {
                 font_size: 14.0,
@@ -1525,7 +1531,7 @@ fn enter_test(
     ));
     commands.spawn((
         Text::new(
-            "Shift/Ctrl throttle · Z/X full/cut · WSAD QE attitude · T SAS  F off · pad: stick pitch-roll / bumpers yaw / triggers throttle / Y SAS / Start pause / Back → BUILD · ,/. warp · Backspace reset · Enter → BUILD",
+            "Shift/Ctrl throttle · Z/X full/cut · WSAD QE attitude · T SAS  F off · pad: stick pitch-roll / bumpers yaw / triggers throttle / Y SAS / right-stick look / Start pause / Back → BUILD · ,/. warp · Backspace reset · Enter → BUILD",
         ),
         TextFont {
             font_size: 14.0,
@@ -2038,20 +2044,47 @@ fn track_meshes(
 
 fn follow_camera(
     world: Res<WorkshopWorld>,
+    look: Res<ChaseLook>,
     mut camera: Query<(&mut Transform, &mut WorldPlacement), With<AnchorCamera>>,
 ) {
     if world.rover.is_some() {
-        return; // the rover uses a fixed chase camera (rover-anchored rendering)
+        return; // the rover uses its own chase camera (rover-anchored rendering), see rover_chase_camera
     }
     if let Ok((mut tf, mut placement)) = camera.single_mut() {
         let target = world.focus();
-        let eye = target + DVec3::new(14.0, 7.0, 16.0);
+        // Default chase offset, orbited by the gamepad free-look (WI 665); (0,0) keeps the old view.
+        let off = orbit_offset(Vec3::new(14.0, 7.0, 16.0), look.yaw, look.pitch);
+        let eye = target + off.as_dvec3();
         placement.0 = WorldPos::new(FrameId::CENTRAL_BODY, eye);
         let look_dir = (target - eye).as_vec3().normalize_or_zero();
         if look_dir != Vec3::ZERO {
             tf.rotation = Transform::default().looking_to(look_dir, Vec3::Y).rotation;
         }
     }
+}
+
+/// Orbits the rover's chase camera with the gamepad free-look (WI 665). The rover renders anchored
+/// near the origin (terrain scrolls beneath it), so the camera orbits a fixed render point; `(0, 0)`
+/// reproduces the static framing `enter_test` spawns.
+fn rover_chase_camera(
+    world: Res<WorkshopWorld>,
+    look: Res<ChaseLook>,
+    mut camera: Query<&mut Transform, With<RoverTestCam>>,
+) {
+    if world.rover.is_none() {
+        return;
+    }
+    if let Ok(mut tf) = camera.single_mut() {
+        let target = Vec3::new(0.0, 1.0, 4.0);
+        let off = orbit_offset(Vec3::new(0.0, 6.0, -20.0), look.yaw, look.pitch);
+        *tf = Transform::from_translation(target + off).looking_at(target, Vec3::Y);
+    }
+}
+
+/// Reset the chase free-look to the default view on entering Test (WI 665), so a held view doesn't
+/// carry over between sessions.
+fn reset_chase_look(mut look: ResMut<ChaseLook>) {
+    look.reset();
 }
 
 /// Where a wheel's mesh sits and how it aligns, given its suspension mount `hub` (world) and the body
