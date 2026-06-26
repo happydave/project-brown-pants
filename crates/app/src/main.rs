@@ -45,6 +45,7 @@ mod editor;
 mod floating_origin;
 mod flooding_scene;
 mod gallery_scene;
+mod gamepad;
 mod ground;
 mod land_scene;
 mod launch_scene;
@@ -70,8 +71,8 @@ use compartments_scene::CompartmentsScenePlugin;
 use crash_scene::CrashScenePlugin;
 use dive_scene::DiveScenePlugin;
 use editor::EditorPlugin;
-use gallery_scene::GalleryScenePlugin;
 use flooding_scene::FloodingScenePlugin;
+use gallery_scene::GalleryScenePlugin;
 use land_scene::LandScenePlugin;
 use launch_scene::LaunchScenePlugin;
 use materials_scene::MaterialsScenePlugin;
@@ -146,6 +147,9 @@ fn main() {
     .expect("initial orbit is bound");
 
     let mut app = App::new();
+    // Gamepad mapping table (WI 617): one rebindable resource read by the keyboard input systems
+    // (rover/rocket/flight/build-camera) as an additive controller source.
+    app.init_resource::<gamepad::GamepadMap>();
     app.add_plugins(DefaultPlugins)
         .add_plugins(OrbitPlugin {
             central_body,

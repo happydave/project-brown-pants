@@ -36,6 +36,7 @@ use sounding_sim::voxel::{Device, Material, Voxel, VoxelCraft};
 
 use crate::bus::ActiveFlight;
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
+use crate::gamepad::{GamepadMap, PadSample};
 use sounding_sim::telemetry::ActiveFlightTelemetry;
 
 const BODY: CentralBody = CentralBody::EARTHLIKE;
@@ -336,20 +337,32 @@ fn setup_scene(
 
 /// Translates keyboard input into `Command`s applied to the craft (no direct state
 /// mutation): throttle, manual attitude, SAS mode, and time-warp.
-fn player_input(time: Res<Time>, keys: Res<ButtonInput<KeyCode>>, mut world: ResMut<PlayWorld>) {
+fn player_input(
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
+    pad_map: Res<GamepadMap>,
+    mut world: ResMut<PlayWorld>,
+) {
     let dt = time.delta_secs_f64();
+    let pad = pad_map.sample(&gamepads);
 
-    // Throttle.
+    // Throttle. Shift/Ctrl or the gamepad triggers (RT up, LT down) ramp the absolute throttle;
+    // Z/X or the gamepad full/cut buttons snap it (WI 617).
+    let pad_ramp = (pad.throttle_fwd - pad.throttle_rev) as f64;
     if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
         world.throttle = (world.throttle + THROTTLE_RATE * dt).min(1.0);
     }
     if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
         world.throttle = (world.throttle - THROTTLE_RATE * dt).max(0.0);
     }
-    if keys.just_pressed(KeyCode::KeyZ) {
+    if pad_ramp != 0.0 {
+        world.throttle = (world.throttle + THROTTLE_RATE * dt * pad_ramp).clamp(0.0, 1.0);
+    }
+    if keys.just_pressed(KeyCode::KeyZ) || pad.throttle_max {
         world.throttle = 1.0;
     }
-    if keys.just_pressed(KeyCode::KeyX) {
+    if keys.just_pressed(KeyCode::KeyX) || pad.throttle_zero {
         world.throttle = 0.0;
     }
     let orientation = world.body.orientation;
@@ -380,12 +393,23 @@ fn player_input(time: Res<Time>, keys: Res<ButtonInput<KeyCode>>, mut world: Res
     if keys.pressed(KeyCode::KeyE) {
         manual.y -= 1.0;
     }
+    // Gamepad attitude wins per-axis past the deadzone (WI 617): left stick = pitch (Y) / roll (X),
+    // bumpers = yaw.
+    if PadSample::active(pad.pitch) {
+        manual.x = -pad.pitch as f64;
+    }
+    if PadSample::active(pad.roll) {
+        manual.z = -pad.roll as f64;
+    }
+    if PadSample::active(pad.yaw) {
+        manual.y = pad.yaw as f64;
+    }
     world
         .craft
         .apply_command(&Command::SetAttitude(manual), orientation);
 
     // SAS mode.
-    if keys.just_pressed(KeyCode::KeyT) {
+    if keys.just_pressed(KeyCode::KeyT) || pad.sas_toggle {
         let mode = if world.craft.attitude.sas.mode == SasMode::Hold {
             SasMode::Off
         } else {

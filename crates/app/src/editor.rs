@@ -529,6 +529,8 @@ fn setup_view(mut commands: Commands) {
 pub(crate) fn orbit_camera(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
+    pad_map: Res<crate::gamepad::GamepadMap>,
     editor: Res<EditorState>,
     mut cam: ResMut<OrbitCam>,
     mut camera: Query<&mut Transform, With<Camera3d>>,
@@ -550,6 +552,16 @@ pub(crate) fn orbit_camera(
         cam.dist = (cam.dist - dt * cam.dist * 1.5).max(0.2);
     }
     if keys.pressed(KeyCode::KeyC) {
+        cam.dist = (cam.dist + dt * 12.0).min(80.0);
+    }
+    // Gamepad orbit (WI 617): right stick orbits (yaw/pitch), bumpers zoom; same clamps as the keys.
+    let pad = pad_map.sample(&gamepads);
+    cam.yaw += pad.cam_yaw * dt * 2.0;
+    cam.pitch = (cam.pitch - pad.cam_pitch * dt * 2.0).clamp(-1.4, 1.4);
+    if pad.zoom_in {
+        cam.dist = (cam.dist - dt * cam.dist * 1.5).max(0.2);
+    }
+    if pad.zoom_out {
         cam.dist = (cam.dist + dt * 12.0).min(80.0);
     }
 

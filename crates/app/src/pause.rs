@@ -20,10 +20,13 @@ const STEP_CHUNK_SECONDS: f64 = 1.0 / 60.0;
 /// `P` emits the inverted [`Command::SetPaused`] (pause ↔ resume) onto the command bus.
 pub(crate) fn toggle_pause(
     keys: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
+    pad_map: Res<crate::gamepad::GamepadMap>,
     clock: Res<SimClock>,
     mut commands: MessageWriter<Command>,
 ) {
-    if keys.just_pressed(KeyCode::KeyP) {
+    // P or the gamepad Start button (WI 617).
+    if keys.just_pressed(KeyCode::KeyP) || pad_map.sample(&gamepads).pause {
         commands.write(Command::SetPaused(!clock.paused));
     }
 }
@@ -91,6 +94,7 @@ mod tests {
                     ..Default::default()
                 })
                 .insert_resource(ButtonInput::<KeyCode>::default())
+                .init_resource::<crate::gamepad::GamepadMap>()
                 .init_resource::<Seen>()
                 .add_systems(Update, (toggle_pause, record).chain());
             app.world_mut()

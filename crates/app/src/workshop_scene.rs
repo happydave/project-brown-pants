@@ -71,12 +71,13 @@ use crate::editor::{
     Brush, EditorState, HoverState, OrbitCam, PaletteEntry, PointerOnPalette, PALETTE_GROUPS,
 };
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
+use crate::gamepad::{GamepadMap, PadSample};
 use crate::overlay::{spawn_overlay, update_overlay, CockpitOverlay};
-use crate::replay::Replayable;
 use crate::parts::{
     device_face_normal, device_part_name, part_build_pose, part_face_normal, part_glb_scale,
     part_kind_name, part_up_correction, spawn_part_mesh, REFERENCE_CELL,
 };
+use crate::replay::Replayable;
 use crate::voxel_skin::{pbr_material, skin_submeshes, VoxelSkin};
 
 const BODY: CentralBody = CentralBody::EARTHLIKE;
@@ -930,14 +931,21 @@ impl Plugin for WorkshopScenePlugin {
 /// `Enter` toggles between Build and Test (from either mode).
 fn toggle_mode(
     keys: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
+    pad_map: Res<GamepadMap>,
     state: Res<State<WorkshopMode>>,
     mut next: ResMut<NextState<WorkshopMode>>,
 ) {
+    let pad = pad_map.sample(&gamepads);
     if keys.just_pressed(KeyCode::Enter) {
         next.set(match state.get() {
             WorkshopMode::Build => WorkshopMode::Test,
             WorkshopMode::Test => WorkshopMode::Build,
         });
+    }
+    // Gamepad Back returns to the workshop build view from Test (WI 617).
+    if pad.back && *state.get() == WorkshopMode::Test {
+        next.set(WorkshopMode::Build);
     }
 }
 
@@ -984,7 +992,7 @@ fn enter_build(mut commands: Commands) {
     ));
     commands.spawn((
         Text::new(
-            "left-click place · right-click remove · middle-drag orbit · scroll zoom · Tab material · K save · O open craft · P pause · Enter → TEST (4 wheels ⇒ drive it)",
+            "left-click place · right-click remove · middle-drag orbit · scroll zoom · pad: right-stick orbit / bumpers zoom · Tab material · K save · O open craft · P pause · Enter → TEST (4 wheels ⇒ drive it)",
         ),
         TextFont {
             font_size: 14.0,
@@ -1127,7 +1135,12 @@ fn exit_build(mut commands: Commands, q: Query<Entity, With<BuildEntity>>) {
     }
 }
 
-fn update_build_hud(editor: Res<EditorState>, mut hud: Query<&mut Text, With<BuildHud>>) {
+fn update_build_hud(
+    editor: Res<EditorState>,
+    gamepads: Query<&Gamepad>,
+    pad_map: Res<GamepadMap>,
+    mut hud: Query<&mut Text, With<BuildHud>>,
+) {
     if let Ok(mut text) = hud.single_mut() {
         let mass = editor
             .craft
@@ -1139,8 +1152,14 @@ fn update_build_hud(editor: Res<EditorState>, mut hud: Query<&mut Text, With<Bui
             other => other.label().to_string(),
         };
         let m = editor.motor.spec();
+        // Controller indicator (WI 617): confirms a pad is detected; input is additive over kb/mouse.
+        let pad = if pad_map.sample(&gamepads).connected {
+            "\ngamepad: connected 🎮"
+        } else {
+            ""
+        };
         text.0 = format!(
-            "workshop · BUILD\nbrush:   {brush}\nvoxels:  {}\ndevices: {}\nwheels:  {}\nmass:    {mass:.0} kg\nmotor:   {} ({:.0} N·m, top {:.0}) [M]",
+            "workshop · BUILD\nbrush:   {brush}\nvoxels:  {}\ndevices: {}\nwheels:  {}\nmass:    {mass:.0} kg\nmotor:   {} ({:.0} N·m, top {:.0}) [M]{pad}",
             editor.craft.voxels.len(),
             editor.craft.devices.len(),
             editor.craft.parts.len(),
@@ -1339,7 +1358,7 @@ fn enter_test(
         ));
         commands.spawn((
             Text::new(
-                "W/S drive · A/D steer · Space brake · P pause · R replay [/] scrub · G cockpit · Backspace reset · Enter → BUILD",
+                "W/S drive · A/D steer · Space brake · pad: stick steer / triggers throttle / LB brake / Start pause / Back → BUILD · P pause · R replay [/] scrub · G cockpit · Backspace reset · Enter → BUILD",
             ),
             TextFont {
                 font_size: 14.0,
@@ -1392,7 +1411,10 @@ fn enter_test(
                 ));
             }
             for (j, part) in rs.lattice.parts.iter().enumerate() {
-                if matches!(part.kind, PartKind::Wheel(_) | PartKind::Rim(_) | PartKind::Tire(_)) {
+                if matches!(
+                    part.kind,
+                    PartKind::Wheel(_) | PartKind::Rim(_) | PartKind::Tire(_)
+                ) {
                     continue; // wheels are rendered by the dedicated slip-spoke wheel render
                 }
                 // Render the part as its mechanical-kit mesh (WI 654); `track_rover_meshes` poses it
@@ -1503,7 +1525,7 @@ fn enter_test(
     ));
     commands.spawn((
         Text::new(
-            "Shift/Ctrl throttle · Z/X full/cut · WSAD QE attitude · T SAS  F off · ,/. warp · Backspace reset · Enter → BUILD",
+            "Shift/Ctrl throttle · Z/X full/cut · WSAD QE attitude · T SAS  F off · pad: stick pitch-roll / bumpers yaw / triggers throttle / Y SAS / Start pause / Back → BUILD · ,/. warp · Backspace reset · Enter → BUILD",
         ),
         TextFont {
             font_size: 14.0,
@@ -1549,30 +1571,39 @@ fn exit_test(
 fn workshop_input(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
+    pad_map: Res<GamepadMap>,
     mut world: ResMut<WorkshopWorld>,
 ) {
+    let pad = pad_map.sample(&gamepads);
     if keys.just_pressed(KeyCode::Backspace) {
         world.reset();
         return;
     }
     if world.rover.is_some() {
-        drive_rover(&keys, &mut world, time.delta_secs_f64());
+        drive_rover(&keys, &pad, &mut world, time.delta_secs_f64());
         return;
     }
     if world.state != CraftState::Intact {
         return; // debris isn't controllable
     }
     let dt = time.delta_secs_f64();
+    // Throttle ramps with Shift/Ctrl or the gamepad triggers (RT up, LT down), preserving the
+    // absolute-throttle model; trigger pressure scales the ramp rate (WI 617).
+    let pad_ramp = (pad.throttle_fwd - pad.throttle_rev) as f64;
     if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
         world.throttle = (world.throttle + THROTTLE_RATE * dt).min(1.0);
     }
     if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
         world.throttle = (world.throttle - THROTTLE_RATE * dt).max(0.0);
     }
-    if keys.just_pressed(KeyCode::KeyZ) {
+    if pad_ramp != 0.0 {
+        world.throttle = (world.throttle + THROTTLE_RATE * dt * pad_ramp).clamp(0.0, 1.0);
+    }
+    if keys.just_pressed(KeyCode::KeyZ) || pad.throttle_max {
         world.throttle = 1.0;
     }
-    if keys.just_pressed(KeyCode::KeyX) {
+    if keys.just_pressed(KeyCode::KeyX) || pad.throttle_zero {
         world.throttle = 0.0;
     }
     let orientation = world.body.orientation;
@@ -1600,11 +1631,22 @@ fn workshop_input(
     if keys.pressed(KeyCode::KeyE) {
         manual.y -= 1.0;
     }
+    // Gamepad attitude wins per-axis when the stick is past the deadzone (WI 617): left stick =
+    // pitch (Y) / roll (X), bumpers = yaw. Keyboard otherwise governs.
+    if PadSample::active(pad.pitch) {
+        manual.x = -pad.pitch as f64;
+    }
+    if PadSample::active(pad.roll) {
+        manual.z = -pad.roll as f64;
+    }
+    if PadSample::active(pad.yaw) {
+        manual.y = pad.yaw as f64;
+    }
     world
         .craft
         .apply_command(&Command::SetAttitude(manual), orientation);
 
-    if keys.just_pressed(KeyCode::KeyT) {
+    if keys.just_pressed(KeyCode::KeyT) || pad.sas_toggle {
         let mode = if world.craft.attitude.sas.mode == SasMode::Hold {
             SasMode::Off
         } else {
@@ -1629,27 +1671,34 @@ fn workshop_input(
 }
 
 /// Drive the rover by **group**: throttle the drive wheels, steer the steer wheels, brake all.
-fn drive_rover(keys: &ButtonInput<KeyCode>, world: &mut WorkshopWorld, dt: f64) {
+fn drive_rover(keys: &ButtonInput<KeyCode>, pad: &PadSample, world: &mut WorkshopWorld, dt: f64) {
     let Some(rs) = world.rover.as_mut() else {
         return;
     };
     // Set the throttle/brake **intent**; the powertrain turns throttle into (fuel-gated) torque each
-    // frame in `step_workshop` (WI 609).
-    rs.throttle = if keys.pressed(KeyCode::KeyW) {
+    // frame in `step_workshop` (WI 609). The gamepad triggers give bipolar analog throttle and win
+    // over the digital keys when past the deadzone (WI 617).
+    rs.throttle = if PadSample::active(pad.throttle) {
+        pad.throttle as f64
+    } else if keys.pressed(KeyCode::KeyW) {
         1.0
     } else if keys.pressed(KeyCode::KeyS) {
         -1.0
     } else {
         0.0
     };
-    rs.brake = if keys.pressed(KeyCode::Space) {
+    rs.brake = if keys.pressed(KeyCode::Space) || pad.brake {
         rs.rover.body.mass * ROVER_BRAKE_PER_KG
     } else {
         0.0
     };
     // Smooth the keyboard steer toward its target so a quick tap is a small correction, not instant
-    // full lock (WI 630 feel tuning).
-    let target = if keys.pressed(KeyCode::KeyA) {
+    // full lock (WI 630 feel tuning). An analog stick (WI 617) sets the target directly — proportional
+    // deflection — and wins over the keys when past the deadzone. Negated so stick-right steers right
+    // (matching the D key, which is −1).
+    let target = if PadSample::active(pad.steer) {
+        -(pad.steer as f64)
+    } else if keys.pressed(KeyCode::KeyA) {
         1.0
     } else if keys.pressed(KeyCode::KeyD) {
         -1.0
