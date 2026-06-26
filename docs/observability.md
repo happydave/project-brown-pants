@@ -15,10 +15,38 @@ build/speed). The items below remove that blindfold.
 | **Vehicle (craft) save/load** | Save a built rover/craft to a file; reload it. Saves the user re-building; lets the assistant load the *exact* craft under test. | **Done (WI 637)** — `editor.rs` `K` save / `O` open `craft.json` via the versioned `persist` envelope. |
 | **World pause** | Freeze the running scene to inspect a state without it evolving. | **Done (WI 638)** — `P` emits `Command::SetPaused` on the bus; `workshop`/`rover`/`play` gate their step on `SimClock.paused`, with a `⏸ PAUSED` HUD banner (`crate::pause`). |
 | **World save/load + save-file inspector** | Persist a whole scenario (craft + world + clock); a CLI/tool to **dump/inspect** a save file so the assistant can read what's there. | Partly designed: **WI 537** (fp-world-save, deferred) and **WI 553** (sc-content-aware-persistence, pending — subsumes 537). The *inspector tool* is the new, assistant-facing piece → tracked in 553's scope / a small CLI. |
-| **Dev MCP (live introspection)** | An MCP bridge to the running game so the assistant can query ECS state / telemetry / the command bus live. | **Spike done (WI 639)** — bridge at `dev/mcp/` (command-bus over BRP-generic); self-test green. **`Telemetry` now carries a rover block (WI 640)** — `-- rover` and the workshop Test publish pose/contact/per-wheel state. Remaining follow-up: user registers the MCP. See findings below. |
+| **Dev MCP (live introspection)** | An MCP bridge to the running game so the assistant can query ECS state / telemetry / the command bus live. | **Done (WI 639/640) and grown into the "Glass Cockpit"** — see below. Remaining follow-up: user registers the MCP. |
 
 (Foundational observability already exists: **WI 499** observability harness + physics-invariant
 metrics; `crates/sim/src/{telemetry,diagnostics}.rs`; the `Telemetry` snapshot is a versioned API.)
+
+## The Glass Cockpit (sub-initiative `sounding-observability`, 642–648 done)
+
+The dev-MCP thread became its own [design + sub-initiative](../../../tickets/docs/projects/sounding-observability/project.md)
+("Glass Cockpit"): make the running sim legible to a human and to the assistant, on the always-on bus.
+Shipped (crate ≥ 0.1.78), four layers:
+
+- **Data** — `Telemetry.rover` block (WI 640) with per-wheel **contact** (`tire_contact`, rover
+  `grounded`, WI 642) and **slip ratio** (WI 650); a bounded **history ring** served at
+  `GET /telemetry/history` (WI 644).
+- **Control** — `Command::Step { seconds }` advances a **paused** scene a known beat (`.` key + bus),
+  on top of WI 638 pause (WI 643).
+- **Presentation** — a reusable autoscaled **sparkline** (WI 645) hosted in a toggleable (`G`)
+  **cockpit overlay** of signals — contact_jitter / speed / **wheel slip** / ang.vel / hull_pen
+  (WI 646); the workshop tints the tyre spin-spokes by |slip| (WI 650). **Screenshot-over-MCP**
+  (`GET /screenshot` → a PNG the bridge returns as an image, WI 647).
+- **Replay** — a **Tier-B transform-ring replay cam** (`R` toggle, `[`/`]` scrub, bus-drivable):
+  records tagged entity transforms for the last few seconds and scrubs them (WI 648). Tier-C
+  deterministic crash-cam is the deferred WI 649 (needs the world-save line + a determinism audit).
+
+**dev-MCP tools** (`dev/mcp/sounding_mcp.py`): `get_telemetry`, `get_telemetry_history`,
+`get_screenshot`, `replay`, `send_command`. The bridge is a stdlib stdio proxy over the bus; its
+self-test (`test_bridge.py`) covers the toolset without a window.
+
+**Rover drive feel (650/651), found via the cockpit:** the slip cue showed the rover spinning its
+wheels out (~4× the torque the tyre could put down). **Soft traction control** (WI 651, `rover.rs`
+`traction_control`) rolls off drive torque past the grip-peak slip so it hooks up instead of lighting
+up; the slip indicator/cockpit signal confirm it. A motor-stat-selection follow-up is WI 652.
 
 ## Dev-MCP findings (WI 639 spike — resolved)
 
