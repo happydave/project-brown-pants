@@ -19,6 +19,8 @@
 //!   re-deriving its own mass/inertia, conserving total momentum.
 
 use crate::active::ActiveBody;
+use crate::collision::{craft_bounds, craft_collision_shape, Bounds, CollisionShape};
+use crate::contact::{body_contact_wrench, ground_contact_wrench, ContactParams};
 use crate::voxel::{Axis, VoxelCraft};
 use glam::{DVec3, IVec3};
 use std::collections::{HashMap, HashSet};
@@ -294,6 +296,60 @@ pub fn fracture_on_impact(
     fracture(craft, body, contact_force / body.mass)
 }
 
+/// Advance a set of fracture fragments one substep in a **local frame** (WI 629): each fragment is a
+/// rigid body under a constant gravity acceleration, a static `ground`, and pairwise inter-fragment
+/// contact, integrated via [`ActiveBody::integrate_wrench`]. This is the headless, rover-frame
+/// analogue of the rocket Test's app-side `step_fragments`: the rover Test calls it with
+/// `gravity = (0, -g, 0)` and a flat-pad `HalfSpace` ground. Fragments with degenerate mass
+/// properties contribute no shape/contact but are still integrated (gravity only), never panicking.
+pub fn step_debris(
+    fragments: &mut [(VoxelCraft, ActiveBody)],
+    ground: &CollisionShape,
+    gravity: DVec3,
+    params: &ContactParams,
+    dt: f64,
+) {
+    let n = fragments.len();
+    let shapes: Vec<CollisionShape> = fragments
+        .iter()
+        .map(|(v, _)| craft_collision_shape(v))
+        .collect();
+    let bounds: Vec<Option<Bounds>> = fragments.iter().map(|(v, _)| craft_bounds(v)).collect();
+    let coms: Vec<DVec3> = fragments
+        .iter()
+        .map(|(v, _)| {
+            v.mass_properties()
+                .map(|mp| mp.center_of_mass)
+                .unwrap_or(DVec3::ZERO)
+        })
+        .collect();
+
+    let mut acc = vec![(DVec3::ZERO, DVec3::ZERO); n];
+    for (i, item) in acc.iter_mut().enumerate() {
+        let (_, b) = &fragments[i];
+        item.0 += gravity * b.mass;
+        let (gf, gt) = ground_contact_wrench(b, &shapes[i], bounds[i], coms[i], ground, params);
+        item.0 += gf;
+        item.1 += gt;
+    }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let (_, bi) = &fragments[i];
+            let (_, bj) = &fragments[j];
+            let ((fa, ta), (fb, tb)) = body_contact_wrench(
+                bi, &shapes[i], bounds[i], coms[i], bj, &shapes[j], bounds[j], coms[j], params,
+            );
+            acc[i].0 += fa;
+            acc[i].1 += ta;
+            acc[j].0 += fb;
+            acc[j].1 += tb;
+        }
+    }
+    for (i, (_, b)) in fragments.iter_mut().enumerate() {
+        b.integrate_wrench(acc[i].0, acc[i].1, dt);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +372,110 @@ mod tests {
             .iter()
             .filter_map(|f| f.mass_properties().map(|mp| mp.mass))
             .sum()
+    }
+
+    /// A single unit-cell fragment + its body at `pos` with velocity `vel`.
+    fn cube_fragment(pos: DVec3, vel: DVec3) -> (VoxelCraft, ActiveBody) {
+        let mut c = VoxelCraft::new(1.0);
+        c.voxels.push(Voxel {
+            cell: IVec3::ZERO,
+            material: Material::ALUMINIUM,
+        });
+        let mp = c.mass_properties().expect("one voxel has mass");
+        let body = ActiveBody::new(pos, vel, mp.mass, mp.inertia);
+        (c, body)
+    }
+
+    fn flat_ground(y: f64) -> CollisionShape {
+        CollisionShape::HalfSpace {
+            normal: DVec3::Y,
+            offset: y,
+        }
+    }
+
+    // --- WI 629 debris stepper ---
+
+    #[test]
+    fn debris_fragment_falls_and_comes_to_rest() {
+        // A cube released at y=5 over a ground at y=0 settles near the surface with ~zero speed.
+        let mut frags = vec![cube_fragment(DVec3::new(0.0, 5.0, 0.0), DVec3::ZERO)];
+        let ground = flat_ground(0.0);
+        let params = ContactParams::default();
+        let g = DVec3::new(0.0, -9.81, 0.0);
+        for _ in 0..3000 {
+            step_debris(&mut frags, &ground, g, &params, 0.004);
+        }
+        let b = &frags[0].1;
+        assert!(b.position.is_finite(), "position went non-finite");
+        assert!(
+            b.position.y < 5.0,
+            "fragment did not fall: y={}",
+            b.position.y
+        );
+        // Resting on the surface: the CoM (cube centre, ~0.5 above its base) hovers near +0.5, neither
+        // sunk through the plane nor floating, and the speed has bled off.
+        assert!(
+            (-0.2..1.2).contains(&b.position.y),
+            "fragment not resting on the ground: y={}",
+            b.position.y
+        );
+        assert!(
+            b.velocity.length() < 1.0,
+            "fragment not at rest: |v|={}",
+            b.velocity.length()
+        );
+    }
+
+    #[test]
+    fn debris_overlapping_fragments_separate_without_sinking() {
+        // Two cubes overlapping along x (ground far below, to isolate inter-fragment contact) push
+        // apart: their x-separation grows and neither sinks through the distant ground.
+        let mut frags = vec![
+            cube_fragment(DVec3::new(0.0, 0.0, 0.0), DVec3::ZERO),
+            cube_fragment(DVec3::new(0.5, 0.0, 0.0), DVec3::ZERO),
+        ];
+        let ground = flat_ground(-1000.0);
+        let params = ContactParams::default();
+        let sep0 = (frags[1].1.position - frags[0].1.position).length();
+        for _ in 0..50 {
+            step_debris(&mut frags, &ground, DVec3::ZERO, &params, 0.004);
+        }
+        let sep1 = (frags[1].1.position - frags[0].1.position).length();
+        assert!(
+            sep1 >= sep0,
+            "overlapping fragments did not separate: {sep0} -> {sep1}"
+        );
+        for (_, b) in &frags {
+            assert!(b.position.is_finite());
+            assert!(b.position.y > -1.5, "a fragment sank: y={}", b.position.y);
+        }
+    }
+
+    #[test]
+    fn debris_free_fall_is_gravity_impulse_and_finite() {
+        // No contact (ground far below): one step changes vertical velocity by exactly g·dt.
+        let mut frags = vec![cube_fragment(DVec3::new(0.0, 0.0, 0.0), DVec3::ZERO)];
+        let ground = flat_ground(-1000.0);
+        let params = ContactParams::default();
+        let dt = 0.01;
+        step_debris(
+            &mut frags,
+            &ground,
+            DVec3::new(0.0, -9.81, 0.0),
+            &params,
+            dt,
+        );
+        let b = &frags[0].1;
+        assert!(b.velocity.is_finite() && b.position.is_finite());
+        assert!(
+            (b.velocity.y - (-9.81 * dt)).abs() < 1e-9,
+            "free-fall Δv≠g·dt: vy={}",
+            b.velocity.y
+        );
+        assert!(
+            b.velocity.x.abs() < 1e-12 && b.velocity.z.abs() < 1e-12,
+            "free fall gained lateral velocity"
+        );
     }
 
     // --- I1 partition ---

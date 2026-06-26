@@ -40,7 +40,7 @@ use bevy::prelude::*;
 
 use sounding_sim::active::ActiveBody;
 use sounding_sim::attitude::{AttitudeControl, AttitudePilot, ReactionWheels, Sas};
-use sounding_sim::breakage::fracture_on_impact;
+use sounding_sim::breakage::{fracture_on_impact, step_debris};
 use sounding_sim::collision::{
     craft_bounding_radius, craft_bounds, craft_collision_shape, ground_half_space, Bounds,
     BoxShape, CollisionShape,
@@ -401,6 +401,14 @@ struct RoverState {
     fall_peak: f64,
     /// Smoothed steering input (−1..1): ramps toward the key target so a tap is a gentle correction.
     steer_input: f64,
+    /// Chassis fracture (WI 629): once a hard enough obstacle/landing impact breaks the chassis, the
+    /// rover is replaced by tumbling debris stepped in the rover's local frame and driving ends.
+    fractured: bool,
+    /// The debris fragment `(lattice, body)` pairs while `fractured`; empty otherwise.
+    fragments: Vec<(VoxelCraft, ActiveBody)>,
+    /// The flat-ground height (local y) the debris rests on — the terrain height under the rover at
+    /// the moment of fracture (the pad is flat; ramp-aware debris contact is deferred).
+    debris_ground_y: f64,
 }
 
 /// The grounded workshop Test state: one controllable craft, or its debris after a crash.
@@ -652,6 +660,9 @@ impl WorkshopWorld {
             airborne: false,
             fall_peak: 0.0,
             steer_input: 0.0,
+            fractured: false,
+            fragments: Vec::new(),
+            debris_ground_y: 0.0,
         });
         world
     }
@@ -847,6 +858,9 @@ struct RoverPartMesh(usize);
 /// A rover Test device (motor/battery/tank/…) mesh by device index (WI 655) — visible while driving.
 #[derive(Component)]
 struct RoverDeviceMesh(usize);
+/// A rover chassis-fracture debris fragment mesh by fragment index (WI 629).
+#[derive(Component)]
+struct RoverFragmentMesh(usize);
 /// A rover Test obstacle box mesh by obstacle index (WI 610).
 #[derive(Component)]
 struct RoverObstacleMesh(usize);
@@ -919,6 +933,8 @@ impl Plugin for WorkshopScenePlugin {
                     track_meshes,
                     track_rover_meshes,
                     track_device_meshes,
+                    reconcile_rover_debris,
+                    track_rover_debris,
                     track_ramp_mesh,
                     accumulate_chase_look,
                     follow_camera,
@@ -1579,11 +1595,18 @@ fn workshop_input(
     keys: Res<ButtonInput<KeyCode>>,
     gamepads: Query<&Gamepad>,
     pad_map: Res<GamepadMap>,
+    mut next_mode: ResMut<NextState<WorkshopMode>>,
     mut world: ResMut<WorkshopWorld>,
 ) {
     let pad = pad_map.sample(&gamepads);
     if keys.just_pressed(KeyCode::Backspace) {
-        world.reset();
+        // A fractured wreck can't reset in place (its intact meshes were despawned for debris);
+        // return to Build instead, so re-entering Test rebuilds a fresh rover (WI 629).
+        if world.rover.as_ref().is_some_and(|rs| rs.fractured) {
+            next_mode.set(WorkshopMode::Build);
+        } else {
+            world.reset();
+        }
         return;
     }
     if world.rover.is_some() {
@@ -1681,6 +1704,9 @@ fn drive_rover(keys: &ButtonInput<KeyCode>, pad: &PadSample, world: &mut Worksho
     let Some(rs) = world.rover.as_mut() else {
         return;
     };
+    if rs.fractured {
+        return; // driving ends once the chassis is debris (WI 629)
+    }
     // Set the throttle/brake **intent**; the powertrain turns throttle into (fuel-gated) torque each
     // frame in `step_workshop` (WI 609). The gamepad triggers give bipolar analog throttle and win
     // over the digital keys when past the deadzone (WI 617).
@@ -1731,6 +1757,7 @@ fn publish_rover(world: Res<WorkshopWorld>, mut grounded: ResMut<GroundedRover>)
     grounded.0 = world
         .rover
         .as_ref()
+        .filter(|rs| !rs.fractured) // fractured ⇒ debris, no controllable rover to report (WI 629)
         .map(|rs| RoverTelemetry::from_rover(&rs.rover));
 }
 
@@ -1747,6 +1774,30 @@ fn step_workshop(time: Res<Time>, mut clock: ResMut<SimClock>, mut world: ResMut
     };
     if world.rover.is_some() {
         let rs = world.rover.as_mut().expect("rover present");
+        // Chassis fractured (WI 629): the rover is gone — step the tumbling debris in the rover's
+        // local frame (constant gravity + flat pad ground + pairwise contact) and stop driving.
+        if rs.fractured {
+            rs.accumulator += frame_dt;
+            let ground = CollisionShape::HalfSpace {
+                normal: DVec3::Y,
+                offset: rs.debris_ground_y,
+            };
+            let gravity = DVec3::new(0.0, -ROVER_GRAVITY, 0.0);
+            let contact = ContactParams::default();
+            let mut n = 0;
+            while rs.accumulator >= ROVER_SUBSTEP_DT && n < ROVER_MAX_SUBSTEPS {
+                step_debris(
+                    &mut rs.fragments,
+                    &ground,
+                    gravity,
+                    &contact,
+                    ROVER_SUBSTEP_DT,
+                );
+                rs.accumulator -= ROVER_SUBSTEP_DT;
+                n += 1;
+            }
+            return;
+        }
         // Route throttle through the powertrain (consumes fuel/charge over the frame); the realized
         // torque drives the drive-group wheels, brake applies to all.
         let torque = rs.powertrain.drive_torque(rs.throttle, frame_dt);
@@ -1766,6 +1817,10 @@ fn step_workshop(time: Res<Time>, mut clock: ResMut<SimClock>, mut world: ResMut
         let mut n = 0;
         while rs.accumulator >= ROVER_SUBSTEP_DT && n < ROVER_MAX_SUBSTEPS {
             let mut any_contact = false;
+            // Chassis fracture (WI 629): a transmitted contact force above the chassis material
+            // strength splits it into debris. Decided per sub-step from the hardest obstacle contact;
+            // applied after the obstacle loop to keep the borrow of `rs.obstacles` immutable.
+            let mut fracture_pending: Option<Vec<(VoxelCraft, ActiveBody)>> = None;
             for obs in &rs.obstacles {
                 let ((mut force, torque), _) = body_contact_wrench(
                     &rs.rover.body,
@@ -1803,6 +1858,12 @@ fn step_workshop(time: Res<Time>, mut clock: ResMut<SimClock>, mut world: ResMut
                     rs.drive.retain(|&x| x != idx);
                     rs.steer.retain(|&x| x != idx);
                 }
+                // Chassis fracture (WI 629): the transmitted obstacle contact force, run through the
+                // material-strength proxy — a hard enough hit splits the chassis into debris. Recorded
+                // here, applied after the obstacle loop (keeps `&rs.obstacles` borrowed immutably).
+                if fracture_pending.is_none() {
+                    fracture_pending = fracture_on_impact(&rs.lattice, &rs.rover.body, force);
+                }
                 // Diagnostic: build a report for a notable impact; log shears immediately (so a
                 // sustained square-on hit still reports), and remember a non-shearing episode's peak
                 // to emit a "survived" report when it ends.
@@ -1836,6 +1897,18 @@ fn step_workshop(time: Res<Time>, mut clock: ResMut<SimClock>, mut world: ResMut
                     }
                 }
                 rs.rover.apply_external(force, torque);
+            }
+            // Apply a pending chassis fracture (WI 629): switch to debris on the flat pad ground under
+            // the rover, end driving, and stop stepping the (now-gone) rover this frame.
+            if let Some(frags) = fracture_pending.take() {
+                let bp = rs.rover.body.position;
+                rs.debris_ground_y = rs.terrain.height(bp.x, bp.z);
+                rs.fragments = frags;
+                rs.fractured = true;
+                rs.throttle = 0.0;
+                rs.brake = 0.0;
+                info!("chassis fractured into {} piece(s)", rs.fragments.len());
+                break;
             }
             // Episode ended this sub-step: if a notable hit didn't shear anything, emit it now.
             if !any_contact {
@@ -2165,6 +2238,9 @@ fn track_rover_meshes(
     let Some(rs) = &world.rover else {
         return;
     };
+    if rs.fractured {
+        return; // intact rover meshes are despawned; debris is posed by track_rover_debris (WI 629)
+    }
     let body = &rs.rover.body;
     let anchor = body.position;
     let q = body.orientation;
@@ -2236,6 +2312,9 @@ fn track_device_meshes(
     let Some(rs) = &world.rover else {
         return;
     };
+    if rs.fractured {
+        return; // device meshes are despawned on fracture (WI 629)
+    }
     let body = &rs.rover.body;
     let q = body.orientation;
     let half = rs.lattice.cell_size * 0.5;
@@ -2248,6 +2327,73 @@ fn track_device_meshes(
             tf.translation = (q * (anchor - rs.com)).as_vec3();
             tf.rotation =
                 q.as_quat() * Quat::from_rotation_arc(Vec3::Y, normal) * part_up_correction();
+        }
+    }
+}
+
+/// On the first frame after a chassis fracture (WI 629), despawn the intact rover meshes (chassis /
+/// wheels / parts / devices) and spawn a skin mesh per debris fragment; obstacles and the ramp stay.
+#[allow(clippy::type_complexity)]
+fn reconcile_rover_debris(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    asset_server: Res<AssetServer>,
+    world: Res<WorkshopWorld>,
+    frag_q: Query<Entity, With<RoverFragmentMesh>>,
+    rover_meshes: Query<
+        Entity,
+        Or<(
+            With<RoverChassisMesh>,
+            With<RoverWheelMesh>,
+            With<RoverPartMesh>,
+            With<RoverDeviceMesh>,
+        )>,
+    >,
+) {
+    let Some(rs) = &world.rover else { return };
+    if !rs.fractured || !frag_q.is_empty() {
+        return; // not fractured, or debris meshes already spawned
+    }
+    for e in &rover_meshes {
+        commands.entity(e).despawn();
+    }
+    for (i, (voxels, _)) in rs.fragments.iter().enumerate() {
+        for (material, mesh) in skin_submeshes(voxels, VoxelSkin::Hull) {
+            let mat = pbr_material(material, &asset_server, &mut materials);
+            commands.spawn((
+                Mesh3d(meshes.add(mesh)),
+                MeshMaterial3d(mat),
+                Transform::default(),
+                RoverFragmentMesh(i),
+                TestEntity,
+            ));
+        }
+    }
+}
+
+/// Poses the chassis-fracture debris each frame (WI 629), rover-anchored on the debris centroid so it
+/// stays framed by the fixed chase camera (which the gamepad free-look can still orbit, WI 665).
+fn track_rover_debris(
+    world: Res<WorkshopWorld>,
+    mut q: Query<(&RoverFragmentMesh, &mut Transform)>,
+) {
+    let Some(rs) = &world.rover else { return };
+    if !rs.fractured || rs.fragments.is_empty() {
+        return;
+    }
+    let anchor: DVec3 =
+        rs.fragments.iter().map(|(_, b)| b.position).sum::<DVec3>() / rs.fragments.len() as f64;
+    for (tag, mut tf) in &mut q {
+        if let Some((voxels, body)) = rs.fragments.get(tag.0) {
+            let com = voxels
+                .mass_properties()
+                .map(|mp| mp.center_of_mass)
+                .unwrap_or(DVec3::ZERO);
+            // Mesh lattice origin = physical origin (body CoM − orientation·com), rover-anchored.
+            let world_pos = body.position - body.orientation * com;
+            tf.translation = (world_pos - anchor).as_vec3();
+            tf.rotation = body.orientation.as_quat();
         }
     }
 }
@@ -2275,6 +2421,9 @@ fn draw_rover(mut gizmos: Gizmos, world: Res<WorkshopWorld>) {
     let Some(rs) = &world.rover else {
         return;
     };
+    if rs.fractured {
+        return; // no intact rover to draw once it's debris (WI 629)
+    }
     let body = &rs.rover.body;
     let anchor = body.position;
     let to_render = |p: DVec3| (p - anchor).as_vec3();
@@ -2366,6 +2515,19 @@ fn update_test_hud(
     };
     if let Ok(mut text) = hud.single_mut() {
         if let Some(rs) = &world.rover {
+            // Chassis fractured (WI 629): the rover is debris — show the wreck state, not drive stats.
+            if rs.fractured {
+                let pieces = rs.fragments.len();
+                let impact = rs
+                    .last_impact
+                    .as_ref()
+                    .map(|r| format!("\n{}", r.hud_line()))
+                    .unwrap_or_default();
+                text.0 = format!(
+                    "workshop · TEST (rover){paused}\n💥 CHASSIS FRACTURED — {pieces} piece(s)\ndriving ended · Backspace → BUILD to rebuild{impact}"
+                );
+                return;
+            }
             let speed = rs.rover.body.velocity.length();
             let height = rs.rover.height_above_terrain(&rs.terrain);
             let live = rs.rover.wheels.iter().filter(|w| !w.inert).count();
