@@ -51,6 +51,7 @@ mod overlay;
 mod pause;
 mod planet;
 mod play_scene;
+mod replay;
 mod rover_scene;
 mod skins_scene;
 mod sparkline;
@@ -146,7 +147,8 @@ fn main() {
         })
         .add_plugins(FlightControlPlugin)
         .add_plugins(SimDiagnosticsPlugin)
-        .add_plugins(bus::BusPlugin::default());
+        .add_plugins(bus::BusPlugin::default())
+        .add_plugins(replay::ReplayPlugin);
 
     match selected_scene() {
         Scene::Editor => {

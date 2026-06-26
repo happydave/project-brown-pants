@@ -72,6 +72,7 @@ use crate::editor::{
 };
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
 use crate::overlay::{spawn_overlay, update_overlay, CockpitOverlay};
+use crate::replay::Replayable;
 use crate::voxel_skin::{pbr_material, skin_submeshes, VoxelSkin};
 
 const BODY: CentralBody = CentralBody::EARTHLIKE;
@@ -1323,7 +1324,9 @@ fn enter_test(
             TestEntity,
         ));
         commands.spawn((
-            Text::new("W/S drive · A/D steer · Space brake · Backspace reset · Enter → BUILD"),
+            Text::new(
+                "W/S drive · A/D steer · Space brake · P pause · R replay [/] scrub · G cockpit · Backspace reset · Enter → BUILD",
+            ),
             TextFont {
                 font_size: 14.0,
                 ..default()
@@ -1353,6 +1356,7 @@ fn enter_test(
                 MeshMaterial3d(chassis_mat),
                 Transform::default(),
                 RoverChassisMesh,
+                Replayable,
                 TestEntity,
             ));
         }
@@ -1369,6 +1373,7 @@ fn enter_test(
                     MeshMaterial3d(tyre_mat.clone()),
                     Transform::default(),
                     RoverWheelMesh(i, r),
+                    Replayable,
                     TestEntity,
                 ));
             }
@@ -1383,6 +1388,7 @@ fn enter_test(
                     MeshMaterial3d(mat),
                     Transform::default(),
                     RoverPartMesh(j),
+                    Replayable,
                     TestEntity,
                 ));
             }
@@ -2088,7 +2094,13 @@ fn track_rover_meshes(
             Without<RoverPartMesh>,
         ),
     >,
+    cam: Res<crate::replay::ReplayCam>,
 ) {
+    // During replay (WI 648) the recorded poses drive the meshes — don't overwrite them with the live
+    // rover state (which is frozen anyway).
+    if cam.is_playback() {
+        return;
+    }
     let Some(rs) = &world.rover else {
         return;
     };
@@ -2238,10 +2250,19 @@ fn draw_rover(mut gizmos: Gizmos, world: Res<WorkshopWorld>) {
 fn update_test_hud(
     world: Res<WorkshopWorld>,
     clock: Res<SimClock>,
+    cam: Res<crate::replay::ReplayCam>,
     mut hud: Query<&mut Text, With<TestHud>>,
 ) {
-    // A clear paused banner (WI 638): the physics is frozen but the scene stays inspectable.
-    let paused = crate::pause::paused_banner(&clock);
+    // A clear paused banner (WI 638); during replay (WI 648) show the scrub position instead.
+    let paused = if cam.is_playback() {
+        format!(
+            "\n⏪ REPLAY {}/{} (R live · [ ] scrub)",
+            cam.cursor() + 1,
+            cam.len()
+        )
+    } else {
+        crate::pause::paused_banner(&clock).to_string()
+    };
     if let Ok(mut text) = hud.single_mut() {
         if let Some(rs) = &world.rover {
             let speed = rs.rover.body.velocity.length();

@@ -4,11 +4,12 @@
 //! returns a bounded ring of recent snapshots as a JSON array (WI 644);
 //! `POST /command` injects a JSON [`Command`] into the executor (malformed input →
 //! HTTP 400); `GET /screenshot` triggers a framebuffer capture saved to a file the
-//! caller reads back (WI 647). The server
+//! caller reads back (WI 647); `POST /replay` drives the Tier-B replay cam (WI 648). The server
 //! runs on its own thread, bridged to Bevy by channels, so network I/O never
 //! blocks the sim loop. This is the **runtime** surface — distinct from the
 //! dev-gated Bevy Remote Protocol god-mode surface.
 
+use crate::replay::ReplayCommand;
 use bevy::diagnostic::DiagnosticsStore;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
@@ -53,6 +54,12 @@ struct BusScreenshotRx(Mutex<Receiver<()>>);
 #[derive(Resource, Clone)]
 struct ScreenshotPath(String);
 
+/// Replay control actions received by the server thread (WI 648), drained into `ReplayCommand`
+/// messages — so the assistant can drive the replay cam (`POST /replay`) and screenshot a scrubbed
+/// moment, not only the keyboard.
+#[derive(Resource)]
+struct BusReplayRx(Mutex<Receiver<ReplayCommand>>);
+
 /// Bridge from an active scene to the bus publisher (WI 569): the latest active-craft
 /// autonomy snapshot. A scene that owns a `FlightCraft` (e.g. `-- play`, `-- autopilot`)
 /// writes it each frame; `publish_telemetry` attaches it. `None` ⇒ orbit-only telemetry.
@@ -81,6 +88,7 @@ impl Plugin for BusPlugin {
         let telemetry = Arc::new(Mutex::new(VecDeque::with_capacity(HISTORY_CAP)));
         let (tx, rx) = mpsc::channel::<Command>();
         let (shot_tx, shot_rx) = mpsc::channel::<()>();
+        let (replay_tx, replay_rx) = mpsc::channel::<ReplayCommand>();
         // An absolute path next to the working directory, so the (same-machine) MCP can read it back.
         let shot_path = std::env::current_dir()
             .unwrap_or_default()
@@ -92,7 +100,7 @@ impl Plugin for BusPlugin {
             Ok(server) => {
                 let shared = telemetry.clone();
                 let path = shot_path.clone();
-                thread::spawn(move || serve(server, shared, tx, shot_tx, path));
+                thread::spawn(move || serve(server, shared, tx, shot_tx, replay_tx, path));
                 info!("bus: listening on http://127.0.0.1:{}", self.port);
             }
             Err(e) => warn!(
@@ -105,21 +113,29 @@ impl Plugin for BusPlugin {
             .insert_resource(BusCommandRx(Mutex::new(rx)))
             .insert_resource(BusScreenshotRx(Mutex::new(shot_rx)))
             .insert_resource(ScreenshotPath(shot_path))
+            .insert_resource(BusReplayRx(Mutex::new(replay_rx)))
             .init_resource::<ActiveFlight>()
             .init_resource::<GroundedRover>()
             .add_systems(
                 Update,
-                (publish_telemetry, drain_commands, drain_screenshots),
+                (
+                    publish_telemetry,
+                    drain_commands,
+                    drain_screenshots,
+                    drain_replays,
+                ),
             );
     }
 }
 
 /// Blocking server loop (runs on its own thread).
+#[allow(clippy::too_many_arguments)]
 fn serve(
     server: Server,
     telemetry: Arc<Mutex<VecDeque<String>>>,
     tx: Sender<Command>,
     shot_tx: Sender<()>,
+    replay_tx: Sender<ReplayCommand>,
     shot_path: String,
 ) {
     for mut request in server.incoming_requests() {
@@ -127,8 +143,9 @@ fn serve(
         let url = request.url().to_owned();
         let mut body = String::new();
         let _ = request.as_reader().read_to_string(&mut body);
-        let (status, payload) =
-            handle_request(&method, &url, &body, &telemetry, &tx, &shot_tx, &shot_path);
+        let (status, payload) = handle_request(
+            &method, &url, &body, &telemetry, &tx, &shot_tx, &replay_tx, &shot_path,
+        );
         let _ = request.respond(Response::from_string(payload).with_status_code(status));
     }
 }
@@ -142,6 +159,7 @@ fn handle_request(
     telemetry: &Mutex<VecDeque<String>>,
     tx: &Sender<Command>,
     shot_tx: &Sender<()>,
+    replay_tx: &Sender<ReplayCommand>,
     shot_path: &str,
 ) -> (u16, String) {
     match (method, url) {
@@ -175,6 +193,13 @@ fn handle_request(
                 format!(r#"{{"ok":true,"path":{}}}"#, json_string(shot_path)),
             )
         }
+        ("POST", "/replay") => match serde_json::from_str::<ReplayCommand>(body) {
+            Ok(cmd) => {
+                let _ = replay_tx.send(cmd);
+                (200, r#"{"ok":true}"#.to_owned())
+            }
+            Err(e) => (400, format!(r#"{{"error":"{e}"}}"#)),
+        },
         _ => (404, r#"{"error":"not found"}"#.to_owned()),
     }
 }
@@ -246,6 +271,15 @@ fn drain_commands(rx: Res<BusCommandRx>, mut commands: MessageWriter<Command>) {
     }
 }
 
+/// Drains replay-control actions received over the bus into `ReplayCommand` messages (WI 648).
+fn drain_replays(rx: Res<BusReplayRx>, mut out: MessageWriter<ReplayCommand>) {
+    if let Ok(rx) = rx.0.lock() {
+        while let Ok(cmd) = rx.try_recv() {
+            out.write(cmd);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,7 +288,7 @@ mod tests {
         Mutex::new(items.iter().map(|s| s.to_string()).collect())
     }
 
-    /// Route a request with throwaway command + screenshot channels (the latter mostly unused).
+    /// Route a request with throwaway command / screenshot / replay channels.
     fn route(
         method: &str,
         url: &str,
@@ -263,7 +297,17 @@ mod tests {
     ) -> (u16, String) {
         let (tx, _rx) = mpsc::channel();
         let (stx, _srx) = mpsc::channel();
-        handle_request(method, url, body, telemetry, &tx, &stx, "/tmp/shot.png")
+        let (rtx, _rrx) = mpsc::channel();
+        handle_request(
+            method,
+            url,
+            body,
+            telemetry,
+            &tx,
+            &stx,
+            &rtx,
+            "/tmp/shot.png",
+        )
     }
 
     #[test]
@@ -312,6 +356,7 @@ mod tests {
         let telemetry = ring(&[]);
         let (tx, _rx) = mpsc::channel();
         let (stx, srx) = mpsc::channel();
+        let (rtx, _rrx) = mpsc::channel();
         let (status, body) = handle_request(
             "GET",
             "/screenshot",
@@ -319,6 +364,7 @@ mod tests {
             &telemetry,
             &tx,
             &stx,
+            &rtx,
             "/tmp/shot.png",
         );
         assert_eq!(status, 200);
@@ -333,6 +379,7 @@ mod tests {
         let telemetry = ring(&[]);
         let (tx, rx) = mpsc::channel();
         let (stx, _srx) = mpsc::channel();
+        let (rtx, _rrx) = mpsc::channel();
         let (status, _) = handle_request(
             "POST",
             "/command",
@@ -340,10 +387,31 @@ mod tests {
             &telemetry,
             &tx,
             &stx,
+            &rtx,
             "/tmp/shot.png",
         );
         assert_eq!(status, 200);
         assert_eq!(rx.try_recv().unwrap(), Command::SetWarp(8.0));
+    }
+
+    #[test]
+    fn post_replay_is_accepted_and_forwarded() {
+        let telemetry = ring(&[]);
+        let (tx, _rx) = mpsc::channel();
+        let (stx, _srx) = mpsc::channel();
+        let (rtx, rrx) = mpsc::channel();
+        let (status, _) = handle_request(
+            "POST",
+            "/replay",
+            r#"{"scrub":-2}"#,
+            &telemetry,
+            &tx,
+            &stx,
+            &rtx,
+            "/tmp/shot.png",
+        );
+        assert_eq!(status, 200);
+        assert_eq!(rrx.try_recv().unwrap(), ReplayCommand::Scrub(-2));
     }
 
     #[test]

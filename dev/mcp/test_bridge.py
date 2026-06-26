@@ -86,8 +86,21 @@ def main():
             "get_telemetry",
             "get_telemetry_history",
             "get_screenshot",
+            "replay",
             "send_command",
         }, names
+
+        rep = rpc(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {"name": "replay", "arguments": {"action": {"scrub": -1}}},
+            },
+        )
+        assert rep["result"]["content"][0]["text"] == '{"ok":true}', rep
+        assert ("/replay", '{"scrub": -1}') in received["posts"], received["posts"]
 
         shot = rpc(
             proc,
@@ -135,7 +148,7 @@ def main():
             },
         )
         assert json.loads(cmd["result"]["content"][0]["text"])["ok"] is True, cmd
-        assert received["posts"] == [("/command", '{"SetPaused": true}')], received["posts"]
+        assert ("/command", '{"SetPaused": true}') in received["posts"], received["posts"]
 
         # A notification draws no reply (id-less) — the bridge must not wedge.
         proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")

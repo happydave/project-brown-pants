@@ -13,6 +13,8 @@ scenario under test instead of reproducing it headlessly:
     snapshots, oldest-first (WI 644); a time series for spiky signals (pair with a paused ``Step``).
   * ``get_screenshot`` → ``GET /screenshot`` — capture the window and return it as an image (WI 647);
     a gestalt read of the scene / cockpit overlay (the image arrives as a file the bridge reads back).
+  * ``replay`` → ``POST /replay`` — drive the Tier-B replay cam (WI 648): enter/exit/toggle, scrub, or
+    seek the last few seconds (workshop Test); pair with ``get_screenshot`` to capture a scrubbed moment.
   * ``send_command``  → ``POST /command``  — inject one JSON `Command` (e.g. ``{"SetPaused": true}``,
     ``{"SetWarp": 4.0}``, or — while paused — ``{"Step": {"seconds": 0.1}}`` to advance a frozen scene
     a known amount for inspection, WI 643).
@@ -61,6 +63,23 @@ TOOLS = [
             "Prefer this over raw telemetry for a gestalt read of the scene / cockpit overlay."
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "replay",
+        "description": (
+            "Drive the Tier-B replay cam (POST /replay, WI 648), in the workshop Test. `action` is the "
+            'JSON body: "enter" / "exit" / "toggle", {"scrub": -2} (frames), or {"seek": 0.5} '
+            "(fraction). Replay freezes the sim and re-poses the last few seconds; pair with "
+            "get_screenshot to capture a scrubbed moment."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"description": "A serialized ReplayCommand (string or object)."}
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
     },
     {
         "name": "send_command",
@@ -132,6 +151,11 @@ def _call_tool(name: str, arguments: dict) -> dict:
             text = _http_get("/telemetry/history")
         elif name == "get_screenshot":
             return _capture_screenshot()
+        elif name == "replay":
+            action = arguments.get("action")
+            if action is None:
+                raise ValueError("replay requires an `action`")
+            text = _http_post("/replay", json.dumps(action))
         elif name == "send_command":
             command = arguments.get("command")
             if command is None:

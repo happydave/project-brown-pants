@@ -20,5 +20,6 @@ dev = ["bevy/bevy_remote"]
 [dependencies]
 bevy = { workspace = true }
 sounding_sim = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tiny_http = "0.12"
