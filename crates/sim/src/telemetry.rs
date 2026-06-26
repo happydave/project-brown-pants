@@ -4,11 +4,14 @@
 //! not a separate model). WI 502's bus serves this over a transport; the AI
 //! companion, second-screen, and replay read the same shape. Rendering-free.
 
+use crate::active::ActiveBody;
 use crate::control::ControlTier;
 use crate::flight::FlightCraft;
 use crate::orbit::Orbit;
 use crate::rover::Rover;
 use crate::sim::SimClock;
+use crate::voxel::VoxelCraft;
+use glam::DVec3;
 use serde::{Deserialize, Serialize};
 
 /// A point-in-time snapshot of the simulation, as served to external clients.
@@ -85,6 +88,18 @@ pub struct RoverTelemetry {
     pub grounded: bool,
     /// Per-wheel state, in build order.
     pub wheels: Vec<WheelTelemetry>,
+    /// Chassis fractured into debris (WI 629/671): the rover is no longer a single controllable body.
+    /// While `true`, `position`/`velocity` are the debris **aggregate** and `wheels` is empty.
+    /// Additive/serde-defaulted.
+    #[serde(default)]
+    pub fractured: bool,
+    /// Number of debris fragments while `fractured` (0 when intact). Additive/serde-defaulted.
+    #[serde(default)]
+    pub fragment_count: usize,
+    /// Whether the debris has settled (every fragment below a small speed). Meaningful only while
+    /// `fractured`. Additive/serde-defaulted.
+    #[serde(default)]
+    pub debris_at_rest: bool,
 }
 
 /// One wheel's live state on the bus (WI 640).
@@ -160,6 +175,58 @@ impl RoverTelemetry {
                     slip_ratio: w.slip_ratio,
                 })
                 .collect(),
+            fractured: false,
+            fragment_count: 0,
+            debris_at_rest: false,
+        }
+    }
+
+    /// Speed (m/s) below which a debris fragment counts as settled (WI 671).
+    const DEBRIS_REST_SPEED: f64 = 0.1;
+
+    /// Snapshot a **fractured** rover's debris (WI 629/671): the rover is gone, so report the
+    /// aggregate — mass-weighted centroid `position`, total-momentum/total-mass `velocity`, the
+    /// fragment count, and whether every piece has settled. `wheels` is empty and `orientation` is
+    /// identity (a debris field has no single body frame). Pure — borrows only the fragment
+    /// `(VoxelCraft, ActiveBody)` pairs.
+    pub fn from_debris(fragments: &[(VoxelCraft, ActiveBody)]) -> Self {
+        let mut total_mass = 0.0;
+        let mut weighted_pos = DVec3::ZERO;
+        let mut momentum = DVec3::ZERO;
+        let mut at_rest = true;
+        for (_, b) in fragments {
+            // A degenerate (massless) fragment contributes nothing to the weighting.
+            if b.mass > 0.0 {
+                total_mass += b.mass;
+                weighted_pos += b.position * b.mass;
+                momentum += b.velocity * b.mass;
+            }
+            if b.velocity.length() >= Self::DEBRIS_REST_SPEED {
+                at_rest = false;
+            }
+        }
+        let position = if total_mass > 0.0 {
+            weighted_pos / total_mass
+        } else {
+            DVec3::ZERO
+        };
+        let velocity = if total_mass > 0.0 {
+            momentum / total_mass
+        } else {
+            DVec3::ZERO
+        };
+        Self {
+            position: [position.x, position.y, position.z],
+            orientation: [0.0, 0.0, 0.0, 1.0],
+            velocity: [velocity.x, velocity.y, velocity.z],
+            angular_velocity: [0.0, 0.0, 0.0],
+            contact_jitter: 0.0,
+            hull_penetration: 0.0,
+            grounded: at_rest,
+            wheels: Vec::new(),
+            fractured: true,
+            fragment_count: fragments.len(),
+            debris_at_rest: at_rest,
         }
     }
 }
@@ -234,6 +301,62 @@ impl Telemetry {
 mod tests {
     use super::*;
     use glam::DVec2;
+
+    /// A unit-cell fragment + a body at `pos` with velocity `vel` (WI 671 debris telemetry test).
+    fn debris_fragment(pos: DVec3, vel: DVec3) -> (VoxelCraft, ActiveBody) {
+        use crate::voxel::{Material, Voxel};
+        use glam::IVec3;
+        let mut c = VoxelCraft::new(1.0);
+        c.voxels.push(Voxel {
+            cell: IVec3::ZERO,
+            material: Material::ALUMINIUM,
+        });
+        let mp = c.mass_properties().expect("one voxel has mass");
+        (c, ActiveBody::new(pos, vel, mp.mass, mp.inertia))
+    }
+
+    #[test]
+    fn from_debris_reports_count_centroid_and_rest() {
+        // Two equal-mass fragments: centroid is their midpoint; one moving ⇒ not at rest.
+        let frags = vec![
+            debris_fragment(DVec3::new(0.0, 0.0, 0.0), DVec3::new(0.0, 0.0, 0.0)),
+            debris_fragment(DVec3::new(4.0, 0.0, 0.0), DVec3::new(2.0, 0.0, 0.0)),
+        ];
+        let t = RoverTelemetry::from_debris(&frags);
+        assert!(t.fractured);
+        assert_eq!(t.fragment_count, 2);
+        assert!(
+            (t.position[0] - 2.0).abs() < 1e-9,
+            "centroid x={}",
+            t.position[0]
+        );
+        assert!(
+            !t.debris_at_rest && !t.grounded,
+            "a moving piece ⇒ not at rest"
+        );
+        assert!(t.wheels.is_empty());
+
+        // Both slow ⇒ settled.
+        let settled = vec![
+            debris_fragment(DVec3::new(0.0, 0.0, 0.0), DVec3::ZERO),
+            debris_fragment(DVec3::new(4.0, 0.0, 0.0), DVec3::new(0.01, 0.0, 0.0)),
+        ];
+        let t2 = RoverTelemetry::from_debris(&settled);
+        assert!(t2.debris_at_rest && t2.grounded);
+    }
+
+    #[test]
+    fn from_debris_handles_no_fragments() {
+        let t = RoverTelemetry::from_debris(&[]);
+        assert!(t.fractured && t.fragment_count == 0 && t.debris_at_rest);
+        assert_eq!(t.position, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn from_rover_is_not_fractured() {
+        let t = RoverTelemetry::from_rover(&test_rover());
+        assert!(!t.fractured && t.fragment_count == 0);
+    }
 
     #[test]
     fn capture_reflects_state_and_serializes() {

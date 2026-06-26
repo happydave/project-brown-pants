@@ -196,6 +196,9 @@ mod tests {
             hull_penetration: 0.04,
             grounded: true,
             wheels: vec![],
+            fractured: false,
+            fragment_count: 0,
+            debris_at_rest: false,
         }
     }
 

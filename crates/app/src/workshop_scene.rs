@@ -1754,11 +1754,14 @@ fn drive_rover(keys: &ButtonInput<KeyCode>, pad: &PadSample, world: &mut Worksho
 /// `GET /telemetry` and the dev-MCP bridge can introspect a workshop rover. Carries `None`
 /// when Test is flying a rocket (no assembled rover); cleared on leaving Test.
 fn publish_rover(world: Res<WorkshopWorld>, mut grounded: ResMut<GroundedRover>) {
-    grounded.0 = world
-        .rover
-        .as_ref()
-        .filter(|rs| !rs.fractured) // fractured ⇒ debris, no controllable rover to report (WI 629)
-        .map(|rs| RoverTelemetry::from_rover(&rs.rover));
+    // Keep reporting through a wreck (WI 671): debris telemetry while fractured, live rover otherwise.
+    grounded.0 = world.rover.as_ref().map(|rs| {
+        if rs.fractured {
+            RoverTelemetry::from_debris(&rs.fragments)
+        } else {
+            RoverTelemetry::from_rover(&rs.rover)
+        }
+    });
 }
 
 /// Clears the rover bridge when leaving Test (WI 640) so Build mode publishes no stale rover.
