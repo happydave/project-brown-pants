@@ -237,6 +237,7 @@ mod tests {
             time: 0.0,
             warp: 8.0,
             paused: true,
+            ..Default::default()
         };
         let orbit =
             Orbit::from_state(1.0, DVec2::new(1.0, 0.0), DVec2::new(0.0, 1.0), 0.0).unwrap();

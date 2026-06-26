@@ -80,6 +80,7 @@ mod tests {
             time,
             warp: 1.0,
             paused: false,
+            ..Default::default()
         };
         Telemetry::capture(&clock, Some(orbit), 1.0, None)
     }
@@ -142,6 +143,7 @@ mod tests {
             time: t_apo,
             warp: 1.0,
             paused: false,
+            ..Default::default()
         };
         let tele = Telemetry::capture(&clock, Some(&orbit), MU_SI, None);
         let mut brain = NavigatorBrain;
