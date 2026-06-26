@@ -555,8 +555,9 @@ pub(crate) fn orbit_camera(
         cam.dist = (cam.dist + dt * 12.0).min(80.0);
     }
     // Gamepad orbit (WI 617): right stick orbits (yaw/pitch), bumpers zoom; same clamps as the keys.
+    // Yaw negated to match the Test/flight free-look convention (WI 665) — stick-right orbits right.
     let pad = pad_map.sample(&gamepads);
-    cam.yaw += pad.cam_yaw * dt * 2.0;
+    cam.yaw -= pad.cam_yaw * dt * 2.0;
     cam.pitch = (cam.pitch - pad.cam_pitch * dt * 2.0).clamp(-1.4, 1.4);
     if pad.zoom_in {
         cam.dist = (cam.dist - dt * cam.dist * 1.5).max(0.2);

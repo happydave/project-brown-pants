@@ -224,9 +224,10 @@ impl ChaseLook {
     /// Stick → orbit rate (rad/s).
     pub const RATE: f32 = 2.5;
 
-    /// Accumulate one frame of right-stick input (already deadzoned), clamping pitch.
+    /// Accumulate one frame of right-stick input (already deadzoned), clamping pitch. Yaw is negated
+    /// so stick-right swings the view the way players reach for it (orbit toward the right).
     pub fn accumulate(&mut self, cam_yaw: f32, cam_pitch: f32, dt: f32) {
-        self.yaw += cam_yaw * Self::RATE * dt;
+        self.yaw -= cam_yaw * Self::RATE * dt;
         self.pitch =
             (self.pitch - cam_pitch * Self::RATE * dt).clamp(-Self::PITCH_LIMIT, Self::PITCH_LIMIT);
     }
@@ -344,7 +345,8 @@ mod tests {
     fn chase_look_accumulates_and_clamps_pitch() {
         let mut look = ChaseLook::default();
         look.accumulate(1.0, 0.0, 0.1);
-        assert!(look.yaw > 0.0 && look.pitch == 0.0);
+        // Yaw is negated (stick-right orbits right); pitch untouched by a pure-yaw input.
+        assert!(look.yaw < 0.0 && look.pitch == 0.0);
         // Drive pitch hard and long; it saturates at the clamp, not beyond.
         for _ in 0..100 {
             look.accumulate(0.0, 1.0, 0.1);
