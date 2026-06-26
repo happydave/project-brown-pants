@@ -21,6 +21,7 @@
 //! - `cargo run -p sounding -- workshop` — grounded build-and-test sandbox: Build (edit a craft) ↔ Test (fly what you built, with live ground collision), toggle with Enter
 //! - `cargo run -p sounding -- materials` — preview a generated PBR material set on lit geometry
 //! - `cargo run -p sounding -- terrainmesh` — preview a generated MoGe terrain relief (glTF)
+//! - `cargo run -p sounding -- gallery` — part catalog viewer: every mechanical-kit part laid out by category, click to inspect
 //!
 //! The Toy 1–3 simulation and runtime bus run headless behind whichever scene is
 //! shown, so the companion still works. Per-scene controls are documented in
@@ -43,11 +44,13 @@ mod dive_scene;
 mod editor;
 mod floating_origin;
 mod flooding_scene;
+mod gallery_scene;
 mod ground;
 mod land_scene;
 mod launch_scene;
 mod materials_scene;
 mod overlay;
+mod parts;
 mod pause;
 mod planet;
 mod play_scene;
@@ -67,6 +70,7 @@ use compartments_scene::CompartmentsScenePlugin;
 use crash_scene::CrashScenePlugin;
 use dive_scene::DiveScenePlugin;
 use editor::EditorPlugin;
+use gallery_scene::GalleryScenePlugin;
 use flooding_scene::FloodingScenePlugin;
 use land_scene::LandScenePlugin;
 use launch_scene::LaunchScenePlugin;
@@ -99,6 +103,7 @@ enum Scene {
     Crash,
     Workshop,
     TerrainMesh,
+    Gallery,
 }
 
 fn selected_scene() -> Scene {
@@ -120,6 +125,7 @@ fn selected_scene() -> Scene {
         Some("crash") => Scene::Crash,
         Some("workshop") => Scene::Workshop,
         Some("terrainmesh") => Scene::TerrainMesh,
+        Some("gallery") => Scene::Gallery,
         _ => Scene::Editor,
     }
 }
@@ -201,6 +207,9 @@ fn main() {
         }
         Scene::Workshop => {
             app.add_plugins(WorkshopScenePlugin);
+        }
+        Scene::Gallery => {
+            app.add_plugins(GalleryScenePlugin);
         }
         Scene::TerrainMesh => {
             app.add_plugins(TerrainMeshScenePlugin);

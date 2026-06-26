@@ -73,6 +73,7 @@ use crate::editor::{
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
 use crate::overlay::{spawn_overlay, update_overlay, CockpitOverlay};
 use crate::replay::Replayable;
+use crate::parts::{device_part_name, part_kind_name, spawn_part_mesh};
 use crate::voxel_skin::{pbr_material, skin_submeshes, VoxelSkin};
 
 const BODY: CentralBody = CentralBody::EARTHLIKE;
@@ -1170,7 +1171,8 @@ fn sync_build_meshes(
             BuildEntity,
         ));
     }
-    // Devices: small orange cubes at their cell centres.
+    // Devices render as their mechanical-kit mesh (motor/battery/fuel-tank/…, WI 653) at the cell
+    // centre; a device kind with no mapped part falls back to an orange cube.
     let dev_mat = materials.add(StandardMaterial {
         base_color: Color::srgb(1.0, 0.55, 0.0),
         perceptual_roughness: 0.8,
@@ -1178,48 +1180,39 @@ fn sync_build_meshes(
     });
     for d in &editor.craft.devices {
         let c = ((d.cell.as_dvec3() + DVec3::splat(0.5)) * editor.craft.cell_size).as_vec3();
-        let m = meshes.add(Mesh::from(Cuboid::new(s * 0.55, s * 0.55, s * 0.55)));
-        commands.spawn((
-            Mesh3d(m),
-            MeshMaterial3d(dev_mat.clone()),
-            Transform::from_translation(c),
-            BuildMesh,
-            BuildEntity,
-        ));
-    }
-    // Wheel parts: dark cylinders at their mount, axis along X (the spin axis).
-    let wheel_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.10, 0.10, 0.13),
-        perceptual_roughness: 0.9,
-        ..default()
-    });
-    for p in &editor.craft.parts {
-        if let PartKind::Wheel(spec) = p.kind {
-            let m = meshes.add(Mesh::from(Cylinder::new(
-                spec.radius as f32,
-                (spec.radius * 0.6) as f32,
-            )));
-            let tf = Transform::from_translation(p.mount.as_vec3())
-                .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2));
+        if let Some(name) = device_part_name(d.kind) {
+            let e = spawn_part_mesh(
+                &mut commands,
+                &asset_server,
+                name,
+                editor.craft.cell_size,
+                c,
+                Quat::IDENTITY,
+            );
+            commands.entity(e).insert((BuildMesh, BuildEntity));
+        } else {
+            let m = meshes.add(Mesh::from(Cuboid::new(s * 0.55, s * 0.55, s * 0.55)));
             commands.spawn((
                 Mesh3d(m),
-                MeshMaterial3d(wheel_mat.clone()),
-                tf,
-                BuildMesh,
-                BuildEntity,
-            ));
-        } else {
-            // Cosmetic parts (seat/antenna/solar/bumper): recognisable solids at their mount.
-            let (mesh, mat) =
-                part_mesh(p.kind, editor.craft.cell_size, &mut meshes, &mut materials);
-            commands.spawn((
-                Mesh3d(mesh),
-                MeshMaterial3d(mat),
-                Transform::from_translation(p.mount.as_vec3()),
+                MeshMaterial3d(dev_mat.clone()),
+                Transform::from_translation(c),
                 BuildMesh,
                 BuildEntity,
             ));
         }
+    }
+    // Parts (wheels' suspension/rim/tire + seat/antenna/solar/bumper) render as their mechanical-kit
+    // mesh at the mount, in the catalog frame (+Y up, +Z fwd, +X axle), scaled by cell size (WI 653).
+    for p in &editor.craft.parts {
+        let e = spawn_part_mesh(
+            &mut commands,
+            &asset_server,
+            part_kind_name(p.kind),
+            editor.craft.cell_size,
+            p.mount.as_vec3(),
+            Quat::IDENTITY,
+        );
+        commands.entity(e).insert((BuildMesh, BuildEntity));
     }
 }
 
