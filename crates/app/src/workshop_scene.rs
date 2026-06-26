@@ -416,6 +416,23 @@ struct RoverState {
     debris_ground_y: f64,
 }
 
+impl RoverState {
+    /// The point the rover-anchored render centres on: the live body while intact, the debris
+    /// centroid once fractured (WI 672) — so the ground grid / ramp / debris all stay coherent
+    /// around the wreck instead of the world vanishing with the (frozen) rover body.
+    fn render_anchor(&self) -> DVec3 {
+        if self.fractured && !self.fragments.is_empty() {
+            self.fragments
+                .iter()
+                .map(|(_, b)| b.position)
+                .sum::<DVec3>()
+                / self.fragments.len() as f64
+        } else {
+            self.rover.body.position
+        }
+    }
+}
+
 /// The grounded workshop Test state: one controllable craft, or its debris after a crash.
 #[derive(Resource)]
 struct WorkshopWorld {
@@ -2403,8 +2420,7 @@ fn track_rover_debris(
     if !rs.fractured || rs.fragments.is_empty() {
         return;
     }
-    let anchor: DVec3 =
-        rs.fragments.iter().map(|(_, b)| b.position).sum::<DVec3>() / rs.fragments.len() as f64;
+    let anchor = rs.render_anchor();
     for (tag, mut tf) in &mut q {
         if let Some((voxels, body)) = rs.fragments.get(tag.0) {
             let com = voxels
@@ -2424,7 +2440,7 @@ fn track_rover_debris(
 fn track_ramp_mesh(world: Res<WorkshopWorld>, mut q: Query<&mut Transform, With<RoverRampMesh>>) {
     let Some(rs) = &world.rover else { return };
     let Some(r) = rs.terrain.ramp else { return };
-    let anchor = rs.rover.body.position;
+    let anchor = rs.render_anchor();
     // Centre of the inclined slab (base terrain is flat here, so y is half the peak height).
     let center = DVec3::new(
         r.center_x,
@@ -2442,11 +2458,11 @@ fn draw_rover(mut gizmos: Gizmos, world: Res<WorkshopWorld>) {
     let Some(rs) = &world.rover else {
         return;
     };
-    if rs.fractured {
-        return; // no intact rover to draw once it's debris (WI 629)
-    }
+    // Anchor on the wreck's centroid once fractured (WI 672) so the ground stays under the debris —
+    // the terrain grid + trail are the only "world" the rover Test draws, so they must persist; only
+    // the rover-specific gizmos (forward arrow, wheel spokes) are skipped when there's no rover.
     let body = &rs.rover.body;
-    let anchor = body.position;
+    let anchor = rs.render_anchor();
     let to_render = |p: DVec3| (p - anchor).as_vec3();
     let terrain = &rs.terrain;
 
@@ -2480,7 +2496,11 @@ fn draw_rover(mut gizmos: Gizmos, world: Res<WorkshopWorld>) {
     }
 
     // The chassis, tyres, and parts are **solid meshes** (positioned by `track_rover_meshes`); the
-    // gizmos here are just overlays.
+    // gizmos here are just overlays. Once fractured there's no rover/wheels — skip the rover-specific
+    // overlays but keep the world (grid + trail) above.
+    if rs.fractured {
+        return;
+    }
 
     // Forward indicator: +Z in the body frame (cyan arrow).
     let fwd = body.orientation * DVec3::Z;
