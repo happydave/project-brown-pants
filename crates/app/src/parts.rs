@@ -8,8 +8,9 @@
 //! shipped glb falls back to a caller-supplied placeholder via [`part_glb_path`] returning `None`.
 
 use bevy::gltf::GltfAssetLabel;
+use bevy::math::DVec3;
 use bevy::prelude::*;
-use sounding_sim::voxel::{device_mass, DeviceKind, PartKind};
+use sounding_sim::voxel::{device_mass, DeviceKind, PartKind, VoxelCraft};
 
 /// The reference cell the parts were authored at (manifest `reference_cell`); a part is scaled by
 /// `cell_size / REFERENCE_CELL` so it matches the build's cell size.
@@ -134,25 +135,103 @@ pub fn part_kind_name(kind: PartKind) -> &'static str {
     }
 }
 
-/// Spawn a part's glb `SceneRoot` at `translation`/`rotation`, scaled by `cell_size / REFERENCE_CELL`.
-/// Returns the spawned root entity so the caller can attach markers. Assumes the part is in the
-/// catalog (`part_glb_path` is `Some`); callers handle the placeholder case themselves.
+/// The orientation correction every part needs: the glb are authored +Y-up in Blender, which the
+/// glTF exporter lands along -Z, so a +90°-about-X rotation restores Bevy +Y-up / +Z-forward / +X-axle
+/// (WI 653). Composed under any mount rotation.
+pub fn part_up_correction() -> Quat {
+    Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)
+}
+
+/// The chassis face a part at `mount` attaches to, derived from geometry (WI 654): the unit direction
+/// from the adjacent solid voxel toward the mount (a part on the top face yields +Y, a side face
+/// ±X/±Z). Falls back to +Y when no solid neighbour is found (e.g. a ground-placed part).
+pub fn part_face_normal(craft: &VoxelCraft, mount: DVec3) -> Vec3 {
+    let cell = craft.cell_size;
+    // The empty cell whose centre is `mount` (where the part was placed).
+    let add_cell = (mount / cell - DVec3::splat(0.5)).round().as_ivec3();
+    for n in [
+        IVec3::Y,
+        IVec3::NEG_Y,
+        IVec3::X,
+        IVec3::NEG_X,
+        IVec3::Z,
+        IVec3::NEG_Z,
+    ] {
+        let solid = add_cell - n;
+        if craft.voxels.iter().any(|v| v.cell == solid) {
+            return n.as_vec3();
+        }
+    }
+    Vec3::Y
+}
+
+/// The build pose (translation, rotation) for a part of `kind` mounted at `mount` against face
+/// `normal`, at `cell` size (WI 654). Cosmetic parts + suspension anchor their base on the face
+/// (`mount − normal·½cell`) with their up (+Y) aligned to the normal — so a seat sits on the face and
+/// a suspension/antenna pokes out of it. Wheel components anchor at the hub (`mount`) with their axle
+/// (+X) aligned to the normal. The rotation is composed **under** [`part_up_correction`] by the
+/// spawner / updater.
+pub fn part_build_pose(kind: PartKind, mount: Vec3, normal: Vec3, cell: f32) -> (Vec3, Quat) {
+    let n = normal.normalize_or(Vec3::Y);
+    let (axis, at_face) = match kind {
+        PartKind::Wheel(_) | PartKind::Rim(_) | PartKind::Tire(_) => (Vec3::X, false),
+        _ => (Vec3::Y, true),
+    };
+    let rotation = Quat::from_rotation_arc(axis, n);
+    let translation = if at_face { mount - n * (cell * 0.5) } else { mount };
+    (translation, rotation)
+}
+
+/// The authored outer radius (m) of the `tire` glb at the reference cell — the reference for sizing a
+/// wheel mesh to its physical rolling radius (WI 654).
+pub const TIRE_GLB_RADIUS: f64 = 0.30;
+
+/// The render scale for a part's glb (WI 654). Most parts scale by `cell / REFERENCE_CELL`; wheel
+/// components scale to the **physical rolling radius** of their station (`rim.radius + tire.profile`)
+/// over the tire glb's authored radius, so the build view's wheel matches the driven wheel instead of
+/// rendering ~cell-sized. Falls back to the cell scale when no wheel specs are found.
+pub fn part_glb_scale(kind: PartKind, craft: &VoxelCraft, mount: DVec3, cell: f64) -> f32 {
+    let cell_scale = (cell / REFERENCE_CELL) as f32;
+    match kind {
+        PartKind::Wheel(_) | PartKind::Rim(_) | PartKind::Tire(_) => {
+            let mut rim = 0.0;
+            let mut profile = 0.0;
+            for p in &craft.parts {
+                if (p.mount - mount).length() > 1e-6 {
+                    continue; // a different station
+                }
+                match p.kind {
+                    PartKind::Rim(s) => rim = s.radius,
+                    PartKind::Tire(s) => profile = s.profile,
+                    _ => {}
+                }
+            }
+            let rolling = rim + profile;
+            if rolling > 1e-6 {
+                (rolling / TIRE_GLB_RADIUS) as f32
+            } else {
+                cell_scale
+            }
+        }
+        _ => cell_scale,
+    }
+}
+
+/// Spawn a part's glb `SceneRoot` at `translation`/`rotation`, with a uniform `scale` (see
+/// [`part_glb_scale`]). Returns the spawned root entity so the caller can attach markers. Assumes the
+/// part is in the catalog (`part_glb_path` is `Some`); callers handle the placeholder case themselves.
 pub fn spawn_part_mesh(
     commands: &mut Commands,
     asset_server: &AssetServer,
     name: &str,
-    cell_size: f64,
+    scale: f32,
     translation: Vec3,
     rotation: Quat,
 ) -> Entity {
     let path = part_glb_path(name).expect("spawn_part_mesh called for an uncatalogued part");
     let scene = asset_server.load(GltfAssetLabel::Scene(0).from_asset(path));
-    let scale = (cell_size / REFERENCE_CELL) as f32;
-    // The parts are authored +Y-up in Blender; the glTF exporter's Z-up→Y-up rotation lands their
-    // "up" along -Z in glTF/Bevy space. Rotate +90° about X to bring it back to Bevy's +Y-up (and
-    // forward to +Z, axle to +X) — the frame the manifest intends. Composed under the caller's
-    // mount rotation so caller orientations still apply on top of the corrected part.
-    let rotation = rotation * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+    // Correct the Blender-+Y-up → glTF-(-Z) export quirk, composed under the caller's mount rotation.
+    let rotation = rotation * part_up_correction();
     commands
         .spawn((
             SceneRoot(scene),
@@ -197,6 +276,35 @@ mod tests {
                 assert!(catalog_part(name).is_some(), "{name} not in catalog for {k:?}");
             }
         }
+    }
+
+    #[test]
+    fn face_normal_reads_top_and_side_and_falls_back() {
+        use sounding_sim::voxel::{Material, Voxel};
+        let mut craft = VoxelCraft::new(1.0);
+        craft.voxels.push(Voxel { cell: IVec3::new(0, 0, 0), material: Material::ALUMINIUM });
+        // A part placed on the top face sits in the empty cell above → normal +Y.
+        let top = (IVec3::new(0, 1, 0).as_dvec3() + DVec3::splat(0.5)) * 1.0;
+        assert_eq!(part_face_normal(&craft, top), Vec3::Y);
+        // On the +X side face → normal +X.
+        let side = (IVec3::new(1, 0, 0).as_dvec3() + DVec3::splat(0.5)) * 1.0;
+        assert_eq!(part_face_normal(&craft, side), Vec3::X);
+        // Far from any voxel → fallback +Y.
+        let far = DVec3::new(20.0, 20.0, 20.0);
+        assert_eq!(part_face_normal(&craft, far), Vec3::Y);
+    }
+
+    #[test]
+    fn build_pose_seats_cosmetic_on_the_face_and_orients_up_to_normal() {
+        let mount = Vec3::new(0.0, 1.0, 0.0);
+        // Cosmetic: anchored half a cell back along the normal (onto the face), +Y → normal.
+        let (t, r) = part_build_pose(PartKind::Seat, mount, Vec3::Y, 0.5);
+        assert!((t - Vec3::new(0.0, 0.75, 0.0)).length() < 1e-5);
+        assert!((r * Vec3::Y - Vec3::Y).length() < 1e-5);
+        // On a +X side face the part's up tips to +X and anchors back along +X.
+        let (ts, rs) = part_build_pose(PartKind::Seat, mount, Vec3::X, 0.5);
+        assert!((ts - Vec3::new(-0.25, 1.0, 0.0)).length() < 1e-5);
+        assert!((rs * Vec3::Y - Vec3::X).length() < 1e-5);
     }
 
     #[test]

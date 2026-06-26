@@ -12,7 +12,7 @@ use bevy::picking::events::{Click, Pointer};
 use bevy::picking::mesh_picking::MeshPickingPlugin;
 use bevy::prelude::*;
 
-use crate::parts::{part_device_mass, spawn_part_mesh, PartCategory, CATALOG};
+use crate::parts::{part_device_mass, spawn_part_mesh, PartCategory, CATALOG, REFERENCE_CELL};
 
 /// The cell size the gallery displays parts at (the workshop's editor-scale cell).
 const DISPLAY_CELL: f64 = 0.5;
@@ -118,7 +118,7 @@ fn setup(
                 &mut commands,
                 &asset_server,
                 CATALOG[idx].name,
-                DISPLAY_CELL,
+                (DISPLAY_CELL / REFERENCE_CELL) as f32,
                 Vec3::new(x, DISPLAY_H, z),
                 Quat::IDENTITY,
             );

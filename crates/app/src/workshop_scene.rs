@@ -73,7 +73,10 @@ use crate::editor::{
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
 use crate::overlay::{spawn_overlay, update_overlay, CockpitOverlay};
 use crate::replay::Replayable;
-use crate::parts::{device_part_name, part_kind_name, spawn_part_mesh};
+use crate::parts::{
+    device_part_name, part_build_pose, part_face_normal, part_glb_scale, part_kind_name,
+    part_up_correction, spawn_part_mesh, REFERENCE_CELL,
+};
 use crate::voxel_skin::{pbr_material, skin_submeshes, VoxelSkin};
 
 const BODY: CentralBody = CentralBody::EARTHLIKE;
@@ -1181,12 +1184,14 @@ fn sync_build_meshes(
     for d in &editor.craft.devices {
         let c = ((d.cell.as_dvec3() + DVec3::splat(0.5)) * editor.craft.cell_size).as_vec3();
         if let Some(name) = device_part_name(d.kind) {
+            // Anchor the device's base at the cell floor (it sits in its chassis cell), upright.
+            let base = c - Vec3::Y * (s * 0.5);
             let e = spawn_part_mesh(
                 &mut commands,
                 &asset_server,
                 name,
-                editor.craft.cell_size,
-                c,
+                (editor.craft.cell_size / REFERENCE_CELL) as f32,
+                base,
                 Quat::IDENTITY,
             );
             commands.entity(e).insert((BuildMesh, BuildEntity));
@@ -1201,16 +1206,20 @@ fn sync_build_meshes(
             ));
         }
     }
-    // Parts (wheels' suspension/rim/tire + seat/antenna/solar/bumper) render as their mechanical-kit
-    // mesh at the mount, in the catalog frame (+Y up, +Z fwd, +X axle), scaled by cell size (WI 653).
+    // Parts render as their mechanical-kit mesh, seated on the clicked chassis face and oriented to it
+    // (WI 654): cosmetic parts/suspension sit on the face with +Y along the normal; wheel components
+    // sit at the hub with their axle along the normal.
     for p in &editor.craft.parts {
+        let normal = part_face_normal(&editor.craft, p.mount);
+        let (t, r) = part_build_pose(p.kind, p.mount.as_vec3(), normal, s);
+        let scale = part_glb_scale(p.kind, &editor.craft, p.mount, editor.craft.cell_size);
         let e = spawn_part_mesh(
             &mut commands,
             &asset_server,
             part_kind_name(p.kind),
-            editor.craft.cell_size,
-            p.mount.as_vec3(),
-            Quat::IDENTITY,
+            scale,
+            t,
+            r,
         );
         commands.entity(e).insert((BuildMesh, BuildEntity));
     }
@@ -1371,19 +1380,22 @@ fn enter_test(
                 ));
             }
             for (j, part) in rs.lattice.parts.iter().enumerate() {
-                if matches!(part.kind, PartKind::Wheel(_)) {
-                    continue; // wheels handled above
+                if matches!(part.kind, PartKind::Wheel(_) | PartKind::Rim(_) | PartKind::Tire(_)) {
+                    continue; // wheels are rendered by the dedicated slip-spoke wheel render
                 }
-                let (mesh, mat) =
-                    part_mesh(part.kind, rs.lattice.cell_size, &mut meshes, &mut materials);
-                commands.spawn((
-                    Mesh3d(mesh),
-                    MeshMaterial3d(mat),
-                    Transform::default(),
-                    RoverPartMesh(j),
-                    Replayable,
-                    TestEntity,
-                ));
+                // Render the part as its mechanical-kit mesh (WI 654); `track_rover_meshes` poses it
+                // each frame (the scale set here is preserved).
+                let e = spawn_part_mesh(
+                    &mut commands,
+                    &asset_server,
+                    part_kind_name(part.kind),
+                    (rs.lattice.cell_size / REFERENCE_CELL) as f32,
+                    Vec3::ZERO,
+                    Quat::IDENTITY,
+                );
+                commands
+                    .entity(e)
+                    .insert((RoverPartMesh(j), Replayable, TestEntity));
             }
             // Obstacles (WI 610): solid boxes to drive into.
             let obs_mat = materials.add(StandardMaterial {
@@ -1964,61 +1976,6 @@ fn follow_camera(
     }
 }
 
-/// A procedural mesh + material for a catalog part (WI 608), sized to `cell_size`. Recognisable
-/// primitive shapes (textured asset-harness versions are deferred to WI 614).
-fn part_mesh(
-    kind: PartKind,
-    s: f64,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
-) -> (Handle<Mesh>, Handle<StandardMaterial>) {
-    let s = s as f32;
-    let (mesh, color) = match kind {
-        PartKind::Seat => (
-            Mesh::from(Cuboid::new(s * 1.2, s * 0.7, s * 1.2)),
-            Color::srgb(0.15, 0.16, 0.2),
-        ),
-        PartKind::Antenna => (
-            Mesh::from(Cylinder::new(s * 0.12, s * 4.0)),
-            Color::srgb(0.7, 0.72, 0.78),
-        ),
-        PartKind::SolarPanel => (
-            Mesh::from(Cuboid::new(s * 3.0, s * 0.1, s * 2.0)),
-            Color::srgb(0.06, 0.1, 0.35),
-        ),
-        PartKind::Bumper => (
-            Mesh::from(Cuboid::new(s * 3.0, s * 0.5, s * 0.5)),
-            Color::srgb(0.5, 0.5, 0.55),
-        ),
-        PartKind::Wheel(w) => (
-            Mesh::from(Cylinder::new(w.radius as f32, (w.radius * 0.5) as f32)),
-            Color::srgb(0.07, 0.07, 0.09),
-        ),
-        // Wheel-station components (WI 630): the suspension strut, the metallic rim, and the rubber
-        // tire. (Station render is refined in Phase C; these are recognisable placeholders.)
-        PartKind::Suspension(susp) => (
-            Mesh::from(Cylinder::new(s * 0.08, susp.rest_length as f32)),
-            Color::srgb(0.55, 0.45, 0.2),
-        ),
-        PartKind::Rim(r) => (
-            Mesh::from(Cylinder::new(r.radius as f32, (r.radius * 0.45) as f32)),
-            Color::srgb(0.6, 0.62, 0.68),
-        ),
-        PartKind::Tire(t) => (
-            Mesh::from(Cylinder::new(t.profile as f32 * 2.0, t.profile as f32)),
-            Color::srgb(0.07, 0.07, 0.09),
-        ),
-    };
-    (
-        meshes.add(mesh),
-        materials.add(StandardMaterial {
-            base_color: color,
-            perceptual_roughness: 0.8,
-            ..default()
-        }),
-    )
-}
-
 /// Where a wheel's mesh sits and how it aligns, given its suspension mount `hub` (world) and the body
 /// `up`. For a quarter-car wheel (WI 631a) this is the **actual axle height** (`hub − axle_drop`
 /// vertically), so the wheel visibly hops, squats under load, and droops when airborne — the ride
@@ -2134,9 +2091,15 @@ fn track_rover_meshes(
     }
     for (tag, mut tf) in &mut part_q {
         if let Some(part) = rs.lattice.parts.get(tag.0) {
-            let world_pos = body.position + q * (part.mount - rs.com);
+            // Seat/orient the part on its chassis face (WI 654), then carry the body pose + the glb
+            // up-correction. Scale was set at spawn and is preserved.
+            let cell = rs.lattice.cell_size as f32;
+            let normal = part_face_normal(&rs.lattice, part.mount);
+            let (anchor_local, local_rot) =
+                part_build_pose(part.kind, part.mount.as_vec3(), normal, cell);
+            let world_pos = body.position + q * (anchor_local.as_dvec3() - rs.com);
             tf.translation = (world_pos - anchor).as_vec3();
-            tf.rotation = q.as_quat();
+            tf.rotation = q.as_quat() * local_rot * part_up_correction();
         }
     }
     // Obstacles are world-static; rover-anchored, they slide relative to the rover.
