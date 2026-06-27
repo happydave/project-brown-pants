@@ -37,7 +37,7 @@
 use crate::aero::windward_faces;
 use crate::breakage::{connected_components, Severed};
 use crate::fluid::FluidSample;
-use crate::voxel::VoxelCraft;
+use crate::voxel::{Thermal, VoxelCraft};
 use glam::{DQuat, DVec3, IVec3};
 use std::collections::{HashMap, HashSet};
 
@@ -52,10 +52,17 @@ const STEFAN_BOLTZMANN: f64 = 5.670_374_419e-8;
 /// assert ordering/relative properties, not absolute temperatures.
 const CONV_COEFF: f64 = 1.74e-4;
 
-/// Fraction of a voxel's mass assigned to the fast-responding **skin** node; the
-/// remainder is the slow **core**. A thin skin heats and cools quickly (the
-/// re-entry surface), the core lags.
-const SKIN_FRACTION: f64 = 0.1;
+/// Characteristic heating time, s (WI 692) — the timescale the surface thermal
+/// layer ("skin") responds over. Sets the skin depth `δ = √(α·τ)` from the material's
+/// thermal diffusivity `α = k/(ρ·c)`: a high-conductivity material (aluminium) gets a
+/// deep skin, a low one (composite/ablator) a thin hot shell — the physical reason a
+/// poor conductor's surface runs hotter.
+const THERMAL_SKIN_TIME: f64 = 4.0;
+
+/// Floor (and ceiling) on the skin's share of a voxel's mass (WI 692): keeps both the
+/// skin and the core capacities strictly positive — so an interior (unexposed) voxel
+/// still integrates and a fully-exposed thin voxel keeps a core node.
+const MIN_SKIN_FRACTION: f64 = 0.01;
 
 /// Safety factor below the explicit-Euler stability limit for the adaptive
 /// sub-step (the limit is 2·C/G; staying well under it keeps the linear loss terms
@@ -89,6 +96,32 @@ pub struct ThermalState {
     /// Remaining ablator mass per voxel, kg (WI 688) — only present for ablative
     /// materials; drained by the ablation thermostat, never refilled.
     ablator: HashMap<IVec3, f64>,
+}
+
+/// The skin and core heat capacities (J/K) of a voxel (WI 692). The skin is the
+/// responsive surface layer — `exposed_area × δ`, where the thermal skin depth
+/// `δ = √(α·τ)` (α = `k/(ρ·c)` the diffusivity, τ = [`THERMAL_SKIN_TIME`]) — capped at
+/// the cell and floored by [`MIN_SKIN_FRACTION`] so both nodes keep a positive
+/// capacity. Replaces the old fixed skin fraction with a material-physical split: a
+/// poor conductor gets a thin, fast-heating skin; a good one a deep, slow one.
+fn skin_core_capacity(
+    density: f64,
+    th: Thermal,
+    exposed_area: f64,
+    cell_volume: f64,
+) -> (f64, f64) {
+    let mass = density * cell_volume;
+    let diffusivity = th.conductivity / (density * th.specific_heat);
+    let skin_depth = (diffusivity * THERMAL_SKIN_TIME).max(0.0).sqrt();
+    let skin_volume = (exposed_area * skin_depth).clamp(
+        MIN_SKIN_FRACTION * cell_volume,
+        (1.0 - MIN_SKIN_FRACTION) * cell_volume,
+    );
+    let skin_mass = density * skin_volume;
+    (
+        skin_mass * th.specific_heat,
+        (mass - skin_mass) * th.specific_heat,
+    )
 }
 
 /// The ablator mass budget of a voxel (kg): `density · cell_volume · ablator_fraction`,
@@ -213,9 +246,11 @@ impl ThermalState {
         let mut nodes: Vec<Node> = Vec::with_capacity(craft.voxels.len());
         for v in &craft.voxels {
             let th = v.material.thermal;
-            let mass = v.material.density * cell_volume;
-            let heat_capacity = mass * th.specific_heat;
             let exp = exposure_by_cell[&v.cell];
+            // Physical skin/core split (WI 692): the responsive surface layer is the
+            // exposed area × the material's thermal skin depth `δ = √(α·τ)`.
+            let (c_skin, c_core) =
+                skin_core_capacity(v.material.density, th, exp.exposed_area, cell_volume);
             // Occupied face-neighbours, each with a symmetric (averaged) core↔core
             // bond conductance so heat exchange across dissimilar materials conserves.
             let neighbours: Vec<(IVec3, f64)> = FACE_OFFSETS
@@ -231,8 +266,8 @@ impl ThermalState {
             nodes.push(Node {
                 cell: v.cell,
                 conductivity: th.conductivity,
-                c_skin: SKIN_FRACTION * heat_capacity,
-                c_core: (1.0 - SKIN_FRACTION) * heat_capacity,
+                c_skin,
+                c_core,
                 exposed_area: exp.exposed_area,
                 conv_power: q_density * exp.windward_area,
                 emissivity: th.emissivity,
@@ -654,6 +689,33 @@ mod tests {
             "harsh heating should fail a voxel; max={}",
             st.max_skin_temp()
         );
+    }
+
+    // --- WI 692: physical skin depth ---
+
+    #[test]
+    fn skin_depth_is_physical_and_thinner_for_poor_conductors() {
+        let cell_volume = 1.0;
+        // Both nodes keep a positive capacity, and the skin is a smaller share than the
+        // core (a surface layer, not the bulk).
+        let (alu_skin, alu_core) = skin_core_capacity(2700.0, Thermal::ALUMINIUM, 6.0, cell_volume);
+        let (comp_skin, comp_core) =
+            skin_core_capacity(1600.0, Thermal::COMPOSITE, 6.0, cell_volume);
+        for c in [alu_skin, alu_core, comp_skin, comp_core] {
+            assert!(c > 0.0, "capacities are strictly positive");
+        }
+        // The good conductor (aluminium) gets a *deeper* skin than the poor one
+        // (composite) — the physical reason a poor conductor's surface runs hotter.
+        let alu_frac = alu_skin / (alu_skin + alu_core);
+        let comp_frac = comp_skin / (comp_skin + comp_core);
+        assert!(
+            alu_frac > comp_frac,
+            "aluminium skin deeper than composite: {alu_frac} vs {comp_frac}"
+        );
+        // An interior (unexposed) voxel still keeps a positive, floored skin capacity.
+        let (interior_skin, interior_core) =
+            skin_core_capacity(2700.0, Thermal::ALUMINIUM, 0.0, cell_volume);
+        assert!(interior_skin > 0.0 && interior_core > 0.0);
     }
 
     // --- WI 688: ablation ---

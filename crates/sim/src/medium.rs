@@ -361,15 +361,15 @@ pub struct DivingCraft {
     pub glide: GlideParams,
 }
 
-/// The calibrated convective heat-scale for the `-- dive` re-entry (WI 691, 693) —
-/// a small **scenario balance scalar** (the physical `√ρ·v³` shape is unchanged).
-/// Since WI 693 the dive is a **genuine orbital re-entry** (~7 km/s entry, ~100× the
-/// old tame lob's flux), so this collapsed from 250 to ~4 — heating is now mostly
-/// physical, with the residual standing in for the simplified (lumped, thick-skin)
-/// thermal model that WI 692/688 (a realistic thin skin + ablation) will retire. The
-/// calibration test brackets the working window (nose > 900 K, hull < 3000 K, ≈[1.5,
-/// 8]); 4 sits comfortably inside it.
-pub const DIVE_HEAT_SCALE: f64 = 4.0;
+/// The convective heat-scale for the `-- dive` re-entry. **It is now `1.0` — the
+/// fully-physical model, no balance fudge.** The journey: WI 691's tame lob needed a
+/// 250× scalar to show heat; WI 693 (a genuine ~7 km/s orbital entry, heating ∝ v³)
+/// dropped it to ~4; WI 692 (a realistic thin skin, depth from thermal diffusivity)
+/// and WI 688 (the ablative nose that survives the thin skin by ablating) retired the
+/// rest. Heating is the physical `√ρ·v³`. The calibration test brackets the working
+/// window (nose ablates and survives, hull < `max_temp`, ≈[0.55, >1.5]); 1.0 sits
+/// comfortably inside. Kept as a knob so a scenario can still dial difficulty.
+pub const DIVE_HEAT_SCALE: f64 = 1.0;
 
 /// Re-entry **thermal state** carried on a diving craft (WI 691). When present on
 /// an entity alongside [`DivingCraft`], [`advance_descent`] steps the two-node
