@@ -25,14 +25,21 @@ use sounding_sim::fluid::{FluidMedium, MediumKind};
 use sounding_sim::frame::{FrameId, WorldPos};
 use sounding_sim::handoff::{orbit_state_3d, GearState, HandoffPlugin};
 use sounding_sim::medium::{
-    dynamic_pressure, max_cross_section, DescentParams, DescentPlugin, DiveTriggerPlugin,
-    DivingCraft, EntryInterface, GlideParams,
+    dynamic_pressure, max_cross_section, CraftThermal, DescentParams, DescentPlugin,
+    DiveTriggerPlugin, DivingCraft, EntryInterface, GlideParams, DIVE_HEAT_SCALE,
 };
 use sounding_sim::orbit::Orbit;
 use sounding_sim::sim::{CentralBody, Craft, SimClock};
+use sounding_sim::telemetry::ThermalTelemetry;
 use sounding_sim::voxel::{Axis, Material, Voxel, VoxelCraft};
 
+use crate::bus::DiveThermal;
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
+
+/// Ambient / radiative-sink temperature for the dive, K.
+const DIVE_AMBIENT: f64 = 250.0;
+/// Skin temperature (K) at which the craft begins to visibly glow.
+const GLOW_ONSET: f64 = 500.0;
 
 /// The canonical Earth-like body, in SI (WI 527).
 const BODY: CentralBody = CentralBody::EARTHLIKE;
@@ -88,6 +95,10 @@ struct DiveReadout {
     medium: MediumKind,
     pressure: f64,
     ram: f64,
+    /// Hottest skin temperature, K (WI 691).
+    skin_temp: f64,
+    /// Any voxel at/over its material limit (overheating / burn-through).
+    over_limit: bool,
 }
 
 /// Marks the heads-up readout.
@@ -120,7 +131,10 @@ impl Plugin for DiveScenePlugin {
                 max_substeps: MAX_SUBSTEPS,
             })
             .add_systems(Startup, setup_scene)
-            .add_systems(Update, (track_craft, follow_camera, update_hud).chain());
+            .add_systems(
+                Update,
+                (track_craft, track_thermal, follow_camera, update_hud).chain(),
+            );
     }
 }
 
@@ -158,12 +172,14 @@ fn setup_scene(
     if let Ok((entity, mut craft, mut gear)) = craft_q.single_mut() {
         craft.orbit = orbit;
         *gear = GearState::new(mp.mass, mp.inertia);
+        let thermal = CraftThermal::new(&voxels, DIVE_AMBIENT, DIVE_AMBIENT, DIVE_HEAT_SCALE);
         commands.entity(entity).insert((
             DivingCraft {
                 craft: voxels,
                 com: mp.center_of_mass,
                 glide,
             },
+            thermal,
             Mesh3d(meshes.add(Mesh::from(Cuboid::new(3.0, 3.0, 5.0)))),
             MeshMaterial3d(materials.add(StandardMaterial {
                 base_color: Color::srgb(0.85, 0.84, 0.88),
@@ -227,7 +243,7 @@ fn setup_scene(
     // Heads-up readout.
     commands.spawn((
         Text::new(
-            "gear:       on-rails\naltitude:        0 m\nspeed:       0.0 m/s\nmedium:   vacuum\nhull P:        0.0 kPa\nram P:         0.0 kPa",
+            "gear:       on-rails\naltitude:        0 m\nspeed:       0.0 m/s\nmedium:   vacuum\nhull P:        0.0 kPa\nram P:         0.0 kPa\nskin T:        250 K",
         ),
         TextFont {
             font_size: 20.0,
@@ -312,6 +328,47 @@ fn track_craft(
     }
 }
 
+/// Reads the craft's thermal state (WI 691): publishes the skin-temperature readout
+/// to the HUD and the bus, and makes the craft glow red→white-hot as it heats.
+fn track_thermal(
+    mut readout: ResMut<DiveReadout>,
+    mut bridge: ResMut<DiveThermal>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    craft: Query<
+        (
+            &DivingCraft,
+            &CraftThermal,
+            &MeshMaterial3d<StandardMaterial>,
+        ),
+        With<CraftMarker>,
+    >,
+) {
+    let Ok((dc, thermal, mat)) = craft.single() else {
+        return;
+    };
+    let (max_skin, over_limit) = thermal.readout(&dc.craft);
+    readout.skin_temp = max_skin;
+    readout.over_limit = over_limit;
+    bridge.0 = Some(ThermalTelemetry {
+        max_skin_temp: max_skin,
+        over_limit,
+    });
+    if let Some(material) = materials.get_mut(&mat.0) {
+        material.emissive = glow_color(max_skin);
+    }
+}
+
+/// A heating glow: black below [`GLOW_ONSET`], ramping red → orange → white-hot as
+/// skin temperature climbs. Returned over-bright (HDR) so the dive's bloom blooms.
+fn glow_color(skin_temp: f64) -> LinearRgba {
+    let x = (((skin_temp - GLOW_ONSET) / 2_000.0).clamp(0.0, 1.0)) as f32;
+    if x <= 0.0 {
+        return LinearRgba::BLACK;
+    }
+    // Red leads, green follows (→orange/yellow), blue last (→white); brightness grows.
+    LinearRgba::rgb(x * 8.0, x * x * 8.0, x * x * x * 8.0)
+}
+
 /// Keeps the anchor camera a fixed offset from the craft's render position.
 #[allow(clippy::type_complexity)] // disjoint Bevy queries (craft vs. camera)
 fn follow_camera(
@@ -348,8 +405,14 @@ fn update_hud(readout: Res<DiveReadout>, mut hud: Query<&mut Text, With<Hud>>) {
         let speed = readout.speed;
         let pressure_kpa = readout.pressure / 1_000.0;
         let ram_kpa = readout.ram / 1_000.0;
+        let skin = readout.skin_temp;
+        let heat = if readout.over_limit {
+            "  *** OVERHEAT ***"
+        } else {
+            ""
+        };
         text.0 = format!(
-            "gear:     {gear}\naltitude: {alt:8.0} m\nspeed:    {speed:7.1} m/s\nmedium:   {medium}\nhull P:   {pressure_kpa:8.1} kPa\nram P:    {ram_kpa:8.1} kPa"
+            "gear:     {gear}\naltitude: {alt:8.0} m\nspeed:    {speed:7.1} m/s\nmedium:   {medium}\nhull P:   {pressure_kpa:8.1} kPa\nram P:    {ram_kpa:8.1} kPa\nskin T:   {skin:8.0} K{heat}"
         );
     }
 }

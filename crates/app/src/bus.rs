@@ -16,7 +16,7 @@ use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use sounding_sim::command::Command;
 use sounding_sim::diagnostics::ENERGY_DRIFT;
 use sounding_sim::sim::{CentralBody, Craft, SimClock};
-use sounding_sim::telemetry::{ActiveFlightTelemetry, RoverTelemetry, Telemetry};
+use sounding_sim::telemetry::{ActiveFlightTelemetry, RoverTelemetry, Telemetry, ThermalTelemetry};
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -72,6 +72,12 @@ pub struct ActiveFlight(pub Option<ActiveFlightTelemetry>);
 #[derive(Resource, Default)]
 pub struct GroundedRover(pub Option<RoverTelemetry>);
 
+/// Bridge from the dive scene to the bus publisher (WI 691): the latest re-entry
+/// thermal readout. The `-- dive` scene writes it each frame; `publish_telemetry`
+/// attaches it. `None` ⇒ no thermal block.
+#[derive(Resource, Default)]
+pub struct DiveThermal(pub Option<ThermalTelemetry>);
+
 /// Serves the runtime bus on `port`.
 pub struct BusPlugin {
     pub port: u16,
@@ -116,6 +122,7 @@ impl Plugin for BusPlugin {
             .insert_resource(BusReplayRx(Mutex::new(replay_rx)))
             .init_resource::<ActiveFlight>()
             .init_resource::<GroundedRover>()
+            .init_resource::<DiveThermal>()
             .add_systems(
                 Update,
                 (
@@ -235,6 +242,7 @@ fn publish_telemetry(
     diagnostics: Res<DiagnosticsStore>,
     active: Res<ActiveFlight>,
     rover: Res<GroundedRover>,
+    thermal: Res<DiveThermal>,
     mut frame: Local<u32>,
 ) {
     let orbit = craft.single().ok().map(|c| c.orbit);
@@ -247,6 +255,10 @@ fn publish_telemetry(
     // Attach the grounded rover's state when a rover scene has published one (WI 640).
     if let Some(r) = rover.0.clone() {
         snapshot = snapshot.with_rover(r);
+    }
+    // Attach the re-entry thermal readout when the dive scene has published one (WI 691).
+    if let Some(t) = thermal.0 {
+        snapshot = snapshot.with_thermal(t);
     }
     // Decimate the per-frame publish into the bounded history ring (WI 644) so it spans several
     // seconds without an oversized payload; the newest entry is always `GET /telemetry`.

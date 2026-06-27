@@ -38,6 +38,22 @@ pub struct Telemetry {
     /// orbit). Additive/serde-defaulted: snapshots without it deserialize to `None`.
     #[serde(default)]
     pub rover: Option<RoverTelemetry>,
+    /// Thermal state of the live craft (WI 691), when a scene steps a thermal model
+    /// (the `-- dive` re-entry). The hottest skin temperature and whether any part has
+    /// reached its material limit. Additive/serde-defaulted: snapshots without it
+    /// deserialize to `None`.
+    #[serde(default)]
+    pub thermal: Option<ThermalTelemetry>,
+}
+
+/// The live craft's thermal state on the bus (WI 691): the re-entry heating readout.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub struct ThermalTelemetry {
+    /// Hottest skin temperature over the craft, K (the re-entry gauge).
+    pub max_skin_temp: f64,
+    /// Whether any voxel has reached its material maximum temperature (overheating /
+    /// burn-through). A shielded/blunt craft keeps this `false`.
+    pub over_limit: bool,
 }
 
 /// The active craft's autonomy state on the bus (WI 569): the control-tier model from
@@ -275,6 +291,7 @@ impl Telemetry {
             energy_drift,
             active: None,
             rover: None,
+            thermal: None,
         }
     }
 
@@ -293,6 +310,14 @@ impl Telemetry {
     /// `capture` signature, mirroring [`Telemetry::with_active_flight`].
     pub fn with_rover(mut self, rover: RoverTelemetry) -> Self {
         self.rover = Some(rover);
+        self
+    }
+
+    /// Attach thermal state to this snapshot (WI 691). Builder-style, mirroring
+    /// [`Telemetry::with_rover`], so the dive scene can layer the re-entry heating
+    /// readout onto `capture`.
+    pub fn with_thermal(mut self, thermal: ThermalTelemetry) -> Self {
+        self.thermal = Some(thermal);
         self
     }
 }
@@ -558,5 +583,33 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         let back: Telemetry = serde_json::from_str(&json).unwrap();
         assert_eq!(back, snap);
+    }
+
+    // --- WI 691: thermal block ---
+
+    #[test]
+    fn thermal_block_attaches_and_round_trips() {
+        let thermal = ThermalTelemetry {
+            max_skin_temp: 1234.5,
+            over_limit: true,
+        };
+        let snap = Telemetry::capture(&SimClock::default(), None, 1.0, None).with_thermal(thermal);
+        assert_eq!(snap.thermal.unwrap().max_skin_temp, 1234.5);
+        assert!(snap.thermal.unwrap().over_limit);
+
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: Telemetry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, snap);
+        let value = serde_json::to_value(&snap).unwrap();
+        assert_eq!(value["thermal"]["max_skin_temp"], 1234.5);
+    }
+
+    #[test]
+    fn thermal_block_is_backward_compatible_over_json() {
+        // A legacy snapshot (no `thermal`) deserializes to None.
+        let legacy =
+            r#"{"time":0.0,"warp":1.0,"paused":false,"mu":1.0,"craft":null,"energy_drift":null}"#;
+        let snap: Telemetry = serde_json::from_str(legacy).unwrap();
+        assert!(snap.thermal.is_none());
     }
 }

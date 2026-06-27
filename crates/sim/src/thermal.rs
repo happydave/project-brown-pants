@@ -120,7 +120,8 @@ impl ThermalState {
 
     /// Advance the thermal state by `dt` seconds for a craft moving at `velocity`
     /// (world frame, relative to the static medium) with the given `orientation`,
-    /// in the sampled medium, radiating toward `env_temp`.
+    /// in the sampled medium, radiating toward `env_temp`. The physical model
+    /// (convective flux scale = 1).
     pub fn step(
         &mut self,
         craft: &VoxelCraft,
@@ -129,6 +130,25 @@ impl ThermalState {
         orientation: DQuat,
         env_temp: f64,
         dt: f64,
+    ) {
+        self.step_scaled(craft, sample, velocity, orientation, env_temp, dt, 1.0);
+    }
+
+    /// As [`Self::step`], but with a `heat_scale` multiplier on the convective flux
+    /// (WI 691). The multiplier is a **scenario balance scalar over the physical
+    /// `√ρ·v³` shape** — it tunes magnitude, never the shape (design discipline:
+    /// "balance multiplies physics, never replaces it"). `heat_scale = 1.0` is the
+    /// pure physical model.
+    #[allow(clippy::too_many_arguments)] // the full thermal step state is irreducible here
+    pub fn step_scaled(
+        &mut self,
+        craft: &VoxelCraft,
+        sample: &FluidSample,
+        velocity: DVec3,
+        orientation: DQuat,
+        env_temp: f64,
+        dt: f64,
+        heat_scale: f64,
     ) {
         if dt <= 0.0 || craft.voxels.is_empty() {
             return;
@@ -146,7 +166,7 @@ impl ThermalState {
         let density = sample.density;
         let total_windward: f64 = exposure.iter().map(|e| e.windward_area).sum();
         let q_density = if density > 0.0 && speed > 0.0 && total_windward > 0.0 {
-            CONV_COEFF * density.sqrt() * speed.powi(3) / total_windward.sqrt()
+            heat_scale * CONV_COEFF * density.sqrt() * speed.powi(3) / total_windward.sqrt()
         } else {
             0.0
         };
@@ -265,6 +285,17 @@ impl ThermalState {
             })
             .map(|v| v.cell)
             .collect()
+    }
+
+    /// Whether any voxel has reached its material maximum temperature — the
+    /// non-allocating "is anything overheating?" check (the HUD/telemetry path),
+    /// equivalent to `!failed_cells(craft).is_empty()`.
+    pub fn any_over_limit(&self, craft: &VoxelCraft) -> bool {
+        craft.voxels.iter().any(|v| {
+            self.skin(v.cell)
+                .map(|s| s >= v.material.thermal.max_temp)
+                .unwrap_or(false)
+        })
     }
 }
 

@@ -361,6 +361,53 @@ pub struct DivingCraft {
     pub glide: GlideParams,
 }
 
+/// The calibrated convective heat-scale for the tame `-- dive` re-entry (WI 691) —
+/// a **scenario balance scalar** (the physical `√ρ·v³` shape is unchanged) tuned so
+/// the dive's low-energy (~1.5 km/s) entry visibly overheats the exposed aluminium
+/// nose while the composite hull survives. The magnitude is not arbitrary: it maps
+/// this tame demonstration onto realistic *orbital* re-entry skin temperatures — a
+/// real orbital entry is ~7.5 km/s and heating scales as v³, so ≈(7500/1500)³ ≈ 125×
+/// the tame flux, the remainder accounting for the lumped skin's thermal mass. The
+/// calibration test brackets the working window (nose > 900 K, hull < 3000 K); 250
+/// sits comfortably inside it.
+pub const DIVE_HEAT_SCALE: f64 = 250.0;
+
+/// Re-entry **thermal state** carried on a diving craft (WI 691). When present on
+/// an entity alongside [`DivingCraft`], [`advance_descent`] steps the two-node
+/// thermal model ([`crate::thermal`]) each sub-step using the same medium sample and
+/// body motion the descent uses — so a craft heats through re-entry. The
+/// `heat_scale` is a **scenario balance scalar** over the physical heating shape
+/// (the `-- dive` uses it to make its tame entry visibly consequential without
+/// changing the physical law). Opt-in: a diving craft without this component simply
+/// does not heat.
+#[derive(Component, Clone)]
+pub struct CraftThermal {
+    /// The per-voxel two-node thermal state.
+    pub state: crate::thermal::ThermalState,
+    /// Radiative-sink (environment) temperature, K.
+    pub env_temp: f64,
+    /// Convective-flux balance scalar (1.0 = pure physical).
+    pub heat_scale: f64,
+}
+
+impl CraftThermal {
+    /// A thermal state initialised to `ambient`, radiating to `env_temp`, with the
+    /// given convective `heat_scale`.
+    pub fn new(craft: &VoxelCraft, ambient: f64, env_temp: f64, heat_scale: f64) -> Self {
+        Self {
+            state: crate::thermal::ThermalState::new(craft, ambient),
+            env_temp,
+            heat_scale,
+        }
+    }
+
+    /// The hottest skin temperature (K) and whether any voxel has reached its
+    /// material limit — the re-entry gauge for the HUD/telemetry.
+    pub fn readout(&self, craft: &VoxelCraft) -> (f64, bool) {
+        (self.state.max_skin_temp(), self.state.any_over_limit(craft))
+    }
+}
+
 /// Drives the **active gear's aero/descent forces** (WI 527). Each frame it
 /// sub-steps [`glide_step`] on every active craft carrying a [`DivingCraft`], so a
 /// craft woken into the active gear inside a fluid experiences gravity + drag +
@@ -400,7 +447,11 @@ fn advance_descent(
     time: Res<Time>,
     clock: Res<SimClock>,
     mut sub: ResMut<DescentSubstep>,
-    mut bodies: Query<(&mut crate::active::ActiveBody, &DivingCraft)>,
+    mut bodies: Query<(
+        &mut crate::active::ActiveBody,
+        &DivingCraft,
+        Option<&mut CraftThermal>,
+    )>,
 ) {
     if clock.paused {
         return;
@@ -414,8 +465,24 @@ fn advance_descent(
     let dt = sub.dt;
     let mut n = 0;
     while sub.accumulator >= dt && n < sub.max {
-        for (mut body, dc) in &mut bodies {
-            glide_step(&mut body, &dc.craft, dc.com, &dc.glide, dt);
+        for (mut body, dc, thermal) in &mut bodies {
+            let sample = glide_step(&mut body, &dc.craft, dc.com, &dc.glide, dt);
+            // A craft carrying thermal state heats from the same medium sample and
+            // motion the descent just used (WI 691) — a passive overlay (no force
+            // feedback this slice), so the trajectory is unchanged.
+            if let Some(mut th) = thermal {
+                let env = th.env_temp;
+                let scale = th.heat_scale;
+                th.state.step_scaled(
+                    &dc.craft,
+                    &sample,
+                    body.velocity,
+                    body.orientation,
+                    env,
+                    dt,
+                    scale,
+                );
+            }
         }
         sub.accumulator -= dt;
         n += 1;
@@ -593,6 +660,98 @@ mod tests {
         // removes energy; gravity adds a little over 30 km).
         assert!(max_speed < 2_000.0, "velocity stayed bounded: {max_speed}");
         let _ = seen_vacuum_or_thin;
+    }
+
+    /// The `-- dive` craft: a 3×3×4 composite hull with a single aluminium nose tip
+    /// at the windward front (cell (1,1,4)) — replicated from `dive_scene::dive_craft`
+    /// for the WI 691 calibration.
+    fn dive_calibration_craft() -> VoxelCraft {
+        let mut c = VoxelCraft::new(1.0);
+        for z in 0..4 {
+            for x in 0..3 {
+                for y in 0..3 {
+                    c.voxels.push(Voxel {
+                        cell: IVec3::new(x, y, z),
+                        material: Material::COMPOSITE,
+                    });
+                }
+            }
+        }
+        c.voxels.push(Voxel {
+            cell: IVec3::new(1, 1, 4),
+            material: Material::ALUMINIUM,
+        });
+        c
+    }
+
+    // --- WI 691: dive thermal calibration ---
+
+    #[test]
+    fn dive_reentry_overheats_the_alu_nose_and_spares_the_composite_hull() {
+        use crate::thermal::ThermalState;
+        use glam::DQuat;
+        use std::f64::consts::FRAC_PI_2;
+
+        let craft = dive_calibration_craft();
+        let mp = craft.mass_properties().unwrap();
+        let params = DescentParams {
+            medium: FluidMedium::EARTHLIKE,
+            mu: MU,
+            surface_radius: SURFACE_R,
+            drag_area: max_cross_section(&craft),
+            drag_coefficient: 1.0,
+        };
+        let glide = GlideParams::for_craft(params, &craft, Axis::Z);
+
+        // Nose-first re-entry: descend radially (-Y) with the +Z nose rotated to point
+        // down into the flow (the trimmed attitude), so the aluminium tip is windward.
+        let mut body = ActiveBody::new(
+            DVec3::new(0.0, SURFACE_R + 30_000.0, 0.0),
+            DVec3::new(0.0, -1_500.0, 0.0),
+            mp.mass,
+            mp.inertia,
+        );
+        body.orientation = DQuat::from_rotation_x(FRAC_PI_2); // local +Z → world -Y
+
+        let env = 250.0;
+        let mut thermal = ThermalState::new(&craft, env);
+        let nose = IVec3::new(1, 1, 4);
+
+        let dt = 0.01;
+        let mut peak_nose = 0.0_f64;
+        let mut peak_hull = 0.0_f64;
+        for _ in 0..200_000 {
+            let sample = glide_step(&mut body, &craft, mp.center_of_mass, &glide, dt);
+            thermal.step_scaled(
+                &craft,
+                &sample,
+                body.velocity,
+                body.orientation,
+                env,
+                dt,
+                DIVE_HEAT_SCALE,
+            );
+            peak_nose = peak_nose.max(thermal.skin(nose).unwrap());
+            for v in &craft.voxels {
+                if v.cell != nose {
+                    peak_hull = peak_hull.max(thermal.skin(v.cell).unwrap());
+                }
+            }
+            if sample.medium == MediumKind::Liquid {
+                break;
+            }
+        }
+
+        // The exposed aluminium nose (max 900 K) overheats; the composite hull
+        // (max 3000 K) survives — the "unshielded part fails, shielded survives" story.
+        assert!(
+            peak_nose >= Material::ALUMINIUM.thermal.max_temp,
+            "alu nose should overheat: peak_nose={peak_nose}"
+        );
+        assert!(
+            peak_hull < Material::COMPOSITE.thermal.max_temp,
+            "composite hull should survive: peak_hull={peak_hull}"
+        );
     }
 
     #[test]
