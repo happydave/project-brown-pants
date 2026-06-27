@@ -15,6 +15,7 @@
 
 use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::Tonemapping;
+use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::light::{light_consts::lux, AtmosphereEnvironmentMapLight};
 use bevy::math::{DVec2, DVec3};
 use bevy::pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium};
@@ -113,6 +114,39 @@ struct DiveReadout {
     steam_mass: f64,
 }
 
+/// Mouse-driven orbit/zoom state for the follow camera (WI 702): the eye sits at
+/// `craft + orbit_offset(yaw, pitch, dist)`. The default reproduces the historical fixed
+/// `(18, 8, 18)` view, so the scene opens unchanged.
+#[derive(Resource)]
+struct DiveCam {
+    /// Orbit yaw about the craft (radians).
+    yaw: f32,
+    /// Orbit pitch above the horizon (radians), clamped away from the poles.
+    pitch: f32,
+    /// Eye distance from the craft (metres).
+    dist: f32,
+}
+
+impl Default for DiveCam {
+    fn default() -> Self {
+        // Matches the previous fixed offset (18, 8, 18): yaw = π/4, a gentle downward pitch,
+        // distance ≈ 26.68 m.
+        Self {
+            yaw: std::f32::consts::FRAC_PI_4,
+            pitch: 0.305,
+            dist: 26.683,
+        }
+    }
+}
+
+/// The camera eye offset from the orbit target for a yaw/pitch/distance (WI 702) — the
+/// spherical-to-cartesian the gallery/editor orbit cameras use. Pure (unit-tested).
+fn orbit_offset(yaw: f32, pitch: f32, dist: f32) -> Vec3 {
+    let (sy, cy) = yaw.sin_cos();
+    let (sp, cp) = pitch.sin_cos();
+    Vec3::new(sy * cp, sp, cy * cp) * dist
+}
+
 /// Marks the heads-up readout.
 #[derive(Component)]
 struct Hud;
@@ -144,10 +178,18 @@ impl Plugin for DiveScenePlugin {
             })
             .init_resource::<SteamAssets>()
             .init_resource::<SplashAssets>()
+            .init_resource::<DiveCam>()
             .add_systems(Startup, setup_scene)
             .add_systems(
                 Update,
-                (track_craft, track_thermal, follow_camera, update_hud).chain(),
+                (
+                    track_craft,
+                    track_thermal,
+                    dive_camera_input,
+                    follow_camera,
+                    update_hud,
+                )
+                    .chain(),
             )
             // Phase-change spike (WI 695): steam when the hot craft hits the ocean.
             .add_systems(Update, (emit_steam, update_steam))
@@ -397,9 +439,29 @@ fn glow_color(skin_temp: f64) -> LinearRgba {
     LinearRgba::rgb(x * 8.0, x * x * 8.0, x * x * x * 8.0)
 }
 
-/// Keeps the anchor camera a fixed offset from the craft's render position.
+/// Reads mouse input into the orbit camera state (WI 702): middle-drag orbits (yaw/pitch),
+/// the wheel zooms (distance) — the editor/gallery convention, leaving left/right free.
+fn dive_camera_input(
+    motion: Res<AccumulatedMouseMotion>,
+    scroll: Res<AccumulatedMouseScroll>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    mut cam: ResMut<DiveCam>,
+) {
+    if buttons.pressed(MouseButton::Middle) {
+        cam.yaw += motion.delta.x * 0.01;
+        cam.pitch = (cam.pitch + motion.delta.y * 0.01).clamp(-1.4, 1.4);
+    }
+    if scroll.delta.y != 0.0 {
+        // Zoom step scales with distance so it stays usable close in and far out.
+        cam.dist = (cam.dist - scroll.delta.y * cam.dist * 0.1).clamp(5.0, 2_000.0);
+    }
+}
+
+/// Keeps the anchor camera orbiting/zooming the craft's render position (WI 702): the eye is
+/// `craft + orbit_offset(DiveCam)`, still tracking the craft every frame.
 #[allow(clippy::type_complexity)] // disjoint Bevy queries (craft vs. camera)
 fn follow_camera(
+    cam: Res<DiveCam>,
     craft: Query<&WorldPlacement, (With<CraftMarker>, Without<AnchorCamera>)>,
     mut camera: Query<
         (&mut Transform, &mut WorldPlacement),
@@ -413,7 +475,7 @@ fn follow_camera(
         return;
     };
     let target = craft_wp.0.pos;
-    let eye = target + DVec3::new(18.0, 8.0, 18.0);
+    let eye = target + orbit_offset(cam.yaw, cam.pitch, cam.dist).as_dvec3();
     placement.0 = WorldPos::new(FrameId::CENTRAL_BODY, eye);
     let look_dir = (target - eye).as_vec3().normalize_or_zero();
     if look_dir != Vec3::ZERO {
@@ -743,5 +805,34 @@ mod tests {
         assert!(splash_intensity(SPLASH_FULL * 10.0) <= 1.0);
         // Full intensity reached by the full-speed mark.
         assert!((splash_intensity(SPLASH_FULL) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn orbit_offset_default_reproduces_the_legacy_view() {
+        let cam = DiveCam::default();
+        let off = orbit_offset(cam.yaw, cam.pitch, cam.dist);
+        // The default reproduces the historical fixed (18, 8, 18) offset.
+        assert!((off.x - 18.0).abs() < 0.1, "x = {}", off.x);
+        assert!((off.y - 8.0).abs() < 0.1, "y = {}", off.y);
+        assert!((off.z - 18.0).abs() < 0.1, "z = {}", off.z);
+        // Magnitude equals the orbit distance.
+        assert!((off.length() - cam.dist).abs() < 1e-3);
+
+        // Pitching up raises the eye; pitching down lowers it.
+        let up = orbit_offset(cam.yaw, cam.pitch + 0.3, cam.dist);
+        assert!(up.y > off.y, "more pitch raises the eye");
+        // Zooming changes the distance, not the direction.
+        let near = orbit_offset(cam.yaw, cam.pitch, cam.dist * 0.5);
+        assert!((near.length() - cam.dist * 0.5).abs() < 1e-3);
+        assert!(
+            off.normalize().distance(near.normalize()) < 1e-5,
+            "zoom keeps the view direction"
+        );
+        // Orbiting yaw rotates the eye around the target (the x/z direction changes).
+        let spun = orbit_offset(cam.yaw + 1.0, cam.pitch, cam.dist);
+        assert!(
+            (spun.x - off.x).abs() > 1.0 || (spun.z - off.z).abs() > 1.0,
+            "yaw orbits horizontally"
+        );
     }
 }
