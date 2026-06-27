@@ -69,8 +69,8 @@ pub fn ground_safe_warp(
             let approach = -body.velocity.dot(*normal);
             max_safe_warp(requested, gap, approach, base_dt, tolerance)
         }
-        // No proximity model for a cuboid compound or a heightfield here; leave warp unchanged.
-        CollisionShape::CuboidCompound(_) | CollisionShape::Heightfield { .. } => requested,
+        // No proximity model for a cuboid compound here; leave warp unchanged.
+        CollisionShape::CuboidCompound(_) => requested,
     }
 }
 

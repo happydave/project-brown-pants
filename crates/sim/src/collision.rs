@@ -5,7 +5,6 @@
 //! the detection backend's types (`parry3d-f64`); keeping parry out of this module means the
 //! shapes stay pure, headless, and unit-testable, and the backend is swappable.
 
-use crate::terrain::Terrain;
 use crate::voxel::VoxelCraft;
 use glam::DVec3;
 
@@ -26,23 +25,6 @@ pub enum CollisionShape {
     /// A flat ground plane: points with `p·normal < offset` are below the surface
     /// (penetrating). `normal` is unit.
     HalfSpace { normal: DVec3, offset: f64 },
-    /// A terrain patch as a regular height grid (WI 636): a static, body-B surface for true
-    /// hull-vs-terrain manifolds at a sharp discontinuity (the ramp lip), where independent point
-    /// sampling fails. Sampled from the analytic [`crate::terrain::Terrain`] over a small,
-    /// rover-local footprint each step (see [`terrain_heightfield`]). The grid has `nx × nz` nodes;
-    /// `heights` are **absolute world-Y** values in **column-major** order (`heights[ix*nz + iz]`,
-    /// matching parry's `Array2` layout); `origin` is the world position of the footprint centre
-    /// (its `y` is the surface datum, normally 0); `size_x`/`size_z` are the world footprint extents
-    /// along X/Z. Node `(ix, iz)` sits at world
-    /// `origin + ((ix/(nx-1) − 0.5)·size_x, 0, (iz/(nz-1) − 0.5)·size_z)` at height `heights[..]`.
-    Heightfield {
-        heights: Vec<f64>,
-        nx: usize,
-        nz: usize,
-        origin: DVec3,
-        size_x: f64,
-        size_z: f64,
-    },
 }
 
 /// Broad-phase bounds for a body: a local AABB plus an **orientation-invariant** bounding
@@ -122,42 +104,6 @@ pub fn ground_half_space(surface_offset: f64) -> CollisionShape {
     CollisionShape::HalfSpace {
         normal: DVec3::Y,
         offset: surface_offset,
-    }
-}
-
-/// Sample the analytic [`Terrain`] into a local [`CollisionShape::Heightfield`] patch (WI 636): an
-/// `nx × nz`-node grid spanning `size_x × size_z` (world metres) centred on `center` (only `center`'s
-/// X/Z are used; the patch datum `origin.y` is 0). Each node's height is an **exact** `Terrain::height`
-/// sample, so the hull manifold and the wheel quarter-car (which still reads `Terrain` analytically)
-/// never disagree about the ground. The footprint must be sized past the rover's reach by the caller so
-/// no hull point is ever over un-sampled terrain; the resolution must be fine enough that a sharp
-/// feature (the ramp lip) falls within one cell. `nx`, `nz` are clamped to ≥ 2.
-pub fn terrain_heightfield(
-    terrain: &Terrain,
-    center: DVec3,
-    size_x: f64,
-    size_z: f64,
-    nx: usize,
-    nz: usize,
-) -> CollisionShape {
-    let nx = nx.max(2);
-    let nz = nz.max(2);
-    // Column-major (`heights[ix*nz + iz]`) to match parry's `Array2` layout (cols = x, rows = z).
-    let mut heights = Vec::with_capacity(nx * nz);
-    for ix in 0..nx {
-        let lx = (ix as f64 / (nx - 1) as f64 - 0.5) * size_x;
-        for iz in 0..nz {
-            let lz = (iz as f64 / (nz - 1) as f64 - 0.5) * size_z;
-            heights.push(terrain.height(center.x + lx, center.z + lz));
-        }
-    }
-    CollisionShape::Heightfield {
-        heights,
-        nx,
-        nz,
-        origin: DVec3::new(center.x, 0.0, center.z),
-        size_x,
-        size_z,
     }
 }
 

@@ -2657,7 +2657,7 @@ mod tests {
         // driving fast off the ramp *launches* (intended) at a sane speed, lands, and drives on — it
         // never explodes. (KNOWN LIMITATION, deferred: at a *mid* approach speed the chassis can still
         // clip / get a smaller toss at the sharp lip — point-sampled contact cannot fully resolve a
-        // terrain discontinuity; the robust fix is the heightfield-manifold contact, tracked separately.)
+        // terrain discontinuity; the robust fix is **edge-aware** contact, tracked separately as WI 636.)
         use crate::terrain::Ramp;
         let terrain = Terrain {
             amplitude: 0.0,
