@@ -138,11 +138,14 @@ impl Plugin for DiveScenePlugin {
                 substep_dt: SUBSTEP_DT,
                 max_substeps: MAX_SUBSTEPS,
             })
+            .init_resource::<SteamAssets>()
             .add_systems(Startup, setup_scene)
             .add_systems(
                 Update,
                 (track_craft, track_thermal, follow_camera, update_hud).chain(),
-            );
+            )
+            // Phase-change spike (WI 695): steam when the hot craft hits the ocean.
+            .add_systems(Update, (emit_steam, update_steam));
     }
 }
 
@@ -435,5 +438,146 @@ fn update_hud(readout: Res<DiveReadout>, mut hud: Query<&mut Text, With<Hud>>) {
         text.0 = format!(
             "gear:     {gear}\naltitude: {alt:8.0} m\nspeed:    {speed:7.1} m/s\nmedium:   {medium}\nhull P:   {pressure_kpa:8.1} kPa\nram P:    {ram_kpa:8.1} kPa\nskin T:   {skin:8.0} K{heat}{shield}"
         );
+    }
+}
+
+// --- Phase-change spike (WI 695): water → steam when a hot craft hits the ocean ---
+
+/// Skin temperature (K) above which a craft in contact with water throws off steam.
+const STEAM_ONSET: f64 = 400.0;
+/// Maximum concurrent steam puffs (a bounded pool).
+const STEAM_MAX: usize = 80;
+/// Steam puffs emitted per second at full intensity.
+const STEAM_RATE: f32 = 40.0;
+
+/// Steam emission intensity, 0–1 (pure, unit-tested): zero unless the craft is in
+/// contact with water, otherwise ramping with how far the skin is above the steam
+/// onset. The visual rate/opacity scale with this.
+fn steam_intensity(skin_temp: f64, in_water: bool) -> f64 {
+    if !in_water {
+        return 0.0;
+    }
+    ((skin_temp - STEAM_ONSET) / 1_000.0).clamp(0.0, 1.0)
+}
+
+/// A rising, growing, fading steam puff.
+#[derive(Component)]
+struct SteamPuff {
+    age: f32,
+    lifetime: f32,
+    vel: Vec3,
+}
+
+/// The shared steam puff mesh (one sphere, instanced per puff).
+#[derive(Resource)]
+struct SteamAssets {
+    mesh: Handle<Mesh>,
+}
+
+impl FromWorld for SteamAssets {
+    fn from_world(world: &mut World) -> Self {
+        let mut meshes = world.resource_mut::<Assets<Mesh>>();
+        Self {
+            mesh: meshes.add(Mesh::from(Sphere { radius: 1.0 })),
+        }
+    }
+}
+
+/// Spawns steam puffs at the craft while it is hot and in/just above the ocean,
+/// at a rate proportional to the steam intensity (WI 695, prototype).
+#[allow(clippy::too_many_arguments)]
+fn emit_steam(
+    mut commands: Commands,
+    time: Res<Time>,
+    readout: Res<DiveReadout>,
+    assets: Res<SteamAssets>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    craft: Query<&Transform, With<CraftMarker>>,
+    existing: Query<(), With<SteamPuff>>,
+    mut accum: Local<f32>,
+    mut seed: Local<u32>,
+) {
+    let in_water = matches!(readout.medium, MediumKind::Liquid) || readout.altitude < 50.0;
+    let intensity = steam_intensity(readout.skin_temp, in_water) as f32;
+    if intensity <= 0.0 {
+        *accum = 0.0;
+        return;
+    }
+    let Ok(craft_tf) = craft.single() else {
+        return;
+    };
+    if existing.iter().count() >= STEAM_MAX {
+        return;
+    }
+    *accum += time.delta_secs() * intensity * STEAM_RATE;
+    while *accum >= 1.0 {
+        *accum -= 1.0;
+        // A cheap LCG for scatter (no rng dependency; gameplay-noncritical).
+        *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let r = |shift: u32| (((*seed >> shift) & 0xff) as f32 / 255.0) - 0.5;
+        let offset = Vec3::new(r(0) * 4.0, 0.0, r(8) * 4.0);
+        let vel = Vec3::new(r(16) * 2.0, 6.0 + r(4) * 3.0, r(24) * 2.0);
+        let mat = materials.add(StandardMaterial {
+            base_color: Color::srgba(0.9, 0.92, 0.95, 0.5),
+            emissive: LinearRgba::rgb(0.25, 0.25, 0.28),
+            alpha_mode: AlphaMode::Blend,
+            ..default()
+        });
+        commands.spawn((
+            Mesh3d(assets.mesh.clone()),
+            MeshMaterial3d(mat),
+            Transform::from_translation(craft_tf.translation + offset).with_scale(Vec3::splat(0.8)),
+            SteamPuff {
+                age: 0.0,
+                lifetime: 1.6,
+                vel,
+            },
+        ));
+    }
+}
+
+/// Rises, grows, and fades each steam puff, despawning it (and freeing its material)
+/// at the end of its life (WI 695, prototype).
+fn update_steam(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut puffs: Query<(
+        Entity,
+        &mut Transform,
+        &mut SteamPuff,
+        &MeshMaterial3d<StandardMaterial>,
+    )>,
+) {
+    let dt = time.delta_secs();
+    for (entity, mut tf, mut puff, mat) in &mut puffs {
+        puff.age += dt;
+        if puff.age >= puff.lifetime {
+            commands.entity(entity).despawn();
+            continue;
+        }
+        let t = puff.age / puff.lifetime;
+        tf.translation += puff.vel * dt;
+        tf.scale = Vec3::splat(0.8 + t * 3.0); // grow as it rises
+        if let Some(m) = materials.get_mut(&mat.0) {
+            m.base_color = Color::srgba(0.9, 0.92, 0.95, (1.0 - t) * 0.5); // fade out
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn steam_only_forms_hot_and_in_water() {
+        // No steam out of the water, however hot.
+        assert_eq!(steam_intensity(2000.0, false), 0.0);
+        // No steam in water below the onset.
+        assert_eq!(steam_intensity(300.0, true), 0.0);
+        // Steam in water above the onset, ramping with temperature and clamped to 1.
+        assert!(steam_intensity(700.0, true) > 0.0);
+        assert!(steam_intensity(2000.0, true) <= 1.0);
+        assert!(steam_intensity(1400.0, true) > steam_intensity(700.0, true));
     }
 }
