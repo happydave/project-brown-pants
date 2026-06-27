@@ -45,6 +45,11 @@ const GLOW_ONSET: f64 = 500.0;
 const BODY: CentralBody = CentralBody::EARTHLIKE;
 /// Starting altitude of the orbit's high point, metres.
 const START_ALT: f64 = 120_000.0;
+/// Tangential entry speed, m/s (WI 693): a genuine **orbital** re-entry (~7 km/s,
+/// just under circular at this altitude) rather than the old ~600 m/s suborbital
+/// lob — so heating is physically dramatic. Periapsis falls into the atmosphere, so
+/// the craft re-enters and reaches the ocean (validated headless).
+const ENTRY_SPEED: f64 = 7_000.0;
 /// Atmospheric-entry interface altitude, metres (where warp drops and the craft
 /// wakes into active physics).
 const ENTRY_ALT: f64 = 100_000.0;
@@ -146,13 +151,19 @@ fn setup_scene(
     mut clock: ResMut<SimClock>,
     mut craft_q: Query<(Entity, &mut Craft, &mut GearState)>,
 ) {
-    // A steep, low-energy re-entry plunge from START_ALT: a bound Kepler orbit
-    // (periapsis deep below the surface) whose entry speed stays tame (~1–2 km/s).
-    // Start at the +Y high point with a small +X tangential velocity so "up" ≈ +Y,
-    // matching the flat-ground render convention.
+    // A genuine **orbital** re-entry from START_ALT (WI 693): a bound Kepler orbit at
+    // near-circular speed whose periapsis falls into the atmosphere, so the craft
+    // enters at ~7 km/s — carrying orbital kinetic energy, so re-entry heating is
+    // physically dramatic (heating ∝ v³). Start at the +Y high point with a +X
+    // tangential velocity so "up" ≈ +Y, matching the flat-ground render convention.
     let r0 = BODY.radius + START_ALT;
-    let orbit = Orbit::from_state(BODY.mu, DVec2::new(0.0, r0), DVec2::new(600.0, 0.0), 0.0)
-        .expect("bound re-entry orbit");
+    let orbit = Orbit::from_state(
+        BODY.mu,
+        DVec2::new(0.0, r0),
+        DVec2::new(ENTRY_SPEED, 0.0),
+        0.0,
+    )
+    .expect("bound re-entry orbit");
 
     let voxels = dive_craft();
     let mp = voxels.mass_properties().expect("non-empty craft");

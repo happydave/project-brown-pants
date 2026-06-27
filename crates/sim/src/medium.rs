@@ -361,16 +361,15 @@ pub struct DivingCraft {
     pub glide: GlideParams,
 }
 
-/// The calibrated convective heat-scale for the tame `-- dive` re-entry (WI 691) —
-/// a **scenario balance scalar** (the physical `√ρ·v³` shape is unchanged) tuned so
-/// the dive's low-energy (~1.5 km/s) entry visibly overheats the exposed aluminium
-/// nose while the composite hull survives. The magnitude is not arbitrary: it maps
-/// this tame demonstration onto realistic *orbital* re-entry skin temperatures — a
-/// real orbital entry is ~7.5 km/s and heating scales as v³, so ≈(7500/1500)³ ≈ 125×
-/// the tame flux, the remainder accounting for the lumped skin's thermal mass. The
-/// calibration test brackets the working window (nose > 900 K, hull < 3000 K); 250
-/// sits comfortably inside it.
-pub const DIVE_HEAT_SCALE: f64 = 250.0;
+/// The calibrated convective heat-scale for the `-- dive` re-entry (WI 691, 693) —
+/// a small **scenario balance scalar** (the physical `√ρ·v³` shape is unchanged).
+/// Since WI 693 the dive is a **genuine orbital re-entry** (~7 km/s entry, ~100× the
+/// old tame lob's flux), so this collapsed from 250 to ~4 — heating is now mostly
+/// physical, with the residual standing in for the simplified (lumped, thick-skin)
+/// thermal model that WI 692/688 (a realistic thin skin + ablation) will retire. The
+/// calibration test brackets the working window (nose > 900 K, hull < 3000 K, ≈[1.5,
+/// 8]); 4 sits comfortably inside it.
+pub const DIVE_HEAT_SCALE: f64 = 4.0;
 
 /// Re-entry **thermal state** carried on a diving craft (WI 691). When present on
 /// an entity alongside [`DivingCraft`], [`advance_descent`] steps the two-node
@@ -684,66 +683,122 @@ mod tests {
         c
     }
 
-    // --- WI 691: dive thermal calibration ---
+    // --- WI 691/693: dive thermal calibration (full orbital re-entry chain) ---
 
+    /// The whole `-- dive` chain, headless: the dive craft on the **orbital** re-entry
+    /// orbit coasts on rails, auto-drops to active at the entry interface, and descends
+    /// through the atmosphere into the ocean while the `DescentPlugin` steps its
+    /// `CraftThermal`. Asserts WI 693's invariants together: the entry is genuinely
+    /// orbital (≥ 6 km/s), it reaches the ocean, and under `DIVE_HEAT_SCALE` the
+    /// aluminium nose overheats (≥ 900 K) while the composite hull survives (< 3000 K).
     #[test]
-    fn dive_reentry_overheats_the_alu_nose_and_spares_the_composite_hull() {
-        use crate::thermal::ThermalState;
-        use glam::DQuat;
-        use std::f64::consts::FRAC_PI_2;
+    fn dive_orbital_reentry_overheats_the_alu_nose_and_spares_the_composite_hull() {
+        use crate::active::Gravity;
+        use crate::sim::CentralBody;
+        use std::time::Duration;
+
+        let body = CentralBody::EARTHLIKE;
+        // The dive's orbital entry: near-circular at 120 km, periapsis in the atmosphere
+        // (matches dive_scene's ENTRY_SPEED = 7000 m/s).
+        let orbit = Orbit::from_state(
+            body.mu,
+            DVec2::new(body.radius + 120_000.0, 0.0),
+            DVec2::new(0.0, 7_000.0),
+            0.0,
+        )
+        .unwrap();
+        assert!(
+            orbit.periapsis_radius() < body.radius,
+            "must be a re-entry trajectory"
+        );
 
         let craft = dive_calibration_craft();
         let mp = craft.mass_properties().unwrap();
-        let params = DescentParams {
+        let descent = DescentParams {
             medium: FluidMedium::EARTHLIKE,
-            mu: MU,
-            surface_radius: SURFACE_R,
+            mu: body.mu,
+            surface_radius: body.radius,
             drag_area: max_cross_section(&craft),
             drag_coefficient: 1.0,
         };
-        let glide = GlideParams::for_craft(params, &craft, Axis::Z);
+        let glide = GlideParams::for_craft(descent, &craft, Axis::Z);
 
-        // Nose-first re-entry: descend radially (-Y) with the +Z nose rotated to point
-        // down into the flow (the trimmed attitude), so the aluminium tip is windward.
-        let mut body = ActiveBody::new(
-            DVec3::new(0.0, SURFACE_R + 30_000.0, 0.0),
-            DVec3::new(0.0, -1_500.0, 0.0),
-            mp.mass,
-            mp.inertia,
-        );
-        body.orientation = DQuat::from_rotation_x(FRAC_PI_2); // local +Z → world -Y
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default());
+        app.insert_resource(Gravity { mu: body.mu });
+        app.add_plugins(OrbitPlugin {
+            central_body: body,
+            initial_orbit: orbit,
+        });
+        app.add_plugins(FlightControlPlugin);
+        app.add_plugins(HandoffPlugin);
+        app.add_plugins(DiveTriggerPlugin {
+            interface: EntryInterface {
+                surface_radius: body.radius,
+                altitude: 100_000.0,
+            },
+        });
+        app.add_plugins(DescentPlugin {
+            substep_dt: 0.002,
+            max_substeps: 4_000,
+        });
+        {
+            let mut q = app.world_mut().query_filtered::<Entity, With<Craft>>();
+            let e = q.single(app.world()).unwrap();
+            app.world_mut().entity_mut(e).insert((
+                GearState::new(mp.mass, mp.inertia),
+                DivingCraft {
+                    craft: craft.clone(),
+                    com: mp.center_of_mass,
+                    glide,
+                },
+                CraftThermal::new(&craft, 250.0, 250.0, DIVE_HEAT_SCALE),
+            ));
+        }
+        app.world_mut().resource_mut::<SimClock>().warp = 50.0;
 
-        let env = 250.0;
-        let mut thermal = ThermalState::new(&craft, env);
         let nose = IVec3::new(1, 1, 4);
-
-        let dt = 0.01;
+        let mut entry_speed = 0.0_f64;
+        let mut reached_ocean = false;
         let mut peak_nose = 0.0_f64;
         let mut peak_hull = 0.0_f64;
-        for _ in 0..200_000 {
-            let sample = glide_step(&mut body, &craft, mp.center_of_mass, &glide, dt);
-            thermal.step_scaled(
-                &craft,
-                &sample,
-                body.velocity,
-                body.orientation,
-                env,
-                dt,
-                DIVE_HEAT_SCALE,
-            );
-            peak_nose = peak_nose.max(thermal.skin(nose).unwrap());
-            for v in &craft.voxels {
-                if v.cell != nose {
-                    peak_hull = peak_hull.max(thermal.skin(v.cell).unwrap());
+        for _ in 0..20_000 {
+            app.world_mut()
+                .resource_mut::<Time<()>>()
+                .advance_by(Duration::from_secs_f64(0.25));
+            app.update();
+
+            let mut q = app.world_mut().query::<(&ActiveBody, &CraftThermal)>();
+            if let Ok((b, th)) = q.single(app.world()) {
+                assert!(
+                    b.position.is_finite() && b.velocity.is_finite(),
+                    "active descent state must stay finite"
+                );
+                if entry_speed == 0.0 {
+                    entry_speed = b.velocity.length();
                 }
-            }
-            if sample.medium == MediumKind::Liquid {
-                break;
+                peak_nose = peak_nose.max(th.state.skin(nose).unwrap());
+                for v in &craft.voxels {
+                    if v.cell != nose {
+                        peak_hull = peak_hull.max(th.state.skin(v.cell).unwrap());
+                    }
+                }
+                let altitude = b.position.length() - body.radius;
+                if descent.medium.sample_altitude(altitude).medium == MediumKind::Liquid {
+                    reached_ocean = true;
+                    break;
+                }
             }
         }
 
-        // The exposed aluminium nose (max 900 K) overheats; the composite hull
-        // (max 3000 K) survives — the "unshielded part fails, shielded survives" story.
+        // I2: a genuinely orbital entry speed (not the old ~1.5 km/s lob).
+        assert!(
+            entry_speed >= 6_000.0,
+            "entry must be orbital: {entry_speed}"
+        );
+        // I1: it still descends all the way to the ocean.
+        assert!(reached_ocean, "must reach the ocean");
+        // I3: the exposed aluminium nose overheats; the composite hull survives.
         assert!(
             peak_nose >= Material::ALUMINIUM.thermal.max_temp,
             "alu nose should overheat: peak_nose={peak_nose}"
