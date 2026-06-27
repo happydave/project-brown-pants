@@ -214,7 +214,7 @@ fn advance_active_bodies(
 mod tests {
     use super::*;
     use crate::orbit::Orbit;
-    use crate::voxel::{Material, Voxel, VoxelCraft};
+    use crate::voxel::{Material, Thermal, Voxel, VoxelCraft};
     use glam::{DVec2, IVec3};
     use std::f64::consts::TAU;
 
@@ -364,6 +364,7 @@ mod tests {
             material: Material {
                 density: 1_000.0,
                 strength: 1.0e9,
+                thermal: Thermal::INERT,
             },
         });
         let mp = craft.mass_properties().unwrap();

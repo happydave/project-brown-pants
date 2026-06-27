@@ -37,6 +37,7 @@ pub mod sim;
 pub mod surface;
 pub mod telemetry;
 pub mod terrain;
+pub mod thermal;
 pub mod universe;
 pub mod voxel;
 pub mod voxel_mesh;

@@ -16,8 +16,69 @@
 //! stay quarantined spikes). Headless; the wind-tunnel scene lives in the app.
 
 use crate::fluid::{FluidSample, MediumKind};
-use glam::DVec3;
+use crate::voxel::VoxelCraft;
+use glam::{DVec3, IVec3};
+use std::collections::HashSet;
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
+
+/// The six axis-aligned face offsets / outward normals of a cubic cell.
+const FACE_OFFSETS: [IVec3; 6] = [
+    IVec3::new(1, 0, 0),
+    IVec3::new(-1, 0, 0),
+    IVec3::new(0, 1, 0),
+    IVec3::new(0, -1, 0),
+    IVec3::new(0, 0, 1),
+    IVec3::new(0, 0, -1),
+];
+
+/// One voxel's exposed-face geometry for a given flow direction (WI 687) — the
+/// directional generalization of [`VoxelCraft::area_curve`] /
+/// [`crate::medium::max_cross_section`], and the aero-derived output the thermal
+/// model consumes for convective heating (so thermal does not re-derive the
+/// lattice itself — design resolution T3/T4).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VoxelExposure {
+    /// The voxel's lattice cell.
+    pub cell: IVec3,
+    /// Total exposed skin area (faces bordering empty space), m².
+    pub exposed_area: f64,
+    /// Windward-projected exposed area, m²: `Σ face_area · max(0, n · flow_dir)`
+    /// over the voxel's exposed faces. Zero for interior or fully-leeward voxels.
+    pub windward_area: f64,
+}
+
+/// Per-voxel exposed and windward-projected areas for a flow direction expressed
+/// in the craft's **local** frame (the direction the craft moves through the
+/// medium). A face is *exposed* when its neighbouring cell is empty, and *windward*
+/// in proportion to how directly its outward normal faces the oncoming flow
+/// (`n · flow_dir > 0`). `flow_dir` need not be unit; a zero/degenerate direction
+/// yields zero windward area everywhere (no convective loading at rest). Pure
+/// geometry over the lattice — the cross-section aero already owns this domain.
+pub fn windward_faces(craft: &VoxelCraft, flow_dir: DVec3) -> Vec<VoxelExposure> {
+    let occupied: HashSet<IVec3> = craft.voxels.iter().map(|v| v.cell).collect();
+    let cell_area = craft.cell_size * craft.cell_size;
+    let f = flow_dir.normalize_or_zero();
+    craft
+        .voxels
+        .iter()
+        .map(|v| {
+            let mut exposed_area = 0.0;
+            let mut windward_area = 0.0;
+            for off in FACE_OFFSETS {
+                if occupied.contains(&(v.cell + off)) {
+                    continue; // interior face between two occupied cells
+                }
+                exposed_area += cell_area;
+                windward_area += cell_area * off.as_dvec3().dot(f).max(0.0);
+            }
+            VoxelExposure {
+                cell: v.cell,
+                exposed_area,
+                windward_area,
+            }
+        })
+        .collect()
+}
 
 /// Ratio of specific heats for air (diatomic), for the speed of sound.
 const GAMMA: f64 = 1.4;
@@ -354,5 +415,59 @@ mod tests {
             pitch_damping_moment(&air(), 0.0, omega, 4.0, 2.0, 0.1),
             DVec3::ZERO
         );
+    }
+
+    #[test]
+    fn windward_faces_expose_only_the_oncoming_direction() {
+        use crate::voxel::{Material, Voxel, VoxelCraft};
+        use glam::IVec3;
+
+        // A single voxel: all six faces exposed; only the +x face is windward to +x flow.
+        let mut single = VoxelCraft::new(1.0);
+        single.voxels.push(Voxel {
+            cell: IVec3::ZERO,
+            material: Material::ALUMINIUM,
+        });
+        let exp = windward_faces(&single, DVec3::X);
+        assert_eq!(exp.len(), 1);
+        assert!(
+            (exp[0].exposed_area - 6.0).abs() < 1e-9,
+            "6 faces of area 1"
+        );
+        assert!(
+            (exp[0].windward_area - 1.0).abs() < 1e-9,
+            "one face faces +x"
+        );
+
+        // A 2-voxel bar along x: the shared interior face is culled (each has 5 exposed),
+        // and only the leading (+x) voxel takes windward area for +x flow.
+        let mut bar = VoxelCraft::new(1.0);
+        bar.voxels.push(Voxel {
+            cell: IVec3::new(0, 0, 0),
+            material: Material::ALUMINIUM,
+        });
+        bar.voxels.push(Voxel {
+            cell: IVec3::new(1, 0, 0),
+            material: Material::ALUMINIUM,
+        });
+        let exp = windward_faces(&bar, DVec3::X);
+        let lead = exp.iter().find(|e| e.cell.x == 1).unwrap();
+        let trail = exp.iter().find(|e| e.cell.x == 0).unwrap();
+        assert!(
+            (lead.exposed_area - 5.0).abs() < 1e-9,
+            "interior face culled"
+        );
+        assert!(
+            (lead.windward_area - 1.0).abs() < 1e-9,
+            "leading face windward"
+        );
+        assert!(
+            trail.windward_area.abs() < 1e-9,
+            "trailing voxel not windward"
+        );
+
+        // At rest (zero flow) nothing is windward.
+        let rest = windward_faces(&bar, DVec3::ZERO);
+        assert!(rest.iter().all(|e| e.windward_area.abs() < 1e-9));
     }
 }

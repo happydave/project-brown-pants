@@ -381,7 +381,7 @@ pub fn step_debris(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::voxel::{Material, Voxel};
+    use crate::voxel::{Material, Thermal, Voxel};
 
     /// A straight bar of `n` unit cells along +x, all one material.
     fn bar(n: i32, material: Material) -> VoxelCraft {
@@ -780,6 +780,7 @@ mod tests {
     const FRANGIBLE: Material = Material {
         density: 2700.0,
         strength: 2.0e6,
+        thermal: Thermal::INERT,
     };
 
     #[test]

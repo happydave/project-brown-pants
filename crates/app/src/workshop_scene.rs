@@ -64,7 +64,9 @@ use sounding_sim::rover::{
 use sounding_sim::sim::{CentralBody, SimClock};
 use sounding_sim::telemetry::RoverTelemetry;
 use sounding_sim::terrain::{Ramp, Terrain};
-use sounding_sim::voxel::{device_mass, Device, DeviceKind, Material, PartKind, Voxel, VoxelCraft};
+use sounding_sim::voxel::{
+    device_mass, Device, DeviceKind, Material, PartKind, Thermal, Voxel, VoxelCraft,
+};
 use sounding_sim::warp::safe_substep_dt;
 
 use crate::bus::GroundedRover;
@@ -95,6 +97,7 @@ const CONTACT_TOL: f64 = 0.1;
 const FRAME: Material = Material {
     density: 1_600.0,
     strength: 3.0e6,
+    thermal: Thermal::INERT,
 };
 
 /// Which half of the build-and-test loop is active.

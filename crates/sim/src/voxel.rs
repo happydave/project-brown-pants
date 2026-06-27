@@ -14,8 +14,9 @@ use glam::{DMat3, DVec3, IVec3};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// A structural material: the data the discipline says to model — density and
-/// tensile strength. A new material is a new value, not a new code path.
+/// A structural material: the data the discipline says to model — density,
+/// tensile strength, and thermal properties. A new material is a new value, not a
+/// new code path.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Material {
     /// Density, kg/m³.
@@ -25,6 +26,12 @@ pub struct Material {
     /// WI 518). Defaulted on load so pre-strength saves stay backward-loadable.
     #[serde(default = "Material::default_strength")]
     pub strength: f64,
+    /// Thermal properties (WI 687): heat capacity, conductivity, emissivity, and
+    /// failure temperature, consumed by the two-node thermal model
+    /// ([`crate::thermal`]). Defaulted to [`Thermal::INERT`] on load so
+    /// pre-thermal saves stay backward-loadable (and never spontaneously melt).
+    #[serde(default)]
+    pub thermal: Thermal,
 }
 
 impl Material {
@@ -32,21 +39,26 @@ impl Material {
     pub const ALUMINIUM: Material = Material {
         density: 2_700.0,
         strength: 3.1e8,
+        thermal: Thermal::ALUMINIUM,
     };
     /// Steel-like structural material.
     pub const STEEL: Material = Material {
         density: 7_850.0,
         strength: 5.0e8,
+        thermal: Thermal::STEEL,
     };
     /// Titanium-like structural material.
     pub const TITANIUM: Material = Material {
         density: 4_500.0,
         strength: 9.0e8,
+        thermal: Thermal::TITANIUM,
     };
-    /// Light composite.
+    /// Light composite — also the slice's reference heat-resistant material
+    /// (low conductivity, high emissivity, high failure temperature).
     pub const COMPOSITE: Material = Material {
         density: 1_600.0,
         strength: 6.0e8,
+        thermal: Thermal::COMPOSITE,
     };
 
     /// The strength assumed for a material loaded from a pre-strength save: high
@@ -55,6 +67,71 @@ impl Material {
     pub fn default_strength() -> f64 {
         1.0e12
     }
+}
+
+/// The thermal properties of a [`Material`] (WI 687) — the data the two-node
+/// thermal model integrates. Per the governing discipline these are fields, not
+/// code paths: a heat-shield material is a value with a high failure temperature
+/// and low conductivity, not a special case.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Thermal {
+    /// Specific heat capacity, J·kg⁻¹·K⁻¹ — energy to raise 1 kg by 1 K.
+    pub specific_heat: f64,
+    /// Thermal conductivity, W·m⁻¹·K⁻¹ — skin↔core and voxel↔voxel heat transfer.
+    pub conductivity: f64,
+    /// Emissivity, 0–1 — radiative efficiency toward the environment.
+    pub emissivity: f64,
+    /// Maximum temperature, K — the skin temperature at which the voxel fails
+    /// (consumed by the thermal→breakage failure path).
+    pub max_temp: f64,
+}
+
+impl Default for Thermal {
+    fn default() -> Self {
+        Self::INERT
+    }
+}
+
+impl Thermal {
+    /// The thermal properties assumed for a pre-thermal save: a high failure
+    /// temperature (so legacy/structural craft never melt), modest capacity, and
+    /// low emissivity. Backward-load default and the value structural-only
+    /// fixtures use.
+    pub const INERT: Thermal = Thermal {
+        specific_heat: 900.0,
+        conductivity: 200.0,
+        emissivity: 0.1,
+        max_temp: 1.0e9,
+    };
+    /// Aluminium-like: high conductivity, low emissivity, ~melting at 900 K.
+    pub const ALUMINIUM: Thermal = Thermal {
+        specific_heat: 900.0,
+        conductivity: 237.0,
+        emissivity: 0.15,
+        max_temp: 900.0,
+    };
+    /// Steel-like: moderate conductivity, higher failure temperature.
+    pub const STEEL: Thermal = Thermal {
+        specific_heat: 490.0,
+        conductivity: 50.0,
+        emissivity: 0.30,
+        max_temp: 1_700.0,
+    };
+    /// Titanium-like: low conductivity, high failure temperature.
+    pub const TITANIUM: Thermal = Thermal {
+        specific_heat: 520.0,
+        conductivity: 22.0,
+        emissivity: 0.30,
+        max_temp: 1_940.0,
+    };
+    /// Carbon-composite-like: a poor conductor, strong radiator, very high
+    /// failure temperature — the reference heat-shield material.
+    pub const COMPOSITE: Thermal = Thermal {
+        specific_heat: 1_000.0,
+        conductivity: 5.0,
+        emissivity: 0.80,
+        max_temp: 3_000.0,
+    };
 }
 
 /// A single occupied cell of the lattice.
@@ -843,6 +920,7 @@ mod tests {
             Material {
                 density: 1_000.0,
                 strength: 1.0e9,
+                thermal: Thermal::INERT,
             },
         );
         let mp = craft.mass_properties().unwrap();
@@ -892,6 +970,7 @@ mod tests {
             Material {
                 density,
                 strength: 1.0e9,
+                thermal: Thermal::INERT,
             },
         );
         let mp = craft.mass_properties().unwrap();
@@ -923,6 +1002,7 @@ mod tests {
             Material {
                 density: 1_200.0,
                 strength: 1.0e9,
+                thermal: Thermal::INERT,
             },
         );
         let mp = craft.mass_properties().unwrap();
@@ -953,6 +1033,7 @@ mod tests {
             material: Material {
                 density: 1_000.0,
                 strength: 1.0e9,
+                thermal: Thermal::INERT,
             },
         });
         craft.voxels.push(Voxel {
@@ -960,6 +1041,7 @@ mod tests {
             material: Material {
                 density: 3_000.0,
                 strength: 1.0e9,
+                thermal: Thermal::INERT,
             },
         });
         let mp = craft.mass_properties().unwrap();
@@ -1058,6 +1140,7 @@ mod tests {
         let exotic = Material {
             density: 19_300.0,
             strength: 1.0e9,
+            thermal: Thermal::INERT,
         }; // tungsten-like
         let mut craft = VoxelCraft::new(1.0);
         craft.voxels.push(Voxel {
@@ -1066,5 +1149,16 @@ mod tests {
         });
         let mp = craft.mass_properties().unwrap();
         assert!((mp.mass - 19_300.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pre_thermal_material_loads_with_inert_thermal_defaults() {
+        // A material serialized before WI 687 (no `thermal` field) must still load,
+        // defaulting to inert thermal properties so legacy craft never melt.
+        let json = r#"{"density":2700.0,"strength":3.1e8}"#;
+        let m: Material = serde_json::from_str(json).unwrap();
+        assert_eq!(m.density, 2_700.0);
+        assert_eq!(m.thermal, Thermal::INERT);
+        assert!(m.thermal.max_temp > 1.0e8, "inert default never fails");
     }
 }

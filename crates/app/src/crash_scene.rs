@@ -21,7 +21,7 @@ use sounding_sim::collision::{
     craft_bounds, craft_collision_shape, ground_half_space, Bounds, CollisionShape,
 };
 use sounding_sim::contact::{body_contact_wrench, ground_contact_wrench, ContactParams};
-use sounding_sim::voxel::{Material, Voxel, VoxelCraft};
+use sounding_sim::voxel::{Material, Thermal, Voxel, VoxelCraft};
 
 /// Uniform gravity for the local sandbox, m/s² (Earth surface).
 const G: f64 = 9.85;
@@ -33,6 +33,7 @@ const THRUST_ACCEL: f64 = 40.0;
 const FRANGIBLE: Material = Material {
     density: 2700.0,
     strength: 2.0e6,
+    thermal: Thermal::INERT,
 };
 
 const PROJECTILE_COLOR: Color = Color::srgb(0.90, 0.55, 0.30);
