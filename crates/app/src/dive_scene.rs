@@ -107,6 +107,9 @@ struct DiveReadout {
     over_limit: bool,
     /// Remaining ablative-shield fraction, or `None` if no shield (WI 688).
     ablator_remaining: Option<f64>,
+    /// Steam mass vaporised last step, kg (WI 698) — the boiling-clamp output that drives
+    /// the steam VFX intensity (replaces the old skin-temperature proxy).
+    steam_mass: f64,
 }
 
 /// Marks the heads-up readout.
@@ -367,6 +370,7 @@ fn track_thermal(
     readout.skin_temp = max_skin;
     readout.over_limit = over_limit;
     readout.ablator_remaining = ablator_remaining;
+    readout.steam_mass = thermal.state.steam_mass(); // WI 698: boiling-clamp output
     bridge.0 = Some(ThermalTelemetry {
         max_skin_temp: max_skin,
         over_limit,
@@ -441,23 +445,24 @@ fn update_hud(readout: Res<DiveReadout>, mut hud: Query<&mut Text, With<Hud>>) {
     }
 }
 
-// --- Phase-change spike (WI 695): water → steam when a hot craft hits the ocean ---
+// --- Phase-change (WI 695 VFX, WI 698 coupling): water → steam from actual boiling ---
 
-/// Skin temperature (K) above which a craft in contact with water throws off steam.
-const STEAM_ONSET: f64 = 400.0;
+/// Steam mass (kg/step) at which the steam VFX is at full intensity (WI 698). A tuning
+/// knob for the deferred general VFX pass — the visual rate/opacity scale with the
+/// boiling vigour, which the sim now reports as vaporised mass.
+const STEAM_MASS_FULL: f64 = 0.2;
 /// Maximum concurrent steam puffs (a bounded pool).
 const STEAM_MAX: usize = 80;
 /// Steam puffs emitted per second at full intensity.
 const STEAM_RATE: f32 = 40.0;
 
-/// Steam emission intensity, 0–1 (pure, unit-tested): zero unless the craft is in
-/// contact with water, otherwise ramping with how far the skin is above the steam
-/// onset. The visual rate/opacity scale with this.
-fn steam_intensity(skin_temp: f64, in_water: bool) -> f64 {
-    if !in_water {
-        return 0.0;
-    }
-    ((skin_temp - STEAM_ONSET) / 1_000.0).clamp(0.0, 1.0)
+/// Steam emission intensity, 0–1 (pure, unit-tested): driven by the boiling clamp's
+/// vaporised **steam mass** (WI 698), not a skin-temperature proxy — so steam appears
+/// exactly when and as hard as the surface is actually boiling (the sim already produces
+/// steam mass only when submerged and above the boiling point). The visual rate/opacity
+/// scale with this.
+fn steam_intensity(steam_mass: f64) -> f64 {
+    (steam_mass / STEAM_MASS_FULL).clamp(0.0, 1.0)
 }
 
 /// A rising, growing, fading steam puff.
@@ -497,8 +502,7 @@ fn emit_steam(
     mut accum: Local<f32>,
     mut seed: Local<u32>,
 ) {
-    let in_water = matches!(readout.medium, MediumKind::Liquid) || readout.altitude < 50.0;
-    let intensity = steam_intensity(readout.skin_temp, in_water) as f32;
+    let intensity = steam_intensity(readout.steam_mass) as f32;
     if intensity <= 0.0 {
         *accum = 0.0;
         return;
@@ -570,14 +574,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn steam_only_forms_hot_and_in_water() {
-        // No steam out of the water, however hot.
-        assert_eq!(steam_intensity(2000.0, false), 0.0);
-        // No steam in water below the onset.
-        assert_eq!(steam_intensity(300.0, true), 0.0);
-        // Steam in water above the onset, ramping with temperature and clamped to 1.
-        assert!(steam_intensity(700.0, true) > 0.0);
-        assert!(steam_intensity(2000.0, true) <= 1.0);
-        assert!(steam_intensity(1400.0, true) > steam_intensity(700.0, true));
+    fn steam_intensity_tracks_vaporised_mass() {
+        // No vaporised mass → no steam (the sim produces mass only when submerged + boiling,
+        // WI 698, so the in-water/hot gating now lives in the sim, not here).
+        assert_eq!(steam_intensity(0.0), 0.0);
+        // Positive mass ramps with how vigorously the surface boils, and clamps to 1.
+        assert!(steam_intensity(STEAM_MASS_FULL * 0.25) > 0.0);
+        assert!(steam_intensity(STEAM_MASS_FULL * 0.5) > steam_intensity(STEAM_MASS_FULL * 0.25));
+        assert!(steam_intensity(STEAM_MASS_FULL * 10.0) <= 1.0);
     }
 }

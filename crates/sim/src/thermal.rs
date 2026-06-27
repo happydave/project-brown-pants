@@ -44,7 +44,7 @@
 
 use crate::aero::windward_faces;
 use crate::breakage::{connected_components, Severed};
-use crate::fluid::FluidSample;
+use crate::fluid::{FluidSample, MediumKind};
 use crate::voxel::{Thermal, VoxelCraft};
 use glam::{DQuat, DVec3, IVec3};
 use std::collections::{HashMap, HashSet};
@@ -106,6 +106,16 @@ const TEMP_CEILING: f64 = 100_000.0;
 /// conductance.
 const CONV_EXCHANGE_COEFF: f64 = 2.0;
 
+/// Water's boiling temperature, K (WI 698) — the set-point of the boiling clamp. A
+/// submerged surface above this cannot quench through it within a sub-step; the heat it
+/// sheds vaporises water at this temperature (a fixed surface value — pressure dependence
+/// is out of scope).
+const BOILING_TEMP: f64 = 373.0;
+
+/// Latent heat of vaporisation of water, J·kg⁻¹ (WI 698) — converts the latent energy the
+/// boiling clamp removes into a steam **mass** (the quantity that drives the WI 695 VFX).
+const LATENT_HEAT_WATER: f64 = 2.26e6;
+
 /// The two thermal nodes of one voxel (kelvin).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VoxelTemp {
@@ -124,6 +134,10 @@ pub struct ThermalState {
     /// Remaining ablator mass per voxel, kg (WI 688) — only present for ablative
     /// materials; drained by the ablation thermostat, never refilled.
     ablator: HashMap<IVec3, f64>,
+    /// Steam mass vaporised by the boiling clamp during the most recent [`Self::step`]
+    /// call, kg (WI 698) — reset at the start of each call, accumulated across its
+    /// sub-steps. Drives the steam VFX; runtime-only, not serialised.
+    steam_mass: f64,
 }
 
 /// The skin and core heat capacities (J/K) of a voxel (WI 692). The skin is the
@@ -189,7 +203,11 @@ impl ThermalState {
                 (b > 0.0).then_some((v.cell, b))
             })
             .collect();
-        Self { temps, ablator }
+        Self {
+            temps,
+            ablator,
+            steam_mass: 0.0,
+        }
     }
 
     /// The skin temperature of `cell`, if present.
@@ -244,6 +262,9 @@ impl ThermalState {
         if dt <= 0.0 || craft.voxels.is_empty() {
             return;
         }
+
+        // Fresh steam tally for this call (WI 698) — accumulated across the sub-steps.
+        self.steam_mass = 0.0;
 
         // Per-voxel static inputs for this call: material thermal props, mass,
         // exposed area, and the convective power onto the skin.
@@ -324,6 +345,10 @@ impl ThermalState {
         // windward conductance (WI 696), so at rest it quenches toward the static medium.
         let h_exchange = CONV_EXCHANGE_COEFF * sample.density;
 
+        // Boiling clamp set-point (WI 698): only when submerged in a liquid; `None` in
+        // atmosphere/vacuum leaves re-entry (688/693) and the air/vacuum cases untouched.
+        let boiling = (sample.medium == MediumKind::Liquid).then_some(BOILING_TEMP);
+
         // Sub-step with an adaptively-bounded stable step.
         let mut remaining = dt;
         let mut steps = 0usize;
@@ -331,7 +356,9 @@ impl ThermalState {
             let sub_dt = self
                 .stable_substep(&nodes, cell_size, h_exchange)
                 .min(remaining);
-            self.integrate_substep(&nodes, cell_size, env_temp, h_exchange, t_recovery, sub_dt);
+            self.integrate_substep(
+                &nodes, cell_size, env_temp, h_exchange, t_recovery, boiling, sub_dt,
+            );
             remaining -= sub_dt;
             steps += 1;
         }
@@ -377,6 +404,7 @@ impl ThermalState {
         env_temp: f64,
         h_exchange: f64,
         t_recovery: f64,
+        boiling: Option<f64>,
         dt: f64,
     ) {
         let snapshot = self.temps.clone();
@@ -420,6 +448,23 @@ impl ThermalState {
                             *remaining -= consumed;
                         }
                     }
+                }
+            }
+
+            // Boiling clamp (WI 698): while submerged and boiling-hot, the latent plateau
+            // holds the surface at the boiling point — it cannot quench through it within a
+            // sub-step. The heat its cooling sheds at the plateau vaporises water (water is
+            // an unbounded consumable, so unlike ablation nothing depletes); the latent
+            // energy / water's latent heat is the steam mass produced. Only arrested
+            // *cooling* counts (a surface being heated underwater makes no steam).
+            if let Some(t_boil) = boiling {
+                if t.skin > t_boil {
+                    let clamped = new_skin.max(t_boil);
+                    let vaporised_q = n.c_skin * (t.skin - clamped);
+                    if vaporised_q > 0.0 {
+                        self.steam_mass += vaporised_q / LATENT_HEAT_WATER;
+                    }
+                    new_skin = clamped;
                 }
             }
 
@@ -475,6 +520,14 @@ impl ThermalState {
             }
         }
         (total_initial > 0.0).then(|| total_remaining / total_initial)
+    }
+
+    /// Steam mass (kg) vaporised by the boiling clamp during the most recent [`Self::step`]
+    /// call (WI 698) — the quantity of water flashed to steam as a submerged hot surface
+    /// quenched. `0.0` unless the craft was submerged and boiling. Drives the WI 695 steam
+    /// VFX from energy actually vaporised rather than a skin-temperature proxy.
+    pub fn steam_mass(&self) -> f64 {
+        self.steam_mass
     }
 }
 
@@ -1053,6 +1106,71 @@ mod tests {
         assert!(
             t_shielded < t_exposed,
             "the shadowed body stays cooler: shielded {t_shielded} vs exposed {t_exposed}"
+        );
+    }
+
+    // --- WI 698: boiling clamp (latent-heat plateau + steam) ---
+
+    // A hot block submerged in water boils: the surface is held at the boiling point (it
+    // does not quench through it in one sub-step) and the vaporised water is reported as
+    // steam mass. In air and vacuum the clamp is inert (no steam) — AC2.
+    #[test]
+    fn boiling_clamp_plateaus_submerged_surface_and_reports_steam() {
+        let craft = box_craft(2, 2, 2, 0.5, Material::ALUMINIUM);
+        let env = 290.0;
+
+        // Submerged in water: boils — steam produced, surface plateaus at/above boiling.
+        let mut water = ThermalState::new(&craft, 1_500.0);
+        water.step(
+            &craft,
+            &liquid(290.0),
+            DVec3::ZERO,
+            DQuat::IDENTITY,
+            env,
+            0.1,
+        );
+        assert!(
+            water.steam_mass() > 0.0,
+            "boiling produced steam: {}",
+            water.steam_mass()
+        );
+        assert!(
+            water.max_skin_temp() >= BOILING_TEMP - 1.0,
+            "surface held at/above boiling, not dropped to the ocean instantly: {}",
+            water.max_skin_temp()
+        );
+
+        // Same hot block in air: the clamp is inert (no steam) — AC2.
+        let mut air = ThermalState::new(&craft, 1_500.0);
+        air.step(
+            &craft,
+            &atmosphere(1.2),
+            DVec3::ZERO,
+            DQuat::IDENTITY,
+            env,
+            0.1,
+        );
+        assert_eq!(air.steam_mass(), 0.0, "no boiling in air");
+
+        // And in vacuum.
+        let mut vac = ThermalState::new(&craft, 1_500.0);
+        vac.step(&craft, &vacuum(), DVec3::ZERO, DQuat::IDENTITY, env, 0.1);
+        assert_eq!(vac.steam_mass(), 0.0, "no boiling in vacuum");
+
+        // A submerged block below the boiling point makes no steam (just quenches).
+        let mut cool = ThermalState::new(&craft, 320.0); // below BOILING_TEMP
+        cool.step(
+            &craft,
+            &liquid(290.0),
+            DVec3::ZERO,
+            DQuat::IDENTITY,
+            env,
+            0.1,
+        );
+        assert_eq!(
+            cool.steam_mass(),
+            0.0,
+            "a sub-boiling submerged surface makes no steam"
         );
     }
 }
