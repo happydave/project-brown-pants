@@ -1,6 +1,7 @@
 /target
 
 # Editor-generated craft saves (Toy 5)
+/craft.json
 /blueprint.json
 /subassembly.json
 # Named craft library (WI 675) — runtime vehicle saves
