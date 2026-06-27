@@ -18,6 +18,7 @@ use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::light::{light_consts::lux, AtmosphereEnvironmentMapLight};
 use bevy::math::{DVec2, DVec3};
+use bevy::mesh::VertexAttributeValues;
 use bevy::pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium};
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
@@ -194,7 +195,9 @@ impl Plugin for DiveScenePlugin {
             // Phase-change spike (WI 695): steam when the hot craft hits the ocean.
             .add_systems(Update, (emit_steam, update_steam))
             // Water-entry splash (WI 699, temporary): a one-shot spray burst on splashdown.
-            .add_systems(Update, (emit_splash, update_splash));
+            .add_systems(Update, (emit_splash, update_splash))
+            // Water surface (WI 703): a local animated patch ripples + follows the camera.
+            .add_systems(Update, animate_water);
     }
 }
 
@@ -279,22 +282,52 @@ fn setup_scene(
         )),
     ));
 
-    // Ocean: a translucent blue sphere whose surface is sea level (Y = 0).
+    // Distant ocean: a deep, reflective blue sphere providing the broad ocean + horizon.
+    // Sunk a couple of metres below sea level so the animated near-surface patch (which
+    // oscillates around Y = 0) does not z-fight its surface (WI 703).
     commands.spawn((
         Mesh3d(meshes.add(Mesh::from(Sphere {
             radius: BODY.radius as f32,
         }))),
         MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgba(0.05, 0.20, 0.40, 0.55),
+            base_color: Color::srgba(0.02, 0.12, 0.26, 0.92),
             alpha_mode: AlphaMode::Blend,
-            perceptual_roughness: 0.1,
+            perceptual_roughness: 0.06,
+            reflectance: 0.6,
             ..default()
         })),
         Transform::default(),
         WorldPlacement(WorldPos::new(
             FrameId::CENTRAL_BODY,
-            DVec3::new(0.0, -BODY.radius, 0.0),
+            DVec3::new(0.0, -BODY.radius - 2.0, 0.0),
         )),
+    ));
+
+    // Near surface: a local animated water patch at sea level that follows the camera and
+    // ripples, so the ocean reads as a moving surface and splash/steam register against it
+    // (WI 703). Initial placement under the craft; `animate_water` tracks the camera each frame.
+    commands.spawn((
+        Mesh3d(
+            meshes.add(Mesh::from(
+                Plane3d::default()
+                    .mesh()
+                    .size(2.0 * WATER_HALF, 2.0 * WATER_HALF)
+                    .subdivisions(WATER_SUBDIV),
+            )),
+        ),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgba(0.10, 0.30, 0.46, 0.78),
+            alpha_mode: AlphaMode::Blend,
+            perceptual_roughness: 0.08,
+            reflectance: 0.6,
+            ..default()
+        })),
+        Transform::default(),
+        WorldPlacement(WorldPos::new(
+            FrameId::CENTRAL_BODY,
+            DVec3::new(start_render.x, 0.0, start_render.z),
+        )),
+        WaterPatch,
     ));
 
     // The sun: raw sunlight the atmosphere filters.
@@ -779,6 +812,63 @@ fn update_splash(
     }
 }
 
+// --- Water surface (WI 703) ---
+
+/// Half-extent of the animated water patch, metres (the patch spans 2× this per side).
+const WATER_HALF: f32 = 160.0;
+/// Plane subdivisions per side — the wave grid resolution.
+const WATER_SUBDIV: u32 = 64;
+/// Peak wave amplitude, metres: the surface oscillates within ±this.
+const WATER_AMPLITUDE: f32 = 0.55;
+
+/// The animated near-surface water patch (WI 703).
+#[derive(Component)]
+struct WaterPatch;
+
+/// Height of the water surface at local patch coordinate `(x, z)` and time `t` (WI 703) — a
+/// small sum of travelling sine waves, **bounded** by [`WATER_AMPLITUDE`] (the component
+/// weights sum to 1). Pure (unit-tested); computed in the patch's local frame so the surface
+/// ripples in place rather than scrolling as the camera moves.
+fn wave_height(x: f32, z: f32, t: f32) -> f32 {
+    let w1 = (x * 0.08 + t * 1.1).sin();
+    let w2 = (z * 0.11 - t * 0.9).sin();
+    let w3 = ((x + z) * 0.05 + t * 0.7).sin();
+    WATER_AMPLITUDE * (0.45 * w1 + 0.35 * w2 + 0.20 * w3)
+}
+
+/// Keeps the water patch under the view (follows the camera's X/Z at sea level) and ripples
+/// its surface each frame by [`wave_height`], recomputing normals (WI 703).
+#[allow(clippy::type_complexity)] // disjoint Bevy queries (camera vs. patch)
+fn animate_water(
+    time: Res<Time>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    camera: Query<&WorldPlacement, (With<AnchorCamera>, Without<WaterPatch>)>,
+    mut patch: Query<(&Mesh3d, &mut WorldPlacement), (With<WaterPatch>, Without<AnchorCamera>)>,
+) {
+    let Ok(cam_wp) = camera.single() else {
+        return;
+    };
+    let Ok((mesh3d, mut wp)) = patch.single_mut() else {
+        return;
+    };
+    // Follow the camera horizontally at sea level (render Y = 0).
+    let c = cam_wp.0.pos;
+    wp.0 = WorldPos::new(FrameId::CENTRAL_BODY, DVec3::new(c.x, 0.0, c.z));
+    // Ripple the surface in the patch's local frame.
+    let t = time.elapsed_secs();
+    let Some(mesh) = meshes.get_mut(&mesh3d.0) else {
+        return;
+    };
+    if let Some(VertexAttributeValues::Float32x3(positions)) =
+        mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION)
+    {
+        for p in positions.iter_mut() {
+            p[1] = wave_height(p[0], p[2], t);
+        }
+    }
+    mesh.compute_normals();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,5 +924,28 @@ mod tests {
             (spun.x - off.x).abs() > 1.0 || (spun.z - off.z).abs() > 1.0,
             "yaw orbits horizontally"
         );
+    }
+
+    #[test]
+    fn wave_height_is_bounded_and_animates() {
+        // Bounded by the amplitude over a grid of positions and times, and deterministic.
+        let mut moved = false;
+        for &x in &[-160.0, -40.0, 0.0, 37.0, 160.0_f32] {
+            for &z in &[-160.0, -12.0, 0.0, 88.0, 160.0_f32] {
+                for &t in &[0.0, 0.5, 1.7, 3.3, 10.0_f32] {
+                    let h = wave_height(x, z, t);
+                    assert!(
+                        h.abs() <= WATER_AMPLITUDE + 1e-5,
+                        "wave exceeded amplitude: {h} at ({x},{z},{t})"
+                    );
+                    assert_eq!(h, wave_height(x, z, t), "deterministic");
+                }
+                // The surface actually animates: at least one time differs from t=0.
+                if (wave_height(x, z, 0.0) - wave_height(x, z, 1.3)).abs() > 1e-4 {
+                    moved = true;
+                }
+            }
+        }
+        assert!(moved, "the surface must animate over time");
     }
 }
