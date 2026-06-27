@@ -161,45 +161,6 @@ pub fn terrain_heightfield(
     }
 }
 
-/// Sample the analytic [`Terrain`] into a **solid** local patch of cuboid *columns* (WI 636): one
-/// upward box per grid cell, its top face at the cell's `Terrain::height` and extruded `depth` metres
-/// downward, tiling an `nx × nz` grid over `size_x × size_z` (world) centred on `center`'s X/Z. Resolved
-/// through the proven `boxes_vs_boxes` contact (a craft hull vs this compound), it is a true **solid**:
-/// a resting hull cannot tunnel through it (unlike a thin one-sided heightfield), and a sharp feature
-/// (the ramp-lip cliff) becomes the exposed **side face** of a tall column — a vertical face the hull
-/// contacts with a horizontal normal, so there is no upward "toss". `depth` must exceed how far any hull
-/// box could reach below the surface so the column's (never-contacted) bottom is irrelevant. Column tops
-/// are flat per cell (a staircase); this is the *hull's* contact surface only — wheels still read the
-/// smooth analytic terrain — and the hull contact is inert in normal driving.
-pub fn terrain_columns(
-    terrain: &Terrain,
-    center: DVec3,
-    size_x: f64,
-    size_z: f64,
-    nx: usize,
-    nz: usize,
-    depth: f64,
-) -> CollisionShape {
-    let nx = nx.max(2);
-    let nz = nz.max(2);
-    let cell_x = size_x / (nx - 1) as f64;
-    let cell_z = size_z / (nz - 1) as f64;
-    let half = DVec3::new(0.5 * cell_x, 0.5 * depth, 0.5 * cell_z);
-    let mut boxes = Vec::with_capacity(nx * nz);
-    for ix in 0..nx {
-        let cx = center.x + (ix as f64 / (nx - 1) as f64 - 0.5) * size_x;
-        for iz in 0..nz {
-            let cz = center.z + (iz as f64 / (nz - 1) as f64 - 0.5) * size_z;
-            let top = terrain.height(cx, cz);
-            boxes.push(BoxShape {
-                center: DVec3::new(cx, top - 0.5 * depth, cz),
-                half_extents: half,
-            });
-        }
-    }
-    CollisionShape::CuboidCompound(boxes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

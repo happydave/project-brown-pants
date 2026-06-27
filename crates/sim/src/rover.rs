@@ -14,10 +14,7 @@
 //! / no-launch test (the design's kraken detector as an automated bound).
 
 use crate::active::ActiveBody;
-use crate::collision::{
-    craft_bounding_radius, craft_collision_shape, terrain_columns, BoxShape, CollisionShape,
-};
-use crate::collision_detect::contacts;
+use crate::collision::BoxShape;
 use crate::powertrain::{build_powertrain, RoverPowertrain};
 use crate::terrain::Terrain;
 use crate::voxel::{DeviceKind, PartKind, RimSpec, SuspensionSpec, TireSpec, VoxelCraft};
@@ -151,35 +148,16 @@ const HULL_CONTACT_OMEGA: f64 = 140.0;
 /// Hull-contact damping ratio (WI 634): **critical**, so a hard hit on the hull is dissipated rather
 /// than stored and flung back (no "toss" off the ramp lip).
 const HULL_CONTACT_DAMPING_RATIO: f64 = 1.0;
-/// Per-contact hull-contact force cap, in multiples of `weight / n_hull` (WI 634/636). Bounds the
-/// **total** hull contact force (spring + damping) to about `HULL_MAX_G·g` so the contact can never
-/// explode — and, critically, keeps the **ramp-lip launch modest** (a hard hull contact with an
-/// up-and-back normal and large forward closing speed would otherwise redirect forward motion upward —
-/// the WI 634 "toss"). Kept low; the **tunnel** failure (a sinking hull passing through parry's thin
-/// one-sided heightfield surface) is handled not by raising this — which would re-toss the lip — but by
-/// the analytic deep **backstop** ([`hull_terrain_contacts`]), which keeps contact persistent so even a
-/// low cap arrests the sink. Mass-relative, so it is the same at any build scale.
+/// Per-point hull-contact force cap, in multiples of `weight / n_hull` (WI 634). Bounds the **total**
+/// hull contact force (spring + damping) to about `HULL_MAX_G·g` so the contact can never explode. The
+/// terrain has discontinuities — the ramp lip is a *vertical cliff* — so a hull point still over the
+/// tall incline after the chassis pitches off the lip reports a huge penetration *and* a large closing
+/// velocity into the incline; the damping `c·closing` then redirects forward motion **upward** (the
+/// incline normal points up-and-back) and launches the rover ("toss"). Capping bounds the total to
+/// ~`HULL_MAX_G·g` — plenty to catch any real landing, never enough to fully fling. The cap removes the
+/// catastrophic kraken but a *mid* approach-speed toss at the sharp lip remains a known, deferred
+/// limitation (WI 636, reopened). Mass-relative, so it is the same at any build scale.
 const HULL_MAX_G: f64 = 12.0;
-/// Hull–terrain heightfield patch margin (m) (WI 636): how far past the rover's bounding radius the
-/// locally-sampled terrain patch extends, so no hull box is ever over un-sampled terrain (covers the
-/// step's motion and any tumble). A scale-independent absolute clearance.
-const HULL_PATCH_MARGIN: f64 = 0.5;
-/// Hull–terrain heightfield patch cell bounds (m) (WI 636). The patch cell is tied to the **build's own
-/// cell size** (so a hull box overlaps ~one heightfield cell — both the cheapest manifold and the
-/// cleanest contact), clamped to this range: never finer than `MIN` (a fine cell on a big box is the
-/// per-step cost blow-up — a 0.5 m box over 0.05 m cells overlaps ~100), never coarser than `MAX` (a
-/// coarse cell on a small box is a degenerate contact, and blunts the ramp-lip cliff face). A build-cell
-/// patch keeps the editor-scale rover (the one that drives the ramp) fine *and* cheap.
-const HULL_PATCH_CELL_MIN: f64 = 0.08;
-const HULL_PATCH_CELL_MAX: f64 = 0.3;
-/// Hull–terrain heightfield patch node cap per axis (WI 636): bounds the per-step sampling cost
-/// regardless of build size (the patch coarsens for a very large rover rather than exploding).
-const HULL_PATCH_MAX_NODES: usize = 80;
-/// Per-box hull–terrain proximity gate margin (m) (WI 636): a hull box runs the heightfield manifold
-/// only when its lowest rotated corner is within this of the terrain. Small (a touch above a contact),
-/// so a normally-supported hull (wheels holding it clear) skips the manifold entirely.
-const HULL_GATE_MARGIN: f64 = 0.02;
-
 /// A wheel's lateral half-width as a fraction of its radius (WI 631c): the obstacle-collider proxy and
 /// the contact-site attribution gate. There is no authored wheel-width datum, so the swept proxy is a
 /// box of half-extents `(WHEEL_HALF_WIDTH_FRAC·radius, radius, radius)` about the hub. Only the lateral
@@ -429,28 +407,7 @@ pub struct Rover {
     /// the whole shell (faces in all directions), so it works upside down and on its side. Set densely
     /// from the craft hull by [`assemble_rover`]; hand-built fixtures keep a wheel-corner belly fallback.
     hull_points: Vec<DVec3>,
-    /// The chassis hull collision shape in the **CoM/body frame** (WI 636): a `CuboidCompound` posed at
-    /// `(body.position, body.orientation)`. When present, the hull contacts the terrain as a true
-    /// cuboid-vs-**heightfield** manifold (a locally-sampled patch) instead of the WI 634 dense-point
-    /// penalty — so a sharp discontinuity (the ramp lip) is contacted as a face/edge, not sampled as
-    /// independent false penetrations. Set by [`assemble_rover`]; `None` for hand-built fixtures, which
-    /// keep the `hull_points` penalty fallback.
-    hull_shape: Option<CollisionShape>,
-    /// Orientation-invariant bounding radius about the CoM (m) (WI 636): sizes the heightfield patch and
-    /// gates the cheap "could the hull reach the ground?" check. Zero when `hull_shape` is `None`.
-    hull_radius: f64,
-    /// Heightfield patch cell size (m) (WI 636): the build's own cell size, clamped to
-    /// `[HULL_PATCH_CELL_MIN, HULL_PATCH_CELL_MAX]`, so a hull box overlaps ~one patch cell.
-    hull_patch_cell: f64,
-    /// Cached local **solid terrain-column** patch (WI 636): a `CuboidCompound` of per-cell columns
-    /// (top = terrain height, extruded down) the hull contacts via `boxes_vs_boxes`, and the horizontal
-    /// position it was sampled at. The patch depends only on `(x, z)` and the terrain (not attitude), and
-    /// the rover moves far less than a cell per ~0.5 ms sub-step, so it is rebuilt only when the rover has
-    /// moved more than half a cell. The generous patch margin keeps a half-cell-stale patch covering the
-    /// hull. Per sub-step the columns are culled to those under the contacting hull boxes before contact.
-    hull_patch: Option<CollisionShape>,
-    hull_patch_center: DVec3,
-    /// Deepest hull-point penetration into the terrain last step (m) (WI 634/636): a debug/observability
+    /// Deepest hull-point penetration into the terrain last step (m) (WI 634): a debug/observability
     /// signal — zero in nominal driving (the wheels hold the hull clear), positive when the hull is
     /// loaded (cresting the ramp lip, resting wheel-less / inverted).
     pub hull_penetration: f64,
@@ -481,11 +438,6 @@ impl Rover {
             contact_jitter: 0.0,
             last_total_normal: 0.0,
             hull_points,
-            hull_shape: None,
-            hull_radius: 0.0,
-            hull_patch_cell: HULL_PATCH_CELL_MAX,
-            hull_patch: None,
-            hull_patch_center: DVec3::ZERO,
             hull_penetration: 0.0,
             external_force: DVec3::ZERO,
             external_torque: DVec3::ZERO,
@@ -677,14 +629,15 @@ impl Rover {
             w.spin = apply_brake(w.spin, w.brake, w.wheel_inertia, dt);
         }
 
-        // Chassis hull contact (WI 634/636): keep the chassis from ghosting through terrain between
-        // wheels (the ramp lip) and let a wheel-less / inverted rover rest on its hull at any attitude.
-        // Assembled rovers (a `hull_shape`) contact the terrain as a true cuboid-vs-**heightfield**
-        // manifold against a locally-sampled patch (WI 636) — a sharp discontinuity is contacted as a
-        // face/edge, which point sampling cannot resolve; hand-built fixtures fall back to the WI 634
-        // dense-point penalty. Either source is inert in normal driving (the wheels hold the hull clear).
+        // Chassis hull contact (WI 634): keep the chassis from ghosting through terrain between wheels
+        // and let a wheel-less / inverted rover rest on its hull at any attitude — a dense set of
+        // hull-shell points penalty-probed against the smooth analytic terrain (see
+        // [`Rover::hull_terrain_contacts`]). Inert in normal driving (the wheels hold the hull clear).
         let hull_contacts = self.hull_terrain_contacts(terrain);
-        let n_hull = hull_contacts.len().max(1) as f64;
+        // Normalise by the **total** hull-point count (not just the penetrating ones), so total stiffness
+        // is `ω²m` only when the whole hull is loaded and softer when just a few points touch (WI 634):
+        // keying `k` to the penetrating count would over-stiffen a few-point lip contact and re-toss it.
+        let n_hull = self.hull_points.len().max(1) as f64;
         // Hull-contact spring is a **mass-relative rate** at a stiff contact frequency (WI 634), so the
         // resting sag is `g/ω²` (sub-mm) and a normal-speed touch barely penetrates. **Critically
         // damped** so an impact is dissipated, not flung back. The guard is the **per-contact force cap**
@@ -761,123 +714,22 @@ impl Rover {
         self.body.integrate_wrench(net_force, net_torque, dt);
     }
 
-    /// The hull–terrain contacts this sub-step (WI 636), each `(world_point, unit_normal, penetration)`.
-    /// With a `hull_shape` (assembled rovers), the contacts come from a cuboid-vs-**heightfield** manifold
-    /// against a freshly-sampled local terrain patch — a sharp discontinuity (the ramp lip) is contacted
-    /// as a face/edge. Without one (hand-built fixtures), it is the WI 634 dense-point penalty against the
-    /// analytic terrain. A cheap conservative gate skips the patch build entirely when the hull cannot
-    /// reach the terrain, so normal driving pays nothing.
-    fn hull_terrain_contacts(&mut self, terrain: &Terrain) -> Vec<(DVec3, DVec3, f64)> {
-        let boxes = match &self.hull_shape {
-            Some(CollisionShape::CuboidCompound(b)) => b.clone(),
-            _ => {
-                // WI 634 fallback: dense hull points, each penalty-probed against the analytic terrain.
-                let r = DMat3::from_quat(self.body.orientation);
-                return self
-                    .hull_points
-                    .iter()
-                    .filter_map(|&hp| {
-                        let p = self.body.position + r * hp;
-                        let ground = terrain.height(p.x, p.z);
-                        (p.y < ground).then(|| (p, terrain.normal(p.x, p.z), ground - p.y))
-                    })
-                    .collect();
-            }
-        };
-        let pos = self.body.position;
+    /// The hull–terrain contacts this sub-step (WI 634), each `(world_point, unit_normal, penetration)`:
+    /// the dense hull-shell points, each penalty-probed against the **analytic** `Terrain` (smooth
+    /// `height`/`normal`), so the chassis rests cleanly on slopes and bumps without jitter. Inert in
+    /// normal driving (the wheels hold the hull clear). A sharp discontinuity (the ramp-lip cliff) is the
+    /// one case point-sampling cannot fully resolve — the mid-speed "toss" is a known, deferred limitation
+    /// (WI 636, reopened): point-penalty over the tall incline can redirect forward motion upward.
+    fn hull_terrain_contacts(&self, terrain: &Terrain) -> Vec<(DVec3, DVec3, f64)> {
         let r = DMat3::from_quat(self.body.orientation);
-        // Tight per-box proximity gate: only hull boxes whose **actual rotated lowest corner** can reach
-        // the terrain need the (expensive) heightfield manifold; the rest are provably clear. At normal
-        // rest/driving the wheels hold every hull box above the ground, so `near` is empty and no
-        // heightfield query (nor patch build) runs — the hull contact is inert exactly as it should be.
-        let near: Vec<BoxShape> = boxes
+        self.hull_points
             .iter()
-            .filter(|b| {
-                let wc = pos + r * b.center;
-                // Lowest world-Y the rotated box reaches below its centre.
-                let dy = r.x_axis.y.abs() * b.half_extents.x
-                    + r.y_axis.y.abs() * b.half_extents.y
-                    + r.z_axis.y.abs() * b.half_extents.z;
-                wc.y - dy <= terrain.height(wc.x, wc.z) + HULL_GATE_MARGIN
+            .filter_map(|&hp| {
+                let p = self.body.position + r * hp;
+                let ground = terrain.height(p.x, p.z);
+                (p.y < ground).then(|| (p, terrain.normal(p.x, p.z), ground - p.y))
             })
-            .copied()
-            .collect();
-        if near.is_empty() {
-            self.hull_patch = None;
-            return Vec::new();
-        }
-        // (Re)build the cached solid column patch only when missing or the rover has moved more than half
-        // a cell horizontally since the last build — the generous margin keeps a half-cell-stale patch
-        // covering the hull, and the terrain/patch is attitude-independent. This makes the (cheap) column
-        // build rare; the per-sub-step cost is just the culled box↔box contact below.
-        let moved = (pos.x - self.hull_patch_center.x).hypot(pos.z - self.hull_patch_center.z);
-        if self.hull_patch.is_none() || moved > 0.5 * self.hull_patch_cell {
-            let extent = 2.0 * (self.hull_radius + HULL_PATCH_MARGIN);
-            let n = ((extent / self.hull_patch_cell).ceil() as usize + 1)
-                .clamp(2, HULL_PATCH_MAX_NODES);
-            // Columns extend well below any reach of the hull so their bottoms are never contacted.
-            let depth = 2.0 * (self.hull_radius + HULL_PATCH_MARGIN) + 1.0;
-            self.hull_patch = Some(terrain_columns(terrain, pos, extent, extent, n, n, depth));
-            self.hull_patch_center = pos;
-        }
-        let CollisionShape::CuboidCompound(columns) = self.hull_patch.as_ref().unwrap() else {
-            return Vec::new();
-        };
-        // Cull the columns to those under the contacting hull boxes' world XZ footprint (+ a cell), so the
-        // box↔box contact runs only the handful of relevant pairs, not the whole patch.
-        let mut lo = DVec3::splat(f64::INFINITY);
-        let mut hi = DVec3::splat(f64::NEG_INFINITY);
-        for b in &near {
-            let wc = pos + r * b.center;
-            let rad = b.half_extents.length();
-            lo = lo.min(wc - rad);
-            hi = hi.max(wc + rad);
-        }
-        let pad = self.hull_patch_cell;
-        let culled: Vec<BoxShape> = columns
-            .iter()
-            .filter(|c| {
-                c.center.x + c.half_extents.x >= lo.x - pad
-                    && c.center.x - c.half_extents.x <= hi.x + pad
-                    && c.center.z + c.half_extents.z >= lo.z - pad
-                    && c.center.z - c.half_extents.z <= hi.z + pad
-            })
-            .copied()
-            .collect();
-        if culled.is_empty() {
-            return Vec::new();
-        }
-        // Hull (body A, CoM frame) vs the solid columns (body B, world frame) through the proven
-        // box↔box manifold: solid (no tunnel), the cliff is a column side face (horizontal normal, no
-        // toss), and it yields a few clean contacts (no resting jitter).
-        let hull = CollisionShape::CuboidCompound(near);
-        let columns = CollisionShape::CuboidCompound(culled);
-        let mut cps: Vec<(DVec3, DVec3, f64)> = contacts(
-            &hull,
-            (pos, self.body.orientation),
-            None,
-            &columns,
-            (DVec3::ZERO, DQuat::IDENTITY),
-            None,
-            0.0,
-        )
-        .into_iter()
-        .map(|cp| (cp.point, cp.normal, cp.depth))
-        .collect();
-        // **Spatially dedupe** (WI 636): a hull box overlapping several columns yields many redundant
-        // contact points (≈4 per column), which inflate `n_hull` and so soften the per-contact stiffness
-        // `k = ω²m/n` — the body then rests too deep / slightly tilted. Greedily keep the deepest contacts
-        // that are at least half a cell apart: a well-spread, build-size-independent set (a few per hull
-        // box) that resists tipping and keeps the resting sag at the intended `g/ω²` (sub-mm).
-        cps.sort_by(|a, b| b.2.total_cmp(&a.2));
-        let sep2 = (0.5 * self.hull_patch_cell).powi(2);
-        let mut kept: Vec<(DVec3, DVec3, f64)> = Vec::new();
-        for c in cps {
-            if kept.iter().all(|k| (k.0 - c.0).length_squared() > sep2) {
-                kept.push(c);
-            }
-        }
-        kept
+            .collect()
     }
 
     /// Accumulate an external contact wrench (force + torque about the CoM, world frame) to apply on
@@ -1401,26 +1253,6 @@ pub fn assemble_rover(craft: &VoxelCraft, position: DVec3, gravity: f64) -> Opti
     let hull = hull_contact_points(craft, com);
     if !hull.is_empty() {
         rover.hull_points = hull;
-    }
-    // Chassis hull collision shape in the CoM/body frame (WI 636): the craft cuboid compound with each
-    // box recentred about the CoM, so it poses at `(body.position, body.orientation)`. With this set,
-    // `step` contacts the terrain as a cuboid-vs-heightfield manifold (the robust ramp-lip fix) instead
-    // of the dense-point penalty.
-    if let CollisionShape::CuboidCompound(boxes) = craft_collision_shape(craft) {
-        if !boxes.is_empty() {
-            let com_boxes = boxes
-                .into_iter()
-                .map(|b| BoxShape {
-                    center: b.center - com,
-                    half_extents: b.half_extents,
-                })
-                .collect();
-            rover.hull_shape = Some(CollisionShape::CuboidCompound(com_boxes));
-            rover.hull_radius = craft_bounding_radius(craft).unwrap_or(0.0);
-            rover.hull_patch_cell = craft
-                .cell_size
-                .clamp(HULL_PATCH_CELL_MIN, HULL_PATCH_CELL_MAX);
-        }
     }
     Some(RoverAssembly {
         rover,
