@@ -52,12 +52,23 @@ pub struct VoxelExposure {
 /// medium). A face is *exposed* when its neighbouring cell is empty, and *windward*
 /// in proportion to how directly its outward normal faces the oncoming flow
 /// (`n · flow_dir > 0`). `flow_dir` need not be unit; a zero/degenerate direction
-/// yields zero windward area everywhere (no convective loading at rest). Pure
-/// geometry over the lattice — the cross-section aero already owns this domain.
+/// yields zero windward area everywhere (no convective loading at rest).
+///
+/// **Windward shadowing (WI 697).** A voxel standing in the aerodynamic shadow of an
+/// upstream cell — a shield in front of it, possibly across a gap — has its windward
+/// area attenuated by [`OCCLUSION_RESIDUAL`], so a body behind a heat shield is
+/// physically cooler rather than reliant on a calibrated heat scale. *Adjacent*
+/// shadowing is already handled by face culling (a directly-trailing voxel's leading
+/// face is interior, so it carries no windward area); this adds the non-adjacent /
+/// standoff case via an upstream ray-march. Pure geometry over the lattice — the
+/// cross-section aero already owns this domain.
 pub fn windward_faces(craft: &VoxelCraft, flow_dir: DVec3) -> Vec<VoxelExposure> {
     let occupied: HashSet<IVec3> = craft.voxels.iter().map(|v| v.cell).collect();
     let cell_area = craft.cell_size * craft.cell_size;
     let f = flow_dir.normalize_or_zero();
+    // The occlusion march can cross the craft in at most this many cell steps, so it
+    // always terminates.
+    let max_steps = lattice_span(&occupied);
     craft
         .voxels
         .iter()
@@ -71,6 +82,11 @@ pub fn windward_faces(craft: &VoxelCraft, flow_dir: DVec3) -> Vec<VoxelExposure>
                 exposed_area += cell_area;
                 windward_area += cell_area * off.as_dvec3().dot(f).max(0.0);
             }
+            // WI 697: attenuate the windward heating of a voxel that sits behind an
+            // upstream blocker along the flow (its leading surface is in the wake).
+            if windward_area > 0.0 && occluded_upstream(v.cell, f, &occupied, max_steps) {
+                windward_area *= OCCLUSION_RESIDUAL;
+            }
             VoxelExposure {
                 cell: v.cell,
                 exposed_area,
@@ -78,6 +94,81 @@ pub fn windward_faces(craft: &VoxelCraft, flow_dir: DVec3) -> Vec<VoxelExposure>
             }
         })
         .collect()
+}
+
+/// Residual share of windward heating retained by a fully flow-shadowed voxel (WI 697) —
+/// a wake is cooler than the stagnation surface, but not perfectly cold.
+const OCCLUSION_RESIDUAL: f64 = 0.1;
+
+/// A safe upper bound (in cell steps) on crossing the occupied lattice along any straight
+/// line: the summed bounding-box span over the three axes. Guarantees the occlusion march
+/// terminates. Zero for an empty lattice.
+fn lattice_span(occupied: &HashSet<IVec3>) -> i32 {
+    if occupied.is_empty() {
+        return 0;
+    }
+    let mut lo = IVec3::splat(i32::MAX);
+    let mut hi = IVec3::splat(i32::MIN);
+    for c in occupied {
+        lo = lo.min(*c);
+        hi = hi.max(*c);
+    }
+    let span = hi - lo;
+    span.x + span.y + span.z + 3
+}
+
+/// Whether an occupied cell lies upstream of `cell` along the flow (the `+f` direction) —
+/// i.e. `cell` is in that cell's aerodynamic shadow (WI 697). Marches cell-by-cell toward
+/// the oncoming flow with a 3D DDA, bounded by `max_steps`. `f` is assumed normalized;
+/// a zero direction (no flow) is never shadowed.
+fn occluded_upstream(cell: IVec3, f: DVec3, occupied: &HashSet<IVec3>, max_steps: i32) -> bool {
+    let step = IVec3::new(axis_step(f.x), axis_step(f.y), axis_step(f.z));
+    if step == IVec3::ZERO {
+        return false;
+    }
+    // Parametric distance to cross one cell on each axis (∞ where the flow has no
+    // component); from the cell centre the first boundary is half a cell away.
+    let t_delta = DVec3::new(axis_tdelta(f.x), axis_tdelta(f.y), axis_tdelta(f.z));
+    let mut t_max = t_delta * 0.5;
+    let mut cur = cell;
+    for _ in 0..max_steps {
+        if t_max.x <= t_max.y && t_max.x <= t_max.z {
+            cur.x += step.x;
+            t_max.x += t_delta.x;
+        } else if t_max.y <= t_max.z {
+            cur.y += step.y;
+            t_max.y += t_delta.y;
+        } else {
+            cur.z += step.z;
+            t_max.z += t_delta.z;
+        }
+        if occupied.contains(&cur) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Integer step direction for a flow component: ±1, or 0 when the component is zero
+/// (`f64::signum` returns ±1 even for 0.0, so it cannot be used here).
+fn axis_step(c: f64) -> i32 {
+    if c > 0.0 {
+        1
+    } else if c < 0.0 {
+        -1
+    } else {
+        0
+    }
+}
+
+/// Parametric distance to cross one cell along an axis with flow component `c` (`1/|c|`),
+/// or infinity when the flow has no component on that axis.
+fn axis_tdelta(c: f64) -> f64 {
+    if c != 0.0 {
+        1.0 / c.abs()
+    } else {
+        f64::INFINITY
+    }
 }
 
 /// Ratio of specific heats for air (diatomic), for the speed of sound.
@@ -469,5 +560,52 @@ mod tests {
         // At rest (zero flow) nothing is windward.
         let rest = windward_faces(&bar, DVec3::ZERO);
         assert!(rest.iter().all(|e| e.windward_area.abs() < 1e-9));
+    }
+
+    #[test]
+    fn windward_shadowing_attenuates_a_body_behind_a_blocker() {
+        use crate::voxel::{Material, Voxel, VoxelCraft};
+        use glam::IVec3;
+
+        // Flow +Z: a body at z=0, a gap at z=1, a blocker (shield) at z=2.
+        let body = IVec3::new(0, 0, 0);
+        let shield = IVec3::new(0, 0, 2);
+        let mut craft = VoxelCraft::new(1.0);
+        craft.voxels.push(Voxel {
+            cell: body,
+            material: Material::ALUMINIUM,
+        });
+        craft.voxels.push(Voxel {
+            cell: shield,
+            material: Material::ALUMINIUM,
+        });
+        let exp = windward_faces(&craft, DVec3::Z);
+        let body_w = exp.iter().find(|e| e.cell == body).unwrap().windward_area;
+        let shield_w = exp.iter().find(|e| e.cell == shield).unwrap().windward_area;
+        assert!(shield_w > 0.0, "the shield faces the flow");
+        assert!(
+            body_w < shield_w,
+            "the shadowed body is attenuated: body {body_w} vs shield {shield_w}"
+        );
+        assert!(
+            body_w <= 0.2,
+            "the shadowed body keeps only a little windward area: {body_w}"
+        );
+
+        // Remove the shield: the body is directly exposed and recovers full windward area.
+        let mut solo = VoxelCraft::new(1.0);
+        solo.voxels.push(Voxel {
+            cell: body,
+            material: Material::ALUMINIUM,
+        });
+        let body_solo = windward_faces(&solo, DVec3::Z)[0].windward_area;
+        assert!(
+            (body_solo - shield_w).abs() < 1e-9,
+            "an exposed body has full windward area: {body_solo}"
+        );
+        assert!(
+            body_w < body_solo,
+            "shadowing reduced the body's windward area: {body_w} < {body_solo}"
+        );
     }
 }

@@ -1009,4 +1009,50 @@ mod tests {
             above.max_skin_temp()
         );
     }
+
+    // --- WI 697: windward shadowing protects a body behind a heat shield ---
+
+    // The same body voxel heats far less behind a standoff shield than directly exposed:
+    // the shield protects by shadowing, not by a calibrated heat scale.
+    #[test]
+    fn a_shadowed_body_stays_cooler_than_an_exposed_one() {
+        let sample = atmosphere(1.5);
+        let vel = DVec3::new(0.0, 0.0, 4_000.0); // flow +Z
+        let body = IVec3::new(0, 0, 0);
+
+        let run = |craft: &VoxelCraft| {
+            let mut st = ThermalState::new(craft, AMBIENT);
+            for _ in 0..150 {
+                st.step(craft, &sample, vel, DQuat::IDENTITY, AMBIENT, 0.05);
+            }
+            st.skin(body).unwrap()
+        };
+
+        // Directly exposed.
+        let mut exposed = VoxelCraft::new(0.3);
+        exposed.voxels.push(Voxel {
+            cell: body,
+            material: Material::COMPOSITE,
+        });
+        let t_exposed = run(&exposed);
+
+        // Behind a standoff shield (gap at z=1, shield at z=2) — not adjacent, so no
+        // conduction bridges them; only the windward shadow protects the body.
+        let mut shielded = VoxelCraft::new(0.3);
+        shielded.voxels.push(Voxel {
+            cell: body,
+            material: Material::COMPOSITE,
+        });
+        shielded.voxels.push(Voxel {
+            cell: IVec3::new(0, 0, 2),
+            material: Material::COMPOSITE,
+        });
+        let t_shielded = run(&shielded);
+
+        assert!(t_exposed > AMBIENT, "the exposed body heats: {t_exposed}");
+        assert!(
+            t_shielded < t_exposed,
+            "the shadowed body stays cooler: shielded {t_shielded} vs exposed {t_exposed}"
+        );
+    }
 }
