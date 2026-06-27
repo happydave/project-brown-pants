@@ -43,6 +43,11 @@ pub struct FluidSample {
     pub pressure: f64,
     /// Which medium this sample fell in.
     pub medium: MediumKind,
+    /// Medium temperature, K (WI 694) — the target a part's surface exchanges heat
+    /// toward by convection (large coupling in water, small in air, none in vacuum).
+    /// Defaulted on load so pre-temperature samples stay backward-loadable.
+    #[serde(default)]
+    pub temperature: f64,
 }
 
 /// A data-driven fluid-medium profile about a body's reference surface.
@@ -70,6 +75,14 @@ pub struct FluidMedium {
     pub ocean_density_gradient: f64,
     /// Gravitational acceleration used for ocean hydrostatic pressure, m/s². `>= 0`.
     pub gravity: f64,
+    /// Atmosphere temperature, K (WI 694) — the convective-exchange target above the
+    /// surface. Defaulted on load.
+    #[serde(default)]
+    pub atmosphere_temperature: f64,
+    /// Ocean temperature, K (WI 694) — the convective-exchange target below the
+    /// surface (a hot part quenches toward this). Defaulted on load.
+    #[serde(default)]
+    pub ocean_temperature: f64,
 }
 
 impl FluidMedium {
@@ -82,6 +95,8 @@ impl FluidMedium {
         ocean_surface_pressure: 0.0,
         ocean_density_gradient: 0.0,
         gravity: 0.0,
+        atmosphere_temperature: 3.0, // immaterial (no medium); a cold-space value
+        ocean_temperature: 3.0,
     };
 
     /// An Earth-like body carrying **both** an atmosphere (above the surface) and
@@ -96,6 +111,8 @@ impl FluidMedium {
         ocean_surface_pressure: 101_325.0,      // continuous with the atmosphere
         ocean_density_gradient: 0.0,            // near-incompressible: constant density
         gravity: 9.81,                          // m/s²
+        atmosphere_temperature: 250.0,          // K — a representative atmospheric temp
+        ocean_temperature: 290.0,               // K — surface seawater
     };
 
     /// Samples the medium at signed altitude `h` (metres): `h > 0` above the
@@ -114,6 +131,7 @@ impl FluidMedium {
                 density: self.atmosphere_surface_density * falloff,
                 pressure: self.atmosphere_surface_pressure * falloff,
                 medium,
+                temperature: self.atmosphere_temperature,
             }
         } else {
             // Ocean: linear density in depth; hydrostatic pressure is its integral.
@@ -133,6 +151,7 @@ impl FluidMedium {
                 density,
                 pressure,
                 medium,
+                temperature: self.ocean_temperature,
             }
         }
     }
@@ -266,6 +285,8 @@ mod tests {
             ocean_surface_pressure: 50_000.0,
             ocean_density_gradient: 0.01,
             gravity: 12.0,
+            atmosphere_temperature: 200.0,
+            ocean_temperature: 320.0,
         };
         assert_eq!(exotic.sample_altitude(10.0).medium, MediumKind::Vacuum); // vacuum above
         let d = exotic.sample_altitude(-500.0);

@@ -78,6 +78,14 @@ const MAX_SUBSTEPS: usize = 256;
 /// never produce a non-finite or unbounded temperature.
 const TEMP_CEILING: f64 = 100_000.0;
 
+/// Convective heat-exchange coefficient (WI 694): the skin exchanges heat with the
+/// medium at `h · area · (T_medium − T_skin)`, with `h = CONV_EXCHANGE_COEFF · ρ` —
+/// so coupling is strong in water, weak in thin air, and **zero in vacuum** (ρ=0).
+/// Bidirectional: it cools a hot part (quench) and warms a cold one toward the medium
+/// temperature. Distinct from the speed-driven aeroheating (which dominates at
+/// re-entry speed); this governs at rest.
+const CONV_EXCHANGE_COEFF: f64 = 2.0;
+
 /// The two thermal nodes of one voxel (kelvin).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VoxelTemp {
@@ -277,27 +285,35 @@ impl ThermalState {
             });
         }
 
+        // Convective heat-exchange with the medium (WI 694): coefficient ∝ density
+        // (zero in vacuum), target = the medium temperature.
+        let h_exchange = CONV_EXCHANGE_COEFF * sample.density;
+        let medium_temp = sample.temperature;
+
         // Sub-step with an adaptively-bounded stable step.
         let mut remaining = dt;
         let mut steps = 0usize;
         while remaining > 0.0 && steps < MAX_SUBSTEPS {
-            let sub_dt = self.stable_substep(&nodes, cell_size).min(remaining);
-            self.integrate_substep(&nodes, cell_size, env_temp, sub_dt);
+            let sub_dt = self
+                .stable_substep(&nodes, cell_size, h_exchange)
+                .min(remaining);
+            self.integrate_substep(&nodes, cell_size, env_temp, h_exchange, medium_temp, sub_dt);
             remaining -= sub_dt;
             steps += 1;
         }
     }
 
     /// The largest stable explicit sub-step over all nodes, given current temps.
-    fn stable_substep(&self, nodes: &[Node], cell_size: f64) -> f64 {
+    fn stable_substep(&self, nodes: &[Node], cell_size: f64, h_exchange: f64) -> f64 {
         let mut min_dt = f64::INFINITY;
         for n in nodes {
             let t = self.temps[&n.cell];
             let g_sc = n.conductivity * cell_size; // skin↔core conductance
-                                                   // skin loss derivative: conduction to core + linearised radiation.
+                                                   // skin loss derivative: conduction to core + linearised radiation + convective exchange.
             let rad_deriv =
                 4.0 * n.emissivity * STEFAN_BOLTZMANN * n.exposed_area * t.skin.max(0.0).powi(3);
-            let skin_loss = (g_sc + rad_deriv).max(1e-9);
+            let exchange_deriv = h_exchange * n.exposed_area; // WI 694: linear loss toward T_medium
+            let skin_loss = (g_sc + rad_deriv + exchange_deriv).max(1e-9);
             let dt_skin = STABILITY_SAFETY * n.c_skin / skin_loss;
             // core loss derivative: conduction to skin + to occupied neighbours.
             let g_cc: f64 = n.neighbours.iter().map(|&(_, bond)| bond).sum();
@@ -315,16 +331,27 @@ impl ThermalState {
 
     /// One explicit sub-step (Jacobi over voxels: neighbour temps read from the
     /// snapshot at the start of the sub-step), clamped finite.
-    fn integrate_substep(&mut self, nodes: &[Node], cell_size: f64, env_temp: f64, dt: f64) {
+    #[allow(clippy::too_many_arguments)] // the full thermal sub-step state is irreducible here
+    fn integrate_substep(
+        &mut self,
+        nodes: &[Node],
+        cell_size: f64,
+        env_temp: f64,
+        h_exchange: f64,
+        medium_temp: f64,
+        dt: f64,
+    ) {
         let snapshot = self.temps.clone();
         let env4 = env_temp.powi(4);
         for n in nodes {
             let t = snapshot[&n.cell];
             let g_sc = n.conductivity * cell_size;
-            // Skin node: convection in, radiation out, conduction to core.
+            // Skin node: convection in, radiation out, conduction to core, and
+            // convective exchange with the medium (WI 694 — cools/heats toward T_medium).
             let p_rad = n.emissivity * STEFAN_BOLTZMANN * n.exposed_area * (t.skin.powi(4) - env4);
             let p_sc = g_sc * (t.skin - t.core); // skin → core
-            let d_skin = (n.conv_power - p_rad - p_sc) / n.c_skin * dt;
+            let p_exchange = h_exchange * n.exposed_area * (medium_temp - t.skin);
+            let d_skin = (n.conv_power - p_rad - p_sc + p_exchange) / n.c_skin * dt;
             // Core node: conduction from skin + exchange with occupied neighbours
             // (symmetric averaged bond conductance, computed once per call).
             let mut p_core = p_sc;
@@ -475,6 +502,7 @@ mod tests {
             density: 0.0,
             pressure: 0.0,
             medium: MediumKind::Vacuum,
+            temperature: 250.0,
         }
     }
 
@@ -548,6 +576,7 @@ mod tests {
                 density,
                 pressure: 0.0,
                 medium: MediumKind::Atmosphere,
+                temperature: 250.0,
             };
             let mut st = ThermalState::new(&craft, AMBIENT);
             for _ in 0..50 {
@@ -580,6 +609,7 @@ mod tests {
             density: 1.0,
             pressure: 0.0,
             medium: MediumKind::Atmosphere,
+            temperature: 250.0,
         };
         let run = |vel: DVec3| {
             let mut st = ThermalState::new(&plate, AMBIENT);
@@ -667,6 +697,7 @@ mod tests {
             density: 2.0,
             pressure: 0.0,
             medium: MediumKind::Atmosphere,
+            temperature: 250.0,
         };
         let mut st = ThermalState::new(&craft, AMBIENT);
         let mut failed = Vec::new();
@@ -725,6 +756,7 @@ mod tests {
             density,
             pressure: 0.0,
             medium: MediumKind::Atmosphere,
+            temperature: 250.0,
         }
     }
 
@@ -818,6 +850,66 @@ mod tests {
         assert!(
             st.ablator_fraction_remaining(&craft).is_none(),
             "composite carries no ablator (passive shielding)"
+        );
+    }
+
+    // --- WI 694: convective heat exchange with the medium ---
+
+    fn liquid(temperature: f64) -> FluidSample {
+        FluidSample {
+            density: 1025.0,
+            pressure: 0.0,
+            medium: MediumKind::Liquid,
+            temperature,
+        }
+    }
+
+    // A hot block dropped in water quenches; the same block in vacuum only radiates.
+    #[test]
+    fn hot_block_quenches_in_water_not_in_vacuum() {
+        let craft = box_craft(2, 2, 2, 0.5, Material::ALUMINIUM);
+        let env = 290.0; // both cases radiate to the same sink; only the medium coupling differs
+        let run = |sample: &FluidSample| {
+            let mut st = ThermalState::new(&craft, 1500.0); // start hot
+            for _ in 0..600 {
+                st.step(&craft, sample, DVec3::ZERO, DQuat::IDENTITY, env, 0.1);
+                // 60 s at rest
+            }
+            st.max_skin_temp()
+        };
+        let in_water = run(&liquid(290.0));
+        let in_vacuum = run(&vacuum());
+        assert!(
+            in_water < in_vacuum,
+            "water quenches faster than vacuum: water={in_water} vacuum={in_vacuum}"
+        );
+        assert!(
+            in_water < 600.0,
+            "the water-quenched surface cooled well below the 1500 K start: {in_water}"
+        );
+        assert!(
+            in_water >= 289.0,
+            "never below the water temperature: {in_water}"
+        );
+    }
+
+    // Quenching is faster in dense water than in thin air (the coefficient scales with density).
+    #[test]
+    fn quench_faster_in_water_than_air() {
+        let craft = box_craft(2, 2, 2, 0.5, Material::ALUMINIUM);
+        let env = 290.0;
+        let run = |sample: &FluidSample| {
+            let mut st = ThermalState::new(&craft, 1500.0);
+            for _ in 0..300 {
+                st.step(&craft, sample, DVec3::ZERO, DQuat::IDENTITY, env, 0.1);
+            }
+            st.max_skin_temp()
+        };
+        let in_water = run(&liquid(290.0));
+        let in_air = run(&atmosphere(1.2)); // thin air at 250 K
+        assert!(
+            in_water < in_air,
+            "water cools faster than air: water={in_water} air={in_air}"
         );
     }
 }
