@@ -27,9 +27,9 @@ use sounding_sim::fluid::{FluidMedium, MediumKind};
 use sounding_sim::frame::{FrameId, WorldPos};
 use sounding_sim::handoff::{orbit_state_3d, GearState, HandoffPlugin};
 use sounding_sim::medium::{
-    dynamic_pressure, max_cross_section, CraftThermal, DescentParams, DescentPlugin,
-    DiveTriggerPlugin, DivingCraft, EntryInterface, GlideParams, DEFAULT_SLAM_COEFFICIENT,
-    DIVE_HEAT_SCALE,
+    buoyancy_wrench, dynamic_pressure, heel_angle, max_cross_section, CraftThermal, DescentParams,
+    DescentPlugin, DiveTriggerPlugin, DivingCraft, EntryInterface, GlideParams,
+    DEFAULT_SLAM_COEFFICIENT, DIVE_HEAT_SCALE,
 };
 use sounding_sim::orbit::Orbit;
 use sounding_sim::sim::{CentralBody, Craft, SimClock};
@@ -113,6 +113,12 @@ struct DiveReadout {
     /// Steam mass vaporised last step, kg (WI 698) — the boiling-clamp output that drives
     /// the steam VFX intensity (replaces the old skin-temperature proxy).
     steam_mass: f64,
+    /// Draft: how deep the craft sits below the waterline, m (WI 705).
+    draft: f64,
+    /// Heel/tilt from upright, radians (WI 705).
+    heel: f64,
+    /// Net buoyancy: buoyant force minus weight, N — positive floats, ~0 at equilibrium (WI 705).
+    net_buoyancy: f64,
 }
 
 /// Mouse-driven orbit/zoom state for the follow camera (WI 702): the eye sits at
@@ -422,6 +428,27 @@ fn track_craft(
     readout.pressure = sample.pressure;
     readout.ram = dynamic_pressure(&sample, velocity);
 
+    // Hydrostatic readout (WI 705): recompute the buoyant load for the HUD (one craft, cheap),
+    // independent of the physics step. Draft/heel/net-buoyancy make a capsize or stuck dive legible.
+    if let Some(body) = active {
+        let r = body.position.length();
+        let g_local = if r > 0.0 { BODY.mu / (r * r) } else { 0.0 };
+        let up = if r > 0.0 { body.position / r } else { DVec3::Y };
+        let load = buoyancy_wrench(
+            &dc.craft,
+            dc.com,
+            body.position,
+            body.orientation,
+            BODY.radius,
+            0.0,
+            sample.density,
+            g_local,
+        );
+        readout.draft = load.draft;
+        readout.heel = heel_angle(body.orientation, up);
+        readout.net_buoyancy = load.force.length() - body.mass * g_local;
+    }
+
     // Rest on the seabed (not a collision surface this toy): pause once deep.
     if altitude <= REST_DEPTH {
         clock.paused = true;
@@ -539,8 +566,19 @@ fn update_hud(readout: Res<DiveReadout>, mut hud: Query<&mut Text, With<Hud>>) {
             Some(frac) => format!("\nshield:   {:7.0} %", frac * 100.0),
             None => String::new(),
         };
+        // Hydrostatic gauges (WI 705): shown once the craft touches the water (has draft).
+        let hydro = if readout.draft > 0.0 {
+            format!(
+                "\ndraft:    {:8.1} m\nheel:     {:8.1} deg\nnet buoy: {:8.0} N",
+                readout.draft,
+                readout.heel.to_degrees(),
+                readout.net_buoyancy,
+            )
+        } else {
+            String::new()
+        };
         text.0 = format!(
-            "gear:     {gear}\naltitude: {alt:8.0} m\nspeed:    {speed:7.1} m/s\nmedium:   {medium}\nhull P:   {pressure_kpa:8.1} kPa\nram P:    {ram_kpa:8.1} kPa\nskin T:   {skin:8.0} K{heat}{shield}"
+            "gear:     {gear}\naltitude: {alt:8.0} m\nspeed:    {speed:7.1} m/s\nmedium:   {medium}\nhull P:   {pressure_kpa:8.1} kPa\nram P:    {ram_kpa:8.1} kPa\nskin T:   {skin:8.0} K{heat}{shield}{hydro}"
         );
     }
 }

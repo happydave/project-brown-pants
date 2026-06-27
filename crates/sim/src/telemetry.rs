@@ -44,6 +44,36 @@ pub struct Telemetry {
     /// deserialize to `None`.
     #[serde(default)]
     pub thermal: Option<ThermalTelemetry>,
+    /// Hydrostatic state of the live craft (WI 705), when a scene floats a craft on the water
+    /// (the dive splashdown, the harbor). Draft, heel, and net buoyancy — the surface-vessel
+    /// gauges. Additive/serde-defaulted: snapshots without it deserialize to `None`.
+    #[serde(default)]
+    pub hydro: Option<HydrostaticTelemetry>,
+}
+
+/// The live craft's hydrostatic state on the bus (WI 705): the surface-vessel readout that makes
+/// a capsize or a stuck dive debuggable from data rather than by eye.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub struct HydrostaticTelemetry {
+    /// Draft: how deep the craft sits — the maximum submerged-cell depth below the waterline, m.
+    pub draft: f64,
+    /// Heel/tilt from upright, radians (0 = level, π = inverted).
+    pub heel: f64,
+    /// Net buoyancy: buoyant force magnitude minus weight, N. Positive ⇒ rising/floats high,
+    /// ~0 ⇒ in equilibrium at its waterline, negative ⇒ sinking.
+    pub net_buoyancy: f64,
+}
+
+impl HydrostaticTelemetry {
+    /// Builds the readout from a buoyancy [`load`](crate::medium::BuoyancyLoad), the craft's weight
+    /// (`mass · g_local`), and the heel derived from the body pose against the local up.
+    pub fn new(draft: f64, heel: f64, buoyant_force: f64, weight: f64) -> Self {
+        Self {
+            draft,
+            heel,
+            net_buoyancy: buoyant_force - weight,
+        }
+    }
 }
 
 /// The live craft's thermal state on the bus (WI 691): the re-entry heating readout.
@@ -297,6 +327,7 @@ impl Telemetry {
             active: None,
             rover: None,
             thermal: None,
+            hydro: None,
         }
     }
 
@@ -323,6 +354,14 @@ impl Telemetry {
     /// readout onto `capture`.
     pub fn with_thermal(mut self, thermal: ThermalTelemetry) -> Self {
         self.thermal = Some(thermal);
+        self
+    }
+
+    /// Attach hydrostatic state to this snapshot (WI 705). Builder-style, mirroring
+    /// [`Telemetry::with_thermal`], so a scene that floats a craft can layer the
+    /// draft/heel/net-buoyancy readout onto `capture`.
+    pub fn with_hydro(mut self, hydro: HydrostaticTelemetry) -> Self {
+        self.hydro = Some(hydro);
         self
     }
 }

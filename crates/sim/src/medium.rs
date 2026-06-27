@@ -83,10 +83,14 @@ pub const DEFAULT_SLAM_COEFFICIENT: f64 = 3.0;
 /// govern alone. A `½ρv²`-family form, so it stays finite and bounded.
 ///
 /// `water_density` is the surrounding **liquid** density (not the air the centre of mass may
-/// still sit in during entry); `up` is the unit outward surface normal.
+/// still sit in during entry); `up` is the unit outward surface normal. `water_velocity` is the
+/// local velocity of the water surface itself — **zero in calm water** (WI 705 forward hook #2):
+/// the closing speed is the *relative* normal speed `(v_hull − v_water)·(−up)`, so a future wave
+/// field that heaves the surface re-fires the slam as the hull re-enters, with no edit here.
 pub fn entry_impact_force(
     water_density: f64,
     velocity: DVec3,
+    water_velocity: DVec3,
     up: DVec3,
     entry_area: f64,
     submerged_fraction: f64,
@@ -100,8 +104,9 @@ pub fn entry_impact_force(
     {
         return DVec3::ZERO;
     }
-    // Closing speed into the surface: the inward (−up) component of velocity.
-    let closing = -velocity.dot(up);
+    // Closing speed into the surface: the inward (−up) component of the velocity of the hull
+    // *relative to the water surface* (calm water ⇒ `water_velocity == 0`).
+    let closing = -(velocity - water_velocity).dot(up);
     if closing <= 0.0 {
         return DVec3::ZERO; // rising or skimming the surface: no entry slam
     }
@@ -131,6 +136,158 @@ pub fn submerged_volume(
         }
     }
     submerged as f64 * craft.cell_volume()
+}
+
+/// The effective water-surface radius at a world position and time — the single **seam** a
+/// future wave field plugs into (WI 705 forward hook #1). Today it returns the flat sea-level
+/// datum; a wave implementation will return `surface_radius + wave_height(world, time)` here, and
+/// nothing in [`buoyancy_wrench`] or [`entry_impact_force`] changes. `time` is unused in calm
+/// water but is part of the contract so a heaving surface needs no signature change later.
+#[inline]
+fn water_surface_radius(_world: DVec3, _time: f64, surface_radius: f64) -> f64 {
+    surface_radius
+}
+
+/// The graded submerged fraction of a single cell whose centre sits at world `position`: `1`
+/// when the cell is a full cell-height below the local waterline, `0` a full cell-height above,
+/// ramping linearly (C0, monotone) through a band ~one cell thick across the surface. This is
+/// the **surface-hydrodynamics** smoothing: it removes the binary waterline step so buoyancy is
+/// continuous through the surface (and damps the `dF/dz` kink that would otherwise limit-cycle).
+#[inline]
+fn cell_submerged_fraction(position: DVec3, cell_size: f64, surface_radius: f64, time: f64) -> f64 {
+    let depth = water_surface_radius(position, time, surface_radius) - position.length();
+    (0.5 + depth / cell_size).clamp(0.0, 1.0)
+}
+
+/// The hydrostatic load on a craft: the buoyant **wrench** (force + moment about the centre of
+/// mass) plus the readouts a HUD/telemetry wants. The force equals the displaced-medium weight
+/// (identical to the central [`buoyancy_force`]); the **moment** — `Σ rᵢ × Fᵢ` over the graded
+/// cells — is the righting couple that makes a hull self-right and trim (WI 705).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BuoyancyLoad {
+    /// Resultant buoyant force in the world frame (along the local up).
+    pub force: DVec3,
+    /// Buoyant moment about the centre of mass, world frame — the righting/trim couple.
+    pub torque: DVec3,
+    /// Graded displaced volume, m³ (`Σ fractionᵢ · cell_volume`).
+    pub submerged_volume: f64,
+    /// Draft: the maximum depth of any submerged cell below the local waterline, m (0 if dry).
+    pub draft: f64,
+}
+
+/// Accumulate the buoyant wrench over the craft's cells in **one** O(cells) pass: each cell
+/// contributes its graded displaced weight along the local up, applied **at the cell's location**
+/// (never lumped at the CoM), and the moment of that force about the centre of mass. Stability
+/// (metacentric righting, GM > 0) therefore **emerges** from the geometry — it requires the
+/// displaced cells to be spread across the beam; a centreline-only distribution yields ~zero roll
+/// stiffness. Returns zero force *and* moment in vacuum (`density == 0`) or fully out of the water.
+///
+/// `up` is taken once as the radial out-vector at `body_position` (the craft ≪ planet), so the
+/// force matches the central [`buoyancy_force`] exactly and only the moment is new. `time` feeds
+/// the [`water_surface_radius`] seam (unused in calm water).
+#[allow(clippy::too_many_arguments)]
+pub fn buoyancy_wrench(
+    craft: &VoxelCraft,
+    com: DVec3,
+    body_position: DVec3,
+    body_orientation: DQuat,
+    surface_radius: f64,
+    time: f64,
+    density: f64,
+    gravity: f64,
+) -> BuoyancyLoad {
+    if density <= 0.0 || gravity <= 0.0 {
+        return BuoyancyLoad::default();
+    }
+    let r = body_position.length();
+    let up = if r > 0.0 { body_position / r } else { DVec3::Y };
+    let cell_volume = craft.cell_volume();
+    let mut force = DVec3::ZERO;
+    let mut torque = DVec3::ZERO;
+    let mut submerged_volume = 0.0;
+    let mut draft = 0.0_f64;
+    for v in &craft.voxels {
+        let local = (v.cell.as_dvec3() + DVec3::splat(0.5)) * craft.cell_size - com;
+        let world = body_position + body_orientation * local;
+        let fraction = cell_submerged_fraction(world, craft.cell_size, surface_radius, time);
+        if fraction <= 0.0 {
+            continue;
+        }
+        let f = density * gravity * cell_volume * fraction * up;
+        let arm = world - body_position; // offset from the centre of mass (the body integrates the CoM)
+        force += f;
+        torque += arm.cross(f);
+        submerged_volume += fraction * cell_volume;
+        draft = draft.max(surface_radius - world.length());
+    }
+    BuoyancyLoad {
+        force,
+        torque,
+        submerged_volume,
+        draft: draft.max(0.0),
+    }
+}
+
+/// Heel/tilt angle of a body from upright: the angle (radians) between the craft's body-up axis
+/// (`orientation · +Y`) and the local up. Zero when level; `π` when fully inverted. A pure
+/// function of pose — the readout a boat HUD/telemetry surfaces (WI 705).
+pub fn heel_angle(orientation: DQuat, up: DVec3) -> f64 {
+    let body_up = orientation * DVec3::Y;
+    body_up
+        .normalize_or_zero()
+        .dot(up.normalize_or_zero())
+        .clamp(-1.0, 1.0)
+        .acos()
+}
+
+/// Free-surface damping rate (WI 705): the dimensionless coefficient on the dissipative resistance
+/// a hull feels working the water. The buoyant spring is conservative and the bulk drag acts on the
+/// centre-of-mass velocity only, so heave and (especially) roll about the CoM would otherwise ring;
+/// this is the physical loss (radiation + viscous) that settles them. Scale-relative — the force is
+/// `∝ density · cell_area`, so it sizes itself to the craft and medium rather than being an absolute.
+pub const FREE_SURFACE_DAMPING: f64 = 2.0;
+
+/// The dissipative free-surface damping **wrench** about the centre of mass (WI 705): each submerged
+/// cell opposes its **own** velocity component along the local up (heave + roll motion), with a
+/// resistance `∝ density · cell_area · fraction`. Kept separate from [`buoyancy_wrench`] so the
+/// hydrostatic force/draft/telemetry stay exactly the displaced weight; this only removes energy.
+/// Strictly dissipative (power `Σ f·v ≤ 0`) and zero at rest, in vacuum, or out of the water.
+#[allow(clippy::too_many_arguments)]
+pub fn free_surface_damping(
+    craft: &VoxelCraft,
+    com: DVec3,
+    body_position: DVec3,
+    body_orientation: DQuat,
+    body_velocity: DVec3,
+    angular_velocity: DVec3,
+    surface_radius: f64,
+    time: f64,
+    density: f64,
+    coefficient: f64,
+) -> (DVec3, DVec3) {
+    if density <= 0.0 || coefficient <= 0.0 {
+        return (DVec3::ZERO, DVec3::ZERO);
+    }
+    let r = body_position.length();
+    let up = if r > 0.0 { body_position / r } else { DVec3::Y };
+    let cell_area = craft.cell_size * craft.cell_size; // a cell's waterplane footprint
+    let mut force = DVec3::ZERO;
+    let mut torque = DVec3::ZERO;
+    for v in &craft.voxels {
+        let local = (v.cell.as_dvec3() + DVec3::splat(0.5)) * craft.cell_size - com;
+        let world = body_position + body_orientation * local;
+        let fraction = cell_submerged_fraction(world, craft.cell_size, surface_radius, time);
+        if fraction <= 0.0 {
+            continue;
+        }
+        let arm = world - body_position;
+        let v_cell = body_velocity + angular_velocity.cross(arm);
+        let v_up = v_cell.dot(up);
+        let f = -coefficient * density * cell_area * fraction * v_up * up;
+        force += f;
+        torque += arm.cross(f);
+    }
+    (force, torque)
 }
 
 /// The largest voxel cross-sectional area over the three axes — a conservative
@@ -197,18 +354,23 @@ pub fn descent_step(
         params.drag_area,
         params.drag_coefficient,
     );
-    let sub_vol = submerged_volume(
+    // Buoyancy as a distributed wrench (WI 705): force + righting/trim moment over the graded
+    // submerged cells, so the craft self-rights and settles to a waterline rather than bobbing
+    // as a point mass. The force matches the old central buoyancy; the moment is the new term.
+    let load = buoyancy_wrench(
         craft,
         com,
         body.position,
         body.orientation,
         params.surface_radius,
+        0.0, // calm water (WI 705 seam): wave-time threads sim time here
+        sample.density,
+        g_local,
     );
-    let buoyancy = buoyancy_force(sample.density, sub_vol, g_local, up);
     // Water-entry slam (WI 700): a transient impact while the craft straddles the surface.
     let occupied = craft.occupied_volume();
     let submerged_fraction = if occupied > 0.0 {
-        sub_vol / occupied
+        load.submerged_volume / occupied
     } else {
         0.0
     };
@@ -216,13 +378,33 @@ pub fn descent_step(
     let slam = entry_impact_force(
         water_density,
         body.velocity,
+        DVec3::ZERO, // calm water: still surface (WI 705 forward hook #2)
         up,
         params.drag_area,
         submerged_fraction,
         params.slam_coefficient,
     );
 
-    body.integrate_wrench(gravity + drag + buoyancy + slam, DVec3::ZERO, dt);
+    // Free-surface damping (WI 705): settle the heave/roll the conservative buoyant spring would
+    // otherwise ring (bulk drag damps only the CoM velocity, not roll about it).
+    let (damp_f, damp_t) = free_surface_damping(
+        craft,
+        com,
+        body.position,
+        body.orientation,
+        body.velocity,
+        body.angular_velocity(),
+        params.surface_radius,
+        0.0,
+        sample.density,
+        FREE_SURFACE_DAMPING,
+    );
+
+    body.integrate_wrench(
+        gravity + drag + load.force + slam + damp_f,
+        load.torque + damp_t,
+        dt,
+    );
     sample
 }
 
@@ -318,17 +500,20 @@ pub fn glide_step(
     let sample = p.medium.sample_altitude(altitude);
     let g_local = if r > 0.0 { p.mu / (r * r) } else { 0.0 };
 
-    // Central forces (no moment arm): gravity, drag, buoyancy.
+    // Central forces: gravity, drag. Buoyancy is a distributed wrench (WI 705) — its force is
+    // central but it now also contributes a righting/trim moment (added to the aero moment below).
     let gravity = gravity_force(body.mass, body.position, p.mu);
     let drag = drag_force(&sample, body.velocity, p.drag_area, p.drag_coefficient);
-    let sub_vol = submerged_volume(
+    let load = buoyancy_wrench(
         craft,
         com,
         body.position,
         body.orientation,
         p.surface_radius,
+        0.0, // calm water (WI 705 seam): wave-time threads sim time here
+        sample.density,
+        g_local,
     );
-    let buoyancy = buoyancy_force(sample.density, sub_vol, g_local, up);
 
     // Aero forces from the one area curve: lift ⊥ to the flow, transonic wave drag.
     let forward_world = body.orientation * params.forward_local;
@@ -357,7 +542,7 @@ pub fn glide_step(
     // added to the central forces (same gate as the ballistic descent).
     let occupied = craft.occupied_volume();
     let submerged_fraction = if occupied > 0.0 {
-        sub_vol / occupied
+        load.submerged_volume / occupied
     } else {
         0.0
     };
@@ -365,15 +550,31 @@ pub fn glide_step(
     let slam = entry_impact_force(
         water_density,
         body.velocity,
+        DVec3::ZERO, // calm water: still surface (WI 705 forward hook #2)
         up,
         p.drag_area,
         submerged_fraction,
         p.slam_coefficient,
     );
 
+    // Free-surface damping (WI 705): settle heave/roll on the water (the bulk drag + aero pitch
+    // damping do not damp roll about the CoM).
+    let (damp_f, damp_t) = free_surface_damping(
+        craft,
+        com,
+        body.position,
+        body.orientation,
+        body.velocity,
+        body.angular_velocity(),
+        p.surface_radius,
+        0.0,
+        sample.density,
+        FREE_SURFACE_DAMPING,
+    );
+
     body.integrate_wrench(
-        gravity + drag + buoyancy + lift + wave + slam,
-        restoring + damping,
+        gravity + drag + load.force + lift + wave + slam + damp_f,
+        restoring + damping + load.torque + damp_t,
         dt,
     );
     sample
@@ -680,39 +881,39 @@ mod tests {
         let cs = DEFAULT_SLAM_COEFFICIENT;
 
         // Straddling (half submerged) and descending: a real upward (decelerating) slam.
-        let slam = entry_impact_force(rho, down, up, area, 0.5, cs);
+        let slam = entry_impact_force(rho, down, DVec3::ZERO, up, area, 0.5, cs);
         assert!(slam.y > 0.0, "slam opposes the downward entry: {slam:?}");
         assert!(slam.dot(down) < 0.0, "slam decelerates the entry");
 
         // No ocean (zero water density) → no slam.
         assert_eq!(
-            entry_impact_force(0.0, down, up, area, 0.5, cs),
+            entry_impact_force(0.0, down, DVec3::ZERO, up, area, 0.5, cs),
             DVec3::ZERO
         );
         // Fully out of the water (fraction 0) and fully submerged (fraction 1) → no slam.
         assert_eq!(
-            entry_impact_force(rho, down, up, area, 0.0, cs),
+            entry_impact_force(rho, down, DVec3::ZERO, up, area, 0.0, cs),
             DVec3::ZERO
         );
         assert_eq!(
-            entry_impact_force(rho, down, up, area, 1.0, cs),
+            entry_impact_force(rho, down, DVec3::ZERO, up, area, 1.0, cs),
             DVec3::ZERO
         );
         // Rising out of the water (velocity along +up) → no slam.
         let rising = DVec3::new(0.0, 100.0, 0.0);
         assert_eq!(
-            entry_impact_force(rho, rising, up, area, 0.5, cs),
+            entry_impact_force(rho, rising, DVec3::ZERO, up, area, 0.5, cs),
             DVec3::ZERO
         );
         // Skimming horizontally (no inward closing speed) → no slam.
         let skim = DVec3::new(100.0, 0.0, 0.0);
         assert_eq!(
-            entry_impact_force(rho, skim, up, area, 0.5, cs),
+            entry_impact_force(rho, skim, DVec3::ZERO, up, area, 0.5, cs),
             DVec3::ZERO
         );
         // Slam disabled (coefficient 0) → no slam.
         assert_eq!(
-            entry_impact_force(rho, down, up, area, 0.5, 0.0),
+            entry_impact_force(rho, down, DVec3::ZERO, up, area, 0.5, 0.0),
             DVec3::ZERO
         );
     }
@@ -724,7 +925,16 @@ mod tests {
         let rho = 1_025.0;
         let cs = DEFAULT_SLAM_COEFFICIENT;
         let slam = |speed: f64, frac: f64| {
-            entry_impact_force(rho, DVec3::new(0.0, -speed, 0.0), up, area, frac, cs).length()
+            entry_impact_force(
+                rho,
+                DVec3::new(0.0, -speed, 0.0),
+                DVec3::ZERO,
+                up,
+                area,
+                frac,
+                cs,
+            )
+            .length()
         };
         // Doubling the closing speed quadruples the slam (v² scaling).
         let slow = slam(50.0, 0.5);
@@ -1450,5 +1660,245 @@ mod tests {
             (g_w.velocity - d_w.velocity).length() < 1e-9,
             "ocean: no wave drag and no lift → identical to ballistic"
         );
+    }
+
+    // --- WI 705: righting buoyancy + surface hydrodynamics ---
+
+    /// A light, beam-spread raft: wide in X (the beam), one cell tall, a few cells long in Z.
+    /// Editor-scale 0.5 m cells. `width` should be odd so it is symmetric about the centreline.
+    fn raft_hull(width: i32, length: i32) -> VoxelCraft {
+        let mut c = VoxelCraft::new(0.5);
+        for x in -(width / 2)..=(width / 2) {
+            for z in 0..length {
+                c.voxels.push(Voxel {
+                    cell: IVec3::new(x, 0, z),
+                    material: Material::ALUMINIUM,
+                });
+            }
+        }
+        c
+    }
+
+    /// Behaviour 1: the per-cell submerged fraction is graded (C0) and monotone through the
+    /// waterline, reducing to fully-dry / fully-wet / half at the band edges and centre.
+    #[test]
+    fn cell_submersion_is_graded_and_monotone_through_the_waterline() {
+        let cs = 0.5;
+        let mut last = -1.0;
+        for k in 0..=40 {
+            // Sweep the cell centre downward: +cs above the surface (dry) → −cs below (wet).
+            let height = cs - (2.0 * cs) * (k as f64 / 40.0);
+            let pos = DVec3::new(0.0, SURFACE_R + height, 0.0);
+            let f = cell_submerged_fraction(pos, cs, SURFACE_R, 0.0);
+            assert!((0.0..=1.0).contains(&f), "fraction in [0,1]: {f}");
+            assert!(f >= last - 1e-12, "monotone non-decreasing as it sinks");
+            last = f;
+        }
+        // Band edges and centre: a full half-cell above ⇒ dry, below ⇒ wet, on the surface ⇒ half.
+        assert_eq!(
+            cell_submerged_fraction(DVec3::new(0.0, SURFACE_R - cs, 0.0), cs, SURFACE_R, 0.0),
+            1.0
+        );
+        assert_eq!(
+            cell_submerged_fraction(DVec3::new(0.0, SURFACE_R + cs, 0.0), cs, SURFACE_R, 0.0),
+            0.0
+        );
+        assert!(
+            (cell_submerged_fraction(DVec3::new(0.0, SURFACE_R, 0.0), cs, SURFACE_R, 0.0) - 0.5)
+                .abs()
+                < 1e-9
+        );
+    }
+
+    /// Behaviours 2, 3, 8: the buoyant force equals the displaced-medium weight, and the wrench
+    /// vanishes both fully out of the water and in vacuum.
+    #[test]
+    fn buoyant_force_equals_displaced_weight_and_vanishes_out_of_water_and_in_vacuum() {
+        let craft = raft_hull(7, 3);
+        let com = craft.mass_properties().unwrap().center_of_mass;
+        let rho = 1_025.0;
+        let g = 9.81;
+        // Deep: every cell submerged ⇒ force = ρ·g·occupied_volume, directed up; draft positive.
+        let deep = buoyancy_wrench(
+            &craft,
+            com,
+            DVec3::new(0.0, SURFACE_R - 100.0, 0.0),
+            DQuat::IDENTITY,
+            SURFACE_R,
+            0.0,
+            rho,
+            g,
+        );
+        let full = rho * g * craft.occupied_volume();
+        assert!(
+            (deep.force.length() - full).abs() < 1e-6 * full,
+            "force = displaced weight"
+        );
+        assert!(deep.force.y > 0.0, "buoyancy points up");
+        assert!(deep.draft > 0.0, "submerged ⇒ positive draft");
+        // Fully out of the water ⇒ zero wrench, zero displaced volume.
+        let dry = buoyancy_wrench(
+            &craft,
+            com,
+            DVec3::new(0.0, SURFACE_R + 100.0, 0.0),
+            DQuat::IDENTITY,
+            SURFACE_R,
+            0.0,
+            rho,
+            g,
+        );
+        assert_eq!(dry.force, DVec3::ZERO);
+        assert_eq!(dry.torque, DVec3::ZERO);
+        assert_eq!(dry.submerged_volume, 0.0);
+        assert_eq!(dry.draft, 0.0);
+        // Vacuum (zero density) ⇒ zero wrench even when geometrically submerged.
+        let vac = buoyancy_wrench(
+            &craft,
+            com,
+            DVec3::new(0.0, SURFACE_R - 100.0, 0.0),
+            DQuat::IDENTITY,
+            SURFACE_R,
+            0.0,
+            0.0,
+            g,
+        );
+        assert_eq!(vac.force, DVec3::ZERO);
+        assert_eq!(vac.torque, DVec3::ZERO);
+    }
+
+    /// Behaviours 4, 5 (the load-bearing property): a beam-spread hull produces a restoring roll
+    /// moment opposing an imposed heel, while a degenerate hull whose cells lie on the roll axis
+    /// has ~zero roll stiffness — righting EMERGES from beam spread, it is not a tuned term.
+    #[test]
+    fn righting_moment_opposes_heel_and_requires_beam_spread() {
+        let theta = 0.15_f64;
+        let heel = DQuat::from_rotation_z(theta);
+        let rho = 1_025.0;
+        let g = 9.81;
+        let pos = DVec3::new(0.0, SURFACE_R, 0.0); // craft centre at the waterline
+
+        // Beam-spread raft: a restoring moment (torque.z opposite in sign to the heel θ).
+        let raft = raft_hull(7, 3);
+        let com = raft.mass_properties().unwrap().center_of_mass;
+        let load = buoyancy_wrench(&raft, com, pos, heel, SURFACE_R, 0.0, rho, g);
+        assert!(
+            load.torque.z * theta < 0.0,
+            "beam hull rights (restoring): {:?}",
+            load.torque
+        );
+        let beam_restoring = load.torque.z.abs();
+
+        // Larger heel ⇒ larger restoring over the small (linear GM) range.
+        let load2 = buoyancy_wrench(
+            &raft,
+            com,
+            pos,
+            DQuat::from_rotation_z(2.0 * theta),
+            SURFACE_R,
+            0.0,
+            rho,
+            g,
+        );
+        assert!(
+            load2.torque.z.abs() > beam_restoring,
+            "restoring grows with heel"
+        );
+
+        // Degenerate hull on the roll axis (1×1×N along Z): heeling about Z leaves the cells on the
+        // axis, so the roll moment is ~exactly zero — correct draft, no roll stiffness.
+        let mut line = VoxelCraft::new(0.5);
+        for z in 0..3 {
+            line.voxels.push(Voxel {
+                cell: IVec3::new(0, 0, z),
+                material: Material::ALUMINIUM,
+            });
+        }
+        let lcom = line.mass_properties().unwrap().center_of_mass;
+        let lload = buoyancy_wrench(&line, lcom, pos, heel, SURFACE_R, 0.0, rho, g);
+        assert!(
+            lload.torque.z.abs() < 1e-6,
+            "centreline-on-roll-axis hull has ~zero roll stiffness: {:?}",
+            lload.torque
+        );
+        assert!(
+            beam_restoring > 1e3 * lload.torque.z.abs().max(1e-12),
+            "righting comes from beam spread, not incidentally"
+        );
+    }
+
+    /// Behaviours 6, 7: a raft released at a heel near the surface RIGHTS itself and SETTLES — the
+    /// heel decays, the late-time oscillation is small (no ring/limit-cycle), the state stays finite
+    /// and bounded near the waterline. Light editor-scale fixture.
+    #[test]
+    fn a_heeled_raft_rights_itself_and_settles() {
+        let craft = raft_hull(7, 3);
+        let mp = craft.mass_properties().unwrap();
+        let com = mp.center_of_mass;
+        let params = DescentParams {
+            medium: FluidMedium::EARTHLIKE,
+            mu: MU,
+            surface_radius: SURFACE_R,
+            drag_area: max_cross_section(&craft),
+            drag_coefficient: 1.0,
+            slam_coefficient: DEFAULT_SLAM_COEFFICIENT,
+        };
+        // Float ~half-submerged: mass = half the fully-submerged displaced water mass.
+        let mass = 0.5 * 1_025.0 * craft.occupied_volume();
+        let inertia = mp.inertia * (mass / mp.mass);
+        let mut body = ActiveBody::new(
+            DVec3::new(0.0, SURFACE_R - 0.1, 0.0),
+            DVec3::ZERO,
+            mass,
+            inertia,
+        );
+        body.orientation = DQuat::from_rotation_z(0.3);
+        let initial_heel = heel_angle(body.orientation, DVec3::Y);
+
+        let dt = 0.005;
+        let mut max_late_heel = 0.0_f64;
+        for i in 0..20_000 {
+            descent_step(&mut body, &craft, com, &params, dt);
+            assert!(
+                body.position.is_finite() && body.velocity.is_finite(),
+                "state stayed finite at step {i}"
+            );
+            if i >= 16_000 {
+                let up = body.position.normalize_or_zero();
+                max_late_heel = max_late_heel.max(heel_angle(body.orientation, up));
+            }
+        }
+        let up = body.position.normalize_or_zero();
+        let final_heel = heel_angle(body.orientation, up);
+        assert!(
+            final_heel < 0.5 * initial_heel,
+            "raft rights itself: {initial_heel:.3} → {final_heel:.3} rad"
+        );
+        assert!(
+            max_late_heel < 0.15,
+            "settles (small residual heel, no ring): {max_late_heel:.3} rad"
+        );
+        let altitude = body.position.length() - SURFACE_R;
+        assert!(
+            altitude.abs() < 5.0,
+            "settles near the waterline (bounded): {altitude:.2} m"
+        );
+    }
+
+    /// Forward hook #2 (behaviour 9): the entry slam's closing speed is the hull velocity relative
+    /// to the water surface. With a still surface it is unchanged; a surface rising with the hull
+    /// (no relative closing) produces no slam.
+    #[test]
+    fn entry_slam_uses_relative_closing_speed() {
+        let up = DVec3::Y;
+        let down = DVec3::new(0.0, -100.0, 0.0);
+        let area = 4.0;
+        let rho = 1_025.0;
+        let cs = DEFAULT_SLAM_COEFFICIENT;
+        // Still water ⇒ identical to the calm-water slam.
+        let still = entry_impact_force(rho, down, DVec3::ZERO, up, area, 0.5, cs);
+        assert!(still.y > 0.0);
+        // A water surface descending with the hull at the same rate ⇒ zero relative closing ⇒ no slam.
+        let following = entry_impact_force(rho, down, down, up, area, 0.5, cs);
+        assert_eq!(following, DVec3::ZERO);
     }
 }
