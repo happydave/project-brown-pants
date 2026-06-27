@@ -26,7 +26,8 @@ use sounding_sim::frame::{FrameId, WorldPos};
 use sounding_sim::handoff::{orbit_state_3d, GearState, HandoffPlugin};
 use sounding_sim::medium::{
     dynamic_pressure, max_cross_section, CraftThermal, DescentParams, DescentPlugin,
-    DiveTriggerPlugin, DivingCraft, EntryInterface, GlideParams, DIVE_HEAT_SCALE,
+    DiveTriggerPlugin, DivingCraft, EntryInterface, GlideParams, DEFAULT_SLAM_COEFFICIENT,
+    DIVE_HEAT_SCALE,
 };
 use sounding_sim::orbit::Orbit;
 use sounding_sim::sim::{CentralBody, Craft, SimClock};
@@ -182,6 +183,7 @@ fn setup_scene(
         surface_radius: BODY.radius,
         drag_area: max_cross_section(&voxels),
         drag_coefficient: 1.0,
+        slam_coefficient: DEFAULT_SLAM_COEFFICIENT,
     };
     let glide = GlideParams::for_craft(descent, &voxels, Axis::Z);
     let start_render = render_world(orbit_state_3d(&orbit, 0.0).0);

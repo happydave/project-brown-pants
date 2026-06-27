@@ -64,6 +64,51 @@ pub fn buoyancy_force(density: f64, submerged_volume: f64, gravity: f64, up: DVe
     density * submerged_volume * gravity * up
 }
 
+/// A representative water-entry slamming coefficient (dimensionless, WI 700) — chosen so the
+/// transient entry load exceeds the steady drag at the same closing speed (a slam peak above
+/// the `½·C_d·ρ·v²` steady drag with `C_d ≈ 1`).
+pub const DEFAULT_SLAM_COEFFICIENT: f64 = 3.0;
+
+/// Water-entry **slamming** load (WI 700): the transient impact force as a craft pierces the
+/// surface, *beyond* steady drag. Models the momentum flux into the water the craft entrains
+/// as it penetrates (the added-mass slam):
+/// `F = slam_coefficient · ρ_water · A_entry · v_in² · (1 − submerged_fraction)`, directed
+/// along the outward surface normal `up` (opposing penetration), where `v_in` is the closing
+/// (into-water) speed — the inward normal component of velocity.
+///
+/// **Gated to the entry window:** nonzero only while the craft *straddles* the surface
+/// (`0 < submerged_fraction < 1`) and is *descending*, and it **decays as it submerges**
+/// (peaking near first contact). Zero with no ocean (`water_density = 0`), at rest, when
+/// rising or skimming, and once fully in or out of the water — where steady drag + buoyancy
+/// govern alone. A `½ρv²`-family form, so it stays finite and bounded.
+///
+/// `water_density` is the surrounding **liquid** density (not the air the centre of mass may
+/// still sit in during entry); `up` is the unit outward surface normal.
+pub fn entry_impact_force(
+    water_density: f64,
+    velocity: DVec3,
+    up: DVec3,
+    entry_area: f64,
+    submerged_fraction: f64,
+    slam_coefficient: f64,
+) -> DVec3 {
+    if water_density <= 0.0
+        || entry_area <= 0.0
+        || slam_coefficient <= 0.0
+        || submerged_fraction <= 0.0
+        || submerged_fraction >= 1.0
+    {
+        return DVec3::ZERO;
+    }
+    // Closing speed into the surface: the inward (−up) component of velocity.
+    let closing = -velocity.dot(up);
+    if closing <= 0.0 {
+        return DVec3::ZERO; // rising or skimming the surface: no entry slam
+    }
+    let decay = 1.0 - submerged_fraction; // peak at first contact, → 0 as it fully submerges
+    slam_coefficient * water_density * entry_area * closing * closing * decay * up
+}
+
 /// The volume of the craft below the local surface — the voxel lattice
 /// intersected with the sub-surface half-space. A cell is submerged when its
 /// world position lies inside the planet sphere (`|p| < surface_radius`). For a
@@ -111,6 +156,10 @@ pub struct DescentParams {
     pub drag_area: f64,
     /// Drag coefficient (dimensionless).
     pub drag_coefficient: f64,
+    /// Water-entry slamming coefficient (dimensionless, WI 700) — scales the transient
+    /// impact load as the craft pierces the surface, above steady drag. `0.0` disables the
+    /// slam (steady drag only).
+    pub slam_coefficient: f64,
 }
 
 /// Point-mass gravitational force on `mass` at `position` (toward the origin).
@@ -156,8 +205,24 @@ pub fn descent_step(
         params.surface_radius,
     );
     let buoyancy = buoyancy_force(sample.density, sub_vol, g_local, up);
+    // Water-entry slam (WI 700): a transient impact while the craft straddles the surface.
+    let occupied = craft.occupied_volume();
+    let submerged_fraction = if occupied > 0.0 {
+        sub_vol / occupied
+    } else {
+        0.0
+    };
+    let water_density = params.medium.sample_altitude(-1.0).density;
+    let slam = entry_impact_force(
+        water_density,
+        body.velocity,
+        up,
+        params.drag_area,
+        submerged_fraction,
+        params.slam_coefficient,
+    );
 
-    body.integrate_wrench(gravity + drag + buoyancy, DVec3::ZERO, dt);
+    body.integrate_wrench(gravity + drag + buoyancy + slam, DVec3::ZERO, dt);
     sample
 }
 
@@ -288,8 +353,26 @@ pub fn glide_step(
         params.pitch_damping,
     );
 
+    // Water-entry slam (WI 700): a transient impact while the craft straddles the surface,
+    // added to the central forces (same gate as the ballistic descent).
+    let occupied = craft.occupied_volume();
+    let submerged_fraction = if occupied > 0.0 {
+        sub_vol / occupied
+    } else {
+        0.0
+    };
+    let water_density = p.medium.sample_altitude(-1.0).density;
+    let slam = entry_impact_force(
+        water_density,
+        body.velocity,
+        up,
+        p.drag_area,
+        submerged_fraction,
+        p.slam_coefficient,
+    );
+
     body.integrate_wrench(
-        gravity + drag + buoyancy + lift + wave,
+        gravity + drag + buoyancy + lift + wave + slam,
         restoring + damping,
         dt,
     );
@@ -532,6 +615,7 @@ mod tests {
             surface_radius: SURFACE_R,
             drag_area: max_cross_section(&craft),
             drag_coefficient: 1.0,
+            slam_coefficient: DEFAULT_SLAM_COEFFICIENT,
         }
     }
 
@@ -583,6 +667,119 @@ mod tests {
         // Vacuum / no displacement → no force.
         assert_eq!(buoyancy_force(0.0, 8.0, 9.81, up), DVec3::ZERO);
         assert_eq!(buoyancy_force(1025.0, 0.0, 9.81, up), DVec3::ZERO);
+    }
+
+    // --- WI 700: water-entry slamming load ---
+
+    #[test]
+    fn entry_slam_fires_only_while_straddling_and_descending() {
+        let up = DVec3::Y;
+        let down = DVec3::new(0.0, -100.0, 0.0); // descending into the water
+        let area = 4.0;
+        let rho = 1_025.0;
+        let cs = DEFAULT_SLAM_COEFFICIENT;
+
+        // Straddling (half submerged) and descending: a real upward (decelerating) slam.
+        let slam = entry_impact_force(rho, down, up, area, 0.5, cs);
+        assert!(slam.y > 0.0, "slam opposes the downward entry: {slam:?}");
+        assert!(slam.dot(down) < 0.0, "slam decelerates the entry");
+
+        // No ocean (zero water density) → no slam.
+        assert_eq!(
+            entry_impact_force(0.0, down, up, area, 0.5, cs),
+            DVec3::ZERO
+        );
+        // Fully out of the water (fraction 0) and fully submerged (fraction 1) → no slam.
+        assert_eq!(
+            entry_impact_force(rho, down, up, area, 0.0, cs),
+            DVec3::ZERO
+        );
+        assert_eq!(
+            entry_impact_force(rho, down, up, area, 1.0, cs),
+            DVec3::ZERO
+        );
+        // Rising out of the water (velocity along +up) → no slam.
+        let rising = DVec3::new(0.0, 100.0, 0.0);
+        assert_eq!(
+            entry_impact_force(rho, rising, up, area, 0.5, cs),
+            DVec3::ZERO
+        );
+        // Skimming horizontally (no inward closing speed) → no slam.
+        let skim = DVec3::new(100.0, 0.0, 0.0);
+        assert_eq!(
+            entry_impact_force(rho, skim, up, area, 0.5, cs),
+            DVec3::ZERO
+        );
+        // Slam disabled (coefficient 0) → no slam.
+        assert_eq!(
+            entry_impact_force(rho, down, up, area, 0.5, 0.0),
+            DVec3::ZERO
+        );
+    }
+
+    #[test]
+    fn entry_slam_grows_with_speed_squared_and_decays_with_submersion() {
+        let up = DVec3::Y;
+        let area = 4.0;
+        let rho = 1_025.0;
+        let cs = DEFAULT_SLAM_COEFFICIENT;
+        let slam = |speed: f64, frac: f64| {
+            entry_impact_force(rho, DVec3::new(0.0, -speed, 0.0), up, area, frac, cs).length()
+        };
+        // Doubling the closing speed quadruples the slam (v² scaling).
+        let slow = slam(50.0, 0.5);
+        let fast = slam(100.0, 0.5);
+        assert!(
+            (fast - 4.0 * slow).abs() < 1e-6 * fast.max(1.0),
+            "v² scaling: {slow} vs {fast}"
+        );
+        // The slam decays as the craft submerges (peak near first contact).
+        assert!(
+            slam(100.0, 0.1) > slam(100.0, 0.9),
+            "decays toward full submersion"
+        );
+    }
+
+    #[test]
+    fn fast_entry_decelerates_more_than_steady_drag_alone() {
+        // Two identical craft step through the straddle window: one with the slam, one with
+        // steady drag only. The slammed one loses more downward speed, and both stay finite.
+        let craft = test_craft();
+        let com = craft.mass_properties().unwrap().center_of_mass;
+        let mp = craft.mass_properties().unwrap();
+        let base = earthlike_params();
+        let with_slam = DescentParams {
+            slam_coefficient: DEFAULT_SLAM_COEFFICIENT,
+            ..base
+        };
+        let no_slam = DescentParams {
+            slam_coefficient: 0.0,
+            ..base
+        };
+
+        // Start with the craft half-submerged at the surface, descending fast, and take a
+        // single step through the straddle window (before it fully submerges and water drag
+        // dominates both equally).
+        let start = DVec3::new(0.0, SURFACE_R, 0.0);
+        let v0 = DVec3::new(0.0, -300.0, 0.0);
+        let run = |params: &DescentParams| {
+            let mut body = ActiveBody::new(start, v0, mp.mass, mp.inertia);
+            descent_step(&mut body, &craft, com, params, 1e-3);
+            body
+        };
+        let slammed = run(&with_slam);
+        let plain = run(&no_slam);
+        assert!(
+            slammed.velocity.is_finite() && plain.velocity.is_finite(),
+            "both stay finite"
+        );
+        // Downward speed is the magnitude of the (negative-y) velocity; the slam removes more.
+        assert!(
+            slammed.velocity.y > plain.velocity.y,
+            "the slam decelerates the entry more than steady drag alone: slam vy {} vs plain vy {}",
+            slammed.velocity.y,
+            plain.velocity.y
+        );
     }
 
     // --- I3: physical force directions and submersion ---
@@ -725,6 +922,7 @@ mod tests {
             surface_radius: body.radius,
             drag_area: max_cross_section(&craft),
             drag_coefficient: 1.0,
+            slam_coefficient: DEFAULT_SLAM_COEFFICIENT,
         };
         let glide = GlideParams::for_craft(descent, &craft, Axis::Z);
 
@@ -939,6 +1137,7 @@ mod tests {
             surface_radius: body.radius,
             drag_area: max_cross_section(&craft),
             drag_coefficient: 1.0,
+            slam_coefficient: DEFAULT_SLAM_COEFFICIENT,
         };
         let glide = GlideParams::for_craft(descent, &craft, Axis::Z);
 
@@ -1082,6 +1281,7 @@ mod tests {
             surface_radius: SURFACE_R,
             drag_area: max_cross_section(craft),
             drag_coefficient: 1.0,
+            slam_coefficient: DEFAULT_SLAM_COEFFICIENT,
         };
         let glide = GlideParams::for_craft(descent, craft, Axis::Z);
         (descent, glide)

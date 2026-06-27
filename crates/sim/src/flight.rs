@@ -806,6 +806,7 @@ mod tests {
                 surface_radius: BODY.radius,
                 drag_area: p.drag_area,
                 drag_coefficient: 1.0,
+                slam_coefficient: 0.0, // flight pipeline does not model water-entry slam (WI 700)
             },
             &craft.voxels,
             crate::voxel::Axis::Y,
