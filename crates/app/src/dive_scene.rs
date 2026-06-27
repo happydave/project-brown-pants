@@ -143,13 +143,16 @@ impl Plugin for DiveScenePlugin {
                 max_substeps: MAX_SUBSTEPS,
             })
             .init_resource::<SteamAssets>()
+            .init_resource::<SplashAssets>()
             .add_systems(Startup, setup_scene)
             .add_systems(
                 Update,
                 (track_craft, track_thermal, follow_camera, update_hud).chain(),
             )
             // Phase-change spike (WI 695): steam when the hot craft hits the ocean.
-            .add_systems(Update, (emit_steam, update_steam));
+            .add_systems(Update, (emit_steam, update_steam))
+            // Water-entry splash (WI 699, temporary): a one-shot spray burst on splashdown.
+            .add_systems(Update, (emit_splash, update_splash));
     }
 }
 
@@ -571,6 +574,149 @@ fn update_steam(
     }
 }
 
+// --- Water-entry splash (WI 699, temporary) ---
+//
+// A one-shot spray burst thrown up when the craft pierces the ocean surface at speed — the
+// *kinetic* impact (distinct from the WI 695/698 thermal steam plume), visualising the WI 700
+// water-entry slam. Reuses the steam pooling shape; explicitly a placeholder for the general
+// VFX pass.
+
+/// Entry speed (m/s) below which a splashdown throws up no spray (a gentle touch).
+const SPLASH_ONSET: f64 = 20.0;
+/// Entry speed (m/s) at which the splash is at full intensity.
+const SPLASH_FULL: f64 = 200.0;
+/// Droplets in a full-intensity burst (scaled down by intensity).
+const SPLASH_DROPLETS: usize = 60;
+/// Maximum concurrent splash droplets (a bounded pool).
+const SPLASH_MAX: usize = 140;
+/// Droplet lifetime, seconds.
+const SPLASH_LIFETIME: f32 = 1.2;
+/// Downward acceleration applied to droplets (exaggerated for a snappy arc), m/s².
+const SPLASH_GRAVITY: f32 = 22.0;
+
+/// Splash intensity, 0–1 (pure, unit-tested): ramps from zero at/below [`SPLASH_ONSET`] to
+/// full at [`SPLASH_FULL`], by the craft's entry speed — so a fast splashdown throws up a
+/// big crown and a gentle touch throws up little or none. A VFX-tuning shape for the
+/// deferred general pass.
+fn splash_intensity(impact_speed: f64) -> f64 {
+    ((impact_speed - SPLASH_ONSET) / (SPLASH_FULL - SPLASH_ONSET)).clamp(0.0, 1.0)
+}
+
+/// A ballistic, fading splash droplet.
+#[derive(Component)]
+struct SplashPuff {
+    age: f32,
+    lifetime: f32,
+    vel: Vec3,
+}
+
+/// The shared splash droplet mesh (one small sphere, instanced per droplet).
+#[derive(Resource)]
+struct SplashAssets {
+    mesh: Handle<Mesh>,
+}
+
+impl FromWorld for SplashAssets {
+    fn from_world(world: &mut World) -> Self {
+        let mut meshes = world.resource_mut::<Assets<Mesh>>();
+        Self {
+            mesh: meshes.add(Mesh::from(Sphere { radius: 0.5 })),
+        }
+    }
+}
+
+/// Emits a one-shot crown of droplets when the craft transitions **into** the ocean (the
+/// not-liquid → liquid medium crossing), scaled by the entry speed (WI 699). Fires once per
+/// entry — distinct from the continuous steam.
+#[allow(clippy::too_many_arguments)]
+fn emit_splash(
+    mut commands: Commands,
+    readout: Res<DiveReadout>,
+    assets: Res<SplashAssets>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    craft: Query<&Transform, With<CraftMarker>>,
+    existing: Query<(), With<SplashPuff>>,
+    mut prev_medium: Local<Option<MediumKind>>,
+    mut seed: Local<u32>,
+) {
+    let now = readout.medium;
+    let entering = *prev_medium != Some(MediumKind::Liquid) && now == MediumKind::Liquid;
+    *prev_medium = Some(now);
+    if !entering {
+        return;
+    }
+    let intensity = splash_intensity(readout.speed) as f32;
+    if intensity <= 0.0 {
+        return; // a gentle touch makes no splash
+    }
+    let Ok(craft_tf) = craft.single() else {
+        return;
+    };
+    // The contact point: the craft's horizontal position at the sea surface (render Y = 0).
+    let contact = Vec3::new(craft_tf.translation.x, 0.0, craft_tf.translation.z);
+
+    let want = (SPLASH_DROPLETS as f32 * intensity) as usize;
+    let room = SPLASH_MAX.saturating_sub(existing.iter().count());
+    let count = want.min(room);
+    for _ in 0..count {
+        // A cheap LCG for scatter (no rng dependency; gameplay-noncritical), as for steam.
+        *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let r = |shift: u32| (((*seed >> shift) & 0xff) as f32 / 255.0) - 0.5;
+        // A crown/ring: outward-and-up, the spread growing with intensity.
+        let dir = Vec3::new(r(0), 0.0, r(8)).normalize_or_zero();
+        let out = 6.0 + intensity * 22.0;
+        let upv = 10.0 + intensity * 16.0 + r(16) * 6.0;
+        let vel = dir * out + Vec3::new(0.0, upv, 0.0);
+        let offset = dir * (0.5 + r(24).abs() * 1.5);
+        let mat = materials.add(StandardMaterial {
+            base_color: Color::srgba(0.85, 0.9, 0.97, 0.7),
+            emissive: LinearRgba::rgb(0.2, 0.22, 0.26),
+            alpha_mode: AlphaMode::Blend,
+            ..default()
+        });
+        commands.spawn((
+            Mesh3d(assets.mesh.clone()),
+            MeshMaterial3d(mat),
+            Transform::from_translation(contact + offset).with_scale(Vec3::splat(0.6)),
+            SplashPuff {
+                age: 0.0,
+                lifetime: SPLASH_LIFETIME,
+                vel,
+            },
+        ));
+    }
+}
+
+/// Advances each splash droplet on a ballistic arc (rise then fall under [`SPLASH_GRAVITY`])
+/// and fades it, despawning at end of life (WI 699).
+fn update_splash(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut puffs: Query<(
+        Entity,
+        &mut Transform,
+        &mut SplashPuff,
+        &MeshMaterial3d<StandardMaterial>,
+    )>,
+) {
+    let dt = time.delta_secs();
+    for (entity, mut tf, mut puff, mat) in &mut puffs {
+        puff.age += dt;
+        if puff.age >= puff.lifetime {
+            commands.entity(entity).despawn();
+            continue;
+        }
+        puff.vel.y -= SPLASH_GRAVITY * dt; // ballistic fall
+        tf.translation += puff.vel * dt;
+        let t = puff.age / puff.lifetime;
+        tf.scale = Vec3::splat(0.6 * (1.0 - 0.4 * t)); // shrink slightly as it fades
+        if let Some(m) = materials.get_mut(&mat.0) {
+            m.base_color = Color::srgba(0.85, 0.9, 0.97, (1.0 - t) * 0.7); // fade out
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,5 +730,18 @@ mod tests {
         assert!(steam_intensity(STEAM_MASS_FULL * 0.25) > 0.0);
         assert!(steam_intensity(STEAM_MASS_FULL * 0.5) > steam_intensity(STEAM_MASS_FULL * 0.25));
         assert!(steam_intensity(STEAM_MASS_FULL * 10.0) <= 1.0);
+    }
+
+    #[test]
+    fn splash_intensity_is_speed_gated() {
+        // A gentle touch (at/below the onset) makes no splash.
+        assert_eq!(splash_intensity(0.0), 0.0);
+        assert_eq!(splash_intensity(SPLASH_ONSET), 0.0);
+        // Above the onset it ramps, monotonically, and clamps to 1.
+        assert!(splash_intensity(SPLASH_FULL * 0.4) > 0.0);
+        assert!(splash_intensity(SPLASH_FULL * 0.6) > splash_intensity(SPLASH_FULL * 0.3));
+        assert!(splash_intensity(SPLASH_FULL * 10.0) <= 1.0);
+        // Full intensity reached by the full-speed mark.
+        assert!((splash_intensity(SPLASH_FULL) - 1.0).abs() < 1e-9);
     }
 }
