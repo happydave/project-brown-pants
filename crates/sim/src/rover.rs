@@ -14,6 +14,7 @@
 //! / no-launch test (the design's kraken detector as an automated bound).
 
 use crate::active::ActiveBody;
+use crate::collision::BoxShape;
 use crate::powertrain::{build_powertrain, RoverPowertrain};
 use crate::terrain::Terrain;
 use crate::voxel::{DeviceKind, PartKind, RimSpec, SuspensionSpec, TireSpec, VoxelCraft};
@@ -156,6 +157,11 @@ const HULL_CONTACT_DAMPING_RATIO: f64 = 1.0;
 /// total to about `HULL_MAX_G·g` of acceleration — plenty to catch any real landing, never enough to
 /// fling. Mass-relative, so it is the same at any build scale.
 const HULL_MAX_G: f64 = 12.0;
+/// A wheel's lateral half-width as a fraction of its radius (WI 631c): the obstacle-collider proxy and
+/// the contact-site attribution gate. There is no authored wheel-width datum, so the swept proxy is a
+/// box of half-extents `(WHEEL_HALF_WIDTH_FRAC·radius, radius, radius)` about the hub. Only the lateral
+/// extent depends on this; the tire/rim attribution is radial.
+const WHEEL_HALF_WIDTH_FRAC: f64 = 0.35;
 /// Motor's maximum wheel speed (rad/s). Drive torque falls off as the wheel nears
 /// it, so flooring the throttle cannot spin the wheels up without bound — a burnout
 /// would use all the tyre's grip longitudinally and leave none for cornering,
@@ -719,6 +725,87 @@ impl Rover {
         self.external_torque += torque;
     }
 
+    /// Swept obstacle-collision proxies for the **live** wheels (WI 631c): one body-frame axis-aligned
+    /// [`BoxShape`] per non-`inert` wheel, sized `(WHEEL_HALF_WIDTH_FRAC·radius, radius, radius)` about
+    /// the hub, in the **lattice frame** (`center = mount + dry_com`) so the caller can union them onto
+    /// the chassis `craft_collision_shape` and run the existing `body_contact_wrench` against an
+    /// obstacle — the wheels then push off obstacles *and* their contacts can be attributed. `dry_com`
+    /// is the same lattice-frame CoM the chassis shape is posed with. A sheared wheel contributes
+    /// nothing (it has physically left the rover).
+    pub fn wheel_collider_boxes(&self, dry_com: DVec3) -> Vec<BoxShape> {
+        self.wheels
+            .iter()
+            .filter(|w| !w.inert)
+            .map(|w| BoxShape {
+                center: w.mount + dry_com,
+                half_extents: DVec3::new(WHEEL_HALF_WIDTH_FRAC * w.radius, w.radius, w.radius),
+            })
+            .collect()
+    }
+
+    /// Attribute a world-space obstacle contact `point` to a [`ContactSite`] (WI 631c): the **tire** or
+    /// **rim** of a specific wheel, or the **chassis**. `dry_com` is the lattice-frame CoM (the wheel
+    /// hubs are at `position + R·mount`). The point is taken into the body frame and tested against each
+    /// live wheel's swept proxy (the wheel axle is body-local X); a point inside a wheel proxy is that
+    /// wheel, classified **rim** when its radial distance from the axle is within `rim_radius` else
+    /// **tire**; overlaps resolve to the nearest hub. A point in no wheel proxy is the chassis.
+    pub fn classify_contact_site(&self, point: DVec3, _dry_com: DVec3) -> ContactSite {
+        let r = DMat3::from_quat(self.body.orientation);
+        // CoM-relative body-frame point (the frame `Wheel::mount` lives in).
+        let local = r.transpose() * (point - self.body.position);
+        let tol = 1e-3;
+        let mut best: Option<(f64, ContactSite)> = None;
+        for (i, w) in self.wheels.iter().enumerate() {
+            if w.inert {
+                continue;
+            }
+            let d = local - w.mount;
+            let hw = WHEEL_HALF_WIDTH_FRAC * w.radius;
+            // Inside this wheel's swept proxy box (axle = body X; disc spans Y/Z)?
+            if d.x.abs() > hw + tol || d.y.abs() > w.radius + tol || d.z.abs() > w.radius + tol {
+                continue;
+            }
+            let radial = (d.y * d.y + d.z * d.z).sqrt();
+            let site = if radial <= w.rim_radius + tol {
+                ContactSite::Rim(i)
+            } else {
+                ContactSite::Tire(i)
+            };
+            // Nearest hub wins an overlap (the wheel the point is most centred on).
+            let key = d.length();
+            if best.is_none_or(|(k, _)| key < k) {
+                best = Some((key, site));
+            }
+        }
+        best.map_or(ContactSite::Chassis, |(_, s)| s)
+    }
+
+    /// Apply an obstacle impact attributed to a [`ContactSite`] (WI 631c). A `Tire`/`Rim` site drives
+    /// **that wheel** through the WI 631b failure ladder + WI 618 shear at the full `closing_speed` (a
+    /// direct geometric strike on one wheel needs no side-grading); a `Chassis` site keeps the WI 618
+    /// side-graded inference across all facing wheels ([`Rover::shear_on_impact`]). Returns the
+    /// [`ImpactOutcome`] for the diagnostic.
+    pub fn impact_at_site(
+        &mut self,
+        closing_speed: f64,
+        into_obstacle: DVec3,
+        site: ContactSite,
+    ) -> ImpactOutcome {
+        let i = match site {
+            ContactSite::Chassis => return self.shear_on_impact(closing_speed, into_obstacle),
+            ContactSite::Tire(i) | ContactSite::Rim(i) => i,
+        };
+        let mut out = ImpactOutcome::default();
+        if closing_speed <= 0.0 || i >= self.wheels.len() || self.wheels[i].inert {
+            return out;
+        }
+        out.peak_demand = closing_speed;
+        out.peak_wheel = Some(i);
+        out.peak_capacity = self.wheels[i].shear_speed;
+        self.wheels[i].apply_impact(closing_speed, i, &mut out);
+        out
+    }
+
     /// Height of the body origin above the terrain directly beneath it.
     pub fn height_above_terrain(&self, terrain: &Terrain) -> f64 {
         self.body.position.y - terrain.height(self.body.position.x, self.body.position.z)
@@ -824,6 +911,19 @@ impl Rover {
         }
         out
     }
+}
+
+/// Where an obstacle contact landed on the rover (WI 631c): a specific wheel's tire/rim, or the
+/// chassis hull. The geometric attribution that replaces the WI 618 hull-only `impacted: chassis`
+/// inference, driving the WI 631b failure ladder a real wheel-level trigger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContactSite {
+    /// The chassis hull (no wheel was the first contact).
+    Chassis,
+    /// Wheel `i`'s tire (outer rolling surface).
+    Tire(usize),
+    /// Wheel `i`'s rim (inner radius — e.g. a blown/low tire running on the rim).
+    Rim(usize),
 }
 
 /// What an obstacle impact did to the wheels (WI 618): which wheels sheared, plus the most-stressed
@@ -1995,6 +2095,103 @@ mod tests {
         let mut hard = make();
         assert_eq!(hard.shear_on_landing(50.0).sheared.len(), 4);
         assert!(hard.wheels.iter().all(|w| w.inert));
+    }
+
+    // --- WI 631c: wheels as colliders (attribution) ---
+
+    /// A four-wheel rover with a real tire profile (rim_radius < radius) for attribution tests.
+    fn collider_rover() -> Rover {
+        let body = ActiveBody::new(DVec3::ZERO, DVec3::ZERO, 100.0, DMat3::IDENTITY);
+        let wheels = vec![
+            Wheel::new(DVec3::new(-1.0, -0.2, -1.0)),
+            Wheel::new(DVec3::new(1.0, -0.2, -1.0)),
+            Wheel::new(DVec3::new(-1.0, -0.2, 1.0)),
+            Wheel::new(DVec3::new(1.0, -0.2, 1.0)),
+        ];
+        let mut r = Rover::new(body, wheels, 9.81);
+        for w in &mut r.wheels {
+            w.radius = 0.35;
+            w.rim_radius = 0.20; // a 0.15 m tire profile band
+        }
+        r
+    }
+
+    #[test]
+    fn wheel_collider_boxes_are_live_wheels_at_hub() {
+        let com = DVec3::new(0.0, 0.0, 0.0);
+        let mut r = collider_rover();
+        let boxes = r.wheel_collider_boxes(com);
+        assert_eq!(boxes.len(), 4, "one proxy per live wheel");
+        // Box centre sits at mount+com; half-extents are (frac·radius, radius, radius).
+        assert_eq!(boxes[0].center, r.wheels[0].mount + com);
+        assert!((boxes[0].half_extents.y - 0.35).abs() < 1e-9);
+        assert!((boxes[0].half_extents.x - WHEEL_HALF_WIDTH_FRAC * 0.35).abs() < 1e-9);
+        // A sheared wheel contributes no collider.
+        r.wheels[1].inert = true;
+        assert_eq!(r.wheel_collider_boxes(com).len(), 3);
+    }
+
+    #[test]
+    fn classify_attributes_tire_rim_and_chassis() {
+        let r = collider_rover();
+        let com = DVec3::ZERO;
+        // Identity orientation, body at origin → body frame == world frame.
+        let mount = r.wheels[3].mount; // (1, -0.2, 1)
+                                       // A point on the outer rolling surface (radial ≈ radius) → Tire(3).
+        let tire_pt = mount + DVec3::new(0.0, -0.34, 0.0);
+        assert_eq!(r.classify_contact_site(tire_pt, com), ContactSite::Tire(3));
+        // A point within the rim band (radial < rim_radius) → Rim(3).
+        let rim_pt = mount + DVec3::new(0.0, -0.15, 0.0);
+        assert_eq!(r.classify_contact_site(rim_pt, com), ContactSite::Rim(3));
+        // A point on the hull away from any wheel → Chassis.
+        let hull_pt = DVec3::new(0.0, 0.5, 0.0);
+        assert_eq!(r.classify_contact_site(hull_pt, com), ContactSite::Chassis);
+    }
+
+    #[test]
+    fn classify_is_orientation_aware() {
+        // Roll the body 180° about Z (flip): a world point below the body maps to a wheel that is now
+        // pointing up, so attribution is geometric in the body frame, not world-vertical.
+        let mut r = collider_rover();
+        r.body.orientation = DQuat::from_rotation_z(std::f64::consts::PI);
+        let com = DVec3::ZERO;
+        // World point near where wheel 3's hub now is (mount rotated): R·mount for a Z-flip negates x,y.
+        let m = r.wheels[3].mount;
+        let hub_world = DMat3::from_quat(r.body.orientation) * m;
+        let tire_pt = hub_world + DVec3::new(0.0, 0.30, 0.0); // radial offset in world, still on the disc
+        assert!(matches!(
+            r.classify_contact_site(tire_pt, com),
+            ContactSite::Tire(3) | ContactSite::Rim(3)
+        ));
+    }
+
+    #[test]
+    fn impact_at_site_targets_the_named_wheel() {
+        // A hard tire strike on wheel 2 fails only wheel 2; the others are untouched.
+        let mut r = collider_rover();
+        let out = r.impact_at_site(50.0, DVec3::new(0.0, 0.0, 1.0), ContactSite::Tire(2));
+        assert_eq!(out.peak_wheel, Some(2));
+        assert!(r.wheels[2].inert, "a 50 m/s strike shears wheel 2");
+        assert!(
+            !r.wheels[0].inert && !r.wheels[1].inert && !r.wheels[3].inert,
+            "other wheels unaffected by a single-wheel strike"
+        );
+    }
+
+    #[test]
+    fn impact_at_site_gentle_does_nothing_and_chassis_delegates() {
+        let mut r = collider_rover();
+        // Below the lowest rated band → no failure.
+        let gentle = r.impact_at_site(0.5, DVec3::Z, ContactSite::Tire(0));
+        assert!(gentle.sheared.is_empty() && gentle.blown_tires.is_empty());
+        assert!(!r.wheels[0].inert);
+        // A Chassis site delegates to the side-graded inference across facing wheels (non-empty on a
+        // hard square hit).
+        let chassis = r.impact_at_site(50.0, DVec3::new(0.0, 0.0, -1.0), ContactSite::Chassis);
+        assert!(
+            !chassis.sheared.is_empty(),
+            "a hard chassis hit still shears via the WI 618 inference"
+        );
     }
 
     #[test]

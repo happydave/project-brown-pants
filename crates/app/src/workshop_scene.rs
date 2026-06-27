@@ -46,6 +46,7 @@ use sounding_sim::collision::{
     craft_bounding_radius, craft_bounds, craft_collision_shape, ground_half_space, Bounds,
     BoxShape, CollisionShape,
 };
+use sounding_sim::collision_detect::contacts;
 use sounding_sim::command::{Command, SasMode};
 use sounding_sim::contact::{body_contact_wrench, ground_contact_wrench, ContactParams};
 use sounding_sim::control::{assemble_control, BatterySpec, ControlComputer};
@@ -58,7 +59,7 @@ use sounding_sim::powertrain::RoverPowertrain;
 use sounding_sim::propulsion::{Engine, EngineCommand, Propulsion};
 use sounding_sim::resource::{Reservoir, ReservoirId, ResourceGraph, ResourceType};
 use sounding_sim::rover::{
-    assemble_rover, Rover, RoverAssembly, Wheel, SUBSTEP_DT as ROVER_SUBSTEP_DT,
+    assemble_rover, ContactSite, Rover, RoverAssembly, Wheel, SUBSTEP_DT as ROVER_SUBSTEP_DT,
 };
 use sounding_sim::sim::{CentralBody, SimClock};
 use sounding_sim::telemetry::RoverTelemetry;
@@ -223,8 +224,8 @@ struct ImpactReport {
     speed: f64,
     /// Closing speed into the obstacle (m/s).
     closing: f64,
-    /// What was struck — "chassis" today (the obstacle collision is the hull only); true tire/rim
-    /// attribution is WI 631.
+    /// What was struck — "tire" / "rim" / "chassis" / "landing", from the geometric contact-site
+    /// attribution (WI 631c: the deepest contact between the combined rover shape and the obstacle).
     impacted: &'static str,
     /// The most-stressed wheel at impact (index into `rover.wheels`), if any.
     peak_wheel: Option<usize>,
@@ -1865,10 +1866,15 @@ fn step_workshop(time: Res<Time>, mut clock: ResMut<SimClock>, mut world: ResMut
         }
         rs.accumulator += frame_dt;
         let terrain = rs.terrain;
-        // Rover↔obstacle contact (WI 610): the chassis collision shape vs. each static obstacle,
-        // injected as an external wrench per sub-step (the seam — `rover.step` integrates it).
-        let rover_shape = craft_collision_shape(&rs.lattice);
-        let rover_bounds = craft_bounds(&rs.lattice);
+        // Rover↔obstacle contact (WI 610): the rover collision shape vs. each static obstacle,
+        // injected as an external wrench per sub-step (the seam — `rover.step` integrates it). The
+        // shape is the chassis hull ∪ the live wheels' swept proxies (WI 631c), so a tire pushes off
+        // an obstacle and the contact can be attributed to tire/rim/chassis (rebuilt below per sub-step
+        // so a sheared wheel loses its collider). Chassis boxes are the static base.
+        let chassis_boxes = match craft_collision_shape(&rs.lattice) {
+            CollisionShape::CuboidCompound(b) => b,
+            _ => Vec::new(),
+        };
         let com = rs.com;
         let contact = ContactParams::default();
         // Chassis fracture gate (WI 672): a closing speed above this — clearly harder than the
@@ -1887,11 +1893,22 @@ fn step_workshop(time: Res<Time>, mut clock: ResMut<SimClock>, mut world: ResMut
             // strength splits it into debris. Decided per sub-step from the hardest obstacle contact;
             // applied after the obstacle loop to keep the borrow of `rs.obstacles` immutable.
             let mut fracture_pending: Option<Vec<(VoxelCraft, ActiveBody)>> = None;
+            // Combined rover collision shape this sub-step (WI 631c): chassis hull ∪ live-wheel proxies.
+            // Bounds `None` so the wheel proxies (outside the chassis AABB) are never broad-phase culled.
+            let mut rover_boxes = chassis_boxes.clone();
+            rover_boxes.extend(rs.rover.wheel_collider_boxes(com));
+            let rover_shape = CollisionShape::CuboidCompound(rover_boxes);
+            // The shape's world pose (the convention `body_contact_wrench` uses internally), so we can
+            // fetch the contact points to attribute the impact site.
+            let a_pose = (
+                rs.rover.body.position - rs.rover.body.orientation * com,
+                rs.rover.body.orientation,
+            );
             for obs in &rs.obstacles {
                 let ((mut force, torque), _) = body_contact_wrench(
                     &rs.rover.body,
                     &rover_shape,
-                    rover_bounds,
+                    None,
                     com,
                     &obs.body,
                     &obs.shape,
@@ -1922,7 +1939,27 @@ fn step_workshop(time: Res<Time>, mut clock: ResMut<SimClock>, mut world: ResMut
                     closing = (-rs.rover.body.velocity.dot(nrm)).max(0.0);
                     into = -nrm; // toward the obstacle
                 }
-                let outcome = rs.rover.shear_on_impact(closing, into);
+                // Attribute the impact site (WI 631c): the deepest contact between the combined rover
+                // shape and this obstacle decides tire / rim / chassis.
+                let site = contacts(
+                    &rover_shape,
+                    a_pose,
+                    None,
+                    &obs.shape,
+                    (obs.body.position, obs.body.orientation),
+                    obs.bounds,
+                    0.0,
+                )
+                .iter()
+                .max_by(|x, y| x.depth.total_cmp(&y.depth))
+                .map(|cp| rs.rover.classify_contact_site(cp.point, com))
+                .unwrap_or(ContactSite::Chassis);
+                let impacted = match site {
+                    ContactSite::Tire(_) => "tire",
+                    ContactSite::Rim(_) => "rim",
+                    ContactSite::Chassis => "chassis",
+                };
+                let outcome = rs.rover.impact_at_site(closing, into, site);
                 for &idx in &outcome.sheared {
                     rs.drive.retain(|&x| x != idx);
                     rs.steer.retain(|&x| x != idx);
@@ -1942,7 +1979,7 @@ fn step_workshop(time: Res<Time>, mut clock: ResMut<SimClock>, mut world: ResMut
                     let report = ImpactReport {
                         speed: rs.rover.body.velocity.length(),
                         closing,
-                        impacted: "chassis",
+                        impacted,
                         peak_wheel: outcome.peak_wheel,
                         demand: outcome.peak_demand,
                         capacity: outcome.peak_capacity,
