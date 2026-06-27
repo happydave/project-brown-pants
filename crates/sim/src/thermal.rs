@@ -5,12 +5,20 @@
 //! — not a spatially-resolved field, not FEA. Three heat flows move energy each
 //! active-gear step:
 //!
-//! - **Convective in** — a Sutton–Graves-shaped stagnation flux (rises with the
-//!   square root of medium density and the *cube* of speed, softened for blunt
-//!   bodies via the windward frontal area) distributed onto each voxel's
-//!   **windward** exposed faces. The exposed/windward geometry comes from
-//!   [`crate::aero::windward_faces`] — thermal consumes an aero-derived output, it
-//!   does not re-derive the lattice (design resolutions T1/T3/T4).
+//! - **Convective exchange** (WI 696) — a single Newton relaxation of the skin
+//!   toward a speed-dependent **recovery temperature**
+//!   `T_recovery = T_static + r·v²/(2·c_p)` (the shock/boundary-layer recovery of
+//!   the flow's kinetic energy). The conductance is the sum of two physical
+//!   mechanisms sharing the *one* driving potential `(T_recovery − T_skin)`: a
+//!   **forced** part on the **windward** faces (∝ `√ρ·v`, with the blunt-body
+//!   softening `1/√A_w`), and a **natural/immersion** part on the whole exposed
+//!   surface (∝ `ρ`). At hypersonic speed the forced part dominates and reproduces
+//!   the Sutton–Graves `√ρ·v³` heating shape in the cold-skin limit, but now
+//!   **saturates** at `T_recovery` instead of injecting unbounded power; at rest
+//!   `T_recovery = T_static` and the natural part quenches the part toward the
+//!   ambient medium (the WI 694 behaviour). The windward/exposed geometry comes
+//!   from [`crate::aero::windward_faces`] — thermal consumes an aero-derived output,
+//!   it does not re-derive the lattice (design resolutions T1/T3/T4).
 //! - **Radiative out** — `εσA(T_skin⁴ − T_env⁴)` from each voxel's exposed skin
 //!   area; the only sink in vacuum.
 //! - **Conduction** — skin→core within a voxel and core→core between
@@ -44,13 +52,25 @@ use std::collections::{HashMap, HashSet};
 /// Stefan–Boltzmann constant, W·m⁻²·K⁻⁴.
 const STEFAN_BOLTZMANN: f64 = 5.670_374_419e-8;
 
-/// Convective heating coefficient (Sutton–Graves family). The per-area stagnation
-/// flux is `q = CONV_COEFF · √ρ · v³ / √A_w`, where `A_w` is the total windward
-/// frontal area — so a blunter craft (larger `A_w`) sees a *lower* flux density
-/// (blunt-body softening) while absorbing more total heat over more material. The
-/// absolute value is the calibration knob (plan Remaining Unknown); the tests
-/// assert ordering/relative properties, not absolute temperatures.
+/// Convective heating coefficient (Sutton–Graves family). It fixes the magnitude of
+/// the **forced** convective conductance so that, in the cold-skin limit, the Newton
+/// relaxation toward `T_recovery` reproduces the historical per-area stagnation flux
+/// `q = CONV_COEFF · √ρ · v³ / √A_w` (WI 696): a blunter craft (larger `A_w`) sees a
+/// *lower* flux density (blunt-body softening) while absorbing more total heat over more
+/// material. The absolute value is the calibration knob; the tests assert
+/// ordering/relative properties, not absolute temperatures.
 const CONV_COEFF: f64 = 1.74e-4;
+
+/// Reference gas specific heat at constant pressure, J·kg⁻¹·K⁻¹ (WI 696) — maps the
+/// flow's kinetic energy into the recovery (stagnation) temperature
+/// `T_recovery = T_static + r·v²/(2·c_p)`. A fixed air-like value (not the per-material
+/// specific heat), so the recovery temperature is a property of the *flow*.
+const AIR_SPECIFIC_HEAT: f64 = 1_005.0;
+
+/// Recovery factor `r` (WI 696): the fraction of the free-stream kinetic energy that
+/// appears as the boundary-layer recovery temperature. Slightly below 1
+/// (turbulent-boundary-layer typical).
+const RECOVERY_FACTOR: f64 = 0.9;
 
 /// Characteristic heating time, s (WI 692) — the timescale the surface thermal
 /// layer ("skin") responds over. Sets the skin depth `δ = √(α·τ)` from the material's
@@ -78,12 +98,12 @@ const MAX_SUBSTEPS: usize = 256;
 /// never produce a non-finite or unbounded temperature.
 const TEMP_CEILING: f64 = 100_000.0;
 
-/// Convective heat-exchange coefficient (WI 694): the skin exchanges heat with the
-/// medium at `h · area · (T_medium − T_skin)`, with `h = CONV_EXCHANGE_COEFF · ρ` —
-/// so coupling is strong in water, weak in thin air, and **zero in vacuum** (ρ=0).
-/// Bidirectional: it cools a hot part (quench) and warms a cold one toward the medium
-/// temperature. Distinct from the speed-driven aeroheating (which dominates at
-/// re-entry speed); this governs at rest.
+/// Natural / immersion convective coefficient (WI 694, unified WI 696): the
+/// speed-independent part of the convective conductance, `h = CONV_EXCHANGE_COEFF · ρ`,
+/// acting on the whole exposed surface toward the shared `T_recovery` potential — strong
+/// in water, weak in thin air, and **zero in vacuum** (ρ=0). At rest (`T_recovery =
+/// T_static`) it is the WI 694 quench; at speed it is dominated by the forced windward
+/// conductance.
 const CONV_EXCHANGE_COEFF: f64 = 2.0;
 
 /// The two thermal nodes of one voxel (kelvin).
@@ -236,11 +256,25 @@ impl ThermalState {
         let speed = velocity.length();
         let density = sample.density;
         let total_windward: f64 = exposure.iter().map(|e| e.windward_area).sum();
-        let q_density = if density > 0.0 && speed > 0.0 && total_windward > 0.0 {
-            heat_scale * CONV_COEFF * density.sqrt() * speed.powi(3) / total_windward.sqrt()
+        // Forced convective conductance per unit windward area (WI 696). Derived from
+        // CONV_COEFF so the cold-skin limit of the Newton relaxation reproduces the
+        // historical `√ρ·v³/√A_w` heating: the `2·c_p/r` factor converts the absolute
+        // flux into a conductance against the `r·v²/(2·c_p)` recovery-temperature head.
+        // Vanishes at rest (∝ v) and in vacuum (∝ √ρ).
+        let forced_conductance_density = if density > 0.0 && speed > 0.0 && total_windward > 0.0 {
+            heat_scale
+                * CONV_COEFF
+                * (2.0 * AIR_SPECIFIC_HEAT / RECOVERY_FACTOR)
+                * density.sqrt()
+                * speed
+                / total_windward.sqrt()
         } else {
             0.0
         };
+        // Recovery (stagnation) temperature of the flow — the single convective target.
+        // At rest it collapses to the static medium temperature (quench, WI 694).
+        let t_recovery =
+            sample.temperature + RECOVERY_FACTOR * speed * speed / (2.0 * AIR_SPECIFIC_HEAT);
 
         // Index voxels and build the per-voxel work record.
         let exposure_by_cell: HashMap<IVec3, &crate::aero::VoxelExposure> =
@@ -277,7 +311,7 @@ impl ThermalState {
                 c_skin,
                 c_core,
                 exposed_area: exp.exposed_area,
-                conv_power: q_density * exp.windward_area,
+                forced_cond: forced_conductance_density * exp.windward_area,
                 emissivity: th.emissivity,
                 neighbours,
                 ablation: (th.ablation_temp > 0.0 && th.latent_heat > 0.0)
@@ -285,10 +319,10 @@ impl ThermalState {
             });
         }
 
-        // Convective heat-exchange with the medium (WI 694): coefficient ∝ density
-        // (zero in vacuum), target = the medium temperature.
+        // Natural/immersion convective conductance with the medium (WI 694): coefficient
+        // ∝ density (zero in vacuum). Shares the `t_recovery` target with the forced
+        // windward conductance (WI 696), so at rest it quenches toward the static medium.
         let h_exchange = CONV_EXCHANGE_COEFF * sample.density;
-        let medium_temp = sample.temperature;
 
         // Sub-step with an adaptively-bounded stable step.
         let mut remaining = dt;
@@ -297,7 +331,7 @@ impl ThermalState {
             let sub_dt = self
                 .stable_substep(&nodes, cell_size, h_exchange)
                 .min(remaining);
-            self.integrate_substep(&nodes, cell_size, env_temp, h_exchange, medium_temp, sub_dt);
+            self.integrate_substep(&nodes, cell_size, env_temp, h_exchange, t_recovery, sub_dt);
             remaining -= sub_dt;
             steps += 1;
         }
@@ -309,11 +343,15 @@ impl ThermalState {
         for n in nodes {
             let t = self.temps[&n.cell];
             let g_sc = n.conductivity * cell_size; // skin↔core conductance
-                                                   // skin loss derivative: conduction to core + linearised radiation + convective exchange.
+                                                   // skin loss derivative: conduction to core + linearised radiation + convective relaxation.
             let rad_deriv =
                 4.0 * n.emissivity * STEFAN_BOLTZMANN * n.exposed_area * t.skin.max(0.0).powi(3);
-            let exchange_deriv = h_exchange * n.exposed_area; // WI 694: linear loss toward T_medium
-            let skin_loss = (g_sc + rad_deriv + exchange_deriv).max(1e-9);
+            // WI 696: the convective term is now a linear relaxation toward `t_recovery`,
+            // so its full conductance (forced windward + natural exposed) is the loss
+            // derivative — including the speed-driven forced part, which can be large at
+            // re-entry speed and must bound the sub-step.
+            let conv_deriv = n.forced_cond + h_exchange * n.exposed_area;
+            let skin_loss = (g_sc + rad_deriv + conv_deriv).max(1e-9);
             let dt_skin = STABILITY_SAFETY * n.c_skin / skin_loss;
             // core loss derivative: conduction to skin + to occupied neighbours.
             let g_cc: f64 = n.neighbours.iter().map(|&(_, bond)| bond).sum();
@@ -338,7 +376,7 @@ impl ThermalState {
         cell_size: f64,
         env_temp: f64,
         h_exchange: f64,
-        medium_temp: f64,
+        t_recovery: f64,
         dt: f64,
     ) {
         let snapshot = self.temps.clone();
@@ -346,12 +384,16 @@ impl ThermalState {
         for n in nodes {
             let t = snapshot[&n.cell];
             let g_sc = n.conductivity * cell_size;
-            // Skin node: convection in, radiation out, conduction to core, and
-            // convective exchange with the medium (WI 694 — cools/heats toward T_medium).
+            // Skin node (WI 696): one convective relaxation toward the recovery
+            // temperature — forced (windward) + natural (exposed) conductance sharing the
+            // single `(t_recovery − t.skin)` potential — plus radiation out and conduction
+            // to the core. The convection saturates at `t_recovery` (no unbounded source)
+            // and reverses sign to cool a part hotter than the flow.
             let p_rad = n.emissivity * STEFAN_BOLTZMANN * n.exposed_area * (t.skin.powi(4) - env4);
             let p_sc = g_sc * (t.skin - t.core); // skin → core
-            let p_exchange = h_exchange * n.exposed_area * (medium_temp - t.skin);
-            let d_skin = (n.conv_power - p_rad - p_sc + p_exchange) / n.c_skin * dt;
+            let conv_cond = n.forced_cond + h_exchange * n.exposed_area;
+            let p_conv = conv_cond * (t_recovery - t.skin);
+            let d_skin = (p_conv - p_rad - p_sc) / n.c_skin * dt;
             // Core node: conduction from skin + exchange with occupied neighbours
             // (symmetric averaged bond conductance, computed once per call).
             let mut p_core = p_sc;
@@ -444,7 +486,9 @@ struct Node {
     c_skin: f64,
     c_core: f64,
     exposed_area: f64,
-    conv_power: f64,
+    /// Forced (windward) convective conductance, W/K (WI 696): the speed-driven part of
+    /// the skin's convective coupling, relaxing it toward `t_recovery`. Zero at rest.
+    forced_cond: f64,
     emissivity: f64,
     /// Occupied face-neighbours as `(cell, bond conductance)` for core↔core
     /// conduction (the conductance is the symmetric averaged value).
@@ -910,6 +954,59 @@ mod tests {
         assert!(
             in_water < in_air,
             "water cools faster than air: water={in_water} air={in_air}"
+        );
+    }
+
+    // --- WI 696: convective heating saturates at the recovery temperature ---
+
+    // The soft-spot fix: convection relaxes the skin toward a finite recovery temperature
+    // instead of injecting unbounded power. The skin never exceeds it, heating slows as it
+    // approaches, and a part hotter than the flow is cooled toward it.
+    #[test]
+    fn convective_heating_saturates_at_recovery_temperature() {
+        let craft = box_craft(2, 2, 2, 0.5, Material::COMPOSITE); // high failure temp
+        let sample = atmosphere(1.0); // T_static = 250 K
+        let vel = DVec3::new(4_000.0, 0.0, 0.0);
+        let speed = vel.length();
+        // The recovery temperature the flow can heat toward (mirrors the model).
+        let t_recovery =
+            sample.temperature + RECOVERY_FACTOR * speed * speed / (2.0 * AIR_SPECIFIC_HEAT);
+
+        // Heat hard for a while: the skin climbs toward, but never past, the recovery temp.
+        let mut st = ThermalState::new(&craft, AMBIENT);
+        for _ in 0..2_000 {
+            st.step(&craft, &sample, vel, DQuat::IDENTITY, AMBIENT, 0.05);
+        }
+        let hot = st.max_skin_temp();
+        assert!(hot > AMBIENT, "should have heated: {hot}");
+        assert!(
+            hot < t_recovery,
+            "skin must not exceed the recovery temperature: {hot} vs {t_recovery}"
+        );
+
+        // Saturation: one step warms a cold skin more than a skin already near T_recovery.
+        let one_step = |start: f64| {
+            let mut s = ThermalState::new(&craft, start);
+            let before = s.max_skin_temp();
+            s.step(&craft, &sample, vel, DQuat::IDENTITY, AMBIENT, 0.01);
+            s.max_skin_temp() - before
+        };
+        let d_cold = one_step(300.0);
+        let d_warm = one_step(0.9 * t_recovery);
+        assert!(d_cold > 0.0, "a cold skin heats: {d_cold}");
+        assert!(
+            d_warm < d_cold,
+            "heating saturates near recovery: warm Δ {d_warm} < cold Δ {d_cold}"
+        );
+
+        // Above the recovery temperature the convective term reverses sign (cools).
+        let mut above = ThermalState::new(&craft, t_recovery + 2_000.0);
+        let before = above.max_skin_temp();
+        above.step(&craft, &sample, vel, DQuat::IDENTITY, AMBIENT, 0.01);
+        assert!(
+            above.max_skin_temp() < before,
+            "a skin above T_recovery cools toward it: {} !< {before}",
+            above.max_skin_temp()
         );
     }
 }
