@@ -24,6 +24,7 @@ pub mod fluid;
 pub mod frame;
 pub mod handoff;
 pub mod launch;
+pub mod library;
 pub mod medium;
 pub mod orbit;
 pub mod persist;

@@ -39,6 +39,7 @@ mod break_scene;
 mod bus;
 mod collide_scene;
 mod compartments_scene;
+mod craft_library;
 mod crash_scene;
 mod dive_scene;
 mod editor;
@@ -152,6 +153,10 @@ fn main() {
     app.init_resource::<gamepad::GamepadMap>();
     // Shared chase-camera free-look offset (WI 665), driven by the right stick in Test / -- play.
     app.init_resource::<gamepad::ChaseLook>();
+    // Craft save library (WI 675): the modal state + last-used name are read by the editor's
+    // input guard in any scene that runs the voxel editor (standalone editor + workshop Build).
+    app.init_resource::<craft_library::CraftLibraryModal>();
+    app.init_resource::<craft_library::CurrentCraftName>();
     app.add_plugins(DefaultPlugins)
         .add_plugins(OrbitPlugin {
             central_body,

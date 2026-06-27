@@ -30,8 +30,6 @@ const PALETTE: [(&str, Material); 4] = [
 
 const BLUEPRINT_PATH: &str = "blueprint.json";
 const SUBASSEMBLY_PATH: &str = "subassembly.json";
-/// Where the whole current build is saved/loaded as a craft (WI 637).
-const CRAFT_PATH: &str = "craft.json";
 
 /// A rim+tire combination the player picks as a unit (WI 630). Each preset is a coherent
 /// rim+tire character — the felt difference of "change the tires" — while the underlying suspension /
@@ -489,8 +487,20 @@ impl Plugin for EditorPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<EditorState>()
             .init_resource::<OrbitCam>()
+            .init_resource::<crate::craft_library::CraftLibraryModal>()
+            .init_resource::<crate::craft_library::CurrentCraftName>()
             .add_systems(Startup, setup_view)
-            .add_systems(Update, (editor_input, draw_editor, orbit_camera));
+            .add_systems(
+                Update,
+                (
+                    crate::craft_library::craft_library_input,
+                    editor_input,
+                    draw_editor,
+                    orbit_camera,
+                    crate::craft_library::draw_craft_library_overlay,
+                )
+                    .chain(),
+            );
     }
 }
 
@@ -522,10 +532,13 @@ fn setup_view(mut commands: Commands) {
         },
         Transform::from_xyz(6.0, 12.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
+    // The craft-library modal overlay (WI 675), hidden until K/O opens it.
+    crate::craft_library::spawn_craft_library_overlay(&mut commands);
 }
 
 /// Keyboard orbit camera, always framing the editor's build volume. Crate-visible so the
 /// workshop's Build mode (WI 603) can run it under a state run-condition.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn orbit_camera(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -534,7 +547,12 @@ pub(crate) fn orbit_camera(
     editor: Res<EditorState>,
     mut cam: ResMut<OrbitCam>,
     mut camera: Query<&mut Transform, With<Camera3d>>,
+    modal: Res<crate::craft_library::CraftLibraryModal>,
 ) {
+    // The library modal owns input (WI 675) — don't pan/zoom while naming or browsing.
+    if modal.is_open() {
+        return;
+    }
     let dt = time.delta_secs();
     if keys.pressed(KeyCode::KeyQ) {
         cam.yaw += dt;
@@ -584,7 +602,16 @@ pub(crate) fn orbit_camera(
 
 /// Editor keybindings over [`EditorState`]. Crate-visible so the workshop's Build mode (WI 603)
 /// can run it under a state run-condition.
-pub(crate) fn editor_input(keys: Res<ButtonInput<KeyCode>>, mut state: ResMut<EditorState>) {
+pub(crate) fn editor_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut state: ResMut<EditorState>,
+    modal: Res<crate::craft_library::CraftLibraryModal>,
+) {
+    // While the craft-library modal is up it owns the keyboard (WI 675): stand down so
+    // typing a name or browsing saves never also edits the craft.
+    if modal.is_open() {
+        return;
+    }
     // Move the cursor.
     let mut delta = IVec3::ZERO;
     if keys.just_pressed(KeyCode::ArrowLeft) {
@@ -679,20 +706,10 @@ pub(crate) fn editor_input(keys: Res<ButtonInput<KeyCode>>, mut state: ResMut<Ed
             .retain(|p| (p.mount - center).length() > 1e-6);
     }
 
-    // Save the whole build as a craft / load one back into Build (WI 637). Unlike a subassembly
-    // (which loads into the insert buffer), opening a craft *replaces* the current build.
-    if keys.just_pressed(KeyCode::KeyK) {
-        save(&state.craft, Kind::Craft, CRAFT_PATH);
-    }
-    if keys.just_pressed(KeyCode::KeyO) {
-        match load(CRAFT_PATH) {
-            Some(c) => {
-                info!("loaded craft ({} voxels) into Build", c.voxels.len());
-                state.craft = c;
-            }
-            None => warn!("no craft to load at {CRAFT_PATH}"),
-        }
-    }
+    // The whole-build craft save/load (`K`/`O`) now opens the named craft library
+    // (WI 675) — handled in `crate::craft_library`, which owns those keys while the
+    // modal is closed. Unlike a subassembly (which loads into the insert buffer),
+    // loading a craft *replaces* the current build.
     // Save as a blueprint / a reusable subassembly.
     if keys.just_pressed(KeyCode::KeyB) {
         save(&state.craft, Kind::Blueprint, BLUEPRINT_PATH);
@@ -799,7 +816,11 @@ pub(crate) fn mouse_orbit_input(
     scroll: Res<AccumulatedMouseScroll>,
     buttons: Res<ButtonInput<MouseButton>>,
     mut cam: ResMut<OrbitCam>,
+    modal: Res<crate::craft_library::CraftLibraryModal>,
 ) {
+    if modal.is_open() {
+        return;
+    }
     if buttons.pressed(MouseButton::Middle) {
         // Horizontal drag orbits (yaw); vertical drag tilts (pitch), allowed below the horizon so
         // you can look up at the underside of the build.
@@ -864,7 +885,12 @@ pub(crate) fn mouse_build(
     hover: Res<HoverState>,
     pointer_on_palette: Res<PointerOnPalette>,
     mut state: ResMut<EditorState>,
+    modal: Res<crate::craft_library::CraftLibraryModal>,
 ) {
+    // The library modal owns input (WI 675): don't place/remove while it is open.
+    if modal.is_open() {
+        return;
+    }
     // A click that lands on the palette selects a brush; it must not also edit the world (WI 613).
     if pointer_on_palette.0 {
         return;

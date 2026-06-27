@@ -23,8 +23,9 @@
 //!
 //! Test controls (rocket): Shift/Ctrl throttle · Z/X full/cut · W/S/A/D/Q/E attitude · T SAS ·
 //! F off · `,`/`.` warp · Backspace reset. Test controls (rover): W/S drive · A/D steer ·
-//! Space brake · Backspace reset. `P` pauses/resumes either mode (WI 638). `K` saves the build as a
-//! craft, `O` opens one back into Build (WI 637). Build controls (WI 612): **mouse** — left-click places the active
+//! Space brake · Backspace reset. `P` pauses/resumes either mode (WI 638). `K` saves the build into
+//! the named craft library (a naming prompt), `O` opens the load browser to pick a saved vehicle
+//! (WI 637, 675). Build controls (WI 612): **mouse** — left-click places the active
 //! brush on the hovered face, right-click removes, middle-drag orbits, scroll zooms. The brush is
 //! chosen with Tab (material) and 1-7 (1 control · 2 computer · 3 battery · 4 engine · 5 tank ·
 //! 6/7 wheel drive / drive+steer); the craft renders as a **solid** mesh, gizmos only overlay the
@@ -933,6 +934,7 @@ impl Plugin for WorkshopScenePlugin {
             .add_systems(
                 Update,
                 (
+                    crate::craft_library::craft_library_input,
                     editor_input,
                     mouse_orbit_input,
                     update_hover,
@@ -944,6 +946,7 @@ impl Plugin for WorkshopScenePlugin {
                     draw_build_overlays,
                     update_palette_highlight,
                     update_build_hud,
+                    crate::craft_library::draw_craft_library_overlay,
                 )
                     .chain()
                     .run_if(in_state(WorkshopMode::Build)),
@@ -981,7 +984,12 @@ fn toggle_mode(
     pad_map: Res<GamepadMap>,
     state: Res<State<WorkshopMode>>,
     mut next: ResMut<NextState<WorkshopMode>>,
+    modal: Res<crate::craft_library::CraftLibraryModal>,
 ) {
+    // Enter confirms in the library modal (WI 675), so it must not also flip Build/Test.
+    if modal.is_open() {
+        return;
+    }
     let pad = pad_map.sample(&gamepads);
     if keys.just_pressed(KeyCode::Enter) {
         next.set(match state.get() {
@@ -1038,7 +1046,7 @@ fn enter_build(mut commands: Commands) {
     ));
     commands.spawn((
         Text::new(
-            "left-click place · right-click remove · middle-drag orbit · scroll zoom · pad: right-stick orbit / bumpers zoom · Tab material · K save · O open craft · P pause · Enter → TEST (4 wheels ⇒ drive it)",
+            "left-click place · right-click remove · middle-drag orbit · scroll zoom · pad: right-stick orbit / bumpers zoom · Tab material · K save vehicle · O load vehicle · P pause · Enter → TEST (4 wheels ⇒ drive it)",
         ),
         TextFont {
             font_size: 14.0,
@@ -1054,6 +1062,10 @@ fn enter_build(mut commands: Commands) {
         BuildEntity,
     ));
     spawn_palette(&mut commands);
+    // The craft-library modal overlay (WI 675), hidden until K/O opens it. Tagged so it
+    // tears down when leaving Build.
+    let overlay = crate::craft_library::spawn_craft_library_overlay(&mut commands);
+    commands.entity(overlay).insert(BuildEntity);
 }
 
 /// Spawns the left-edge Build palette (WI 613): a docked column of grouped, clickable swatch+label
@@ -1150,7 +1162,12 @@ fn track_pointer_over_palette(
 fn palette_click(
     buttons: Query<(&PaletteButton, &Interaction), Changed<Interaction>>,
     mut editor: ResMut<EditorState>,
+    modal: Res<crate::craft_library::CraftLibraryModal>,
 ) {
+    // Don't change the brush from a click while the library modal owns input (WI 675).
+    if modal.is_open() {
+        return;
+    }
     for (button, interaction) in &buttons {
         if *interaction == Interaction::Pressed {
             button.0.apply(&mut editor);

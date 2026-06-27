@@ -24,7 +24,12 @@ pub(crate) fn toggle_pause(
     pad_map: Res<crate::gamepad::GamepadMap>,
     clock: Res<SimClock>,
     mut commands: MessageWriter<Command>,
+    modal: Res<crate::craft_library::CraftLibraryModal>,
 ) {
+    // Don't pause from a stray `P` typed into the craft-library naming prompt (WI 675).
+    if modal.is_open() {
+        return;
+    }
     // P or the gamepad Start button (WI 617).
     if keys.just_pressed(KeyCode::KeyP) || pad_map.sample(&gamepads).pause {
         commands.write(Command::SetPaused(!clock.paused));
@@ -95,6 +100,7 @@ mod tests {
                 })
                 .insert_resource(ButtonInput::<KeyCode>::default())
                 .init_resource::<crate::gamepad::GamepadMap>()
+                .init_resource::<crate::craft_library::CraftLibraryModal>()
                 .init_resource::<Seen>()
                 .add_systems(Update, (toggle_pause, record).chain());
             app.world_mut()
