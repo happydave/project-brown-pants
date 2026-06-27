@@ -400,10 +400,15 @@ impl CraftThermal {
         }
     }
 
-    /// The hottest skin temperature (K) and whether any voxel has reached its
-    /// material limit — the re-entry gauge for the HUD/telemetry.
-    pub fn readout(&self, craft: &VoxelCraft) -> (f64, bool) {
-        (self.state.max_skin_temp(), self.state.any_over_limit(craft))
+    /// The hottest skin temperature (K), whether any voxel has reached its material
+    /// limit, and the remaining ablative-shield fraction (`None` if no ablator) — the
+    /// re-entry gauges for the HUD/telemetry (WI 688).
+    pub fn readout(&self, craft: &VoxelCraft) -> (f64, bool, Option<f64>) {
+        (
+            self.state.max_skin_temp(),
+            self.state.any_over_limit(craft),
+            self.state.ablator_fraction_remaining(craft),
+        )
     }
 }
 
@@ -661,9 +666,9 @@ mod tests {
         let _ = seen_vacuum_or_thin;
     }
 
-    /// The `-- dive` craft: a 3×3×4 composite hull with a single aluminium nose tip
-    /// at the windward front (cell (1,1,4)) — replicated from `dive_scene::dive_craft`
-    /// for the WI 691 calibration.
+    /// The `-- dive` craft: a 3×3×4 composite hull with a single **ablative** nose tip
+    /// at the windward front (cell (1,1,4), `Material::ABLATOR`, WI 688) — replicated
+    /// from `dive_scene::dive_craft` for the calibration.
     fn dive_calibration_craft() -> VoxelCraft {
         let mut c = VoxelCraft::new(1.0);
         for z in 0..4 {
@@ -678,21 +683,21 @@ mod tests {
         }
         c.voxels.push(Voxel {
             cell: IVec3::new(1, 1, 4),
-            material: Material::ALUMINIUM,
+            material: Material::ABLATOR,
         });
         c
     }
 
-    // --- WI 691/693: dive thermal calibration (full orbital re-entry chain) ---
+    // --- WI 691/693/688: dive thermal calibration (full orbital re-entry chain) ---
 
     /// The whole `-- dive` chain, headless: the dive craft on the **orbital** re-entry
     /// orbit coasts on rails, auto-drops to active at the entry interface, and descends
     /// through the atmosphere into the ocean while the `DescentPlugin` steps its
-    /// `CraftThermal`. Asserts WI 693's invariants together: the entry is genuinely
-    /// orbital (≥ 6 km/s), it reaches the ocean, and under `DIVE_HEAT_SCALE` the
-    /// aluminium nose overheats (≥ 900 K) while the composite hull survives (< 3000 K).
+    /// `CraftThermal`. Asserts the invariants together: the entry is genuinely orbital
+    /// (≥ 6 km/s, WI 693), it reaches the ocean, and under `DIVE_HEAT_SCALE` the
+    /// **ablative nose ablates and survives** (WI 688) while the composite hull survives.
     #[test]
-    fn dive_orbital_reentry_overheats_the_alu_nose_and_spares_the_composite_hull() {
+    fn dive_orbital_reentry_ablative_nose_survives_and_hull_survives() {
         use crate::active::Gravity;
         use crate::sim::CentralBody;
         use std::time::Duration;
@@ -762,6 +767,7 @@ mod tests {
         let mut reached_ocean = false;
         let mut peak_nose = 0.0_f64;
         let mut peak_hull = 0.0_f64;
+        let mut ablator_frac = 1.0_f64;
         for _ in 0..20_000 {
             app.world_mut()
                 .resource_mut::<Time<()>>()
@@ -783,6 +789,7 @@ mod tests {
                         peak_hull = peak_hull.max(th.state.skin(v.cell).unwrap());
                     }
                 }
+                ablator_frac = th.state.ablator_fraction_remaining(&craft).unwrap_or(1.0);
                 let altitude = b.position.length() - body.radius;
                 if descent.medium.sample_altitude(altitude).medium == MediumKind::Liquid {
                     reached_ocean = true;
@@ -798,14 +805,24 @@ mod tests {
         );
         // I1: it still descends all the way to the ocean.
         assert!(reached_ocean, "must reach the ocean");
-        // I3: the exposed aluminium nose overheats; the composite hull survives.
+        // WI 688: the ablative nose gets hot enough to ablate but **survives** (held
+        // below its bare-char failure temperature), and the composite hull survives.
         assert!(
-            peak_nose >= Material::ALUMINIUM.thermal.max_temp,
-            "alu nose should overheat: peak_nose={peak_nose}"
+            peak_nose >= Material::ABLATOR.thermal.ablation_temp,
+            "nose should reach the ablation set-point: peak_nose={peak_nose}"
+        );
+        assert!(
+            peak_nose < Material::ABLATOR.thermal.max_temp,
+            "ablative nose should survive (not reach bare-char failure): peak_nose={peak_nose}"
         );
         assert!(
             peak_hull < Material::COMPOSITE.thermal.max_temp,
             "composite hull should survive: peak_hull={peak_hull}"
+        );
+        // It survived by ablating: ablator consumed (the shield worked) but not spent.
+        assert!(
+            ablator_frac > 0.0 && ablator_frac < 1.0,
+            "ablator partially consumed: {ablator_frac}"
         );
     }
 

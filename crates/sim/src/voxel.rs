@@ -60,6 +60,13 @@ impl Material {
         strength: 6.0e8,
         thermal: Thermal::COMPOSITE,
     };
+    /// Carbon-phenolic **ablative heat shield** (WI 688): light, and it protects by
+    /// vaporising ablator rather than by a high bare failure temperature.
+    pub const ABLATOR: Material = Material {
+        density: 1_400.0,
+        strength: 5.0e7,
+        thermal: Thermal::ABLATOR,
+    };
 
     /// The strength assumed for a material loaded from a pre-strength save: high
     /// enough to be effectively unbreakable, so old craft do not spontaneously
@@ -84,6 +91,21 @@ pub struct Thermal {
     /// Maximum temperature, K — the skin temperature at which the voxel fails
     /// (consumed by the thermal→breakage failure path).
     pub max_temp: f64,
+    /// Ablation set-point, K (WI 688): while the skin is above this and ablator
+    /// remains, the surface vaporises ablator to hold near this temperature. `0`
+    /// (the default) = non-ablative. Defaulted on load so pre-ablation saves stay
+    /// backward-loadable.
+    #[serde(default)]
+    pub ablation_temp: f64,
+    /// Latent heat of ablation, J·kg⁻¹ (WI 688) — energy carried away per kg of
+    /// ablator vaporised. `0` = non-ablative.
+    #[serde(default)]
+    pub latent_heat: f64,
+    /// Ablator fraction, 0–1 (WI 688) — the share of a voxel's mass that is
+    /// consumable ablator (the rest is the bare structural material that remains
+    /// after burn-through). `0` = non-ablative.
+    #[serde(default)]
+    pub ablator_fraction: f64,
 }
 
 impl Default for Thermal {
@@ -102,6 +124,9 @@ impl Thermal {
         conductivity: 200.0,
         emissivity: 0.1,
         max_temp: 1.0e9,
+        ablation_temp: 0.0,
+        latent_heat: 0.0,
+        ablator_fraction: 0.0,
     };
     /// Aluminium-like: high conductivity, low emissivity, ~melting at 900 K.
     pub const ALUMINIUM: Thermal = Thermal {
@@ -109,6 +134,9 @@ impl Thermal {
         conductivity: 237.0,
         emissivity: 0.15,
         max_temp: 900.0,
+        ablation_temp: 0.0,
+        latent_heat: 0.0,
+        ablator_fraction: 0.0,
     };
     /// Steel-like: moderate conductivity, higher failure temperature.
     pub const STEEL: Thermal = Thermal {
@@ -116,6 +144,9 @@ impl Thermal {
         conductivity: 50.0,
         emissivity: 0.30,
         max_temp: 1_700.0,
+        ablation_temp: 0.0,
+        latent_heat: 0.0,
+        ablator_fraction: 0.0,
     };
     /// Titanium-like: low conductivity, high failure temperature.
     pub const TITANIUM: Thermal = Thermal {
@@ -123,6 +154,9 @@ impl Thermal {
         conductivity: 22.0,
         emissivity: 0.30,
         max_temp: 1_940.0,
+        ablation_temp: 0.0,
+        latent_heat: 0.0,
+        ablator_fraction: 0.0,
     };
     /// Carbon-composite-like: a poor conductor, strong radiator, very high
     /// failure temperature — the reference heat-shield material.
@@ -131,6 +165,22 @@ impl Thermal {
         conductivity: 5.0,
         emissivity: 0.80,
         max_temp: 3_000.0,
+        ablation_temp: 0.0,
+        latent_heat: 0.0,
+        ablator_fraction: 0.0,
+    };
+    /// Carbon-phenolic-like **ablative heat shield** (WI 688): a poor conductor and
+    /// strong radiator that, above its ablation set-point, vaporises ablator to carry
+    /// heat away — protecting the craft until the ablator is spent, then reverting to
+    /// a bare char that fails at `max_temp`.
+    pub const ABLATOR: Thermal = Thermal {
+        specific_heat: 1_500.0,
+        conductivity: 0.5,
+        emissivity: 0.85,
+        max_temp: 3_500.0,
+        ablation_temp: 1_300.0,
+        latent_heat: 5.0e6,
+        ablator_fraction: 0.6,
     };
 }
 

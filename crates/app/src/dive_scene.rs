@@ -63,9 +63,10 @@ const INITIAL_WARP: f64 = 30.0;
 /// than tunnelling the (non-collision) seabed.
 const REST_DEPTH: f64 = -3_500.0;
 
-/// A slender re-entry body along +Z (forward): a 3×3×4 composite hull with a
-/// denser, centred nose tip — a positive static margin so it weathervanes into the
-/// airflow, and a tapered area curve so it shows transonic wave drag (WI 526).
+/// A slender re-entry body along +Z (forward): a 3×3×4 composite hull with an
+/// **ablative heat-shield nose tip** (WI 688) at the windward front — a positive
+/// static margin so it weathervanes into the airflow, a tapered area curve for
+/// transonic wave drag (WI 526), and a shield that ablates to survive re-entry.
 fn dive_craft() -> VoxelCraft {
     let mut c = VoxelCraft::new(1.0);
     for z in 0..4 {
@@ -80,7 +81,7 @@ fn dive_craft() -> VoxelCraft {
     }
     c.voxels.push(Voxel {
         cell: IVec3::new(1, 1, 4),
-        material: Material::ALUMINIUM,
+        material: Material::ABLATOR,
     });
     c
 }
@@ -104,6 +105,8 @@ struct DiveReadout {
     skin_temp: f64,
     /// Any voxel at/over its material limit (overheating / burn-through).
     over_limit: bool,
+    /// Remaining ablative-shield fraction, or `None` if no shield (WI 688).
+    ablator_remaining: Option<f64>,
 }
 
 /// Marks the heads-up readout.
@@ -357,12 +360,14 @@ fn track_thermal(
     let Ok((dc, thermal, mat)) = craft.single() else {
         return;
     };
-    let (max_skin, over_limit) = thermal.readout(&dc.craft);
+    let (max_skin, over_limit, ablator_remaining) = thermal.readout(&dc.craft);
     readout.skin_temp = max_skin;
     readout.over_limit = over_limit;
+    readout.ablator_remaining = ablator_remaining;
     bridge.0 = Some(ThermalTelemetry {
         max_skin_temp: max_skin,
         over_limit,
+        ablator_remaining,
     });
     if let Some(material) = materials.get_mut(&mat.0) {
         material.emissive = glow_color(max_skin);
@@ -422,8 +427,13 @@ fn update_hud(readout: Res<DiveReadout>, mut hud: Query<&mut Text, With<Hud>>) {
         } else {
             ""
         };
+        // Ablative-shield budget (WI 688): a percentage that drains as the nose ablates.
+        let shield = match readout.ablator_remaining {
+            Some(frac) => format!("\nshield:   {:7.0} %", frac * 100.0),
+            None => String::new(),
+        };
         text.0 = format!(
-            "gear:     {gear}\naltitude: {alt:8.0} m\nspeed:    {speed:7.1} m/s\nmedium:   {medium}\nhull P:   {pressure_kpa:8.1} kPa\nram P:    {ram_kpa:8.1} kPa\nskin T:   {skin:8.0} K{heat}"
+            "gear:     {gear}\naltitude: {alt:8.0} m\nspeed:    {speed:7.1} m/s\nmedium:   {medium}\nhull P:   {pressure_kpa:8.1} kPa\nram P:    {ram_kpa:8.1} kPa\nskin T:   {skin:8.0} K{heat}{shield}"
         );
     }
 }

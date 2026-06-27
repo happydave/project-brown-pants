@@ -16,6 +16,12 @@
 //! - **Conduction** — skin→core within a voxel and core→core between
 //!   face-adjacent voxels, scaled by material conductivity.
 //!
+//! **Ablative shielding (WI 688).** An ablative material (e.g. [`crate::voxel::Thermal::ABLATOR`])
+//! carries a per-voxel ablator budget; while its skin is above the material's
+//! ablation set-point and ablator remains, a **thermostat** vaporises ablator to
+//! hold the surface near the set-point (the latent-heat sink). When the budget is
+//! spent the clamp stops and the skin rises into the failure path below.
+//!
 //! A voxel whose **skin** temperature reaches its material's maximum fails: the
 //! caller removes it and re-partitions the lattice through the existing
 //! connected-component breakage ([`sever_failed`]) — thermal adds no destruction
@@ -26,7 +32,7 @@
 //! idle craft is simply not stepped. The integrator sub-steps internally at an
 //! adaptively-bounded stable step so temperatures stay finite and bounded for any
 //! `dt` (the thermal analogue of the project's numerical-stability rule). Headless;
-//! the live `-- dive` wiring + HUD/telemetry are a scene-integration follow-up.
+//! the live `-- dive` wiring, HUD glow, and bus telemetry are in the dive scene (WI 691/693/688).
 
 use crate::aero::windward_faces;
 use crate::breakage::{connected_components, Severed};
@@ -80,10 +86,25 @@ pub struct VoxelTemp {
 #[derive(Clone, Debug, Default)]
 pub struct ThermalState {
     temps: HashMap<IVec3, VoxelTemp>,
+    /// Remaining ablator mass per voxel, kg (WI 688) — only present for ablative
+    /// materials; drained by the ablation thermostat, never refilled.
+    ablator: HashMap<IVec3, f64>,
+}
+
+/// The ablator mass budget of a voxel (kg): `density · cell_volume · ablator_fraction`,
+/// or 0 for a non-ablative material (WI 688).
+fn ablator_budget(material: &crate::voxel::Material, cell_volume: f64) -> f64 {
+    let th = material.thermal;
+    if th.ablation_temp > 0.0 && th.latent_heat > 0.0 && th.ablator_fraction > 0.0 {
+        material.density * cell_volume * th.ablator_fraction
+    } else {
+        0.0
+    }
 }
 
 impl ThermalState {
-    /// A fresh state with every voxel at `ambient` (both nodes).
+    /// A fresh state with every voxel at `ambient` (both nodes) and a full ablator
+    /// budget on each ablative voxel.
     pub fn new(craft: &VoxelCraft, ambient: f64) -> Self {
         let temps = craft
             .voxels
@@ -98,7 +119,16 @@ impl ThermalState {
                 )
             })
             .collect();
-        Self { temps }
+        let cell_volume = craft.cell_volume();
+        let ablator = craft
+            .voxels
+            .iter()
+            .filter_map(|v| {
+                let b = ablator_budget(&v.material, cell_volume);
+                (b > 0.0).then_some((v.cell, b))
+            })
+            .collect();
+        Self { temps, ablator }
     }
 
     /// The skin temperature of `cell`, if present.
@@ -207,6 +237,8 @@ impl ThermalState {
                 conv_power: q_density * exp.windward_area,
                 emissivity: th.emissivity,
                 neighbours,
+                ablation: (th.ablation_temp > 0.0 && th.latent_heat > 0.0)
+                    .then_some((th.ablation_temp, th.latent_heat)),
             });
         }
 
@@ -266,9 +298,30 @@ impl ThermalState {
                 p_core += g_cc * (core_nb - t.core);
             }
             let d_core = p_core / n.c_core * dt;
+            let mut new_skin = clamp_temp(t.skin + d_skin);
+            let new_core = clamp_temp(t.core + d_core);
+
+            // Ablation thermostat (WI 688): while this voxel is ablative, hot above the
+            // set-point, and has ablator remaining, vaporise ablator to carry the
+            // excess heat away — holding the skin toward the set-point (fully while the
+            // budget lasts, partially once it runs low). Only removes heat; once the
+            // budget hits zero the skin rises normally and can fail at `max_temp`.
+            if let Some((abl_temp, latent)) = n.ablation {
+                if new_skin > abl_temp {
+                    if let Some(remaining) = self.ablator.get_mut(&n.cell) {
+                        if *remaining > 0.0 && latent > 0.0 {
+                            let excess_q = n.c_skin * (new_skin - abl_temp);
+                            let consumed = (excess_q / latent).min(*remaining);
+                            new_skin -= consumed * latent / n.c_skin;
+                            *remaining -= consumed;
+                        }
+                    }
+                }
+            }
+
             let entry = self.temps.get_mut(&n.cell).expect("node cell present");
-            entry.skin = clamp_temp(t.skin + d_skin);
-            entry.core = clamp_temp(t.core + d_core);
+            entry.skin = new_skin;
+            entry.core = new_core;
         }
     }
 
@@ -297,6 +350,28 @@ impl ThermalState {
                 .unwrap_or(false)
         })
     }
+
+    /// Remaining ablator mass (kg) on `cell`, if it is an ablative voxel (WI 688).
+    pub fn ablator_remaining(&self, cell: IVec3) -> Option<f64> {
+        self.ablator.get(&cell).copied()
+    }
+
+    /// The craft's remaining ablator as a fraction of its initial budget (WI 688) —
+    /// the shield gauge for the HUD/telemetry. `None` if the craft carries no ablative
+    /// material; `0.0` once every shield is spent.
+    pub fn ablator_fraction_remaining(&self, craft: &VoxelCraft) -> Option<f64> {
+        let cell_volume = craft.cell_volume();
+        let mut total_initial = 0.0;
+        let mut total_remaining = 0.0;
+        for v in &craft.voxels {
+            let budget = ablator_budget(&v.material, cell_volume);
+            if budget > 0.0 {
+                total_initial += budget;
+                total_remaining += self.ablator.get(&v.cell).copied().unwrap_or(0.0);
+            }
+        }
+        (total_initial > 0.0).then(|| total_remaining / total_initial)
+    }
 }
 
 /// Per-voxel work record for one [`ThermalState::step`] call (static across the
@@ -312,6 +387,9 @@ struct Node {
     /// Occupied face-neighbours as `(cell, bond conductance)` for core↔core
     /// conduction (the conductance is the symmetric averaged value).
     neighbours: Vec<(IVec3, f64)>,
+    /// `(ablation_temp, latent_heat)` if the material is ablative (WI 688); the
+    /// thermostat consumes this voxel's ablator while its skin is above the set-point.
+    ablation: Option<(f64, f64)>,
 }
 
 /// The six axis-aligned face offsets of a cubic cell.
@@ -575,6 +653,109 @@ mod tests {
             !failed.is_empty(),
             "harsh heating should fail a voxel; max={}",
             st.max_skin_temp()
+        );
+    }
+
+    // --- WI 688: ablation ---
+
+    fn atmosphere(density: f64) -> FluidSample {
+        FluidSample {
+            density,
+            pressure: 0.0,
+            medium: MediumKind::Atmosphere,
+        }
+    }
+
+    // The headline: an ablative shield survives a re-entry that destroys bare metal.
+    #[test]
+    fn ablative_shield_survives_where_bare_material_fails() {
+        let sample = atmosphere(1.5);
+        let vel = DVec3::new(4000.0, 0.0, 0.0);
+
+        let bare = box_craft(2, 2, 2, 0.2, Material::ALUMINIUM); // max 900 K
+        let shield = box_craft(2, 2, 2, 0.2, Material::ABLATOR); // ablates at 1300 K
+        let mut sb = ThermalState::new(&bare, AMBIENT);
+        let mut ss = ThermalState::new(&shield, AMBIENT);
+
+        let mut bare_failed = false;
+        for _ in 0..150 {
+            sb.step(&bare, &sample, vel, DQuat::IDENTITY, AMBIENT, 0.05);
+            ss.step(&shield, &sample, vel, DQuat::IDENTITY, AMBIENT, 0.05);
+            if !sb.failed_cells(&bare).is_empty() {
+                bare_failed = true;
+            }
+        }
+        assert!(bare_failed, "bare aluminium should fail under the load");
+        assert!(
+            ss.failed_cells(&shield).is_empty(),
+            "ablative shield should survive: max_skin={}",
+            ss.max_skin_temp()
+        );
+        // It survived by ablating: some — but not all — ablator was consumed.
+        let frac = ss.ablator_fraction_remaining(&shield).unwrap();
+        assert!(
+            frac > 0.0 && frac < 1.0,
+            "ablator partially consumed: {frac}"
+        );
+        // The surface was held below the bare-char failure temperature.
+        assert!(ss.max_skin_temp() < Thermal::ABLATOR.max_temp);
+    }
+
+    // Once the ablator is spent, the bare char heats normally and fails.
+    #[test]
+    fn ablator_depletes_then_fails() {
+        // A small (0.1 m) shield voxel → a small budget → it depletes under a sustained
+        // harsh load, after which it exceeds its bare max temperature and fails.
+        let mut craft = VoxelCraft::new(0.1);
+        craft.voxels.push(Voxel {
+            cell: IVec3::ZERO,
+            material: Material::ABLATOR,
+        });
+        let sample = atmosphere(3.0);
+        let vel = DVec3::new(8000.0, 0.0, 0.0);
+        let mut st = ThermalState::new(&craft, AMBIENT);
+        let initial = st.ablator_remaining(IVec3::ZERO).unwrap();
+        assert!(initial > 0.0);
+
+        let mut failed = false;
+        for _ in 0..5000 {
+            st.step(&craft, &sample, vel, DQuat::IDENTITY, AMBIENT, 0.05);
+            if !st.failed_cells(&craft).is_empty() {
+                failed = true;
+                break;
+            }
+        }
+        assert_eq!(
+            st.ablator_remaining(IVec3::ZERO).unwrap(),
+            0.0,
+            "the ablator drained to empty"
+        );
+        assert!(failed, "after depletion the bare char fails");
+    }
+
+    // Passive shielding is just content: a high-max-temp material survives without a consumable.
+    #[test]
+    fn passive_shield_survives_mild_profile_without_ablator() {
+        let craft = box_craft(2, 2, 2, 1.0, Material::COMPOSITE); // max 3000 K, no ablator
+        let mut st = ThermalState::new(&craft, AMBIENT);
+        let sample = atmosphere(0.5);
+        for _ in 0..200 {
+            st.step(
+                &craft,
+                &sample,
+                DVec3::new(2000.0, 0.0, 0.0),
+                DQuat::IDENTITY,
+                AMBIENT,
+                0.05,
+            );
+        }
+        assert!(
+            st.failed_cells(&craft).is_empty(),
+            "passive composite survives a mild profile"
+        );
+        assert!(
+            st.ablator_fraction_remaining(&craft).is_none(),
+            "composite carries no ablator (passive shielding)"
         );
     }
 }

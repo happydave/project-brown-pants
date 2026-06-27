@@ -54,6 +54,11 @@ pub struct ThermalTelemetry {
     /// Whether any voxel has reached its material maximum temperature (overheating /
     /// burn-through). A shielded/blunt craft keeps this `false`.
     pub over_limit: bool,
+    /// Remaining ablative-shield budget as a fraction of its initial value (WI 688),
+    /// or `None` if the craft carries no ablator. `0.0` once the shield is spent.
+    /// Additive/serde-defaulted.
+    #[serde(default)]
+    pub ablator_remaining: Option<f64>,
 }
 
 /// The active craft's autonomy state on the bus (WI 569): the control-tier model from
@@ -592,10 +597,12 @@ mod tests {
         let thermal = ThermalTelemetry {
             max_skin_temp: 1234.5,
             over_limit: true,
+            ablator_remaining: Some(0.42),
         };
         let snap = Telemetry::capture(&SimClock::default(), None, 1.0, None).with_thermal(thermal);
         assert_eq!(snap.thermal.unwrap().max_skin_temp, 1234.5);
         assert!(snap.thermal.unwrap().over_limit);
+        assert_eq!(snap.thermal.unwrap().ablator_remaining, Some(0.42));
 
         let json = serde_json::to_string(&snap).unwrap();
         let back: Telemetry = serde_json::from_str(&json).unwrap();
