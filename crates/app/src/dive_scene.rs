@@ -250,11 +250,7 @@ fn setup_scene(
         *gear = GearState::new(mp.mass, mp.inertia);
         let thermal = CraftThermal::new(&voxels, DIVE_AMBIENT, DIVE_AMBIENT, DIVE_HEAT_SCALE);
         commands.entity(entity).insert((
-            DivingCraft {
-                craft: voxels,
-                com: mp.center_of_mass,
-                glide,
-            },
+            DivingCraft::new(voxels, mp.center_of_mass, glide),
             thermal,
             Mesh3d(meshes.add(Mesh::from(Cuboid::new(3.0, 3.0, 5.0)))),
             MeshMaterial3d(materials.add(StandardMaterial {
@@ -443,6 +439,7 @@ fn track_craft(
             0.0,
             sample.density,
             g_local,
+            &dc.enclosed,
         );
         readout.draft = load.draft;
         readout.heel = heel_angle(body.orientation, up);

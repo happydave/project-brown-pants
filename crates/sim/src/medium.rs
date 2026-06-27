@@ -17,6 +17,7 @@
 
 use crate::aero;
 use crate::command::Command;
+use crate::compartments::compartments;
 use crate::fluid::{FluidMedium, FluidSample};
 use crate::handoff::GearKind;
 use crate::orbit::Orbit;
@@ -25,7 +26,7 @@ use crate::voxel::{Axis, VoxelCraft};
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_time::prelude::*;
-use glam::{DQuat, DVec3};
+use glam::{DQuat, DVec3, IVec3};
 
 /// Aero/hydro drag: a force opposing the body's velocity relative to the
 /// (static) medium, scaling with the sampled density, speed², a reference area,
@@ -185,6 +186,11 @@ pub struct BuoyancyLoad {
 /// `up` is taken once as the radial out-vector at `body_position` (the craft ≪ planet), so the
 /// force matches the central [`buoyancy_force`] exactly and only the moment is new. `time` feeds
 /// the [`water_surface_radius`] seam (unused in calm water).
+///
+/// `enclosed` are the **enclosed airtight-compartment cells** (WI 711): a hollow hull floats on the
+/// water its hull encloses, not just the shell it is built from. They displace exactly like solid
+/// cells (graded, at their own location). Pass an empty slice for solid-only displacement (the WI 705
+/// behaviour). Derive them once via [`enclosed_cells`] and cache — do not recompute per sub-step.
 #[allow(clippy::too_many_arguments)]
 pub fn buoyancy_wrench(
     craft: &VoxelCraft,
@@ -195,6 +201,7 @@ pub fn buoyancy_wrench(
     time: f64,
     density: f64,
     gravity: f64,
+    enclosed: &[IVec3],
 ) -> BuoyancyLoad {
     if density <= 0.0 || gravity <= 0.0 {
         return BuoyancyLoad::default();
@@ -206,8 +213,14 @@ pub fn buoyancy_wrench(
     let mut torque = DVec3::ZERO;
     let mut submerged_volume = 0.0;
     let mut draft = 0.0_f64;
-    for v in &craft.voxels {
-        let local = (v.cell.as_dvec3() + DVec3::splat(0.5)) * craft.cell_size - com;
+    // Displacement = solid voxels (the hull) + enclosed compartment cells (the air it encloses).
+    let cells = craft
+        .voxels
+        .iter()
+        .map(|v| v.cell)
+        .chain(enclosed.iter().copied());
+    for cell in cells {
+        let local = (cell.as_dvec3() + DVec3::splat(0.5)) * craft.cell_size - com;
         let world = body_position + body_orientation * local;
         let fraction = cell_submerged_fraction(world, craft.cell_size, surface_radius, time);
         if fraction <= 0.0 {
@@ -226,6 +239,17 @@ pub fn buoyancy_wrench(
         submerged_volume,
         draft: draft.max(0.0),
     }
+}
+
+/// The enclosed airtight-compartment cells of a craft, flattened (WI 711) — the cells a hollow hull
+/// displaces in addition to its shell. Computed via [`crate::compartments::compartments`]; cache the
+/// result (e.g. on [`DivingCraft`]) rather than recomputing per sub-step.
+pub fn enclosed_cells(craft: &VoxelCraft) -> Vec<IVec3> {
+    compartments(craft)
+        .compartments
+        .iter()
+        .flat_map(|c| c.cells.iter().copied())
+        .collect()
 }
 
 /// Heel/tilt angle of a body from upright: the angle (radians) between the craft's body-up axis
@@ -338,6 +362,7 @@ pub fn descent_step(
     body: &mut crate::active::ActiveBody,
     craft: &VoxelCraft,
     com: DVec3,
+    enclosed: &[IVec3],
     params: &DescentParams,
     dt: f64,
 ) -> FluidSample {
@@ -366,11 +391,14 @@ pub fn descent_step(
         0.0, // calm water (WI 705 seam): wave-time threads sim time here
         sample.density,
         g_local,
+        enclosed,
     );
-    // Water-entry slam (WI 700): a transient impact while the craft straddles the surface.
-    let occupied = craft.occupied_volume();
-    let submerged_fraction = if occupied > 0.0 {
-        load.submerged_volume / occupied
+    // Water-entry slam (WI 700): a transient impact while the craft straddles the surface. The gate
+    // fraction is over the **total displaceable** volume (solid + enclosed, WI 711), so it stays in
+    // [0,1].
+    let displaceable = craft.occupied_volume() + enclosed.len() as f64 * craft.cell_volume();
+    let submerged_fraction = if displaceable > 0.0 {
+        load.submerged_volume / displaceable
     } else {
         0.0
     };
@@ -490,6 +518,7 @@ pub fn glide_step(
     body: &mut crate::active::ActiveBody,
     craft: &VoxelCraft,
     com: DVec3,
+    enclosed: &[IVec3],
     params: &GlideParams,
     dt: f64,
 ) -> FluidSample {
@@ -513,6 +542,7 @@ pub fn glide_step(
         0.0, // calm water (WI 705 seam): wave-time threads sim time here
         sample.density,
         g_local,
+        enclosed,
     );
 
     // Aero forces from the one area curve: lift ⊥ to the flow, transonic wave drag.
@@ -539,10 +569,11 @@ pub fn glide_step(
     );
 
     // Water-entry slam (WI 700): a transient impact while the craft straddles the surface,
-    // added to the central forces (same gate as the ballistic descent).
-    let occupied = craft.occupied_volume();
-    let submerged_fraction = if occupied > 0.0 {
-        load.submerged_volume / occupied
+    // added to the central forces (same gate as the ballistic descent). The fraction is over the
+    // total displaceable volume (solid + enclosed, WI 711).
+    let displaceable = craft.occupied_volume() + enclosed.len() as f64 * craft.cell_volume();
+    let submerged_fraction = if displaceable > 0.0 {
+        load.submerged_volume / displaceable
     } else {
         0.0
     };
@@ -643,6 +674,24 @@ pub struct DivingCraft {
     pub com: DVec3,
     /// Precomputed gliding-descent parameters.
     pub glide: GlideParams,
+    /// Cached enclosed airtight-compartment cells (WI 711) — the hull's enclosed air, displaced for
+    /// buoyancy alongside the solid voxels so a hollow hull floats. Computed once (geometry is fixed
+    /// across a descent); empty for a solid craft.
+    pub enclosed: Vec<IVec3>,
+}
+
+impl DivingCraft {
+    /// Build a diving craft, computing and caching its enclosed-compartment cells (WI 711) from the
+    /// voxel geometry. Prefer this over a struct literal so the cache is never forgotten.
+    pub fn new(craft: VoxelCraft, com: DVec3, glide: GlideParams) -> Self {
+        let enclosed = enclosed_cells(&craft);
+        Self {
+            craft,
+            com,
+            glide,
+            enclosed,
+        }
+    }
 }
 
 /// The convective heat-scale for the `-- dive` re-entry. **It is now `1.0` — the
@@ -754,7 +803,7 @@ fn advance_descent(
     let mut n = 0;
     while sub.accumulator >= dt && n < sub.max {
         for (mut body, dc, thermal) in &mut bodies {
-            let sample = glide_step(&mut body, &dc.craft, dc.com, &dc.glide, dt);
+            let sample = glide_step(&mut body, &dc.craft, dc.com, &dc.enclosed, &dc.glide, dt);
             // A craft carrying thermal state heats from the same medium sample and
             // motion the descent just used (WI 691) — a passive overlay (no force
             // feedback this slice), so the trajectory is unchanged.
@@ -974,7 +1023,7 @@ mod tests {
         let v0 = DVec3::new(0.0, -300.0, 0.0);
         let run = |params: &DescentParams| {
             let mut body = ActiveBody::new(start, v0, mp.mass, mp.inertia);
-            descent_step(&mut body, &craft, com, params, 1e-3);
+            descent_step(&mut body, &craft, com, &[], params, 1e-3);
             body
         };
         let slammed = run(&with_slam);
@@ -1050,7 +1099,7 @@ mod tests {
         let mut reached_ocean = false;
         let mut max_speed = 0.0_f64;
         for _ in 0..200_000 {
-            let sample = descent_step(&mut body, &craft, com, &params, dt);
+            let sample = descent_step(&mut body, &craft, com, &[], &params, dt);
             assert!(
                 body.position.is_finite() && body.velocity.is_finite(),
                 "state stayed finite"
@@ -1160,11 +1209,7 @@ mod tests {
             let e = q.single(app.world()).unwrap();
             app.world_mut().entity_mut(e).insert((
                 GearState::new(mp.mass, mp.inertia),
-                DivingCraft {
-                    craft: craft.clone(),
-                    com: mp.center_of_mass,
-                    glide,
-                },
+                DivingCraft::new(craft.clone(), mp.center_of_mass, glide),
                 CraftThermal::new(&craft, 250.0, 250.0, DIVE_HEAT_SCALE),
             ));
         }
@@ -1252,8 +1297,8 @@ mod tests {
         let mut below = above;
         below.position = DVec3::new(0.0, SURFACE_R - 1.0, 0.0);
 
-        let s_above = descent_step(&mut above, &craft, com, &params, 1e-3);
-        let s_below = descent_step(&mut below, &craft, com, &params, 1e-3);
+        let s_above = descent_step(&mut above, &craft, com, &[], &params, 1e-3);
+        let s_below = descent_step(&mut below, &craft, com, &[], &params, 1e-3);
         assert_eq!(s_above.medium, MediumKind::Atmosphere);
         assert_eq!(s_below.medium, MediumKind::Liquid);
         assert!(above.velocity.is_finite() && below.velocity.is_finite());
@@ -1378,11 +1423,7 @@ mod tests {
             let e = q.single(app.world()).unwrap();
             app.world_mut().entity_mut(e).insert((
                 GearState::new(mp.mass, mp.inertia),
-                DivingCraft {
-                    craft: craft.clone(),
-                    com: mp.center_of_mass,
-                    glide,
-                },
+                DivingCraft::new(craft.clone(), mp.center_of_mass, glide),
             ));
         }
         // Coast under warp; the entry trigger drops warp to 1 and switches gears.
@@ -1552,8 +1593,8 @@ mod tests {
 
         let dt = 0.004;
         for _ in 0..2_000 {
-            glide_step(&mut body, &craft, com, &glide, dt);
-            descent_step(&mut ballistic, &craft, com, &descent, dt);
+            glide_step(&mut body, &craft, com, &[], &glide, dt);
+            descent_step(&mut ballistic, &craft, com, &[], &descent, dt);
         }
 
         // The glider converted descent into downrange (+X) motion; the ballistic
@@ -1595,7 +1636,7 @@ mod tests {
         let mut late_max = 0.0_f64;
         let mut max_omega = 0.0_f64;
         for i in 0..4_000 {
-            glide_step(&mut body, &craft, com, &glide, dt);
+            glide_step(&mut body, &craft, com, &[], &glide, dt);
             let a = aoa(body.orientation, glide.forward_local, body.velocity);
             if i < 1_000 {
                 early_max = early_max.max(a);
@@ -1635,8 +1676,8 @@ mod tests {
         );
         g_air.orientation = aligned;
         let mut d_air = g_air;
-        let s = glide_step(&mut g_air, &craft, com, &glide, 0.004);
-        descent_step(&mut d_air, &craft, com, &descent, 0.004);
+        let s = glide_step(&mut g_air, &craft, com, &[], &glide, 0.004);
+        descent_step(&mut d_air, &craft, com, &[], &descent, 0.004);
         assert_eq!(s.medium, MediumKind::Atmosphere);
         assert!(
             g_air.velocity.length() < d_air.velocity.length(),
@@ -1653,8 +1694,8 @@ mod tests {
         );
         g_w.orientation = aligned;
         let mut d_w = g_w;
-        let sw = glide_step(&mut g_w, &craft, com, &glide, 0.004);
-        descent_step(&mut d_w, &craft, com, &descent, 0.004);
+        let sw = glide_step(&mut g_w, &craft, com, &[], &glide, 0.004);
+        descent_step(&mut d_w, &craft, com, &[], &descent, 0.004);
         assert_eq!(sw.medium, MediumKind::Liquid);
         assert!(
             (g_w.velocity - d_w.velocity).length() < 1e-9,
@@ -1728,6 +1769,7 @@ mod tests {
             0.0,
             rho,
             g,
+            &[],
         );
         let full = rho * g * craft.occupied_volume();
         assert!(
@@ -1746,6 +1788,7 @@ mod tests {
             0.0,
             rho,
             g,
+            &[],
         );
         assert_eq!(dry.force, DVec3::ZERO);
         assert_eq!(dry.torque, DVec3::ZERO);
@@ -1761,6 +1804,7 @@ mod tests {
             0.0,
             0.0,
             g,
+            &[],
         );
         assert_eq!(vac.force, DVec3::ZERO);
         assert_eq!(vac.torque, DVec3::ZERO);
@@ -1780,7 +1824,7 @@ mod tests {
         // Beam-spread raft: a restoring moment (torque.z opposite in sign to the heel θ).
         let raft = raft_hull(7, 3);
         let com = raft.mass_properties().unwrap().center_of_mass;
-        let load = buoyancy_wrench(&raft, com, pos, heel, SURFACE_R, 0.0, rho, g);
+        let load = buoyancy_wrench(&raft, com, pos, heel, SURFACE_R, 0.0, rho, g, &[]);
         assert!(
             load.torque.z * theta < 0.0,
             "beam hull rights (restoring): {:?}",
@@ -1798,6 +1842,7 @@ mod tests {
             0.0,
             rho,
             g,
+            &[],
         );
         assert!(
             load2.torque.z.abs() > beam_restoring,
@@ -1814,7 +1859,7 @@ mod tests {
             });
         }
         let lcom = line.mass_properties().unwrap().center_of_mass;
-        let lload = buoyancy_wrench(&line, lcom, pos, heel, SURFACE_R, 0.0, rho, g);
+        let lload = buoyancy_wrench(&line, lcom, pos, heel, SURFACE_R, 0.0, rho, g, &[]);
         assert!(
             lload.torque.z.abs() < 1e-6,
             "centreline-on-roll-axis hull has ~zero roll stiffness: {:?}",
@@ -1857,7 +1902,7 @@ mod tests {
         let dt = 0.005;
         let mut max_late_heel = 0.0_f64;
         for i in 0..20_000 {
-            descent_step(&mut body, &craft, com, &params, dt);
+            descent_step(&mut body, &craft, com, &[], &params, dt);
             assert!(
                 body.position.is_finite() && body.velocity.is_finite(),
                 "state stayed finite at step {i}"
@@ -1900,5 +1945,165 @@ mod tests {
         // A water surface descending with the hull at the same rate ⇒ zero relative closing ⇒ no slam.
         let following = entry_impact_force(rho, down, down, up, area, 0.5, cs);
         assert_eq!(following, DVec3::ZERO);
+    }
+
+    // --- WI 711: enclosed-volume buoyancy (hollow hulls float) ---
+
+    /// A sealed hollow box: an `n×n×n` cube whose surface cells are solid and whose interior is
+    /// empty (one sealed compartment). Editor-scale 0.5 m cells.
+    fn sealed_box(n: i32, material: Material) -> VoxelCraft {
+        let mut c = VoxelCraft::new(0.5);
+        for x in 0..n {
+            for y in 0..n {
+                for z in 0..n {
+                    let on_surface =
+                        x == 0 || x == n - 1 || y == 0 || y == n - 1 || z == 0 || z == n - 1;
+                    if on_surface {
+                        c.voxels.push(Voxel {
+                            cell: IVec3::new(x, y, z),
+                            material,
+                        });
+                    }
+                }
+            }
+        }
+        c
+    }
+
+    /// Behaviour 3: `enclosed_cells` is exactly the airtight-compartment interior — the sealed box's
+    /// `(n−2)³` interior cells, and nothing for a solid block.
+    #[test]
+    fn enclosed_cells_are_the_sealed_interior() {
+        let hull = sealed_box(5, Material::ALUMINIUM);
+        assert_eq!(enclosed_cells(&hull).len(), 27, "interior 3×3×3 enclosed"); // (5−2)³
+        let solid = test_craft(); // a dense 2×2×2 block — no sealed interior
+        assert!(
+            enclosed_cells(&solid).is_empty(),
+            "a solid block encloses nothing"
+        );
+    }
+
+    /// Behaviours 1, 4: the buoyant force counts the enclosed volume — a hull submerged with its
+    /// enclosed cells displaces exactly the enclosed volume more than the shell alone, still zero in
+    /// vacuum.
+    #[test]
+    fn buoyant_force_includes_enclosed_volume() {
+        let hull = sealed_box(5, Material::ALUMINIUM);
+        let enc = enclosed_cells(&hull);
+        let com = hull.mass_properties().unwrap().center_of_mass;
+        let pos = DVec3::new(0.0, SURFACE_R - 100.0, 0.0); // fully submerged
+        let rho = 1_025.0;
+        let g = 9.81;
+        let shell = buoyancy_wrench(
+            &hull,
+            com,
+            pos,
+            DQuat::IDENTITY,
+            SURFACE_R,
+            0.0,
+            rho,
+            g,
+            &[],
+        );
+        let whole = buoyancy_wrench(
+            &hull,
+            com,
+            pos,
+            DQuat::IDENTITY,
+            SURFACE_R,
+            0.0,
+            rho,
+            g,
+            &enc,
+        );
+        assert!(
+            whole.force.length() > shell.force.length(),
+            "enclosed adds buoyancy"
+        );
+        let enclosed_vol = enc.len() as f64 * hull.cell_volume();
+        assert!(
+            (whole.submerged_volume - shell.submerged_volume - enclosed_vol).abs() < 1e-9,
+            "extra displaced volume = the enclosed volume exactly"
+        );
+        // Vacuum still zero even with enclosed cells.
+        let vac = buoyancy_wrench(
+            &hull,
+            com,
+            pos,
+            DQuat::IDENTITY,
+            SURFACE_R,
+            0.0,
+            0.0,
+            g,
+            &enc,
+        );
+        assert_eq!(vac.force, DVec3::ZERO);
+    }
+
+    /// Behaviour 2 (the headline): a hollow hull **floats only because of its enclosed volume** — the
+    /// same hull + mass with the enclosed cells counted rises to the surface, but displacing the shell
+    /// alone it sinks. Isolates the enclosed-volume effect (mass held identical).
+    #[test]
+    fn hollow_hull_floats_only_because_of_enclosed_volume() {
+        let hull = sealed_box(5, Material::ALUMINIUM);
+        let enc = enclosed_cells(&hull);
+        let mp = hull.mass_properties().unwrap();
+        let com = mp.center_of_mass;
+        let params = DescentParams {
+            medium: FluidMedium::EARTHLIKE,
+            mu: MU,
+            surface_radius: SURFACE_R,
+            drag_area: max_cross_section(&hull),
+            drag_coefficient: 1.0,
+            slam_coefficient: 0.0, // isolate buoyancy from the entry slam
+        };
+        let cv = hull.cell_volume();
+        let shell_vol = hull.occupied_volume();
+        let total_vol = shell_vol + enc.len() as f64 * cv;
+        // Mass between shell displacement and total displacement: floats with enclosed, sinks without.
+        let mass = 0.5 * 1_025.0 * (shell_vol + total_vol);
+        assert!(
+            1_025.0 * shell_vol < mass,
+            "shell alone cannot float this mass"
+        );
+        assert!(1_025.0 * total_vol > mass, "shell + enclosed can");
+        let inertia = mp.inertia * (mass / mp.mass);
+
+        let run = |enclosed: &[IVec3]| {
+            let mut body = ActiveBody::new(
+                DVec3::new(0.0, SURFACE_R - 1.0, 0.0), // start 1 m under
+                DVec3::ZERO,
+                mass,
+                inertia,
+            );
+            for _ in 0..40_000 {
+                descent_step(&mut body, &hull, com, enclosed, &params, 0.005);
+            }
+            body.position.length() - SURFACE_R // final altitude relative to the surface
+        };
+        let floats = run(&enc);
+        let sinks = run(&[]);
+        assert!(
+            floats > -2.0,
+            "with enclosed volume the hull rises to/near the surface: {floats:.2} m"
+        );
+        assert!(
+            sinks < floats - 1.0,
+            "without it (shell only) it sinks markedly deeper: shell {sinks:.2} vs hull {floats:.2}"
+        );
+    }
+
+    /// Behaviour 5: a breached hull (a hole in the shell) has no sealed compartment, so it loses its
+    /// enclosed-volume buoyancy — composing with flooding (WI 520) without a special case.
+    #[test]
+    fn a_breached_hull_loses_enclosed_buoyancy() {
+        let mut hull = sealed_box(5, Material::ALUMINIUM);
+        assert_eq!(enclosed_cells(&hull).len(), 27);
+        // Punch a 1-cell hole in a wall: the exterior now reaches the interior ⇒ no sealed volume.
+        hull.voxels.retain(|v| v.cell != IVec3::new(0, 2, 2));
+        assert!(
+            enclosed_cells(&hull).is_empty(),
+            "a breached hull encloses nothing"
+        );
     }
 }
