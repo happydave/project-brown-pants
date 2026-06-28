@@ -399,7 +399,7 @@ fn harbor_camera_input(
     mut cam: ResMut<HarborCam>,
 ) {
     if buttons.pressed(MouseButton::Middle) {
-        cam.yaw += motion.delta.x * 0.01;
+        cam.yaw -= motion.delta.x * 0.01; // drag-right swings the view right (L/R swapped per Dave)
         cam.pitch = (cam.pitch + motion.delta.y * 0.01).clamp(-1.3, 1.3);
     }
     if scroll.delta.y != 0.0 {
