@@ -790,6 +790,7 @@ impl Plugin for DescentPlugin {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn advance_descent(
     time: Res<Time>,
     clock: Res<SimClock>,
@@ -799,6 +800,7 @@ fn advance_descent(
         &DivingCraft,
         Option<&mut CraftThermal>,
         Option<&mut crate::marine::MarinePropulsion>,
+        Option<&mut crate::ballast::Ballast>,
     )>,
 ) {
     if clock.paused {
@@ -813,7 +815,7 @@ fn advance_descent(
     let dt = sub.dt;
     let mut n = 0;
     while sub.accumulator >= dt && n < sub.max {
-        for (mut body, dc, thermal, marine) in &mut bodies {
+        for (mut body, dc, thermal, marine, ballast) in &mut bodies {
             // Marine propulsion (WI 708): a screw's thrust wrench, scaled by the medium
             // density at each thruster, drawn from its tanks — the external force into
             // `glide_step`. Absent component ⇒ zero (the dive path is unaffected).
@@ -829,10 +831,24 @@ fn advance_descent(
             } else {
                 (DVec3::ZERO, DVec3::ZERO)
             };
+            // Ballast (WI 709): step fill/blow, fold the tank water mass + CoM into the
+            // body on the floodwater precedent, and use the **wet** CoM for the descent
+            // (so net buoyancy flips sign as it floods and it sits lower / trims). The
+            // ballast water is the liquid the tanks sit in (sampled at depth, so it is
+            // inert above an ocean / in vacuum). Absent component ⇒ the dry mass/CoM.
+            let com = if let Some(mut b) = ballast {
+                b.step(dt);
+                let water_density = dc.glide.descent.medium.sample_altitude(-1.0).density;
+                let wet = b.wet_mass(dc.com, water_density);
+                body.mass = wet.mass;
+                wet.center_of_mass
+            } else {
+                dc.com
+            };
             let sample = glide_step(
                 &mut body,
                 &dc.craft,
-                dc.com,
+                com,
                 &dc.enclosed,
                 &dc.glide,
                 external,

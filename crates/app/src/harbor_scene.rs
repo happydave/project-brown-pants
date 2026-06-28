@@ -32,6 +32,7 @@ use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 
 use sounding_sim::active::{ActiveBody, Gravity};
+use sounding_sim::ballast::{Ballast, BallastCommand, BallastTank};
 use sounding_sim::fluid::FluidMedium;
 use sounding_sim::frame::{FrameId, WorldPos};
 use sounding_sim::marine::{MarinePropulsion, MarineThruster, ThrusterCommand};
@@ -137,6 +138,8 @@ struct HarborReadout {
     thrust: f64,
     /// Fuel/charge fraction in `[0, 1]` (WI 708).
     fuel: f64,
+    /// Ballast fill fraction in `[0, 1]` (WI 709).
+    ballast: f64,
 }
 
 // --- markers (teardown: tag only the root of each spawned tree) ---
@@ -218,6 +221,7 @@ impl Plugin for HarborScenePlugin {
                 Update,
                 (
                     harbor_drive_input,
+                    harbor_ballast_input,
                     track_hull,
                     harbor_camera_input,
                     follow_camera,
@@ -324,6 +328,61 @@ fn synth_marine(craft: &VoxelCraft) -> MarinePropulsion {
     }
 }
 
+/// A synthesized ballast tank for a built hull (WI 709): one tank low at the keel, sized so a full
+/// flood **clearly overcomes the hull's reserve buoyancy** (≈1.5× the reserve), so flooding it sinks a
+/// boat that floats empty and blowing it surfaces — controllable dive/surface/hold. `dry_mass` is
+/// cached for the per-tick fold. `None` ⇒ no ballast (an empty/barely-floating hull). Player-placed
+/// ballast awaits the WI 715 device palette.
+fn synth_ballast(craft: &VoxelCraft) -> Option<Ballast> {
+    let mp = craft.mass_properties()?;
+    let g = 9.81;
+    // The hull's reserve buoyancy (fully-submerged displaced weight − real weight), as a mass.
+    let deep = DVec3::new(0.0, BODY.radius - 100.0, 0.0);
+    let max_buoy = buoyancy_wrench(
+        craft,
+        mp.center_of_mass,
+        deep,
+        DQuat::IDENTITY,
+        BODY.radius,
+        0.0,
+        1_025.0,
+        g,
+        &enclosed_cells(craft),
+    )
+    .force
+    .length();
+    let reserve_mass = ((max_buoy - mp.mass * g) / g).max(0.0);
+    if reserve_mass <= 0.0 {
+        return None; // already sinks; ballast is meaningless
+    }
+    let cap_volume = 1.5 * reserve_mass / 1_025.0; // m³ of water to clearly overcome the reserve
+    let cs = craft.cell_size;
+    let (mut lo, mut hi) = (IVec3::MAX, IVec3::MIN);
+    for v in &craft.voxels {
+        lo = lo.min(v.cell);
+        hi = hi.max(v.cell);
+    }
+    let min_m = lo.as_dvec3() * cs;
+    let max_m = (hi.as_dvec3() + DVec3::ONE) * cs;
+    let mount = DVec3::new(
+        0.5 * (min_m.x + max_m.x),
+        min_m.y + 0.5 * cs, // low in the hull, so a flooded tank sinks the bow evenly and trims down
+        0.5 * (min_m.z + max_m.z),
+    );
+    let rate = cap_volume / 6.0; // ~6 s to fully flood or blow
+    Some(Ballast {
+        tanks: vec![BallastTank {
+            capacity: cap_volume,
+            mount,
+            fill: 0.0,
+            fill_rate: rate,
+            blow_rate: rate,
+        }],
+        command: BallastCommand::Hold,
+        dry_mass: mp.mass,
+    })
+}
+
 /// Enters Float: assemble the built hull and spawn the floating waterfront (WI 706 + 707).
 fn enter_float(
     mut commands: Commands,
@@ -343,43 +402,47 @@ fn enter_float(
         // A synthesized stern drive (WI 708): no device palette yet (WI 715), so any built hull
         // gets a port+starboard screw pair so it can sail and steer (differential thrust).
         let marine = synth_marine(&craft);
-        commands
-            .spawn((
-                body,
-                dc,
-                marine,
-                Transform::default(),
-                Visibility::default(),
-                WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, start_render)),
-                HullMarker,
-                FloatEntity,
-            ))
-            .with_children(|parent| {
-                // Render the built hull centred on the CoM — solid cubes in their per-material skin,
-                // thin panels as actual thin plates on the hull faces they form (WI 722).
-                let (solid, _) = split_panels(&craft);
-                for (material, mesh) in skin_submeshes(&solid, VoxelSkin::Hull) {
-                    let mat = pbr_material(material, &asset_server, &mut materials);
-                    parent.spawn((
-                        Mesh3d(meshes.add(mesh)),
-                        MeshMaterial3d(mat),
-                        Transform::from_translation(com_off),
-                    ));
-                }
-                let plates = plate_meshes(craft.cell_size, &mut meshes);
-                let mats = material_handles(&craft, &asset_server, &mut materials);
-                for (material, axis, pos) in panel_plate_specs(&craft) {
-                    let mat = mats
-                        .iter()
-                        .find(|(m, _)| *m == material)
-                        .map(|(_, h)| h.clone());
-                    parent.spawn((
-                        Mesh3d(plates[axis].clone()),
-                        MeshMaterial3d(mat.unwrap_or_default()),
-                        Transform::from_translation(pos + com_off),
-                    ));
-                }
-            });
+        // A synthesized ballast tank (WI 709): flood to dive, blow to surface (no palette yet, WI 715).
+        let ballast = synth_ballast(&craft);
+        let mut hull = commands.spawn((
+            body,
+            dc,
+            marine,
+            Transform::default(),
+            Visibility::default(),
+            WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, start_render)),
+            HullMarker,
+            FloatEntity,
+        ));
+        if let Some(b) = ballast {
+            hull.insert(b);
+        }
+        hull.with_children(|parent| {
+            // Render the built hull centred on the CoM — solid cubes in their per-material skin,
+            // thin panels as actual thin plates on the hull faces they form (WI 722).
+            let (solid, _) = split_panels(&craft);
+            for (material, mesh) in skin_submeshes(&solid, VoxelSkin::Hull) {
+                let mat = pbr_material(material, &asset_server, &mut materials);
+                parent.spawn((
+                    Mesh3d(meshes.add(mesh)),
+                    MeshMaterial3d(mat),
+                    Transform::from_translation(com_off),
+                ));
+            }
+            let plates = plate_meshes(craft.cell_size, &mut meshes);
+            let mats = material_handles(&craft, &asset_server, &mut materials);
+            for (material, axis, pos) in panel_plate_specs(&craft) {
+                let mat = mats
+                    .iter()
+                    .find(|(m, _)| *m == material)
+                    .map(|(_, h)| h.clone());
+                parent.spawn((
+                    Mesh3d(plates[axis].clone()),
+                    MeshMaterial3d(mat.unwrap_or_default()),
+                    Transform::from_translation(pos + com_off),
+                ));
+            }
+        });
     }
 
     // Distant ocean (sunk 2 m so it does not z-fight the animated patch).
@@ -486,7 +549,7 @@ fn enter_float(
 
     // HUD.
     commands.spawn((
-        Text::new("harbor — Float (Enter: Build)\nWASD: drive / steer\ndraft:  --\nheel:   --\nnet buoy: --\nthrust:  --   fuel: --"),
+        Text::new("harbor — Float (Enter: Build)\nWASD: drive / steer   F/G: dive / surface\ndraft:  --\nheel:   --\nnet buoy: --\nthrust:  --   fuel: --\nballast: --"),
         TextFont {
             font_size: 20.0,
             ..default()
@@ -865,6 +928,26 @@ fn harbor_drive_input(
     readout.fuel = mp.fuel_fraction();
 }
 
+/// Player ballast control (WI 709): hold `F` to **flood** (dive), hold `G` to **blow** (surface),
+/// release both to **hold** the current fill (hold depth). Publishes fill fraction to the HUD.
+fn harbor_ballast_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut readout: ResMut<HarborReadout>,
+    mut hull: Query<&mut Ballast, With<HullMarker>>,
+) {
+    let Ok(mut b) = hull.single_mut() else {
+        return;
+    };
+    b.command = if keys.pressed(KeyCode::KeyF) {
+        BallastCommand::Fill
+    } else if keys.pressed(KeyCode::KeyG) {
+        BallastCommand::Blow
+    } else {
+        BallastCommand::Hold
+    };
+    readout.ballast = b.fill_fraction();
+}
+
 /// Middle-drag orbit (L/R swapped per Dave), wheel zoom.
 fn harbor_camera_input(
     motion: Res<AccumulatedMouseMotion>,
@@ -916,12 +999,13 @@ fn update_hud(readout: Res<HarborReadout>, mut hud: Query<&mut Text, With<Hud>>)
             "floating"
         };
         text.0 = format!(
-            "harbor — Float (Enter: Build) — {status}\nWASD: drive / steer\ndraft:    {:6.2} m\nheel:     {:6.1} deg\nnet buoy: {:8.0} N\nthrust:   {:8.0} N   fuel: {:3.0}%",
+            "harbor — Float (Enter: Build) — {status}\nWASD: drive / steer   F/G: dive / surface\ndraft:    {:6.2} m\nheel:     {:6.1} deg\nnet buoy: {:8.0} N\nthrust:   {:8.0} N   fuel:    {:3.0}%\nballast:  {:3.0}%",
             readout.draft,
             readout.heel.to_degrees(),
             readout.net_buoyancy,
             readout.thrust,
             readout.fuel * 100.0,
+            readout.ballast * 100.0,
         );
     }
 }
@@ -1143,6 +1227,44 @@ mod tests {
             tq2.dot(up).abs() > 1e-3,
             "differential thrust steers: {tq2:?}"
         );
+    }
+
+    /// WI 709: flooding the synthesized ballast flips the seed hull's net buoyancy negative (it
+    /// dives), and blowing it recovers positive net buoyancy (it surfaces) — controllable and
+    /// reversible.
+    #[test]
+    fn ballast_flips_net_buoyancy_dive_and_surface() {
+        let seed = seed_hull();
+        let mut b = synth_ballast(&seed).expect("the panel hull has reserve buoyancy");
+        let g = 9.81;
+        let enc = enclosed_cells(&seed);
+        let mp = seed.mass_properties().unwrap();
+        let deep = DVec3::new(0.0, BODY.radius - 100.0, 0.0);
+        let buoy = buoyancy_wrench(
+            &seed,
+            mp.center_of_mass,
+            deep,
+            DQuat::IDENTITY,
+            BODY.radius,
+            0.0,
+            1_025.0,
+            g,
+            &enc,
+        )
+        .force
+        .length();
+        let net = |ballast: &Ballast| buoy - ballast.wet_mass(mp.center_of_mass, 1_025.0).mass * g;
+
+        // Blown (empty): the panel hull floats.
+        assert!(net(&b) > 0.0, "blown ballast ⇒ floats");
+        // Flood it fully: it sinks.
+        b.command = BallastCommand::Fill;
+        b.step(100.0);
+        assert!(net(&b) < 0.0, "flooded ballast ⇒ sinks (dives)");
+        // Blow it again: it floats once more (reversible).
+        b.command = BallastCommand::Blow;
+        b.step(100.0);
+        assert!(net(&b) > 0.0, "blown again ⇒ floats (reversible)");
     }
 
     #[test]

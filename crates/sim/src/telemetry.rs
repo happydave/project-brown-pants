@@ -54,6 +54,19 @@ pub struct Telemetry {
     /// snapshots without it deserialize to `None`.
     #[serde(default)]
     pub marine: Option<MarineTelemetry>,
+    /// Ballast state of the live craft (WI 709), when a scene carries a ballast tank
+    /// (a harbor submarine). Fill fraction. Additive/serde-defaulted: snapshots without
+    /// it deserialize to `None`.
+    #[serde(default)]
+    pub ballast: Option<BallastTelemetry>,
+}
+
+/// The live craft's ballast readout on the bus (WI 709): how full the ballast tanks are
+/// — the dive/surface gauge.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub struct BallastTelemetry {
+    /// Ballast fill fraction in `[0, 1]` (0 = blown/empty, 1 = fully flooded).
+    pub fill_fraction: f64,
 }
 
 /// The live craft's marine-propulsion readout on the bus (WI 708): the surface-drive
@@ -344,6 +357,7 @@ impl Telemetry {
             thermal: None,
             hydro: None,
             marine: None,
+            ballast: None,
         }
     }
 
@@ -385,6 +399,13 @@ impl Telemetry {
     /// scene driving a screw can layer the thrust/fuel readout onto `capture`.
     pub fn with_marine(mut self, marine: MarineTelemetry) -> Self {
         self.marine = Some(marine);
+        self
+    }
+
+    /// Attach ballast state to this snapshot (WI 709). Builder-style, so a harbor
+    /// submarine can layer the fill-fraction readout onto `capture`.
+    pub fn with_ballast(mut self, ballast: BallastTelemetry) -> Self {
+        self.ballast = Some(ballast);
         self
     }
 }

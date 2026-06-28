@@ -10,6 +10,7 @@ pub mod active;
 pub mod aero;
 pub mod attitude;
 pub mod autopilot;
+pub mod ballast;
 pub mod breakage;
 pub mod collision;
 pub mod collision_detect;
