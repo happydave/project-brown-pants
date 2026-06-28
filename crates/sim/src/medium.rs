@@ -456,6 +456,14 @@ pub const FREE_SURFACE_DAMPING: f64 = 2.0;
 /// resistance `∝ density · cell_area · fraction`. Kept separate from [`buoyancy_wrench`] so the
 /// hydrostatic force/draft/telemetry stay exactly the displaced weight; this only removes energy.
 /// Strictly dissipative (power `Σ f·v ≤ 0`) and zero at rest, in vacuum, or out of the water.
+///
+/// Yaw damping (WI 730): the up-component term alone leaves **yaw** undamped — yaw sweeps cells
+/// horizontally in the waterplane, where the up-component is ~zero — so a steered hull would spin in
+/// place after the rudder centres. Each cell additionally opposes the **horizontal** part of its
+/// *rotational* velocity (`angular_velocity × arm`, up-component removed). It is rotation-only (zero
+/// when `angular_velocity` is zero) so it bleeds off yaw and the horizontal sweep of roll/pitch without
+/// adding per-cell surge drag that would fight the thruster's forward drive; translation stays the job
+/// of the bulk drag. Same scale-relative sizing, still strictly dissipative and zero at rest.
 #[allow(clippy::too_many_arguments)]
 pub fn free_surface_damping(
     craft: &VoxelCraft,
@@ -486,8 +494,15 @@ pub fn free_surface_damping(
         }
         let arm = world - body_position;
         let v_cell = body_velocity + angular_velocity.cross(arm);
+        let resistance = coefficient * density * cell_area * fraction;
+        // Heave/roll/pitch: oppose the cell's velocity along local up.
         let v_up = v_cell.dot(up);
-        let f = -coefficient * density * cell_area * fraction * v_up * up;
+        let mut f = -resistance * v_up * up;
+        // Yaw (WI 730): oppose the horizontal part of the cell's rotational velocity only, so a
+        // steered hull bleeds off its yaw rate instead of spinning in place — without damping surge.
+        let v_rot = angular_velocity.cross(arm);
+        let v_rot_h = v_rot - v_rot.dot(up) * up;
+        f -= resistance * v_rot_h;
         force += f;
         torque += arm.cross(f);
     }
@@ -2229,6 +2244,82 @@ mod tests {
         assert!(
             altitude.abs() < 5.0,
             "settles near the waterline (bounded): {altitude:.2} m"
+        );
+    }
+
+    /// WI 730: a floating hull given a yaw rate with no steering input **bleeds it off** instead of
+    /// spinning in place. The up-component damping alone leaves yaw undamped (it sweeps cells
+    /// horizontally); the horizontal rotational term must settle it. Surge is left to the bulk drag,
+    /// so this asserts the *rotational* decay specifically. Light editor-scale fixture.
+    #[test]
+    fn a_yawing_raft_stops_spinning() {
+        let craft = raft_hull(7, 3);
+        let mp = craft.mass_properties().unwrap();
+        let com = mp.center_of_mass;
+        let params = DescentParams {
+            medium: FluidMedium::EARTHLIKE,
+            mu: MU,
+            surface_radius: SURFACE_R,
+            drag_area: max_cross_section(&craft),
+            drag_coefficient: 1.0,
+            slam_coefficient: DEFAULT_SLAM_COEFFICIENT,
+        };
+        let mass = 0.5 * 1_025.0 * craft.occupied_volume();
+        let inertia = mp.inertia * (mass / mp.mass);
+        // Yaw about local up (+Y here, since position is on the +Y axis).
+        let mut body = ActiveBody::new(
+            DVec3::new(0.0, SURFACE_R - 0.1, 0.0),
+            DVec3::ZERO,
+            mass,
+            inertia,
+        )
+        .with_angular_velocity(DVec3::new(0.0, 1.0, 0.0));
+        let up = body.position.normalize_or_zero();
+        let yaw0 = body.angular_velocity().dot(up).abs();
+
+        let dt = 0.005;
+        for i in 0..20_000 {
+            descent_step(&mut body, &craft, com, &[], &params, dt);
+            assert!(
+                body.angular_velocity().is_finite(),
+                "angular velocity stayed finite at step {i}"
+            );
+        }
+        let up = body.position.normalize_or_zero();
+        let yaw1 = body.angular_velocity().dot(up).abs();
+        assert!(
+            yaw1 < 0.05 * yaw0,
+            "yaw rate bleeds off (no continuous spin): {yaw0:.3} → {yaw1:.3} rad/s"
+        );
+    }
+
+    /// WI 730: the yaw damping is **rotation-only** — it must not add per-cell surge drag that fights
+    /// the thruster. A hull translating forward with no spin sees no extra horizontal damping force
+    /// beyond the existing up-component term (which is zero for purely horizontal motion).
+    #[test]
+    fn yaw_damping_does_not_damp_surge() {
+        let craft = raft_hull(7, 3);
+        let mp = craft.mass_properties().unwrap();
+        let com = mp.center_of_mass;
+        let body_position = DVec3::new(0.0, SURFACE_R - 0.1, 0.0);
+        let up = body_position.normalize_or_zero();
+        // Pure horizontal (surge) velocity, no rotation: tangent to the surface.
+        let surge = up.cross(DVec3::Z).normalize() * 5.0;
+        let (force, torque) = free_surface_damping(
+            &craft,
+            com,
+            body_position,
+            DQuat::IDENTITY,
+            surge,
+            DVec3::ZERO,
+            SURFACE_R,
+            0.0,
+            FluidMedium::EARTHLIKE.sample_altitude(-1.0).density,
+            FREE_SURFACE_DAMPING,
+        );
+        assert!(
+            force.length() < 1e-6 && torque.length() < 1e-6,
+            "no damping on pure horizontal surge: f={force:?} t={torque:?}"
         );
     }
 
