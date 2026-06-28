@@ -306,12 +306,22 @@ fn enter_float(
                 FloatEntity,
             ))
             .with_children(|parent| {
-                // Render the actual built hull (solid, per-material sub-meshes) centred on the CoM.
-                for (material, mesh) in skin_submeshes(&craft, VoxelSkin::Hull) {
+                // Render the actual built hull centred on the CoM — solid cubes in their per-material
+                // skin, thin panels in the distinct panel material (WI 719).
+                let (solid, panel) = split_panels(&craft);
+                for (material, mesh) in skin_submeshes(&solid, VoxelSkin::Hull) {
                     let mat = pbr_material(material, &asset_server, &mut materials);
                     parent.spawn((
                         Mesh3d(meshes.add(mesh)),
                         MeshMaterial3d(mat),
+                        Transform::from_translation(com_off),
+                    ));
+                }
+                let pmat = panel_material(&mut materials);
+                for (_m, mesh) in skin_submeshes(&panel, VoxelSkin::Hull) {
+                    parent.spawn((
+                        Mesh3d(meshes.add(mesh)),
+                        MeshMaterial3d(pmat.clone()),
                         Transform::from_translation(com_off),
                     ));
                 }
@@ -516,7 +526,9 @@ fn sync_build_meshes(
     for e in &existing {
         commands.entity(e).despawn();
     }
-    for (material, mesh) in skin_submeshes(&editor.craft, VoxelSkin::Hull) {
+    // Render solid cubes with their per-material skin, thin panels in the distinct panel material (WI 719).
+    let (solid, panel) = split_panels(&editor.craft);
+    for (material, mesh) in skin_submeshes(&solid, VoxelSkin::Hull) {
         let mat = pbr_material(material, &asset_server, &mut materials);
         commands.spawn((
             Mesh3d(meshes.add(mesh)),
@@ -526,6 +538,42 @@ fn sync_build_meshes(
             BuildEntity,
         ));
     }
+    let pmat = panel_material(&mut materials);
+    for (_m, mesh) in skin_submeshes(&panel, VoxelSkin::Hull) {
+        commands.spawn((
+            Mesh3d(meshes.add(mesh)),
+            MeshMaterial3d(pmat.clone()),
+            Transform::default(),
+            BuildMesh,
+            BuildEntity,
+        ));
+    }
+}
+
+/// Partition a craft's voxels into a **solid-cube** craft and a **thin-panel** craft (WI 719), so each
+/// can render with its own material. Hull-skin only (devices/parts unneeded here).
+fn split_panels(craft: &VoxelCraft) -> (VoxelCraft, VoxelCraft) {
+    let mut solid = VoxelCraft::new(craft.cell_size);
+    let mut panel = VoxelCraft::new(craft.cell_size);
+    for v in &craft.voxels {
+        if craft.is_panel(v.cell) {
+            panel.voxels.push(*v);
+        } else {
+            solid.voxels.push(*v);
+        }
+    }
+    (solid, panel)
+}
+
+/// A distinct **panel** material (WI 719): a cool plate blue-grey, clearly different from the metallic
+/// solid-cube skin, so thin panels read at a glance.
+fn panel_material(materials: &mut Assets<StandardMaterial>) -> Handle<StandardMaterial> {
+    materials.add(StandardMaterial {
+        base_color: Color::srgb(0.42, 0.60, 0.72),
+        metallic: 0.2,
+        perceptual_roughness: 0.5,
+        ..default()
+    })
 }
 
 /// Will this craft float, and at what draft? (WI 720, the Build-mode predictor.) Net buoyancy is the
@@ -761,6 +809,23 @@ mod tests {
             net_buoyancy(&solid) < 0.0,
             "the same hull in solid cubes sinks"
         );
+    }
+
+    /// WI 719: `split_panels` partitions voxels into solid + panel sets for distinct rendering.
+    #[test]
+    fn split_panels_partitions_solid_and_panel_cells() {
+        // The all-panel seed: solid set empty, panel set = the whole hull.
+        let seed = seed_hull();
+        let (solid, panel) = split_panels(&seed);
+        assert!(solid.voxels.is_empty());
+        assert_eq!(panel.voxels.len(), seed.voxels.len());
+
+        // A no-panel craft: everything is in the solid set (renders unchanged).
+        let mut plain = seed.clone();
+        plain.panels.clear();
+        let (s2, p2) = split_panels(&plain);
+        assert_eq!(s2.voxels.len(), plain.voxels.len());
+        assert!(p2.voxels.is_empty());
     }
 
     /// WI 720: the predictor agrees with the float — the panel seed predicts FLOAT (draft < 1), the
