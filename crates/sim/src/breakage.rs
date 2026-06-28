@@ -173,7 +173,8 @@ pub fn failing_cut(craft: &VoxelCraft, a_cm: DVec3, omega: DVec3) -> Option<Seve
                 let n = v.cell + off;
                 if occupied.contains(&n) {
                     bonds.insert(bond(v.cell, n));
-                    strength += v.material.strength * face_area;
+                    // A panel's bond has less material cross-section, so it is weaker (WI 716, R2).
+                    strength += v.material.strength * face_area * craft.voxel_fill(v.cell);
                 }
             }
             if bonds.is_empty() {
@@ -197,7 +198,7 @@ pub fn failing_cut(craft: &VoxelCraft, a_cm: DVec3, omega: DVec3) -> Option<Seve
                 if on_high != high_is_outboard {
                     continue;
                 }
-                let m = v.material.density * cell_volume;
+                let m = v.material.density * cell_volume * craft.voxel_fill(v.cell);
                 let r = cell_center(cell_size, v.cell) - com;
                 load += m * point_acceleration(a_cm, omega, r);
             }
@@ -863,5 +864,38 @@ mod tests {
             assert!(b.position.is_finite() && b.velocity.is_finite());
             assert!(b.angular_velocity().is_finite());
         }
+    }
+
+    /// WI 716 (R2): a panel is **not stronger** than a solid cube. Its bond strength scales with the
+    /// plate's thinner cross-section (fill), so under any load that fractures the solid beam the panel
+    /// beam fractures too — and at a load too small for the solid, neither fails. (Under *self-inertial*
+    /// load a uniform panel beam is equal per-g, since both its mass and its bond strength scale by
+    /// fill; the absolute bond strength is lower. The guard catches the real bug: had strength **not**
+    /// been scaled, the lighter panels would fail at a *higher* acceleration — i.e. be *stronger*.)
+    #[test]
+    fn a_panel_beam_is_not_stronger_than_a_solid_beam() {
+        let mut solid = VoxelCraft::new(0.5);
+        for x in 0..6 {
+            solid.voxels.push(Voxel {
+                cell: IVec3::new(x, 0, 0),
+                material: Material::ALUMINIUM,
+            });
+        }
+        let mut panel = solid.clone();
+        for v in solid.voxels.clone() {
+            panel.set_panel(v.cell, true);
+        }
+        let heavy = DVec3::new(0.0, 200_000.0, 0.0); // a bending load past the beam's strength
+        let light = DVec3::new(0.0, 1_000.0, 0.0); // a load neither beam fails under
+        assert!(
+            failing_cut(&solid, heavy, DVec3::ZERO).is_some(),
+            "solid fractures under heavy load"
+        );
+        assert!(
+            failing_cut(&panel, heavy, DVec3::ZERO).is_some(),
+            "panel is not stronger — it fractures under any load the solid does"
+        );
+        assert!(failing_cut(&solid, light, DVec3::ZERO).is_none());
+        assert!(failing_cut(&panel, light, DVec3::ZERO).is_none());
     }
 }

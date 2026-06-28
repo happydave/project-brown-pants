@@ -186,6 +186,7 @@ impl Plugin for HarborScenePlugin {
                 brush: Brush::default(),
                 subassembly: None,
                 motor: MotorTier::Standard,
+                panel_mode: false,
             })
             .init_resource::<OrbitCam>()
             .init_resource::<HoverState>()

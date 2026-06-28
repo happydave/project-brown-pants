@@ -12,7 +12,7 @@
 
 use glam::{DMat3, DVec3, IVec3};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 /// A structural material: the data the discipline says to model — density,
 /// tensile strength, and thermal properties. A new material is a new value, not a
@@ -662,7 +662,19 @@ pub struct VoxelCraft {
     /// Defaulted on load so pre-parts saves stay backward-loadable.
     #[serde(default)]
     pub parts: Vec<Part>,
+    /// Cells built as **thin panels** (Starbase plates, WI 716): a panel is a structural voxel in
+    /// every role *except* mass and buoyancy displacement, where it counts only [`PANEL_FILL`] of a
+    /// cell — so a panel hull is light enough to float honestly. Still a compartment barrier and a
+    /// full aero cross-section. Defaulted on load so pre-panel saves stay backward-loadable (empty ⇒
+    /// every voxel is a solid cube, exactly as before).
+    #[serde(default)]
+    pub panels: HashSet<IVec3>,
 }
+
+/// The fraction of a cell a **panel** (thin plate) occupies, for mass and buoyancy displacement
+/// (WI 716). A panel weighs and displaces `PANEL_FILL ×` a solid cube of the same material — the lever
+/// that lets a real hull float without a magic-light material. Bounded `(0, 1]`; solid cubes are `1.0`.
+pub const PANEL_FILL: f64 = 0.2;
 
 impl Default for VoxelCraft {
     fn default() -> Self {
@@ -673,6 +685,7 @@ impl Default for VoxelCraft {
             attachments: Vec::new(),
             doors: Vec::new(),
             parts: Vec::new(),
+            panels: HashSet::new(),
         }
     }
 }
@@ -696,6 +709,31 @@ impl VoxelCraft {
         self.voxels.len() as f64 * self.cell_volume()
     }
 
+    /// Whether `cell` is built as a thin panel (WI 716).
+    pub fn is_panel(&self, cell: IVec3) -> bool {
+        self.panels.contains(&cell)
+    }
+
+    /// The material-occupancy fraction of `cell` for mass and buoyancy displacement (WI 716):
+    /// [`PANEL_FILL`] for a panel cell, `1.0` for a solid cube. (A panel still seals and presents a
+    /// full aero cross-section — only its mass and displacement are thin.)
+    pub fn voxel_fill(&self, cell: IVec3) -> f64 {
+        if self.is_panel(cell) {
+            PANEL_FILL
+        } else {
+            1.0
+        }
+    }
+
+    /// Mark (or clear) `cell` as a thin panel (WI 716). Clearing a non-panel cell is a no-op.
+    pub fn set_panel(&mut self, cell: IVec3, panel: bool) {
+        if panel {
+            self.panels.insert(cell);
+        } else {
+            self.panels.remove(&cell);
+        }
+    }
+
     /// Whether this craft (or breakage fragment) carries a control point — a
     /// `DeviceKind::Command` device through which commands can enter it. A fragment
     /// without one is uncontrolled (inert debris); the flight-level autonomy tier of
@@ -716,7 +754,8 @@ impl VoxelCraft {
         let mut moment = DVec3::ZERO;
         let cell_volume = self.cell_volume();
         for v in &self.voxels {
-            let m = v.material.density * cell_volume;
+            // A panel carries only PANEL_FILL of a cube's mass (WI 716).
+            let m = v.material.density * cell_volume * self.voxel_fill(v.cell);
             mass += m;
             moment += m * self.cell_center(v.cell);
         }
@@ -743,7 +782,7 @@ impl VoxelCraft {
         // Solid-cube self inertia (per diagonal): m·s²/6.
         let cube_self = self.cell_size * self.cell_size / 6.0;
         for v in &self.voxels {
-            let m = v.material.density * cell_volume;
+            let m = v.material.density * cell_volume * self.voxel_fill(v.cell);
             let r = self.cell_center(v.cell) - com;
             ixx += m * (cube_self + r.y * r.y + r.z * r.z);
             iyy += m * (cube_self + r.x * r.x + r.z * r.z);
@@ -1210,5 +1249,51 @@ mod tests {
         assert_eq!(m.density, 2_700.0);
         assert_eq!(m.thermal, Thermal::INERT);
         assert!(m.thermal.max_temp > 1.0e8, "inert default never fails");
+    }
+
+    // --- WI 716: thin structural panels ---
+
+    #[test]
+    fn panels_default_empty_and_set_panel_round_trips() {
+        let mut craft = block(2, 1, 1, 0.5, Material::ALUMINIUM);
+        // No panels by default ⇒ every cell is a full solid cube.
+        assert!(craft.panels.is_empty());
+        assert_eq!(craft.voxel_fill(IVec3::new(0, 0, 0)), 1.0);
+        assert!(!craft.is_panel(IVec3::new(0, 0, 0)));
+        // Marking a cell a panel sets its fill; clearing restores it.
+        craft.set_panel(IVec3::new(0, 0, 0), true);
+        assert!(craft.is_panel(IVec3::new(0, 0, 0)));
+        assert_eq!(craft.voxel_fill(IVec3::new(0, 0, 0)), PANEL_FILL);
+        craft.set_panel(IVec3::new(0, 0, 0), false);
+        assert!(!craft.is_panel(IVec3::new(0, 0, 0)));
+    }
+
+    #[test]
+    fn a_panel_voxel_masses_a_fraction_of_a_solid_cube() {
+        let solid = block(1, 1, 1, 0.5, Material::ALUMINIUM);
+        let mut panel = solid.clone();
+        panel.set_panel(IVec3::new(0, 0, 0), true);
+        let ms = solid.mass_properties().unwrap().mass;
+        let mp = panel.mass_properties().unwrap().mass;
+        assert!(
+            (mp - ms * PANEL_FILL).abs() < 1e-9,
+            "a panel weighs PANEL_FILL × a cube: {mp} vs {ms}×{PANEL_FILL}"
+        );
+        // Inertia scales with the (reduced) mass too.
+        let is = solid.mass_properties().unwrap().inertia.col(0).x;
+        let ip = panel.mass_properties().unwrap().inertia.col(0).x;
+        assert!((ip - is * PANEL_FILL).abs() < 1e-9 * is.max(1.0));
+    }
+
+    #[test]
+    fn a_panel_keeps_the_full_aero_cross_section() {
+        // A panel is thin only in mass/displacement — for aero it is a present cell (full area).
+        let solid = block(2, 2, 2, 0.5, Material::ALUMINIUM);
+        let mut panel = solid.clone();
+        for v in &solid.voxels {
+            panel.set_panel(v.cell, true);
+        }
+        assert_eq!(panel.area_curve(Axis::X), solid.area_curve(Axis::X));
+        assert_eq!(panel.area_curve(Axis::Y), solid.area_curve(Axis::Y));
     }
 }

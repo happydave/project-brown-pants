@@ -915,6 +915,7 @@ impl Plugin for WorkshopScenePlugin {
                 brush: Brush::default(),
                 subassembly: None,
                 motor: sounding_sim::powertrain::MotorTier::Standard,
+                panel_mode: false,
             })
             .init_resource::<OrbitCam>()
             .init_resource::<HoverState>()

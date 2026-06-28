@@ -180,6 +180,9 @@ pub struct EditorState {
     pub subassembly: Option<VoxelCraft>,
     /// The motor tier a placed Engine device gets (WI 652); cycled with `M`.
     pub(crate) motor: MotorTier,
+    /// Panel-build mode (WI 716): when on, a placed structural voxel is marked a **thin panel**
+    /// (light, for floating hulls). Toggled with `B`.
+    pub(crate) panel_mode: bool,
 }
 
 impl Default for EditorState {
@@ -202,6 +205,7 @@ impl Default for EditorState {
             brush: Brush::Voxel,
             subassembly: None,
             motor: MotorTier::Standard,
+            panel_mode: false,
         }
     }
 }
@@ -676,6 +680,12 @@ pub(crate) fn editor_input(
         state.brush = Brush::Bumper;
     }
 
+    // Toggle panel-build mode (WI 716): placed structural voxels become thin panels (light hulls).
+    if keys.just_pressed(KeyCode::KeyB) {
+        state.panel_mode = !state.panel_mode;
+        info!("panel mode: {}", state.panel_mode);
+    }
+
     // Cycle the motor tier a placed Engine gets (WI 652).
     if keys.just_pressed(KeyCode::KeyM) {
         let i = MotorTier::ALL
@@ -906,6 +916,7 @@ pub(crate) fn mouse_build(
         let device_cell = h.remove_cell.unwrap_or(h.add_cell);
         let wheel_mount = (h.add_cell.as_dvec3() + DVec3::splat(0.5)) * state.craft.cell_size;
         let motor = state.motor;
+        let panel = state.panel_mode;
         place_brush(
             &mut state.craft,
             brush,
@@ -915,6 +926,10 @@ pub(crate) fn mouse_build(
             wheel_mount,
             motor,
         );
+        // Panel-build (WI 716): a placed structural voxel becomes a thin panel (light hull).
+        if panel && brush == Brush::Voxel {
+            state.craft.set_panel(h.add_cell, true);
+        }
     }
     if buttons.just_pressed(MouseButton::Right) {
         let s = state.craft.cell_size;
@@ -922,6 +937,7 @@ pub(crate) fn mouse_build(
         if let Some(cell) = h.remove_cell {
             state.craft.voxels.retain(|v| v.cell != cell);
             state.craft.devices.retain(|dd| dd.cell != cell);
+            state.craft.set_panel(cell, false); // clear any panel entry for the removed cell (WI 716)
         }
         // Remove a wheel/part near the hovered cells. Wheels mount on a **face** (the empty adjacent
         // cell), so they aren't in any voxel cell — check both the hovered cell and the face cell so

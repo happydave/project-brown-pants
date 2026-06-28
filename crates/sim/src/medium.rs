@@ -213,24 +213,27 @@ pub fn buoyancy_wrench(
     let mut torque = DVec3::ZERO;
     let mut submerged_volume = 0.0;
     let mut draft = 0.0_f64;
-    // Displacement = solid voxels (the hull) + enclosed compartment cells (the air it encloses).
+    // Displacement = solid voxels (the hull) + enclosed compartment cells (the air it encloses). A
+    // panel voxel displaces only `voxel_fill` of a cell (WI 716, a thin plate); enclosed air is a full
+    // cell.
     let cells = craft
         .voxels
         .iter()
-        .map(|v| v.cell)
-        .chain(enclosed.iter().copied());
-    for cell in cells {
+        .map(|v| (v.cell, craft.voxel_fill(v.cell)))
+        .chain(enclosed.iter().map(|c| (*c, 1.0)));
+    for (cell, fill) in cells {
         let local = (cell.as_dvec3() + DVec3::splat(0.5)) * craft.cell_size - com;
         let world = body_position + body_orientation * local;
         let fraction = cell_submerged_fraction(world, craft.cell_size, surface_radius, time);
         if fraction <= 0.0 {
             continue;
         }
-        let f = density * gravity * cell_volume * fraction * up;
+        let displaced = cell_volume * fill * fraction; // the water this cell displaces
+        let f = density * gravity * displaced * up;
         let arm = world - body_position; // offset from the centre of mass (the body integrates the CoM)
         force += f;
         torque += arm.cross(f);
-        submerged_volume += fraction * cell_volume;
+        submerged_volume += displaced;
         draft = draft.max(surface_radius - world.length());
     }
     BuoyancyLoad {
@@ -2090,6 +2093,50 @@ mod tests {
         assert!(
             sinks < floats - 1.0,
             "without it (shell only) it sinks markedly deeper: shell {sinks:.2} vs hull {floats:.2}"
+        );
+    }
+
+    /// WI 716 (the panel enabler): a hull built of **thin panels** floats where the **solid-cube** hull
+    /// of the same geometry sinks — because panels mass + displace a plate, not a cube, so the enclosed
+    /// air wins against the light walls. Real mass (no auto-ballast).
+    #[test]
+    fn a_panel_hull_floats_where_a_solid_hull_sinks() {
+        let solid = sealed_box(7, Material::ALUMINIUM); // hollow enough that panels can float it
+        let mut panel = solid.clone();
+        for v in &solid.voxels {
+            panel.set_panel(v.cell, true); // every wall cell is a thin panel
+        }
+        let enc = enclosed_cells(&solid); // identical geometry ⇒ same enclosed set
+        let g = 9.81;
+        let rho = 1_025.0;
+        let deep = DVec3::new(0.0, SURFACE_R - 100.0, 0.0); // fully submerged ⇒ max buoyancy
+
+        let net = |craft: &VoxelCraft| {
+            let mp = craft.mass_properties().unwrap();
+            let buoy = buoyancy_wrench(
+                craft,
+                mp.center_of_mass,
+                deep,
+                DQuat::IDENTITY,
+                SURFACE_R,
+                0.0,
+                rho,
+                g,
+                &enc,
+            )
+            .force
+            .length();
+            buoy - mp.mass * g // >0 ⇒ floats, <0 ⇒ sinks
+        };
+        assert!(
+            net(&solid) < 0.0,
+            "a solid aluminium hull sinks: net {}",
+            net(&solid)
+        );
+        assert!(
+            net(&panel) > 0.0,
+            "the same hull in panels floats: net {}",
+            net(&panel)
         );
     }
 
