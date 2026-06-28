@@ -27,6 +27,7 @@ use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_time::prelude::*;
 use glam::{DQuat, DVec3, IVec3};
+use std::collections::HashSet;
 
 /// Aero/hydro drag: a force opposing the body's velocity relative to the
 /// (static) medium, scaling with the sampled density, speed², a reference area,
@@ -253,6 +254,155 @@ pub fn enclosed_cells(craft: &VoxelCraft) -> Vec<IVec3> {
         .iter()
         .flat_map(|c| c.cells.iter().copied())
         .collect()
+}
+
+/// A hull's **open** (un-sealed) cavity (WI 713): the interior air the hull holds out from the water up
+/// to its open **rim**. Unlike a sealed compartment (WI 711, which displaces at *any* depth), an open
+/// cavity floods when its rim submerges — an open boat floats on its held-out volume and **swamps** when
+/// the gunwale goes under. `cells` are the bucket-interior air cells; `rim_cells` the topmost cavity
+/// cells (the opening edge, where water spills in first). Empty for a sealed/solid hull.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OpenCavity {
+    /// Interior air cells of the open cavity (the held-out volume).
+    pub cells: Vec<IVec3>,
+    /// The opening edge — the topmost cavity cells; the lowest of these in world space is where water
+    /// first spills in (so a heeled hull ships water on the low side first).
+    pub rim_cells: Vec<IVec3>,
+}
+
+/// Compute a hull's [`OpenCavity`] (WI 713): exterior-reachable empty cells that sit **inside** the hull
+/// — a solid cell below them in their column (a floor), at or below the hull's top (under the gunwale) —
+/// i.e. the bucket interior. Empty for a sealed hull (its interior is not exterior-reachable) or a solid
+/// block. A first cut for **top-opening** hulls; side-hole openings below the waterline are a later item.
+pub fn open_cavity(craft: &VoxelCraft) -> OpenCavity {
+    let solid: HashSet<IVec3> = craft.voxels.iter().map(|v| v.cell).collect();
+    if solid.is_empty() {
+        return OpenCavity::default();
+    }
+    let (mut lo, mut hi) = (IVec3::MAX, IVec3::MIN);
+    for &c in &solid {
+        lo = lo.min(c);
+        hi = hi.max(c);
+    }
+    let max_solid_y = hi.y;
+    let (elo, ehi) = (lo - IVec3::ONE, hi + IVec3::ONE);
+    let in_bbox = |c: IVec3| {
+        c.x >= elo.x && c.x <= ehi.x && c.y >= elo.y && c.y <= ehi.y && c.z >= elo.z && c.z <= ehi.z
+    };
+    let is_air = |c: IVec3| in_bbox(c) && !solid.contains(&c);
+    let neighbours = [
+        IVec3::X,
+        IVec3::NEG_X,
+        IVec3::Y,
+        IVec3::NEG_Y,
+        IVec3::Z,
+        IVec3::NEG_Z,
+    ];
+    // Flood-fill the exterior (everything reachable from the border through air).
+    let mut exterior = HashSet::new();
+    let mut stack = Vec::new();
+    for x in elo.x..=ehi.x {
+        for y in elo.y..=ehi.y {
+            for z in elo.z..=ehi.z {
+                let c = IVec3::new(x, y, z);
+                let border = x == elo.x
+                    || x == ehi.x
+                    || y == elo.y
+                    || y == ehi.y
+                    || z == elo.z
+                    || z == ehi.z;
+                if border && is_air(c) && exterior.insert(c) {
+                    stack.push(c);
+                }
+            }
+        }
+    }
+    while let Some(c) = stack.pop() {
+        for off in neighbours {
+            let n = c + off;
+            if is_air(n) && exterior.insert(n) {
+                stack.push(n);
+            }
+        }
+    }
+    // The bucket interior: exterior-reachable air with a floor below it, under the gunwale.
+    let has_solid_below = |c: IVec3| (lo.y..c.y).any(|y| solid.contains(&IVec3::new(c.x, y, c.z)));
+    let mut cells: Vec<IVec3> = exterior
+        .iter()
+        .copied()
+        .filter(|&c| c.y <= max_solid_y && has_solid_below(c))
+        .collect();
+    if cells.is_empty() {
+        return OpenCavity::default();
+    }
+    cells.sort_by_key(|c| (c.y, c.x, c.z));
+    let rim_y = cells.iter().map(|c| c.y).max().unwrap();
+    let rim_cells = cells.iter().copied().filter(|c| c.y == rim_y).collect();
+    OpenCavity { cells, rim_cells }
+}
+
+/// The buoyant **wrench** from a hull's [`OpenCavity`] (WI 713): each interior cell displaces graded
+/// submerged water scaled by a **rim factor** — `clamp(rim_alt / cell, 0, 1)` where `rim_alt` is the
+/// lowest rim cell's height above the local waterline. So the cavity displaces fully while the gunwale
+/// is a cell above water and **ramps to zero (swamps) as the rim reaches the surface**. Per-cell at its
+/// own location (a wrench), so it contributes a righting moment and a heeled hull ships water low-side
+/// first. Zero for a sealed/empty cavity, in vacuum, or once swamped. Add to the shell
+/// [`buoyancy_wrench`]; the band-smoothing keeps the swamp continuous (no buoyancy cliff).
+#[allow(clippy::too_many_arguments)]
+pub fn open_cavity_load(
+    craft: &VoxelCraft,
+    com: DVec3,
+    body_position: DVec3,
+    body_orientation: DQuat,
+    surface_radius: f64,
+    time: f64,
+    density: f64,
+    gravity: f64,
+    open: &OpenCavity,
+) -> BuoyancyLoad {
+    if density <= 0.0 || gravity <= 0.0 || open.cells.is_empty() {
+        return BuoyancyLoad::default();
+    }
+    let r = body_position.length();
+    let up = if r > 0.0 { body_position / r } else { DVec3::Y };
+    let cell_volume = craft.cell_volume();
+    // Rim factor from the lowest gunwale point's height above the waterline (band = one cell).
+    let mut rim_alt = f64::INFINITY;
+    for &c in &open.rim_cells {
+        let local = (c.as_dvec3() + DVec3::splat(0.5)) * craft.cell_size - com;
+        let world = body_position + body_orientation * local;
+        let alt = world.length() - water_surface_radius(world, time, surface_radius);
+        rim_alt = rim_alt.min(alt);
+    }
+    let rim_factor = (rim_alt / craft.cell_size).clamp(0.0, 1.0);
+    if rim_factor <= 0.0 {
+        return BuoyancyLoad::default(); // swamped: the gunwale is under, the cavity has flooded
+    }
+    let mut force = DVec3::ZERO;
+    let mut torque = DVec3::ZERO;
+    let mut submerged_volume = 0.0;
+    let mut draft = 0.0_f64;
+    for &c in &open.cells {
+        let local = (c.as_dvec3() + DVec3::splat(0.5)) * craft.cell_size - com;
+        let world = body_position + body_orientation * local;
+        let fraction = cell_submerged_fraction(world, craft.cell_size, surface_radius, time);
+        if fraction <= 0.0 {
+            continue;
+        }
+        let displaced = cell_volume * rim_factor * fraction;
+        let f = density * gravity * displaced * up;
+        let arm = world - body_position;
+        force += f;
+        torque += arm.cross(f);
+        submerged_volume += displaced;
+        draft = draft.max(surface_radius - world.length());
+    }
+    BuoyancyLoad {
+        force,
+        torque,
+        submerged_volume,
+        draft: draft.max(0.0),
+    }
 }
 
 /// Heel/tilt angle of a body from upright: the angle (radians) between the craft's body-up axis
@@ -688,18 +838,25 @@ pub struct DivingCraft {
     /// buoyancy alongside the solid voxels so a hollow hull floats. Computed once (geometry is fixed
     /// across a descent); empty for a solid craft.
     pub enclosed: Vec<IVec3>,
+    /// Cached **open** cavity (WI 713) — the interior an *un-sealed* (open-top) hull holds out from the
+    /// water up to its rim. Displaced (via [`open_cavity_load`]) until the rim submerges, then swamps.
+    /// Empty for a sealed or solid hull. Computed once; geometry is fixed across a descent.
+    pub open: OpenCavity,
 }
 
 impl DivingCraft {
-    /// Build a diving craft, computing and caching its enclosed-compartment cells (WI 711) from the
-    /// voxel geometry. Prefer this over a struct literal so the cache is never forgotten.
+    /// Build a diving craft, computing and caching its enclosed-compartment cells (WI 711) and open
+    /// cavity (WI 713) from the voxel geometry. Prefer this over a struct literal so the caches are
+    /// never forgotten.
     pub fn new(craft: VoxelCraft, com: DVec3, glide: GlideParams) -> Self {
         let enclosed = enclosed_cells(&craft);
+        let open = open_cavity(&craft);
         Self {
             craft,
             com,
             glide,
             enclosed,
+            open,
         }
     }
 }
@@ -860,6 +1017,28 @@ fn advance_descent(
             } else {
                 dc.com
             };
+            // Open-boat displacement (WI 713): an un-sealed hull's held-out volume buoys it until the
+            // rim submerges, then swamps. Summed into the external wrench (about the same `com` the
+            // glide uses). Empty cavity (sealed/solid hull) ⇒ zero, so sealed buoyancy is unchanged.
+            if !dc.open.cells.is_empty() {
+                let p = &dc.glide.descent;
+                let r = body.position.length();
+                let g_local = if r > 0.0 { p.mu / (r * r) } else { 0.0 };
+                let density = p.medium.sample_altitude(r - p.surface_radius).density;
+                let open = open_cavity_load(
+                    &dc.craft,
+                    com,
+                    body.position,
+                    body.orientation,
+                    p.surface_radius,
+                    0.0,
+                    density,
+                    g_local,
+                    &dc.open,
+                );
+                external.0 += open.force;
+                external.1 += open.torque;
+            }
             let sample = glide_step(
                 &mut body,
                 &dc.craft,
@@ -2246,5 +2425,137 @@ mod tests {
             enclosed_cells(&hull).is_empty(),
             "a breached hull encloses nothing"
         );
+    }
+
+    // --- WI 713: open-boat displacement ---
+
+    /// A `sealed_box` with its top face removed — an open bucket.
+    fn open_box(n: i32, material: Material) -> VoxelCraft {
+        let mut c = sealed_box(n, material);
+        c.voxels.retain(|v| v.cell.y != n - 1);
+        c
+    }
+
+    #[test]
+    fn open_cavity_is_the_bucket_interior_and_empty_when_sealed() {
+        // A sealed hull's interior is not exterior-reachable ⇒ no open cavity (711 owns it).
+        let sealed = sealed_box(5, Material::ALUMINIUM);
+        assert!(
+            open_cavity(&sealed).cells.is_empty(),
+            "a sealed hull has no open cavity"
+        );
+        // Remove the top ⇒ the 3×3×3 interior becomes the open bucket, rim = its top layer.
+        let open = open_cavity(&open_box(5, Material::ALUMINIUM));
+        assert_eq!(open.cells.len(), 27, "the 3×3×3 interior is the bucket");
+        let rim_y = open.cells.iter().map(|c| c.y).max().unwrap();
+        assert_eq!(open.rim_cells.len(), 9, "the rim is the top interior layer");
+        assert!(open.rim_cells.iter().all(|c| c.y == rim_y));
+    }
+
+    #[test]
+    fn open_boat_floats_until_swamped_over_the_rim() {
+        let craft = open_box(5, Material::ALUMINIUM);
+        let open = open_cavity(&craft);
+        let mp = craft.mass_properties().unwrap();
+        let com = mp.center_of_mass;
+        let cs = craft.cell_size;
+        let (rho, g) = (1025.0, 9.81);
+        let rim_local_y = open
+            .rim_cells
+            .iter()
+            .map(|c| (c.y as f64 + 0.5) * cs)
+            .fold(f64::MIN, f64::max)
+            - com.y;
+
+        // Floating: the rim a cell above the waterline ⇒ the held-out volume buoys it (force up).
+        let pos_float = DVec3::new(0.0, SURFACE_R + (cs - rim_local_y), 0.0);
+        let load = open_cavity_load(
+            &craft,
+            com,
+            pos_float,
+            DQuat::IDENTITY,
+            SURFACE_R,
+            0.0,
+            rho,
+            g,
+            &open,
+        );
+        assert!(
+            load.force.y > 0.0 && load.submerged_volume > 0.0,
+            "an open boat floats on its held-out volume: {:?}",
+            load.force
+        );
+
+        // Swamped: the rim well under the waterline ⇒ the cavity has flooded, no open buoyancy.
+        let pos_deep = DVec3::new(0.0, SURFACE_R + (-rim_local_y - 2.0 * cs), 0.0);
+        let load2 = open_cavity_load(
+            &craft,
+            com,
+            pos_deep,
+            DQuat::IDENTITY,
+            SURFACE_R,
+            0.0,
+            rho,
+            g,
+            &open,
+        );
+        assert_eq!(
+            load2.force,
+            DVec3::ZERO,
+            "swamped over the rim ⇒ no open buoyancy"
+        );
+
+        // Contrast (WI 711): a *sealed* hull keeps full displacement even fully submerged.
+        let sealed = sealed_box(5, Material::ALUMINIUM);
+        let smp = sealed.mass_properties().unwrap();
+        let sealed_deep = buoyancy_wrench(
+            &sealed,
+            smp.center_of_mass,
+            pos_deep,
+            DQuat::IDENTITY,
+            SURFACE_R,
+            0.0,
+            rho,
+            g,
+            &enclosed_cells(&sealed),
+        );
+        assert!(
+            sealed_deep.force.length() > 0.0,
+            "a sealed hull still displaces when deep (open ≠ sealed)"
+        );
+    }
+
+    #[test]
+    fn open_cavity_load_is_zero_in_vacuum_and_for_a_sealed_hull() {
+        let craft = open_box(5, Material::ALUMINIUM);
+        let open = open_cavity(&craft);
+        let pos = DVec3::new(0.0, SURFACE_R, 0.0);
+        // Vacuum (zero density) ⇒ no force.
+        let vac = open_cavity_load(
+            &craft,
+            DVec3::ZERO,
+            pos,
+            DQuat::IDENTITY,
+            SURFACE_R,
+            0.0,
+            0.0,
+            9.81,
+            &open,
+        );
+        assert_eq!(vac.force, DVec3::ZERO);
+        // A sealed hull has an empty cavity ⇒ no open load (sealed buoyancy unchanged).
+        let sealed_open = open_cavity(&sealed_box(5, Material::ALUMINIUM));
+        let load = open_cavity_load(
+            &craft,
+            DVec3::ZERO,
+            pos,
+            DQuat::IDENTITY,
+            SURFACE_R,
+            0.0,
+            1025.0,
+            9.81,
+            &sealed_open,
+        );
+        assert_eq!(load.force, DVec3::ZERO);
     }
 }

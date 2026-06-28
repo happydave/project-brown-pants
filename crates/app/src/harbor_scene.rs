@@ -39,8 +39,8 @@ use sounding_sim::fluid::FluidMedium;
 use sounding_sim::frame::{FrameId, WorldPos};
 use sounding_sim::marine::{MarinePropulsion, MarineThruster, Rudder, ThrusterCommand};
 use sounding_sim::medium::{
-    buoyancy_wrench, enclosed_cells, heel_angle, max_cross_section, DescentParams, DescentPlugin,
-    DivingCraft, GlideParams, DEFAULT_SLAM_COEFFICIENT,
+    buoyancy_wrench, enclosed_cells, heel_angle, max_cross_section, open_cavity, open_cavity_load,
+    DescentParams, DescentPlugin, DivingCraft, GlideParams, DEFAULT_SLAM_COEFFICIENT,
 };
 use sounding_sim::powertrain::MotorTier;
 use sounding_sim::resource::{Reservoir, ReservoirId, ResourceGraph, ResourceType};
@@ -981,7 +981,7 @@ fn would_float(craft: &VoxelCraft) -> (bool, f64) {
     }
     let g = 9.81;
     let deep = DVec3::new(0.0, BODY.radius - 100.0, 0.0); // fully submerged ⇒ maximum buoyancy
-    let max_buoy = buoyancy_wrench(
+    let shell_buoy = buoyancy_wrench(
         craft,
         mp.center_of_mass,
         deep,
@@ -994,6 +994,11 @@ fn would_float(craft: &VoxelCraft) -> (bool, f64) {
     )
     .force
     .length();
+    // Open-boat hold-out volume (WI 713): an un-sealed hull floats on the water it holds out up to its
+    // rim — the maximum un-swamped displacement (the full cavity, not the fully-submerged swamped value).
+    let open = open_cavity(craft);
+    let open_buoy = 1_025.0 * g * open.cells.len() as f64 * craft.cell_volume();
+    let max_buoy = shell_buoy + open_buoy;
     let weight = mp.mass * g;
     (max_buoy > weight, (weight / max_buoy).clamp(0.0, 1.0))
 }
@@ -1066,9 +1071,22 @@ fn track_hull(
         g_local,
         &dc.enclosed,
     );
-    readout.draft = load.draft;
+    // Open-boat displacement (WI 713): add the held-out-volume buoyancy (zero for a sealed hull, and
+    // zero once swamped over the rim) so the gauge matches the physics the descent applies.
+    let open = open_cavity_load(
+        &dc.craft,
+        dc.com,
+        body.position,
+        body.orientation,
+        BODY.radius,
+        0.0,
+        sample.density,
+        g_local,
+        &dc.open,
+    );
+    readout.draft = load.draft.max(open.draft);
     readout.heel = heel_angle(body.orientation, up);
-    readout.net_buoyancy = load.force.length() - body.mass * g_local;
+    readout.net_buoyancy = (load.force + open.force).length() - body.mass * g_local;
 }
 
 /// Player marine drive + steering (WI 708 + 725): `W`/`S` throttle forward/reverse, `A`/`D` steer.
@@ -1383,6 +1401,29 @@ mod tests {
         let n = panel_plate_specs(&seed).len();
         assert!(n >= seed.voxels.len());
         assert!(n < 6 * seed.voxels.len());
+    }
+
+    /// WI 713: an **open-top** hull (seed with its top removed) is predicted to FLOAT — on its held-out
+    /// volume — where without the open-cavity term the thin shell alone would read as SINK.
+    #[test]
+    fn would_float_predicts_an_open_top_hull_floats() {
+        let mut open = seed_hull();
+        let max_y = open.voxels.iter().map(|v| v.cell.y).max().unwrap();
+        open.voxels.retain(|v| v.cell.y != max_y); // remove the deck → an open boat
+        open.panels = open
+            .panels
+            .iter()
+            .copied()
+            .filter(|c| c.y != max_y)
+            .collect();
+        assert!(
+            !open_cavity(&open).cells.is_empty(),
+            "removing the deck opens the cavity"
+        );
+        assert!(
+            would_float(&open).0,
+            "an open-top panel hull floats on its held-out volume"
+        );
     }
 
     /// WI 720: the predictor agrees with the float — the panel seed predicts FLOAT (draft < 1), the
