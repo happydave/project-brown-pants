@@ -606,9 +606,13 @@ fn enter_float(
         // cavity (swamps over the rim), and the ballast tanks (fill on command). Driven by WI 519/520/713.
         let flood_state = build_flood_state(&craft, dc.com, ballast.as_ref());
         let dry_fill_mat = materials.add(StandardMaterial {
-            // A painted-hold interior tone (WI 733): light enough to read as the inside of the boat — not
-            // a black void — while still opaque so it occludes the ocean / sea-level water patch.
+            // A painted-hold interior tone (WI 733): opaque so it occludes the ocean / sea-level water
+            // patch, but **self-lit** (emissive) so it reads as the inside of the boat through an open
+            // hatch — the hold is an enclosed recess that direct sun + sky IBL never reach, so a merely
+            // lit grey rendered black. Emissive ~0.2 matches the dive scene's soft-glow convention under
+            // this camera's exposure (not blooming).
             base_color: Color::srgb(0.24, 0.25, 0.27),
+            emissive: LinearRgba::rgb(0.20, 0.21, 0.23),
             perceptual_roughness: 1.0,
             ..default()
         });
