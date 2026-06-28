@@ -275,15 +275,26 @@ fn build_flood_state(craft: &VoxelCraft, com: DVec3, ballast: Option<&Ballast>) 
         });
     }
     // Ballast tanks (WI 709, made visible by WI 729): a region fed by the tank's fill fraction. The tank
-    // has only a mount + capacity (no device palette yet, WI 715), so the render extent is a synthetic
-    // cube of that volume centred on the mount — water rises in it as the tank floods.
+    // carries a buoyancy-overcoming `capacity` (m³), not a physical size, so the **render extent** is
+    // decoupled from it (WI 733 — a `cbrt(capacity)` cube was bigger than the hull): a low bilge box
+    // centred on the mount, a fraction of the hull's footprint, sitting on the floor and clamped **inside**
+    // the hull so it never pokes through the skin. Water still rises in it as the tank floods.
     if let Some(b) = ballast {
+        let (hull_min, hull_max) = cell_aabb(
+            &craft.voxels.iter().map(|v| v.cell).collect::<Vec<_>>(),
+            cs,
+            com_off,
+        );
+        let span = hull_max - hull_min;
         for (tank, t) in b.tanks.iter().enumerate() {
-            let half = (t.capacity.cbrt().max(cs) * 0.5) as f32;
             let centre = t.mount.as_vec3() + com_off;
+            let half = Vec3::new(0.3 * span.x, 0.0, 0.3 * span.z);
+            let min = (Vec3::new(centre.x, hull_min.y, centre.z) - half).max(hull_min);
+            let max =
+                (Vec3::new(centre.x, hull_min.y + 0.35 * span.y, centre.z) + half).min(hull_max);
             regions.push(InteriorWaterRegion {
-                min: centre - Vec3::splat(half),
-                max: centre + Vec3::splat(half),
+                min,
+                max,
                 source: WaterSource::Ballast { tank },
             });
         }
@@ -595,7 +606,9 @@ fn enter_float(
         // cavity (swamps over the rim), and the ballast tanks (fill on command). Driven by WI 519/520/713.
         let flood_state = build_flood_state(&craft, dc.com, ballast.as_ref());
         let dry_fill_mat = materials.add(StandardMaterial {
-            base_color: Color::srgb(0.05, 0.06, 0.07), // a dark dry hold
+            // A painted-hold interior tone (WI 733): light enough to read as the inside of the boat — not
+            // a black void — while still opaque so it occludes the ocean / sea-level water patch.
+            base_color: Color::srgb(0.24, 0.25, 0.27),
             perceptual_roughness: 1.0,
             ..default()
         });
@@ -1742,6 +1755,41 @@ mod tests {
             )),
             1,
             "one tank ⇒ one Ballast region"
+        );
+    }
+
+    /// WI 733: the ballast render box fits **inside** the hull (no black cube poking through the skin) and
+    /// has positive extent (water can still rise in it) — decoupled from the buoyancy `capacity` that made
+    /// it a 2.6 m cube in a 2.5 m hull.
+    #[test]
+    fn ballast_region_fits_within_the_hull() {
+        let seed = seed_hull();
+        let com = seed.mass_properties().unwrap().center_of_mass;
+        let ballast = synth_ballast(&seed).expect("the sealed seed hull synthesizes ballast");
+        let fs = build_flood_state(&seed, com, Some(&ballast));
+        let region = fs
+            .regions
+            .iter()
+            .find(|r| matches!(r.source, WaterSource::Ballast { .. }))
+            .expect("a ballast region exists");
+
+        let (hull_min, hull_max) = cell_aabb(
+            &seed.voxels.iter().map(|v| v.cell).collect::<Vec<_>>(),
+            seed.cell_size,
+            -com.as_vec3(),
+        );
+        let eps = 1e-4;
+        assert!(
+            region.min.cmpge(hull_min - Vec3::splat(eps)).all()
+                && region.max.cmple(hull_max + Vec3::splat(eps)).all(),
+            "ballast box {:?}..{:?} stays inside the hull {hull_min:?}..{hull_max:?}",
+            region.min,
+            region.max
+        );
+        let size = region.max - region.min;
+        assert!(
+            size.x > 0.01 && size.y > 0.01 && size.z > 0.01,
+            "the tank has positive extent so water can rise: {size:?}"
         );
     }
 
