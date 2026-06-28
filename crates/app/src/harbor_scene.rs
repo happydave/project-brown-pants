@@ -1,14 +1,21 @@
-//! Harbor — a calm waterfront where a built hull floats (`-- harbor`, WI 706).
+//! Harbor — a boat workshop on the water (`-- harbor`, WI 706 + 707).
 //!
-//! The first scene that makes the WI 705 righting buoyancy + WI 711 enclosed-volume buoyancy
-//! **visible**: a sealed hull spawns **already active** at the surface and floats through the same
-//! `DescentPlugin` → `glide_step` engine the dive uses (gravity + drag + the buoyancy wrench +
-//! free-surface damping), self-righting from a small initial heel and settling to its waterline by a
-//! dock. No orbit/handoff/warp — the harbor just floats a craft on sheltered water.
+//! A self-contained **Build ↔ Float** loop (toggle with `Enter`), mirroring the grounded workshop's
+//! Build ↔ Test:
 //!
-//! Sealed-hull note (WI 711): buoyancy displaces the hull's **enclosed** air, so the fixture is a
-//! *sealed* box. An open-top hull would sink until WI 713 (open-boat displacement). Camera: middle-
-//! drag orbit + wheel zoom. The HUD shows the WI 705 draft / heel / net-buoyancy gauges.
+//! - **Build** (WI 707): the voxel editor (the `editor` module's systems under a state run-condition)
+//!   edits a hull lattice near the origin — mouse orbit/zoom, left-click place / right-click remove,
+//!   keyboard brush. The craft renders **solid** (`voxel_skin::skin_submeshes`).
+//! - **Float** (WI 706): the built lattice is assembled into an `ActiveBody` + `DivingCraft` and
+//!   **floats on calm water by a dock**, self-righting via the WI 705 buoyancy wrench + WI 711
+//!   enclosed-volume buoyancy + free-surface damping (the same `DescentPlugin` → `glide_step` the dive
+//!   uses). Mass is auto-set from the displaceable volume so the boat floats at a sensible draft.
+//!
+//! Build and Float are different coordinate worlds (Build near the origin with the editor camera;
+//! Float in planetary coordinates with floating origin), so each spawns/despawns its own entities on
+//! the toggle — they never coexist. Sealed-hull buoyancy (WI 711): a sealed hull floats; open-top
+//! hulls await WI 713. Float camera: middle-drag orbit + wheel zoom; HUD shows draft / heel / net
+//! buoyancy.
 
 use std::f32::consts::FRAC_PI_4;
 
@@ -29,10 +36,16 @@ use sounding_sim::medium::{
     buoyancy_wrench, enclosed_cells, heel_angle, max_cross_section, DescentParams, DescentPlugin,
     DivingCraft, GlideParams, DEFAULT_SLAM_COEFFICIENT,
 };
+use sounding_sim::powertrain::MotorTier;
 use sounding_sim::sim::CentralBody;
 use sounding_sim::voxel::{Axis, Material, Voxel, VoxelCraft};
 
+use crate::editor::{
+    draw_editor, editor_input, mouse_build, mouse_orbit_input, orbit_camera, update_hover, Brush,
+    EditorState, HoverState, OrbitCam, PointerOnPalette,
+};
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
+use crate::voxel_skin::{pbr_material, skin_submeshes, VoxelSkin};
 
 const BODY: CentralBody = CentralBody::EARTHLIKE;
 
@@ -41,20 +54,30 @@ const SUBSTEP_DT: f64 = 0.002;
 const MAX_SUBSTEPS: u32 = 64;
 
 /// Fraction of the fully-submerged displaced-water mass used as the hull's mass — its reserve
-/// buoyancy. ~0.4 floats it at roughly 40 % draft (a designer's ballast choice; the *buoyancy* is the
-/// real WI 705/711 geometric displacement, only the hull weight is chosen for a pleasing waterline).
+/// buoyancy. ~0.4 floats the built hull at roughly 40 % draft (auto-ballast, so a build always floats
+/// at a sensible line; real-mass-matters + ballast control are later WIs — 709/713).
 const HULL_MASS_FRACTION: f64 = 0.4;
+
+/// The two harbor modes: float the built hull, or edit it.
+#[derive(States, Default, Debug, Clone, PartialEq, Eq, Hash)]
+enum HarborMode {
+    /// Float the built hull on the water (the opening view).
+    #[default]
+    Float,
+    /// Edit the hull lattice in the voxel editor.
+    Build,
+}
 
 /// Sea level lies at `BODY.radius`; render space puts it at `Y = 0` (floating origin).
 fn render_world(sim_pos: DVec3) -> DVec3 {
     sim_pos - DVec3::new(0.0, BODY.radius, 0.0)
 }
 
-/// A sealed rectangular hull (a decked pontoon): the surface cells of a `W×H×L` box are solid, the
-/// interior is enclosed air (WI 711 buoyancy). Editor-scale 0.5 m cells ⇒ a 3.5 × 2 × 5.5 m hull.
-fn harbor_hull() -> VoxelCraft {
+/// The seed hull: a sealed pontoon (surface cells solid, interior enclosed air ⇒ floats, WI 711).
+/// Editor-scale 0.5 m cells ⇒ a 2.5 × 1.5 × 3.5 m starter boat the player can reshape.
+fn seed_hull() -> VoxelCraft {
     let mut c = VoxelCraft::new(0.5);
-    let (w, h, l) = (7, 4, 11);
+    let (w, h, l) = (5, 3, 7);
     for x in 0..w {
         for y in 0..h {
             for z in 0..l {
@@ -72,7 +95,7 @@ fn harbor_hull() -> VoxelCraft {
     c
 }
 
-/// Mouse-driven orbit/zoom state for the harbor camera (the editor/gallery convention).
+/// Mouse-driven orbit/zoom state for the Float camera (the editor/gallery convention).
 #[derive(Resource)]
 struct HarborCam {
     yaw: f32,
@@ -97,7 +120,7 @@ fn orbit_offset(yaw: f32, pitch: f32, dist: f32) -> Vec3 {
     Vec3::new(sy * cp, sp, cy * cp) * dist
 }
 
-/// The HUD readout (WI 705 hydrostatic gauges).
+/// The Float HUD readout (WI 705 hydrostatic gauges).
 #[derive(Resource, Default)]
 struct HarborReadout {
     draft: f64,
@@ -105,11 +128,31 @@ struct HarborReadout {
     net_buoyancy: f64,
 }
 
+// --- markers (teardown: tag only the root of each spawned tree) ---
+
+/// Tags an entity owned by Float mode (despawned on leaving Float).
+#[derive(Component)]
+struct FloatEntity;
+
+/// Tags an entity owned by Build mode (despawned on leaving Build).
+#[derive(Component)]
+struct BuildEntity;
+
+/// Tags a solid mesh rendering part of the Build craft (rebuilt on edit).
+#[derive(Component)]
+struct BuildMesh;
+
+/// The floating hull (its `ActiveBody` is the physics body).
+#[derive(Component)]
+struct HullMarker;
+
+/// The Float HUD text.
 #[derive(Component)]
 struct Hud;
 
+/// The Build HUD text.
 #[derive(Component)]
-struct HullMarker;
+struct BuildHud;
 
 /// The animated calm-water patch.
 #[derive(Component)]
@@ -129,98 +172,150 @@ fn wave_height(x: f32, z: f32, t: f32) -> f32 {
     WATER_AMPLITUDE * (0.45 * w1 + 0.35 * w2 + 0.20 * w3)
 }
 
-/// The harbor scene (`-- harbor`, WI 706).
+/// The harbor boat-workshop scene (`-- harbor`, WI 706 + 707).
 pub struct HarborScenePlugin;
 
 impl Plugin for HarborScenePlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(FloatingOriginPlugin)
+            .init_state::<HarborMode>()
+            .insert_resource(EditorState {
+                craft: seed_hull(),
+                cursor: IVec3::new(0, 3, 0),
+                material: 0,
+                brush: Brush::default(),
+                subassembly: None,
+                motor: MotorTier::Standard,
+            })
+            .init_resource::<OrbitCam>()
+            .init_resource::<HoverState>()
+            .init_resource::<PointerOnPalette>()
             .init_resource::<HarborReadout>()
             .init_resource::<HarborCam>()
-            // The float engine: glide_step on any active craft carrying a DivingCraft (no orbit gear).
             .insert_resource(Gravity { mu: BODY.mu })
             .add_plugins(DescentPlugin {
                 substep_dt: SUBSTEP_DT,
                 max_substeps: MAX_SUBSTEPS,
             })
-            .add_systems(Startup, setup_scene)
+            .add_systems(OnEnter(HarborMode::Float), enter_float)
+            .add_systems(OnExit(HarborMode::Float), exit_float)
+            .add_systems(OnEnter(HarborMode::Build), enter_build)
+            .add_systems(OnExit(HarborMode::Build), exit_build)
+            .add_systems(Update, toggle_mode)
             .add_systems(
                 Update,
-                (track_hull, harbor_camera_input, follow_camera, update_hud).chain(),
+                (
+                    track_hull,
+                    harbor_camera_input,
+                    follow_camera,
+                    update_hud,
+                    animate_water,
+                )
+                    .chain()
+                    .run_if(in_state(HarborMode::Float)),
             )
-            .add_systems(Update, animate_water);
+            .add_systems(
+                Update,
+                (
+                    editor_input,
+                    mouse_orbit_input,
+                    update_hover,
+                    mouse_build,
+                    orbit_camera,
+                    sync_build_meshes,
+                    draw_editor,
+                    update_build_hud,
+                )
+                    .chain()
+                    .run_if(in_state(HarborMode::Build)),
+            );
     }
 }
 
-fn setup_scene(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut scattering: ResMut<Assets<ScatteringMedium>>,
+/// `Enter` toggles Build ↔ Float.
+fn toggle_mode(
+    keys: Res<ButtonInput<KeyCode>>,
+    state: Res<State<HarborMode>>,
+    mut next: ResMut<NextState<HarborMode>>,
 ) {
-    let hull = harbor_hull();
-    let mp = hull.mass_properties().expect("non-empty hull");
-    let enclosed = enclosed_cells(&hull);
+    if keys.just_pressed(KeyCode::Enter) {
+        next.set(match state.get() {
+            HarborMode::Float => HarborMode::Build,
+            HarborMode::Build => HarborMode::Float,
+        });
+    }
+}
 
-    // Float mass from the *real* displaceable volume (shell + enclosed), so the hull always floats at
-    // a sensible draft regardless of the box dimensions (only the weight is a design choice).
+/// Builds the descent/glide parameters and the floating body for a hull lattice, auto-ballasted to
+/// float at `HULL_MASS_FRACTION` draft. `None` for an empty lattice.
+fn assemble_float(craft: &VoxelCraft) -> Option<(ActiveBody, DivingCraft)> {
+    let mp = craft.mass_properties()?;
+    let enclosed = enclosed_cells(craft);
     let water_density = FluidMedium::EARTHLIKE.sample_altitude(-1.0).density;
-    let displaceable = hull.occupied_volume() + enclosed.len() as f64 * hull.cell_volume();
+    let displaceable = craft.occupied_volume() + enclosed.len() as f64 * craft.cell_volume();
+    if displaceable <= 0.0 || mp.mass <= 0.0 {
+        return None;
+    }
     let mass = HULL_MASS_FRACTION * water_density * displaceable;
     let inertia = mp.inertia * (mass / mp.mass);
-
     let descent = DescentParams {
         medium: FluidMedium::EARTHLIKE,
         mu: BODY.mu,
         surface_radius: BODY.radius,
-        drag_area: max_cross_section(&hull),
+        drag_area: max_cross_section(craft),
         drag_coefficient: 1.0,
         slam_coefficient: DEFAULT_SLAM_COEFFICIENT,
     };
-    let glide = GlideParams::for_craft(descent, &hull, Axis::Z);
-
-    // Spawn the hull **already active** at the surface, heeled slightly so the righting is visible.
+    let glide = GlideParams::for_craft(descent, craft, Axis::Z);
     let start_sim = DVec3::new(0.0, BODY.radius, 0.0);
     let mut body = ActiveBody::new(start_sim, DVec3::ZERO, mass, inertia);
-    body.orientation = DQuat::from_rotation_z(0.25); // a starting list to self-correct
-    let start_render = render_world(start_sim);
+    body.orientation = DQuat::from_rotation_z(0.2); // a starting list, so the self-righting reads
+    Some((
+        body,
+        DivingCraft::new(craft.clone(), mp.center_of_mass, glide),
+    ))
+}
 
-    // Hull bounds in metres (cells × cell_size): 7×4×11 × 0.5.
-    let hull_mesh = meshes.add(Mesh::from(Cuboid::new(3.5, 2.0, 5.5)));
-    let hull_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.72, 0.34, 0.22), // a painted-hull red-brown
-        metallic: 0.1,
-        perceptual_roughness: 0.7,
-        ..default()
-    });
-    let cabin_mesh = meshes.add(Mesh::from(Cuboid::new(2.0, 1.0, 2.4)));
-    let cabin_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.92, 0.90, 0.86),
-        perceptual_roughness: 0.6,
-        ..default()
-    });
+/// Enters Float: assemble the built hull and spawn the floating waterfront (WI 706 + 707).
+fn enter_float(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut scattering: ResMut<Assets<ScatteringMedium>>,
+    asset_server: Res<AssetServer>,
+    editor: Res<EditorState>,
+) {
+    let start_render = render_world(DVec3::new(0.0, BODY.radius, 0.0));
 
-    commands
-        .spawn((
-            body,
-            DivingCraft::new(hull, mp.center_of_mass, glide),
-            Mesh3d(hull_mesh),
-            MeshMaterial3d(hull_mat),
-            Transform::default(),
-            WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, start_render)),
-            HullMarker,
-        ))
-        .with_children(|parent| {
-            // A small deckhouse so the fixture reads as a boat (rides with the hull via Transform).
-            parent.spawn((
-                Mesh3d(cabin_mesh),
-                MeshMaterial3d(cabin_mat),
-                Transform::from_xyz(0.0, 1.4, -0.6),
-            ));
-        });
+    // The floating hull, assembled from the built lattice. If the build is empty, skip it (the
+    // waterfront still renders; the player can return to Build).
+    if let Some((body, dc)) = assemble_float(&editor.craft) {
+        let com_off = -dc.com.as_vec3();
+        let craft = dc.craft.clone();
+        commands
+            .spawn((
+                body,
+                dc,
+                Transform::default(),
+                Visibility::default(),
+                WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, start_render)),
+                HullMarker,
+                FloatEntity,
+            ))
+            .with_children(|parent| {
+                // Render the actual built hull (solid, per-material sub-meshes) centred on the CoM.
+                for (material, mesh) in skin_submeshes(&craft, VoxelSkin::Hull) {
+                    let mat = pbr_material(material, &asset_server, &mut materials);
+                    parent.spawn((
+                        Mesh3d(meshes.add(mesh)),
+                        MeshMaterial3d(mat),
+                        Transform::from_translation(com_off),
+                    ));
+                }
+            });
+    }
 
-    // Distant ocean: a broad reflective blue sphere for the horizon, sunk 2 m so it does not z-fight
-    // the animated near-surface patch (the dive's fix, WI 703).
+    // Distant ocean (sunk 2 m so it does not z-fight the animated patch).
     commands.spawn((
         Mesh3d(meshes.add(Mesh::from(Sphere {
             radius: BODY.radius as f32,
@@ -237,10 +332,10 @@ fn setup_scene(
             FrameId::CENTRAL_BODY,
             DVec3::new(0.0, -2.0, 0.0),
         )),
+        FloatEntity,
     ));
 
-    // Shallow sea floor: an opaque plane a few metres down, so a sinking hull grounds and the depth
-    // reads. Rendered as a wide dim plane just below the hull.
+    // Shallow sea floor.
     commands.spawn((
         Mesh3d(meshes.add(Mesh::from(Plane3d::default().mesh().size(400.0, 400.0)))),
         MeshMaterial3d(materials.add(StandardMaterial {
@@ -253,9 +348,10 @@ fn setup_scene(
             FrameId::CENTRAL_BODY,
             DVec3::new(0.0, -8.0, 0.0),
         )),
+        FloatEntity,
     ));
 
-    // Calm near-surface water patch at sea level (render Y = 0); animate_water follows the camera.
+    // Calm near-surface water patch at sea level.
     commands.spawn((
         Mesh3d(
             meshes.add(Mesh::from(
@@ -278,9 +374,10 @@ fn setup_scene(
             DVec3::new(start_render.x, 0.0, start_render.z),
         )),
         WaterPatch,
+        FloatEntity,
     ));
 
-    // A dock / quay: a low concrete deck on pilings, beside the hull, partly above the waterline.
+    // Dock / quay + pilings.
     let quay_mat = materials.add(StandardMaterial {
         base_color: Color::srgb(0.55, 0.52, 0.48),
         perceptual_roughness: 0.9,
@@ -294,8 +391,8 @@ fn setup_scene(
             FrameId::CENTRAL_BODY,
             DVec3::new(-6.0, 0.5, 0.0),
         )),
+        FloatEntity,
     ));
-    // A couple of pilings.
     for z in [-6.0_f64, 6.0] {
         commands.spawn((
             Mesh3d(meshes.add(Mesh::from(Cuboid::new(0.5, 6.0, 0.5)))),
@@ -305,6 +402,7 @@ fn setup_scene(
                 FrameId::CENTRAL_BODY,
                 DVec3::new(-4.4, -2.5, z),
             )),
+            FloatEntity,
         ));
     }
 
@@ -316,11 +414,12 @@ fn setup_scene(
             ..default()
         },
         Transform::from_rotation(Quat::from_rotation_x(-0.6) * Quat::from_rotation_y(0.5)),
+        FloatEntity,
     ));
 
     // HUD.
     commands.spawn((
-        Text::new("harbor\ndraft:  --\nheel:   --\nnet buoy: --"),
+        Text::new("harbor — Float (Enter: Build)\ndraft:  --\nheel:   --\nnet buoy: --"),
         TextFont {
             font_size: 20.0,
             ..default()
@@ -333,9 +432,10 @@ fn setup_scene(
             ..default()
         },
         Hud,
+        FloatEntity,
     ));
 
-    // HDR camera with the physically-based atmosphere, orbiting the hull.
+    // HDR camera with the atmosphere, orbiting the hull.
     let eye = start_render + orbit_offset(FRAC_PI_4, 0.3, 22.0).as_dvec3();
     commands.spawn((
         Camera3d::default(),
@@ -348,11 +448,94 @@ fn setup_scene(
         AtmosphereEnvironmentMapLight::default(),
         WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, eye)),
         AnchorCamera,
+        FloatEntity,
     ));
 }
 
-/// Renders the floating hull (pose from its `ActiveBody`) and publishes the WI 705 hydrostatic
-/// gauges (draft / heel / net buoyancy) to the HUD.
+fn exit_float(mut commands: Commands, entities: Query<Entity, With<FloatEntity>>) {
+    for e in &entities {
+        commands.entity(e).despawn();
+    }
+}
+
+/// Enters Build: the editor camera + light + build HUD near the origin (the craft meshes are spawned
+/// by `sync_build_meshes`).
+fn enter_build(mut commands: Commands) {
+    commands.spawn((Camera3d::default(), Transform::default(), BuildEntity));
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 6_000.0,
+            ..default()
+        },
+        Transform::from_xyz(6.0, 12.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y),
+        BuildEntity,
+    ));
+    commands.spawn((
+        Text::new(
+            "harbor — Build (Enter: Float)\nmouse: orbit/zoom · L-click place · R-click remove",
+        ),
+        TextFont {
+            font_size: 20.0,
+            ..default()
+        },
+        TextColor(Color::srgb(0.9, 0.95, 1.0)),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(10.0),
+            left: Val::Px(12.0),
+            ..default()
+        },
+        BuildHud,
+        BuildEntity,
+    ));
+}
+
+fn exit_build(mut commands: Commands, entities: Query<Entity, With<BuildEntity>>) {
+    // Build meshes carry `BuildEntity` too, so this clears the whole Build world.
+    for e in &entities {
+        commands.entity(e).despawn();
+    }
+}
+
+/// Rebuilds the solid Build-craft meshes whenever the lattice changes (or after re-entering Build),
+/// reusing the shared `voxel_skin` hull skin (per-material sub-meshes), near the origin.
+fn sync_build_meshes(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    editor: Res<EditorState>,
+    existing: Query<Entity, With<BuildMesh>>,
+) {
+    if !editor.is_changed() && !existing.is_empty() {
+        return;
+    }
+    for e in &existing {
+        commands.entity(e).despawn();
+    }
+    for (material, mesh) in skin_submeshes(&editor.craft, VoxelSkin::Hull) {
+        let mat = pbr_material(material, &asset_server, &mut materials);
+        commands.spawn((
+            Mesh3d(meshes.add(mesh)),
+            MeshMaterial3d(mat),
+            Transform::default(),
+            BuildMesh,
+            BuildEntity,
+        ));
+    }
+}
+
+fn update_build_hud(editor: Res<EditorState>, mut hud: Query<&mut Text, With<BuildHud>>) {
+    if let Ok(mut text) = hud.single_mut() {
+        let cells = editor.craft.voxels.len();
+        text.0 = format!(
+            "harbor — Build (Enter: Float)\nmouse: orbit/zoom · L-click place · R-click remove\ncells: {cells}"
+        );
+    }
+}
+
+/// Renders the floating hull (pose from its `ActiveBody`) and publishes the WI 705 gauges.
+#[allow(clippy::type_complexity)]
 fn track_hull(
     mut readout: ResMut<HarborReadout>,
     mut hull: Query<
@@ -391,7 +574,7 @@ fn track_hull(
     readout.net_buoyancy = load.force.length() - body.mass * g_local;
 }
 
-/// Middle-drag orbit, wheel zoom (the editor/gallery convention).
+/// Middle-drag orbit (L/R swapped per Dave), wheel zoom.
 fn harbor_camera_input(
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
@@ -399,7 +582,7 @@ fn harbor_camera_input(
     mut cam: ResMut<HarborCam>,
 ) {
     if buttons.pressed(MouseButton::Middle) {
-        cam.yaw -= motion.delta.x * 0.01; // drag-right swings the view right (L/R swapped per Dave)
+        cam.yaw -= motion.delta.x * 0.01;
         cam.pitch = (cam.pitch + motion.delta.y * 0.01).clamp(-1.3, 1.3);
     }
     if scroll.delta.y != 0.0 {
@@ -435,7 +618,7 @@ fn follow_camera(
 fn update_hud(readout: Res<HarborReadout>, mut hud: Query<&mut Text, With<Hud>>) {
     if let Ok(mut text) = hud.single_mut() {
         text.0 = format!(
-            "harbor\ndraft:    {:6.2} m\nheel:     {:6.1} deg\nnet buoy: {:8.0} N",
+            "harbor — Float (Enter: Build)\ndraft:    {:6.2} m\nheel:     {:6.1} deg\nnet buoy: {:8.0} N",
             readout.draft,
             readout.heel.to_degrees(),
             readout.net_buoyancy,
@@ -478,33 +661,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn harbor_hull_is_sealed_and_floatable() {
-        let hull = harbor_hull();
-        // A sealed box encloses interior air (WI 711) — the reason it floats.
+    fn seed_hull_is_sealed_and_floats() {
+        let hull = seed_hull();
         let enclosed = enclosed_cells(&hull);
-        assert!(!enclosed.is_empty(), "the hull encloses a sealed volume");
-        // At the chosen mass fraction the hull is net-buoyant (reserve buoyancy > 0).
+        assert!(
+            !enclosed.is_empty(),
+            "the seed hull encloses a sealed volume"
+        );
+        assert!(
+            assemble_float(&hull).is_some(),
+            "the seed hull assembles into a floating body"
+        );
         let water = FluidMedium::EARTHLIKE.sample_altitude(-1.0).density;
         let displaceable = hull.occupied_volume() + enclosed.len() as f64 * hull.cell_volume();
         let mass = HULL_MASS_FRACTION * water * displaceable;
         assert!(
             water * displaceable > mass,
-            "fully-submerged buoyancy exceeds weight ⇒ it floats"
+            "fully-submerged buoyancy exceeds weight ⇒ floats"
         );
     }
 
     #[test]
+    fn an_empty_lattice_does_not_assemble() {
+        assert!(assemble_float(&VoxelCraft::new(0.5)).is_none());
+    }
+
+    #[test]
     fn wave_height_is_calm_and_bounded() {
-        // The amplitude is calm — well under the open-ocean dive's 0.55 m — and bounds the surface.
         const _: () = assert!(WATER_AMPLITUDE < 0.2);
         for &(x, z, t) in &[(0.0, 0.0, 0.0), (12.0, -7.0, 3.0), (-30.0, 40.0, 9.0)] {
             assert!(wave_height(x, z, t).abs() <= WATER_AMPLITUDE + 1e-6);
         }
-    }
-
-    #[test]
-    fn orbit_offset_points_from_target_to_eye() {
-        let v = orbit_offset(0.0, 0.0, 10.0);
-        assert!((v.length() - 10.0).abs() < 1e-4);
     }
 }
