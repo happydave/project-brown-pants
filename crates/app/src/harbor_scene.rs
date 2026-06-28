@@ -18,6 +18,7 @@
 //! hulls await WI 713. Float camera: middle-drag orbit + wheel zoom; HUD shows draft / heel / net
 //! buoyancy.
 
+use std::collections::HashSet;
 use std::f32::consts::FRAC_PI_4;
 
 use bevy::camera::Exposure;
@@ -39,14 +40,14 @@ use sounding_sim::medium::{
 };
 use sounding_sim::powertrain::MotorTier;
 use sounding_sim::sim::CentralBody;
-use sounding_sim::voxel::{Axis, Material, Voxel, VoxelCraft};
+use sounding_sim::voxel::{Axis, Material, Voxel, VoxelCraft, PANEL_FILL};
 
 use crate::editor::{
     draw_editor, editor_input, mouse_build, mouse_orbit_input, orbit_camera, update_hover, Brush,
     EditorState, HoverState, OrbitCam, PointerOnPalette,
 };
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
-use crate::voxel_skin::{pbr_material, skin_submeshes, VoxelSkin};
+use crate::voxel_skin::{materials_present, pbr_material, skin_submeshes, VoxelSkin};
 
 const BODY: CentralBody = CentralBody::EARTHLIKE;
 
@@ -306,9 +307,9 @@ fn enter_float(
                 FloatEntity,
             ))
             .with_children(|parent| {
-                // Render the actual built hull centred on the CoM — solid cubes in their per-material
-                // skin, thin panels in the distinct panel material (WI 719).
-                let (solid, panel) = split_panels(&craft);
+                // Render the built hull centred on the CoM — solid cubes in their per-material skin,
+                // thin panels as actual thin plates on the hull faces they form (WI 722).
+                let (solid, _) = split_panels(&craft);
                 for (material, mesh) in skin_submeshes(&solid, VoxelSkin::Hull) {
                     let mat = pbr_material(material, &asset_server, &mut materials);
                     parent.spawn((
@@ -317,12 +318,17 @@ fn enter_float(
                         Transform::from_translation(com_off),
                     ));
                 }
-                let pmat = panel_material(&mut materials);
-                for (_m, mesh) in skin_submeshes(&panel, VoxelSkin::Hull) {
+                let plates = plate_meshes(craft.cell_size, &mut meshes);
+                let mats = material_handles(&craft, &asset_server, &mut materials);
+                for (material, axis, pos) in panel_plate_specs(&craft) {
+                    let mat = mats
+                        .iter()
+                        .find(|(m, _)| *m == material)
+                        .map(|(_, h)| h.clone());
                     parent.spawn((
-                        Mesh3d(meshes.add(mesh)),
-                        MeshMaterial3d(pmat.clone()),
-                        Transform::from_translation(com_off),
+                        Mesh3d(plates[axis].clone()),
+                        MeshMaterial3d(mat.unwrap_or_default()),
+                        Transform::from_translation(pos + com_off),
                     ));
                 }
             });
@@ -526,8 +532,9 @@ fn sync_build_meshes(
     for e in &existing {
         commands.entity(e).despawn();
     }
-    // Render solid cubes with their per-material skin, thin panels in the distinct panel material (WI 719).
-    let (solid, panel) = split_panels(&editor.craft);
+    // Solid cubes render via the per-material hull skin; thin panels render as actual thin plates on
+    // the hull faces they form (WI 722).
+    let (solid, _) = split_panels(&editor.craft);
     for (material, mesh) in skin_submeshes(&solid, VoxelSkin::Hull) {
         let mat = pbr_material(material, &asset_server, &mut materials);
         commands.spawn((
@@ -538,12 +545,17 @@ fn sync_build_meshes(
             BuildEntity,
         ));
     }
-    let pmat = panel_material(&mut materials);
-    for (_m, mesh) in skin_submeshes(&panel, VoxelSkin::Hull) {
+    let plates = plate_meshes(editor.craft.cell_size, &mut meshes);
+    let mats = material_handles(&editor.craft, &asset_server, &mut materials);
+    for (material, axis, pos) in panel_plate_specs(&editor.craft) {
+        let mat = mats
+            .iter()
+            .find(|(m, _)| *m == material)
+            .map(|(_, h)| h.clone());
         commands.spawn((
-            Mesh3d(meshes.add(mesh)),
-            MeshMaterial3d(pmat.clone()),
-            Transform::default(),
+            Mesh3d(plates[axis].clone()),
+            MeshMaterial3d(mat.unwrap_or_default()),
+            Transform::from_translation(pos),
             BuildMesh,
             BuildEntity,
         ));
@@ -565,15 +577,65 @@ fn split_panels(craft: &VoxelCraft) -> (VoxelCraft, VoxelCraft) {
     (solid, panel)
 }
 
-/// A distinct **panel** material (WI 719): a cool plate blue-grey, clearly different from the metallic
-/// solid-cube skin, so thin panels read at a glance.
-fn panel_material(materials: &mut Assets<StandardMaterial>) -> Handle<StandardMaterial> {
-    materials.add(StandardMaterial {
-        base_color: Color::srgb(0.42, 0.60, 0.72),
-        metallic: 0.2,
-        perceptual_roughness: 0.5,
-        ..default()
-    })
+/// A thin-plate render spec for each panel cell (WI 722): `(material, thin-axis, centre)` in lattice
+/// coords — **one** plate per panel, oriented along the **wall normal** (the axis with the fewest
+/// occupied neighbours, i.e. the direction the wall faces), seated flush with the exterior side when
+/// there is one. So a panel renders as the thin plate it forms, not a tinted cube.
+fn panel_plate_specs(craft: &VoxelCraft) -> Vec<(Material, usize, Vec3)> {
+    let occupied: HashSet<IVec3> = craft.voxels.iter().map(|v| v.cell).collect();
+    let cs = craft.cell_size;
+    let inset = 0.5 * cs - 0.5 * cs * PANEL_FILL; // flush with the exterior face
+    let axes = [IVec3::X, IVec3::Y, IVec3::Z];
+    let mut out = Vec::new();
+    for v in &craft.voxels {
+        if !craft.is_panel(v.cell) {
+            continue;
+        }
+        // Thin axis = the wall normal: the axis with the fewest occupied neighbours (the wall
+        // continues in-plane, so the in-plane axes have occupied neighbours).
+        let occ_count = |a: IVec3| {
+            occupied.contains(&(v.cell + a)) as i32 + occupied.contains(&(v.cell - a)) as i32
+        };
+        let thin = (0..3).min_by_key(|&i| occ_count(axes[i])).unwrap();
+        let a = axes[thin];
+        // Seat the plate flush with whichever side faces outward (empty); centre it if both/neither.
+        let dir = match (
+            !occupied.contains(&(v.cell + a)),
+            !occupied.contains(&(v.cell - a)),
+        ) {
+            (true, false) => 1.0,
+            (false, true) => -1.0,
+            _ => 0.0,
+        };
+        let centre = (v.cell.as_dvec3() + DVec3::splat(0.5)) * cs;
+        let pos = centre + a.as_dvec3() * (dir * inset);
+        out.push((v.material, thin, pos.as_vec3()));
+    }
+    out
+}
+
+/// The three thin-plate meshes (X/Y/Z thin) for a cell size, reused across all panel plates (WI 722).
+fn plate_meshes(cell_size: f64, meshes: &mut Assets<Mesh>) -> [Handle<Mesh>; 3] {
+    let s = cell_size as f32;
+    let t = (cell_size * PANEL_FILL) as f32;
+    [
+        meshes.add(Mesh::from(Cuboid::new(t, s, s))),
+        meshes.add(Mesh::from(Cuboid::new(s, t, s))),
+        meshes.add(Mesh::from(Cuboid::new(s, s, t))),
+    ]
+}
+
+/// One reusable PBR material handle per distinct structural material in the craft (WI 722), so the many
+/// panel plates don't each allocate a material.
+fn material_handles(
+    craft: &VoxelCraft,
+    asset_server: &AssetServer,
+    materials: &mut Assets<StandardMaterial>,
+) -> Vec<(Material, Handle<StandardMaterial>)> {
+    materials_present(craft)
+        .into_iter()
+        .map(|m| (m, pbr_material(m, asset_server, materials)))
+        .collect()
 }
 
 /// Will this craft float, and at what draft? (WI 720, the Build-mode predictor.) Net buoyancy is the
@@ -826,6 +888,47 @@ mod tests {
         let (s2, p2) = split_panels(&plain);
         assert_eq!(s2.voxels.len(), plain.voxels.len());
         assert!(p2.voxels.is_empty());
+    }
+
+    /// WI 722: one thin plate per panel cell; no panels ⇒ no plates.
+    #[test]
+    fn panel_plate_specs_one_plate_per_panel() {
+        // A lone panel cell ⇒ exactly one plate.
+        let mut c = VoxelCraft::new(0.5);
+        c.voxels.push(Voxel {
+            cell: IVec3::ZERO,
+            material: Material::ALUMINIUM,
+        });
+        c.set_panel(IVec3::ZERO, true);
+        assert_eq!(panel_plate_specs(&c).len(), 1);
+
+        // No panels ⇒ no plates (solid renders via the hull skin instead).
+        let mut solid = c.clone();
+        solid.panels.clear();
+        assert!(panel_plate_specs(&solid).is_empty());
+
+        // The seed hull is all panels ⇒ one plate per voxel.
+        let seed = seed_hull();
+        assert_eq!(panel_plate_specs(&seed).len(), seed.voxels.len());
+
+        // A +X wall cell plates along X (the wall normal), not Y/Z (the in-plane axes have neighbours).
+        let mut wall = VoxelCraft::new(0.5);
+        for y in 0..3 {
+            for z in 0..3 {
+                let cell = IVec3::new(0, y, z);
+                wall.voxels.push(Voxel {
+                    cell,
+                    material: Material::ALUMINIUM,
+                });
+                wall.set_panel(cell, true);
+            }
+        }
+        // The middle cell (0,1,1): Y and Z have 2 occupied neighbours, X has 0 ⇒ thin axis = X (0).
+        let mid = panel_plate_specs(&wall)
+            .into_iter()
+            .find(|(_, _, pos)| (*pos - Vec3::new(0.25, 0.75, 0.75)).length() < 0.4)
+            .expect("middle cell plate");
+        assert_eq!(mid.1, 0, "the +X wall plates along X");
     }
 
     /// WI 720: the predictor agrees with the float — the panel seed predicts FLOAT (draft < 1), the
