@@ -681,7 +681,8 @@ pub(crate) fn editor_input(
     }
 
     // Toggle panel-build mode (WI 716): placed structural voxels become thin panels (light hulls).
-    if keys.just_pressed(KeyCode::KeyB) {
+    // `T` (thin) — `B` is already the blueprint-save key below.
+    if keys.just_pressed(KeyCode::KeyT) {
         state.panel_mode = !state.panel_mode;
         info!("panel mode: {}", state.panel_mode);
     }

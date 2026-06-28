@@ -475,7 +475,7 @@ fn enter_build(mut commands: Commands) {
     ));
     commands.spawn((
         Text::new(
-            "harbor — Build (Enter: Float)\nmouse: orbit/zoom · L-click place · R-click remove",
+            "harbor — Build (Enter: Float)\nmouse: orbit/zoom · L-click place · R-click remove\nT: panel mode (thin, light) · Tab: material",
         ),
         TextFont {
             font_size: 20.0,
@@ -531,8 +531,14 @@ fn sync_build_meshes(
 fn update_build_hud(editor: Res<EditorState>, mut hud: Query<&mut Text, With<BuildHud>>) {
     if let Ok(mut text) = hud.single_mut() {
         let cells = editor.craft.voxels.len();
+        let panels = editor.craft.panels.len();
+        let mode = if editor.panel_mode {
+            "PANEL (thin)"
+        } else {
+            "solid"
+        };
         text.0 = format!(
-            "harbor — Build (Enter: Float)\nmouse: orbit/zoom · L-click place · R-click remove\ncells: {cells}"
+            "harbor — Build (Enter: Float)\nmouse: orbit/zoom · L-click place · R-click remove\nT: place mode — {mode} · Tab: material\ncells: {cells}  panels: {panels}"
         );
     }
 }
