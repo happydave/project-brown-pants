@@ -33,6 +33,8 @@ use bevy::prelude::*;
 
 use sounding_sim::active::{ActiveBody, Gravity};
 use sounding_sim::ballast::{Ballast, BallastCommand, BallastTank};
+use sounding_sim::compartments::compartments;
+use sounding_sim::flooding::FloodCompartment;
 use sounding_sim::fluid::FluidMedium;
 use sounding_sim::frame::{FrameId, WorldPos};
 use sounding_sim::marine::{MarinePropulsion, MarineThruster, Rudder, ThrusterCommand};
@@ -142,6 +144,78 @@ struct HarborReadout {
     ballast: f64,
     /// Rudder deflection, radians (WI 725).
     rudder: f64,
+    /// Overall interior flooded fraction in `[0, 1]` (WI 718).
+    flood: f64,
+}
+
+/// The harbor's compartment-flooding state (WI 718): per sealed compartment, its cells (sorted
+/// bottom-up), the WI 520 flood model, and the interior AABB (hull-local, CoM-offset metres) for the
+/// rising-water render. Driven by the existing WI 519/520 systems — no `sounding_sim` change.
+#[derive(Resource, Default)]
+struct FloodState {
+    comps: Vec<FloodComp>,
+    /// Whether the hull has been breached (the player opened it to the sea).
+    breached: bool,
+}
+
+struct FloodComp {
+    /// The compartment's empty cells, sorted by height (ascending) — water fills bottom-up.
+    cells: Vec<IVec3>,
+    /// The WI 520 transient flood model (volume, centroid, breach/flood state).
+    flood: FloodCompartment,
+    /// Interior AABB min/max, hull-local render metres (CoM-offset), for the water cuboid.
+    min: Vec3,
+    max: Vec3,
+}
+
+/// Tags a translucent rising-water cuboid for compartment `index` (WI 718).
+#[derive(Component)]
+struct FloodWater(usize);
+
+/// Flood relaxation rate (1/s) — a several-second flood once breached (WI 520 `step` constant).
+const FLOOD_RATE: f64 = 0.15;
+
+/// The cells of a compartment that still hold **air** at a given flooded fraction (WI 718): water fills
+/// **bottom-up**, so the lowest `fraction · n` cells have flooded (lost their air) and the upper ones
+/// remain. `cells` must be sorted by height ascending. The hull's enclosed-buoyancy set is rebuilt from
+/// these, so buoyancy falls as it floods. Pure (the testable core of the buoyancy feedback).
+fn unflooded_cells(cells: &[IVec3], flooded_fraction: f64) -> Vec<IVec3> {
+    let n = cells.len();
+    let flooded = (flooded_fraction.clamp(0.0, 1.0) * n as f64).round() as usize;
+    cells.iter().skip(flooded.min(n)).copied().collect()
+}
+
+/// Build the harbor flood state from a hull's sealed compartments (WI 519), dry.
+fn build_flood_state(craft: &VoxelCraft, com: DVec3) -> FloodState {
+    let cs = craft.cell_size;
+    let com_off = -com.as_vec3();
+    let atm = 101_325.0;
+    let crush = 5.0e6; // ~500 m of water (well beyond the harbor)
+    let comps = compartments(craft)
+        .compartments
+        .iter()
+        .map(|c| {
+            let mut cells = c.cells.clone();
+            cells.sort_by_key(|p| p.y);
+            let (mut lo, mut hi) = (IVec3::MAX, IVec3::MIN);
+            for &p in &cells {
+                lo = lo.min(p);
+                hi = hi.max(p);
+            }
+            let min_m = (lo.as_dvec3() * cs).as_vec3() + com_off;
+            let max_m = ((hi.as_dvec3() + DVec3::ONE) * cs).as_vec3() + com_off;
+            FloodComp {
+                cells,
+                flood: FloodCompartment::from_compartment(c, cs, atm, crush),
+                min: min_m,
+                max: max_m,
+            }
+        })
+        .collect();
+    FloodState {
+        comps,
+        breached: false,
+    }
 }
 
 // --- markers (teardown: tag only the root of each spawned tree) ---
@@ -209,6 +283,7 @@ impl Plugin for HarborScenePlugin {
             .init_resource::<PointerOnPalette>()
             .init_resource::<HarborReadout>()
             .init_resource::<HarborCam>()
+            .init_resource::<FloodState>()
             .insert_resource(Gravity { mu: BODY.mu })
             .add_plugins(DescentPlugin {
                 substep_dt: SUBSTEP_DT,
@@ -224,6 +299,8 @@ impl Plugin for HarborScenePlugin {
                 (
                     harbor_drive_input,
                     harbor_ballast_input,
+                    harbor_breach_input,
+                    harbor_flood_step,
                     track_hull,
                     harbor_camera_input,
                     follow_camera,
@@ -429,6 +506,22 @@ fn enter_float(
     if let Some((body, dc)) = assemble_float(&editor.craft) {
         let com_off = -dc.com.as_vec3();
         let craft = dc.craft.clone();
+        // Compartment flooding (WI 718): an opaque dry interior so the ocean does not show through, and
+        // a translucent water volume per compartment that rises when breached. Built from the sealed
+        // compartments (WI 519); the rising water + the buoyancy loss are driven by the WI 520 model.
+        let flood_state = build_flood_state(&craft, dc.com);
+        let dry_fill_mat = materials.add(StandardMaterial {
+            base_color: Color::srgb(0.05, 0.06, 0.07), // a dark dry hold
+            perceptual_roughness: 1.0,
+            ..default()
+        });
+        let water_fill_mat = materials.add(StandardMaterial {
+            base_color: Color::srgba(0.08, 0.30, 0.42, 0.75),
+            alpha_mode: AlphaMode::Blend,
+            perceptual_roughness: 0.1,
+            ..default()
+        });
+        let unit_cube = meshes.add(Mesh::from(Cuboid::new(1.0, 1.0, 1.0)));
         // A synthesized stern drive (WI 708): no device palette yet (WI 715), so any built hull
         // gets a port+starboard screw pair so it can sail and steer (differential thrust).
         let marine = synth_marine(&craft);
@@ -475,7 +568,40 @@ fn enter_float(
                     Transform::from_translation(pos + com_off),
                 ));
             }
+            // Interior fill (WI 718): an opaque dry hold (occludes the ocean) + a flat rising-water
+            // cuboid per compartment (a unit cube scaled by `harbor_flood_step` as it floods).
+            for (i, fc) in flood_state.comps.iter().enumerate() {
+                let size = fc.max - fc.min;
+                let centre = 0.5 * (fc.min + fc.max);
+                let eps = 0.02;
+                parent.spawn((
+                    Mesh3d(meshes.add(Mesh::from(Cuboid::new(
+                        (size.x - eps).max(0.01),
+                        (size.y - eps).max(0.01),
+                        (size.z - eps).max(0.01),
+                    )))),
+                    MeshMaterial3d(dry_fill_mat.clone()),
+                    Transform::from_translation(centre),
+                ));
+                parent.spawn((
+                    Mesh3d(unit_cube.clone()),
+                    MeshMaterial3d(water_fill_mat.clone()),
+                    Transform {
+                        translation: Vec3::new(centre.x, fc.min.y, centre.z),
+                        scale: Vec3::new(
+                            (size.x - eps).max(0.01),
+                            0.0001,
+                            (size.z - eps).max(0.01),
+                        ),
+                        ..default()
+                    },
+                    FloodWater(i),
+                ));
+            }
         });
+        commands.insert_resource(flood_state);
+    } else {
+        commands.insert_resource(FloodState::default());
     }
 
     // Distant ocean (sunk 2 m so it does not z-fight the animated patch).
@@ -582,7 +708,7 @@ fn enter_float(
 
     // HUD.
     commands.spawn((
-        Text::new("harbor — Float (Enter: Build)\nWASD: drive / steer   F/G: dive / surface\ndraft:  --\nheel:   --\nnet buoy: --\nthrust:  --   fuel: --\nballast: --   rudder: --"),
+        Text::new("harbor — Float (Enter: Build)\nWASD: drive / steer   F/G: dive / surface   X: breach\ndraft:  --\nheel:   --\nnet buoy: --\nthrust:  --   fuel: --\nballast: --   rudder: --\nflood: --"),
         TextFont {
             font_size: 20.0,
             ..default()
@@ -988,6 +1114,65 @@ fn harbor_ballast_input(
     readout.ballast = b.fill_fraction();
 }
 
+/// Breach the hull (WI 718): `X` opens the sealed compartments to the sea so they begin to flood.
+/// One-way — re-enter Float (toggle to Build and back) to reset to a dry hull.
+fn harbor_breach_input(keys: Res<ButtonInput<KeyCode>>, mut flood: ResMut<FloodState>) {
+    if keys.just_pressed(KeyCode::KeyX) && !flood.breached {
+        flood.breached = true;
+        for c in &mut flood.comps {
+            c.flood.breached = true;
+        }
+    }
+}
+
+/// Advance compartment flooding (WI 718): step each breached compartment against the water at its keel,
+/// rebuild the hull's enclosed-buoyancy set from the still-dry (upper) cells so **buoyancy falls as it
+/// floods** (it sits lower / sinks), and raise each interior-water cuboid to its flooded level. Driven
+/// entirely by the WI 519/520 model — no `sounding_sim` change. Publishes the flooded fraction.
+#[allow(clippy::type_complexity)]
+fn harbor_flood_step(
+    time: Res<Time>,
+    mut flood: ResMut<FloodState>,
+    mut readout: ResMut<HarborReadout>,
+    mut hull: Query<(&ActiveBody, &mut DivingCraft), With<HullMarker>>,
+    mut water: Query<(&FloodWater, &mut Transform)>,
+) {
+    let Ok((body, mut dc)) = hull.single_mut() else {
+        return;
+    };
+    let dt = time.delta_secs_f64();
+    let mut total_vol = 0.0;
+    let mut total_water = 0.0;
+    let mut enclosed: Vec<IVec3> = Vec::new();
+    for comp in &mut flood.comps {
+        // Sample the water at the compartment; the breach is taken to sit at/below the keel, so a
+        // breached hull always takes on water, and the inflow grows as it sinks deeper (real).
+        let centroid_world = body.position + body.orientation * (comp.flood.centroid - dc.com);
+        let alt = (centroid_world.length() - BODY.radius).min(-0.1);
+        let sample = FluidMedium::EARTHLIKE.sample_altitude(alt);
+        comp.flood.step(&sample, FLOOD_RATE, dt);
+        total_vol += comp.flood.volume;
+        total_water += comp.flood.floodwater;
+        enclosed.extend(unflooded_cells(&comp.cells, comp.flood.flooded_fraction()));
+    }
+    // Rebuild the buoyancy set from the still-dry cells (the shared `advance_descent` reads this).
+    dc.enclosed = enclosed;
+    readout.flood = if total_vol > 0.0 {
+        (total_water / total_vol).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    // Raise the interior water cuboids to the flooded level (transform-only, no mesh rebuild).
+    for (fw, mut tf) in &mut water {
+        if let Some(comp) = flood.comps.get(fw.0) {
+            let frac = comp.flood.flooded_fraction() as f32;
+            let h = (frac * (comp.max.y - comp.min.y)).max(0.0001);
+            tf.scale.y = h;
+            tf.translation.y = comp.min.y + 0.5 * h;
+        }
+    }
+}
+
 /// Middle-drag orbit (L/R swapped per Dave), wheel zoom.
 fn harbor_camera_input(
     motion: Res<AccumulatedMouseMotion>,
@@ -1039,7 +1224,7 @@ fn update_hud(readout: Res<HarborReadout>, mut hud: Query<&mut Text, With<Hud>>)
             "floating"
         };
         text.0 = format!(
-            "harbor — Float (Enter: Build) — {status}\nWASD: drive / steer   F/G: dive / surface\ndraft:    {:6.2} m\nheel:     {:6.1} deg\nnet buoy: {:8.0} N\nthrust:   {:8.0} N   fuel:    {:3.0}%\nballast:  {:3.0}%   rudder: {:5.1} deg",
+            "harbor — Float (Enter: Build) — {status}\nWASD: drive / steer   F/G: dive / surface   X: breach\ndraft:    {:6.2} m\nheel:     {:6.1} deg\nnet buoy: {:8.0} N\nthrust:   {:8.0} N   fuel:    {:3.0}%\nballast:  {:3.0}%   rudder: {:5.1} deg\nflood:    {:3.0}%",
             readout.draft,
             readout.heel.to_degrees(),
             readout.net_buoyancy,
@@ -1047,6 +1232,7 @@ fn update_hud(readout: Res<HarborReadout>, mut hud: Query<&mut Text, With<Hud>>)
             readout.fuel * 100.0,
             readout.ballast * 100.0,
             readout.rudder.to_degrees(),
+            readout.flood * 100.0,
         );
     }
 }
@@ -1267,6 +1453,57 @@ mod tests {
         assert!(
             tq2.dot(up).abs() > 1e-3,
             "differential thrust steers: {tq2:?}"
+        );
+    }
+
+    /// WI 718: flooding removes the hull's enclosed buoyancy **bottom-up**, so net buoyancy falls
+    /// monotonically as it floods — a hull that floats dry sinks fully flooded.
+    #[test]
+    fn flooding_removes_buoyancy_bottom_up_and_sinks() {
+        let seed = seed_hull();
+        let mp = seed.mass_properties().unwrap();
+        let mut cells: Vec<IVec3> = compartments(&seed)
+            .compartments
+            .iter()
+            .flat_map(|c| c.cells.iter().copied())
+            .collect();
+        cells.sort_by_key(|c| c.y);
+        assert!(!cells.is_empty(), "the sealed hull has an enclosed cavity");
+
+        let g = 9.81;
+        let deep = DVec3::new(0.0, BODY.radius - 100.0, 0.0);
+        let net = |frac: f64| {
+            let enc = unflooded_cells(&cells, frac);
+            let buoy = buoyancy_wrench(
+                &seed,
+                mp.center_of_mass,
+                deep,
+                DQuat::IDENTITY,
+                BODY.radius,
+                0.0,
+                1_025.0,
+                g,
+                &enc,
+            )
+            .force
+            .length();
+            buoy - mp.mass * g
+        };
+        assert!(net(0.0) > 0.0, "dry, the panel hull floats");
+        assert!(net(1.0) < 0.0, "fully flooded, it sinks");
+        // Monotone buoyancy loss as it floods.
+        assert!(
+            net(0.0) > net(0.5) && net(0.5) > net(1.0),
+            "buoyancy falls as it floods"
+        );
+        // Bottom-up: at half flood the dry cells are the upper half.
+        let dry = unflooded_cells(&cells, 0.5);
+        assert!(dry.len() < cells.len() && !dry.is_empty());
+        let min_dry_y = dry.iter().map(|c| c.y).min().unwrap();
+        let max_flooded_y = cells[(0.5 * cells.len() as f64).round() as usize - 1].y;
+        assert!(
+            min_dry_y >= max_flooded_y,
+            "the dry cells are the upper ones"
         );
     }
 
