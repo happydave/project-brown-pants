@@ -205,6 +205,12 @@ struct InteriorWater(usize);
 /// Flood relaxation rate (1/s) — a several-second flood once breached (WI 520 `step` constant).
 const FLOOD_RATE: f64 = 0.15;
 
+/// How much of an **open** boat's interior the dry-hold occluder fills, bottom-up (WI 734). The cap sits
+/// just above the typical floating waterline so it still hides the sea-level water plane, while the top is
+/// left open so you can see down into the real hollow interior (a recess, not a flush grey lid). Sealed
+/// compartments and ballast tanks fill fully — their interiors are genuinely closed.
+const OPEN_HOLD_FILL: f32 = 0.72;
+
 /// The cells of a compartment that still hold **air** at a given flooded fraction (WI 718): water fills
 /// **bottom-up**, so the lowest `fraction · n` cells have flooded (lost their air) and the upper ones
 /// remain. `cells` must be sorted by height ascending. The hull's enclosed-buoyancy set is rebuilt from
@@ -669,14 +675,28 @@ fn enter_float(
                 let size = region.max - region.min;
                 let centre = 0.5 * (region.min + region.max);
                 let eps = 0.02;
+                // WI 734: an OPEN hold is capped just above the floating waterline (`OPEN_HOLD_FILL`) — it
+                // still hides the sea-level water plane, but the top is left open so you see **down into**
+                // the real hollow interior (a recess, not a flush lid). Sealed compartments + ballast tanks
+                // fill fully (their interiors are genuinely closed).
+                let fill = if matches!(region.source, WaterSource::Open) {
+                    OPEN_HOLD_FILL
+                } else {
+                    1.0
+                };
+                let occ_h = (size.y * fill - eps).max(0.01);
                 parent.spawn((
                     Mesh3d(meshes.add(Mesh::from(Cuboid::new(
                         (size.x - eps).max(0.01),
-                        (size.y - eps).max(0.01),
+                        occ_h,
                         (size.z - eps).max(0.01),
                     )))),
                     MeshMaterial3d(dry_fill_mat.clone()),
-                    Transform::from_translation(centre),
+                    Transform::from_translation(Vec3::new(
+                        centre.x,
+                        region.min.y + 0.5 * size.y * fill,
+                        centre.z,
+                    )),
                 ));
                 parent.spawn((
                     Mesh3d(unit_cube.clone()),
