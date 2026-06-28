@@ -34,8 +34,8 @@ use sounding_sim::active::{ActiveBody, Gravity};
 use sounding_sim::fluid::FluidMedium;
 use sounding_sim::frame::{FrameId, WorldPos};
 use sounding_sim::medium::{
-    buoyancy_wrench, heel_angle, max_cross_section, DescentParams, DescentPlugin, DivingCraft,
-    GlideParams, DEFAULT_SLAM_COEFFICIENT,
+    buoyancy_wrench, enclosed_cells, heel_angle, max_cross_section, DescentParams, DescentPlugin,
+    DivingCraft, GlideParams, DEFAULT_SLAM_COEFFICIENT,
 };
 use sounding_sim::powertrain::MotorTier;
 use sounding_sim::sim::CentralBody;
@@ -528,6 +528,36 @@ fn sync_build_meshes(
     }
 }
 
+/// Will this craft float, and at what draft? (WI 720, the Build-mode predictor.) Net buoyancy is the
+/// fully-submerged displaced weight vs the real weight — the **same** model the Float mode runs, so
+/// the prediction agrees with the live outcome. Returns `(floats, draft_fraction)`; draft is the
+/// equilibrium submerged fraction (1.0 ⇒ awash / sinking).
+fn would_float(craft: &VoxelCraft) -> (bool, f64) {
+    let Some(mp) = craft.mass_properties() else {
+        return (false, 1.0);
+    };
+    if mp.mass <= 0.0 {
+        return (false, 1.0);
+    }
+    let g = 9.81;
+    let deep = DVec3::new(0.0, BODY.radius - 100.0, 0.0); // fully submerged ⇒ maximum buoyancy
+    let max_buoy = buoyancy_wrench(
+        craft,
+        mp.center_of_mass,
+        deep,
+        DQuat::IDENTITY,
+        BODY.radius,
+        0.0,
+        1_025.0,
+        g,
+        &enclosed_cells(craft),
+    )
+    .force
+    .length();
+    let weight = mp.mass * g;
+    (max_buoy > weight, (weight / max_buoy).clamp(0.0, 1.0))
+}
+
 fn update_build_hud(editor: Res<EditorState>, mut hud: Query<&mut Text, With<BuildHud>>) {
     if let Ok(mut text) = hud.single_mut() {
         let cells = editor.craft.voxels.len();
@@ -537,8 +567,15 @@ fn update_build_hud(editor: Res<EditorState>, mut hud: Query<&mut Text, With<Bui
         } else {
             "solid"
         };
+        // Live float prediction (WI 720): the same buoyancy model the Float mode runs.
+        let (floats, draft) = would_float(&editor.craft);
+        let prediction = if floats {
+            format!("will FLOAT (draft ~{:.0}%)", draft * 100.0)
+        } else {
+            "will SINK".to_string()
+        };
         text.0 = format!(
-            "harbor — Build (Enter: Float)\nmouse: orbit/zoom · L-click place · R-click remove\nT: place mode — {mode} · Tab: material\ncells: {cells}  panels: {panels}"
+            "harbor — Build (Enter: Float)\nmouse: orbit/zoom · L-click place · R-click remove\nT: place mode — {mode} · Tab: material\ncells: {cells}  panels: {panels}\n>> {prediction} <<"
         );
     }
 }
@@ -724,6 +761,26 @@ mod tests {
             net_buoyancy(&solid) < 0.0,
             "the same hull in solid cubes sinks"
         );
+    }
+
+    /// WI 720: the predictor agrees with the float — the panel seed predicts FLOAT (draft < 1), the
+    /// same hull in solid cubes predicts SINK.
+    #[test]
+    fn would_float_predicts_panel_floats_solid_sinks() {
+        let seed = seed_hull();
+        let (floats, draft) = would_float(&seed);
+        assert!(floats, "the panel seed is predicted to float");
+        assert!(draft > 0.0 && draft < 1.0, "with a real draft: {draft}");
+
+        let mut solid = seed.clone();
+        solid.panels.clear();
+        assert!(
+            !would_float(&solid).0,
+            "the same hull in solid cubes is predicted to sink"
+        );
+
+        // Empty craft: predicted to sink, no panic.
+        assert!(!would_float(&VoxelCraft::new(0.5)).0);
     }
 
     /// WI 717: the float body carries the craft's **real** mass (no auto-ballast).
