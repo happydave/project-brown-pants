@@ -151,15 +151,20 @@ struct HarborReadout {
     flood: f64,
 }
 
-/// The harbor's compartment-flooding state (WI 718): per sealed compartment, its cells (sorted
-/// bottom-up), the WI 520 flood model, and the interior AABB (hull-local, CoM-offset metres) for the
-/// rising-water render. Driven by the existing WI 519/520 systems — no `sounding_sim` change.
+/// The harbor's interior-water state (WI 718 + 728 + 709, unified by WI 729): the WI 520 flood physics
+/// per sealed compartment, plus a single **render manifest** (`regions`) of every interior volume that can
+/// hold water — sealed compartment, open cavity, or ballast tank — each with the source its fill level
+/// comes from. One renderer draws them all (occluder + rising surface), so a new water source is data (a
+/// new region), not a new render block. Driven by the existing WI 519/520/713 systems — no `sounding_sim`
+/// change.
 #[derive(Resource, Default)]
 struct FloodState {
+    /// The sealed-compartment flood models (WI 520) — the physics that drives buoyancy loss. The render
+    /// manifest references these by index via [`WaterSource::Sealed`].
     comps: Vec<FloodComp>,
-    /// The hull's **open** cavity (WI 713/728), if any — an un-sealed interior. Occluded as a dry hold
-    /// when floating and filled with rising water as it swamps over the rim (swamp-driven, not breach).
-    open: Option<OpenRegion>,
+    /// Every interior volume that can hold water, with its fill source (WI 729). The unified renderer
+    /// spawns one occluder + one rising-water cuboid per region and raises it from `source`.
+    regions: Vec<InteriorWaterRegion>,
     /// Whether the hull has been breached (the player opened it to the sea).
     breached: bool,
 }
@@ -169,24 +174,33 @@ struct FloodComp {
     cells: Vec<IVec3>,
     /// The WI 520 transient flood model (volume, centroid, breach/flood state).
     flood: FloodCompartment,
-    /// Interior AABB min/max, hull-local render metres (CoM-offset), for the water cuboid.
-    min: Vec3,
-    max: Vec3,
 }
 
-/// The render extent of a hull's open cavity (WI 728): the interior AABB in hull-local CoM-offset metres.
-struct OpenRegion {
+/// One interior volume that can hold water (WI 729): an AABB to fill — hull-local, CoM-offset render
+/// metres — plus the [`WaterSource`] its fill fraction is read from each frame. The unifying abstraction:
+/// the renderer treats sealed flooding, open swamping, and ballast identically.
+struct InteriorWaterRegion {
     min: Vec3,
     max: Vec3,
+    source: WaterSource,
 }
 
-/// Tags a translucent rising-water cuboid for compartment `index` (WI 718).
-#[derive(Component)]
-struct FloodWater(usize);
+/// Where an [`InteriorWaterRegion`]'s fill fraction comes from (WI 729).
+#[derive(Clone, Copy)]
+enum WaterSource {
+    /// A sealed compartment (WI 718): fill = its WI 520 flooded fraction (breach-driven).
+    Sealed { comp: usize },
+    /// The open cavity (WI 728): fill = `1 − open_cavity_rim_factor` (swamp-driven).
+    Open,
+    /// A ballast tank (WI 709): fill = the tank's fill fraction (player flood/blow) — so ballast water is
+    /// finally visible in its tank, not just a HUD number.
+    Ballast { tank: usize },
+}
 
-/// Tags the translucent rising-water cuboid for the **open** cavity (WI 728), driven by the swamp state.
+/// Tags a translucent rising-water cuboid, indexing [`FloodState::regions`] (WI 729). One component for
+/// every source (sealed / open / ballast), replacing the per-source `FloodWater`/`OpenWater`.
 #[derive(Component)]
-struct OpenWater;
+struct InteriorWater(usize);
 
 /// Flood relaxation rate (1/s) — a several-second flood once breached (WI 520 `step` constant).
 const FLOOD_RATE: f64 = 0.15;
@@ -201,52 +215,82 @@ fn unflooded_cells(cells: &[IVec3], flooded_fraction: f64) -> Vec<IVec3> {
     cells.iter().skip(flooded.min(n)).copied().collect()
 }
 
-/// Build the harbor flood state from a hull's sealed compartments (WI 519), dry.
-fn build_flood_state(craft: &VoxelCraft, com: DVec3) -> FloodState {
+/// The vertical scale + centre of a rising-water cuboid (WI 729): a unit cube scaled to `frac` of a
+/// region's vertical `extent`, its base pinned at `min_y` so the surface rises from the floor. Returns
+/// `(scale_y, translation_y)`. Pure — the testable core of the interior-water render raise.
+fn fill_cuboid_y(min_y: f32, extent: f32, frac: f32) -> (f32, f32) {
+    let h = (frac.clamp(0.0, 1.0) * extent).max(0.0001);
+    (h, min_y + 0.5 * h)
+}
+
+/// The hull-local CoM-offset render AABB of a set of cells (WI 729): the cell lattice ∩ extents mapped to
+/// metres, used to size an interior-water region's occluder + rising surface.
+fn cell_aabb(cells: &[IVec3], cs: f64, com_off: Vec3) -> (Vec3, Vec3) {
+    let (mut lo, mut hi) = (IVec3::MAX, IVec3::MIN);
+    for &p in cells {
+        lo = lo.min(p);
+        hi = hi.max(p);
+    }
+    (
+        (lo.as_dvec3() * cs).as_vec3() + com_off,
+        ((hi.as_dvec3() + DVec3::ONE) * cs).as_vec3() + com_off,
+    )
+}
+
+/// Build the harbor interior-water state (WI 718/728/709, unified by WI 729), dry: the sealed-compartment
+/// flood models plus the render manifest of every interior volume that can hold water — sealed
+/// compartments, the open cavity, and the ballast tanks (so ballast shows as water in its tank).
+fn build_flood_state(craft: &VoxelCraft, com: DVec3, ballast: Option<&Ballast>) -> FloodState {
     let cs = craft.cell_size;
     let com_off = -com.as_vec3();
     let atm = 101_325.0;
     let crush = 5.0e6; // ~500 m of water (well beyond the harbor)
-    let comps = compartments(craft)
-        .compartments
-        .iter()
-        .map(|c| {
-            let mut cells = c.cells.clone();
-            cells.sort_by_key(|p| p.y);
-            let (mut lo, mut hi) = (IVec3::MAX, IVec3::MIN);
-            for &p in &cells {
-                lo = lo.min(p);
-                hi = hi.max(p);
-            }
-            let min_m = (lo.as_dvec3() * cs).as_vec3() + com_off;
-            let max_m = ((hi.as_dvec3() + DVec3::ONE) * cs).as_vec3() + com_off;
-            FloodComp {
-                cells,
-                flood: FloodCompartment::from_compartment(c, cs, atm, crush),
-                min: min_m,
-                max: max_m,
-            }
-        })
-        .collect();
-    // The open cavity (WI 713/728): its render AABB, so an open boat's interior occludes the ocean
-    // (dry hold) and fills with water as it swamps.
+    let mut comps = Vec::new();
+    let mut regions = Vec::new();
+    // Sealed compartments (WI 718): each a flood model + a region fed by its flooded fraction.
+    for c in &compartments(craft).compartments {
+        let mut cells = c.cells.clone();
+        cells.sort_by_key(|p| p.y);
+        let (min, max) = cell_aabb(&cells, cs, com_off);
+        let comp = comps.len();
+        comps.push(FloodComp {
+            cells,
+            flood: FloodCompartment::from_compartment(c, cs, atm, crush),
+        });
+        regions.push(InteriorWaterRegion {
+            min,
+            max,
+            source: WaterSource::Sealed { comp },
+        });
+    }
+    // The open cavity (WI 713/728): a region fed by the swamp state, so an open boat's interior occludes
+    // the ocean (dry hold) and fills with water as it swamps over the rim.
     let cavity = open_cavity(craft);
-    let open = if cavity.cells.is_empty() {
-        None
-    } else {
-        let (mut lo, mut hi) = (IVec3::MAX, IVec3::MIN);
-        for &p in &cavity.cells {
-            lo = lo.min(p);
-            hi = hi.max(p);
+    if !cavity.cells.is_empty() {
+        let (min, max) = cell_aabb(&cavity.cells, cs, com_off);
+        regions.push(InteriorWaterRegion {
+            min,
+            max,
+            source: WaterSource::Open,
+        });
+    }
+    // Ballast tanks (WI 709, made visible by WI 729): a region fed by the tank's fill fraction. The tank
+    // has only a mount + capacity (no device palette yet, WI 715), so the render extent is a synthetic
+    // cube of that volume centred on the mount — water rises in it as the tank floods.
+    if let Some(b) = ballast {
+        for (tank, t) in b.tanks.iter().enumerate() {
+            let half = (t.capacity.cbrt().max(cs) * 0.5) as f32;
+            let centre = t.mount.as_vec3() + com_off;
+            regions.push(InteriorWaterRegion {
+                min: centre - Vec3::splat(half),
+                max: centre + Vec3::splat(half),
+                source: WaterSource::Ballast { tank },
+            });
         }
-        Some(OpenRegion {
-            min: (lo.as_dvec3() * cs).as_vec3() + com_off,
-            max: ((hi.as_dvec3() + DVec3::ONE) * cs).as_vec3() + com_off,
-        })
-    };
+    }
     FloodState {
         comps,
-        open,
+        regions,
         breached: false,
     }
 }
@@ -539,10 +583,17 @@ fn enter_float(
     if let Some((body, dc)) = assemble_float(&editor.craft) {
         let com_off = -dc.com.as_vec3();
         let craft = dc.craft.clone();
-        // Compartment flooding (WI 718): an opaque dry interior so the ocean does not show through, and
-        // a translucent water volume per compartment that rises when breached. Built from the sealed
-        // compartments (WI 519); the rising water + the buoyancy loss are driven by the WI 520 model.
-        let flood_state = build_flood_state(&craft, dc.com);
+        // A synthesized stern drive (WI 708): no device palette yet (WI 715), so any built hull
+        // gets a port+starboard screw pair so it can sail and steer (differential thrust).
+        let marine = synth_marine(&craft);
+        // A synthesized ballast tank (WI 709): flood to dive, blow to surface (no palette yet, WI 715).
+        let ballast = synth_ballast(&craft);
+        // A synthesized rudder (WI 725): the primary underway steering surface.
+        let rudder = synth_rudder(&craft);
+        // Interior water (WI 718/728/709, unified by WI 729): one render manifest of every interior volume
+        // that can hold water — sealed compartments (occlude the ocean, flood when breached), the open
+        // cavity (swamps over the rim), and the ballast tanks (fill on command). Driven by WI 519/520/713.
+        let flood_state = build_flood_state(&craft, dc.com, ballast.as_ref());
         let dry_fill_mat = materials.add(StandardMaterial {
             base_color: Color::srgb(0.05, 0.06, 0.07), // a dark dry hold
             perceptual_roughness: 1.0,
@@ -555,13 +606,6 @@ fn enter_float(
             ..default()
         });
         let unit_cube = meshes.add(Mesh::from(Cuboid::new(1.0, 1.0, 1.0)));
-        // A synthesized stern drive (WI 708): no device palette yet (WI 715), so any built hull
-        // gets a port+starboard screw pair so it can sail and steer (differential thrust).
-        let marine = synth_marine(&craft);
-        // A synthesized ballast tank (WI 709): flood to dive, blow to surface (no palette yet, WI 715).
-        let ballast = synth_ballast(&craft);
-        // A synthesized rudder (WI 725): the primary underway steering surface.
-        let rudder = synth_rudder(&craft);
         let mut hull = commands.spawn((
             body,
             dc,
@@ -601,39 +645,10 @@ fn enter_float(
                     Transform::from_translation(pos + com_off),
                 ));
             }
-            // Interior fill (WI 718): an opaque dry hold (occludes the ocean) + a flat rising-water
-            // cuboid per compartment (a unit cube scaled by `harbor_flood_step` as it floods).
-            for (i, fc) in flood_state.comps.iter().enumerate() {
-                let size = fc.max - fc.min;
-                let centre = 0.5 * (fc.min + fc.max);
-                let eps = 0.02;
-                parent.spawn((
-                    Mesh3d(meshes.add(Mesh::from(Cuboid::new(
-                        (size.x - eps).max(0.01),
-                        (size.y - eps).max(0.01),
-                        (size.z - eps).max(0.01),
-                    )))),
-                    MeshMaterial3d(dry_fill_mat.clone()),
-                    Transform::from_translation(centre),
-                ));
-                parent.spawn((
-                    Mesh3d(unit_cube.clone()),
-                    MeshMaterial3d(water_fill_mat.clone()),
-                    Transform {
-                        translation: Vec3::new(centre.x, fc.min.y, centre.z),
-                        scale: Vec3::new(
-                            (size.x - eps).max(0.01),
-                            0.0001,
-                            (size.z - eps).max(0.01),
-                        ),
-                        ..default()
-                    },
-                    FloodWater(i),
-                ));
-            }
-            // Open cavity (WI 728): the same dry hold (so an open boat's interior occludes the ocean)
-            // plus an `OpenWater` cuboid that `harbor_flood_step` raises as the boat swamps over the rim.
-            if let Some(region) = &flood_state.open {
+            // Interior water (WI 729): one renderer for every region — sealed compartment, open cavity,
+            // or ballast tank. Each gets an opaque dry hold (occludes the ocean / reads as a tank) + a
+            // flat rising-water cuboid (a unit cube `harbor_flood_step` scales to its source's fill level).
+            for (i, region) in flood_state.regions.iter().enumerate() {
                 let size = region.max - region.min;
                 let centre = 0.5 * (region.min + region.max);
                 let eps = 0.02;
@@ -658,7 +673,7 @@ fn enter_float(
                         ),
                         ..default()
                     },
-                    OpenWater,
+                    InteriorWater(i),
                 ));
             }
         });
@@ -1217,20 +1232,21 @@ fn harbor_breach_input(keys: Res<ButtonInput<KeyCode>>, mut flood: ResMut<FloodS
     }
 }
 
-/// Advance compartment flooding (WI 718): step each breached compartment against the water at its keel,
-/// rebuild the hull's enclosed-buoyancy set from the still-dry (upper) cells so **buoyancy falls as it
-/// floods** (it sits lower / sinks), and raise each interior-water cuboid to its flooded level. Driven
-/// entirely by the WI 519/520 model — no `sounding_sim` change. Publishes the flooded fraction.
+/// Advance interior water (WI 718/728/709, unified by WI 729): step each breached compartment against the
+/// water at its keel, rebuild the hull's enclosed-buoyancy set from the still-dry (upper) cells so
+/// **buoyancy falls as it floods** (it sits lower / sinks), then raise **every** interior-water cuboid to
+/// its source's level — sealed flooding (WI 520), open swamping (WI 713), or ballast fill (WI 709) — in
+/// one loop. Physics driven entirely by the WI 519/520/713 models; no `sounding_sim` change. Publishes the
+/// flooded (flood + swamp) fraction; ballast is reported separately by `track_ballast`.
 #[allow(clippy::type_complexity)]
 fn harbor_flood_step(
     time: Res<Time>,
     mut flood: ResMut<FloodState>,
     mut readout: ResMut<HarborReadout>,
-    mut hull: Query<(&ActiveBody, &mut DivingCraft), With<HullMarker>>,
-    mut water: Query<(&FloodWater, &mut Transform), Without<OpenWater>>,
-    mut open_water: Query<&mut Transform, (With<OpenWater>, Without<FloodWater>)>,
+    mut hull: Query<(&ActiveBody, &mut DivingCraft, Option<&Ballast>), With<HullMarker>>,
+    mut water: Query<(&InteriorWater, &mut Transform)>,
 ) {
-    let Ok((body, mut dc)) = hull.single_mut() else {
+    let Ok((body, mut dc, ballast)) = hull.single_mut() else {
         return;
     };
     let dt = time.delta_secs_f64();
@@ -1255,18 +1271,12 @@ fn harbor_flood_step(
     } else {
         0.0
     };
-    // Raise the interior water cuboids to the flooded level (transform-only, no mesh rebuild).
-    for (fw, mut tf) in &mut water {
-        if let Some(comp) = flood.comps.get(fw.0) {
-            let frac = comp.flood.flooded_fraction() as f32;
-            let h = (frac * (comp.max.y - comp.min.y)).max(0.0001);
-            tf.scale.y = h;
-            tf.translation.y = comp.min.y + 0.5 * h;
-        }
-    }
-    // Open cavity (WI 728): an open boat is dry while afloat (the held-out volume) and ships water as it
-    // **swamps** over the rim — the water share is `1 − rim_factor` (1 floating ⇒ dry, 0 swamped ⇒ full).
-    if let Some(region) = &flood.open {
+    // The open cavity's swamp share, computed once (1 floating ⇒ dry, 0 swamped ⇒ full). `1 − rim_factor`.
+    let open_frac = if flood
+        .regions
+        .iter()
+        .any(|r| matches!(r.source, WaterSource::Open))
+    {
         let rim_factor = open_cavity_rim_factor(
             &dc.craft,
             dc.com,
@@ -1276,13 +1286,32 @@ fn harbor_flood_step(
             0.0,
             &dc.open,
         );
-        let water_frac = (1.0 - rim_factor).clamp(0.0, 1.0) as f32;
-        let h = (water_frac * (region.max.y - region.min.y)).max(0.0001);
-        for mut tf in &mut open_water {
-            tf.scale.y = h;
-            tf.translation.y = region.min.y + 0.5 * h;
-        }
-        readout.flood = readout.flood.max(water_frac as f64);
+        let f = (1.0 - rim_factor).clamp(0.0, 1.0);
+        readout.flood = readout.flood.max(f);
+        f as f32
+    } else {
+        0.0
+    };
+    // Raise every interior-water cuboid to its source's fill level (transform-only, no mesh rebuild).
+    for (iw, mut tf) in &mut water {
+        let Some(region) = flood.regions.get(iw.0) else {
+            continue;
+        };
+        let frac = match region.source {
+            WaterSource::Sealed { comp } => flood
+                .comps
+                .get(comp)
+                .map_or(0.0, |c| c.flood.flooded_fraction() as f32),
+            WaterSource::Open => open_frac,
+            WaterSource::Ballast { tank } => ballast
+                .and_then(|b| b.tanks.get(tank))
+                .filter(|t| t.capacity > 0.0)
+                .map_or(0.0, |t| (t.fill / t.capacity).clamp(0.0, 1.0) as f32),
+        };
+        let (scale_y, translation_y) =
+            fill_cuboid_y(region.min.y, region.max.y - region.min.y, frac);
+        tf.scale.y = scale_y;
+        tf.translation.y = translation_y;
     }
 }
 
@@ -1640,6 +1669,104 @@ mod tests {
         assert!(
             min_dry_y >= max_flooded_y,
             "the dry cells are the upper ones"
+        );
+    }
+
+    /// WI 729: `build_flood_state` produces one render region per water source — a sealed compartment
+    /// (Sealed), the open cavity (Open), and each ballast tank (Ballast) — so the renderer is data-driven.
+    #[test]
+    fn build_flood_state_yields_one_region_per_source() {
+        let count = |fs: &FloodState, pred: fn(&WaterSource) -> bool| {
+            fs.regions.iter().filter(|r| pred(&r.source)).count()
+        };
+
+        // A sealed hull, no ballast: a Sealed region, no Open, no Ballast.
+        let seed = seed_hull();
+        let com = seed.mass_properties().unwrap().center_of_mass;
+        let sealed = build_flood_state(&seed, com, None);
+        assert!(
+            count(&sealed, |s| matches!(s, WaterSource::Sealed { .. })) >= 1,
+            "the sealed hull yields at least one Sealed region"
+        );
+        assert_eq!(
+            count(&sealed, |s| matches!(s, WaterSource::Open)),
+            0,
+            "a sealed hull has no open cavity"
+        );
+        assert_eq!(
+            count(&sealed, |s| matches!(s, WaterSource::Ballast { .. })),
+            0,
+            "no ballast ⇒ no Ballast region"
+        );
+        assert_eq!(
+            sealed.comps.len(),
+            count(&sealed, |s| matches!(s, WaterSource::Sealed { .. })),
+            "each Sealed region maps to a compartment"
+        );
+
+        // An open-top hull: an Open region appears.
+        let mut open = seed_hull();
+        let max_y = open.voxels.iter().map(|v| v.cell.y).max().unwrap();
+        open.voxels.retain(|v| v.cell.y != max_y);
+        open.panels = open
+            .panels
+            .iter()
+            .copied()
+            .filter(|c| c.y != max_y)
+            .collect();
+        let open_com = open.mass_properties().unwrap().center_of_mass;
+        let open_state = build_flood_state(&open, open_com, None);
+        assert_eq!(
+            count(&open_state, |s| matches!(s, WaterSource::Open)),
+            1,
+            "an open-top hull yields exactly one Open region"
+        );
+
+        // With ballast: a Ballast region per tank, fed by the tank's fill.
+        let ballast = Ballast {
+            tanks: vec![BallastTank {
+                capacity: 2.0,
+                mount: DVec3::new(0.0, 0.5, 0.0),
+                fill: 0.0,
+                fill_rate: 1.0,
+                blow_rate: 1.0,
+            }],
+            command: BallastCommand::Hold,
+            dry_mass: 1.0,
+        };
+        let ballasted = build_flood_state(&seed, com, Some(&ballast));
+        assert_eq!(
+            count(&ballasted, |s| matches!(
+                s,
+                WaterSource::Ballast { tank: 0 }
+            )),
+            1,
+            "one tank ⇒ one Ballast region"
+        );
+    }
+
+    /// WI 729: the shared fill-raise math — a unit cube scaled to `frac` of the region height, its base
+    /// pinned at the floor so the surface rises from the bottom (empty floor-flat, full fills the region).
+    #[test]
+    fn fill_cuboid_rises_from_the_floor() {
+        let (min_y, extent) = (2.0_f32, 4.0_f32);
+        // Empty: floor-flat at the base.
+        let (s0, t0) = fill_cuboid_y(min_y, extent, 0.0);
+        assert!(
+            s0 <= 0.001 && (t0 - min_y).abs() < 0.01,
+            "empty sits on the floor"
+        );
+        // Half: half height, centred halfway up.
+        let (s1, t1) = fill_cuboid_y(min_y, extent, 0.5);
+        assert!(
+            (s1 - 2.0).abs() < 1e-4 && (t1 - 3.0).abs() < 1e-4,
+            "half fills to mid-height"
+        );
+        // Full: the whole region, centred at its middle. Over-fill clamps.
+        let (s2, t2) = fill_cuboid_y(min_y, extent, 1.5);
+        assert!(
+            (s2 - 4.0).abs() < 1e-4 && (t2 - 4.0).abs() < 1e-4,
+            "full clamps to the region"
         );
     }
 
