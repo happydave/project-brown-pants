@@ -347,6 +347,33 @@ pub fn open_cavity(craft: &VoxelCraft) -> OpenCavity {
 /// is a cell above water and **ramps to zero (swamps) as the rim reaches the surface**. Per-cell at its
 /// own location (a wrench), so it contributes a righting moment and a heeled hull ships water low-side
 /// first. Zero for a sealed/empty cavity, in vacuum, or once swamped. Add to the shell
+/// The open cavity's **rim factor** at a pose (WI 713/728): `1` while the gunwale (the **lowest** rim
+/// cell) is a cell above the waterline (floating — the cavity holds air), ramping to `0` as the rim
+/// submerges (swamped). It scales open-cavity displacement, and `1 - factor` is the share of the cavity
+/// that has shipped water — the interior-water level the WI 718 viz raises as an open boat swamps. Zero
+/// when there is no rim (no open cavity).
+pub fn open_cavity_rim_factor(
+    craft: &VoxelCraft,
+    com: DVec3,
+    body_position: DVec3,
+    body_orientation: DQuat,
+    surface_radius: f64,
+    time: f64,
+    open: &OpenCavity,
+) -> f64 {
+    if open.rim_cells.is_empty() {
+        return 0.0;
+    }
+    let mut rim_alt = f64::INFINITY;
+    for &c in &open.rim_cells {
+        let local = (c.as_dvec3() + DVec3::splat(0.5)) * craft.cell_size - com;
+        let world = body_position + body_orientation * local;
+        let alt = world.length() - water_surface_radius(world, time, surface_radius);
+        rim_alt = rim_alt.min(alt);
+    }
+    (rim_alt / craft.cell_size).clamp(0.0, 1.0)
+}
+
 /// [`buoyancy_wrench`]; the band-smoothing keeps the swamp continuous (no buoyancy cliff).
 #[allow(clippy::too_many_arguments)]
 pub fn open_cavity_load(
@@ -366,15 +393,15 @@ pub fn open_cavity_load(
     let r = body_position.length();
     let up = if r > 0.0 { body_position / r } else { DVec3::Y };
     let cell_volume = craft.cell_volume();
-    // Rim factor from the lowest gunwale point's height above the waterline (band = one cell).
-    let mut rim_alt = f64::INFINITY;
-    for &c in &open.rim_cells {
-        let local = (c.as_dvec3() + DVec3::splat(0.5)) * craft.cell_size - com;
-        let world = body_position + body_orientation * local;
-        let alt = world.length() - water_surface_radius(world, time, surface_radius);
-        rim_alt = rim_alt.min(alt);
-    }
-    let rim_factor = (rim_alt / craft.cell_size).clamp(0.0, 1.0);
+    let rim_factor = open_cavity_rim_factor(
+        craft,
+        com,
+        body_position,
+        body_orientation,
+        surface_radius,
+        time,
+        open,
+    );
     if rim_factor <= 0.0 {
         return BuoyancyLoad::default(); // swamped: the gunwale is under, the cavity has flooded
     }

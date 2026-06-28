@@ -40,7 +40,8 @@ use sounding_sim::frame::{FrameId, WorldPos};
 use sounding_sim::marine::{MarinePropulsion, MarineThruster, Rudder, ThrusterCommand};
 use sounding_sim::medium::{
     buoyancy_wrench, enclosed_cells, heel_angle, max_cross_section, open_cavity, open_cavity_load,
-    DescentParams, DescentPlugin, DivingCraft, GlideParams, DEFAULT_SLAM_COEFFICIENT,
+    open_cavity_rim_factor, DescentParams, DescentPlugin, DivingCraft, GlideParams,
+    DEFAULT_SLAM_COEFFICIENT,
 };
 use sounding_sim::powertrain::MotorTier;
 use sounding_sim::resource::{Reservoir, ReservoirId, ResourceGraph, ResourceType};
@@ -156,6 +157,9 @@ struct HarborReadout {
 #[derive(Resource, Default)]
 struct FloodState {
     comps: Vec<FloodComp>,
+    /// The hull's **open** cavity (WI 713/728), if any — an un-sealed interior. Occluded as a dry hold
+    /// when floating and filled with rising water as it swamps over the rim (swamp-driven, not breach).
+    open: Option<OpenRegion>,
     /// Whether the hull has been breached (the player opened it to the sea).
     breached: bool,
 }
@@ -170,9 +174,19 @@ struct FloodComp {
     max: Vec3,
 }
 
+/// The render extent of a hull's open cavity (WI 728): the interior AABB in hull-local CoM-offset metres.
+struct OpenRegion {
+    min: Vec3,
+    max: Vec3,
+}
+
 /// Tags a translucent rising-water cuboid for compartment `index` (WI 718).
 #[derive(Component)]
 struct FloodWater(usize);
+
+/// Tags the translucent rising-water cuboid for the **open** cavity (WI 728), driven by the swamp state.
+#[derive(Component)]
+struct OpenWater;
 
 /// Flood relaxation rate (1/s) — a several-second flood once breached (WI 520 `step` constant).
 const FLOOD_RATE: f64 = 0.15;
@@ -214,8 +228,25 @@ fn build_flood_state(craft: &VoxelCraft, com: DVec3) -> FloodState {
             }
         })
         .collect();
+    // The open cavity (WI 713/728): its render AABB, so an open boat's interior occludes the ocean
+    // (dry hold) and fills with water as it swamps.
+    let cavity = open_cavity(craft);
+    let open = if cavity.cells.is_empty() {
+        None
+    } else {
+        let (mut lo, mut hi) = (IVec3::MAX, IVec3::MIN);
+        for &p in &cavity.cells {
+            lo = lo.min(p);
+            hi = hi.max(p);
+        }
+        Some(OpenRegion {
+            min: (lo.as_dvec3() * cs).as_vec3() + com_off,
+            max: ((hi.as_dvec3() + DVec3::ONE) * cs).as_vec3() + com_off,
+        })
+    };
     FloodState {
         comps,
+        open,
         breached: false,
     }
 }
@@ -598,6 +629,36 @@ fn enter_float(
                         ..default()
                     },
                     FloodWater(i),
+                ));
+            }
+            // Open cavity (WI 728): the same dry hold (so an open boat's interior occludes the ocean)
+            // plus an `OpenWater` cuboid that `harbor_flood_step` raises as the boat swamps over the rim.
+            if let Some(region) = &flood_state.open {
+                let size = region.max - region.min;
+                let centre = 0.5 * (region.min + region.max);
+                let eps = 0.02;
+                parent.spawn((
+                    Mesh3d(meshes.add(Mesh::from(Cuboid::new(
+                        (size.x - eps).max(0.01),
+                        (size.y - eps).max(0.01),
+                        (size.z - eps).max(0.01),
+                    )))),
+                    MeshMaterial3d(dry_fill_mat.clone()),
+                    Transform::from_translation(centre),
+                ));
+                parent.spawn((
+                    Mesh3d(unit_cube.clone()),
+                    MeshMaterial3d(water_fill_mat.clone()),
+                    Transform {
+                        translation: Vec3::new(centre.x, region.min.y, centre.z),
+                        scale: Vec3::new(
+                            (size.x - eps).max(0.01),
+                            0.0001,
+                            (size.z - eps).max(0.01),
+                        ),
+                        ..default()
+                    },
+                    OpenWater,
                 ));
             }
         });
@@ -1166,7 +1227,8 @@ fn harbor_flood_step(
     mut flood: ResMut<FloodState>,
     mut readout: ResMut<HarborReadout>,
     mut hull: Query<(&ActiveBody, &mut DivingCraft), With<HullMarker>>,
-    mut water: Query<(&FloodWater, &mut Transform)>,
+    mut water: Query<(&FloodWater, &mut Transform), Without<OpenWater>>,
+    mut open_water: Query<&mut Transform, (With<OpenWater>, Without<FloodWater>)>,
 ) {
     let Ok((body, mut dc)) = hull.single_mut() else {
         return;
@@ -1201,6 +1263,26 @@ fn harbor_flood_step(
             tf.scale.y = h;
             tf.translation.y = comp.min.y + 0.5 * h;
         }
+    }
+    // Open cavity (WI 728): an open boat is dry while afloat (the held-out volume) and ships water as it
+    // **swamps** over the rim — the water share is `1 − rim_factor` (1 floating ⇒ dry, 0 swamped ⇒ full).
+    if let Some(region) = &flood.open {
+        let rim_factor = open_cavity_rim_factor(
+            &dc.craft,
+            dc.com,
+            body.position,
+            body.orientation,
+            BODY.radius,
+            0.0,
+            &dc.open,
+        );
+        let water_frac = (1.0 - rim_factor).clamp(0.0, 1.0) as f32;
+        let h = (water_frac * (region.max.y - region.min.y)).max(0.0001);
+        for mut tf in &mut open_water {
+            tf.scale.y = h;
+            tf.translation.y = region.min.y + 0.5 * h;
+        }
+        readout.flood = readout.flood.max(water_frac as f64);
     }
 }
 
