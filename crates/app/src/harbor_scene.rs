@@ -52,7 +52,9 @@ use crate::editor::{
     EditorState, HoverState, OrbitCam, PointerOnPalette,
 };
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
-use crate::voxel_skin::{materials_present, pbr_material, skin_submeshes, VoxelSkin};
+use crate::voxel_skin::{
+    materials_present, pbr_material, pbr_material_tinted, skin_submeshes, VoxelSkin,
+};
 
 const BODY: CentralBody = CentralBody::EARTHLIKE;
 
@@ -942,8 +944,14 @@ fn plate_meshes(cell_size: f64, meshes: &mut Assets<Mesh>) -> [Handle<Mesh>; 3] 
     ]
 }
 
-/// One reusable PBR material handle per distinct structural material in the craft (WI 722), so the many
-/// panel plates don't each allocate a material.
+/// A steel-blue cast for **panel** plates (WI 727): multiplied over the material's albedo so panels read
+/// as panels at a glance (the at-a-glance cue the old blue-cube WI 719 gave), distinct from solid cubes
+/// which keep their neutral material colour. The plate geometry (WI 723) is unchanged.
+const PANEL_TINT: Color = Color::srgb(0.42, 0.62, 1.0);
+
+/// One reusable **panel-tinted** PBR material handle per distinct structural material in the craft
+/// (WI 722/727), so the many panel plates don't each allocate a material — and panels read distinct from
+/// solid cubes.
 fn material_handles(
     craft: &VoxelCraft,
     asset_server: &AssetServer,
@@ -951,7 +959,12 @@ fn material_handles(
 ) -> Vec<(Material, Handle<StandardMaterial>)> {
     materials_present(craft)
         .into_iter()
-        .map(|m| (m, pbr_material(m, asset_server, materials)))
+        .map(|m| {
+            (
+                m,
+                pbr_material_tinted(m, PANEL_TINT, asset_server, materials),
+            )
+        })
         .collect()
 }
 

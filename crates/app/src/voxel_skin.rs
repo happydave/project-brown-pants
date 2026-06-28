@@ -152,10 +152,38 @@ pub fn pbr_material(
     asset_server: &AssetServer,
     materials: &mut Assets<StandardMaterial>,
 ) -> Handle<StandardMaterial> {
-    let set = material_set_for(material);
     let visual = material_visual(material);
+    pbr_material_with(
+        material,
+        relaxed_base_color(visual.tint),
+        asset_server,
+        materials,
+    )
+}
+
+/// Like [`pbr_material`] but with the `base_color` replaced by `tint` (multiplied over the albedo
+/// texture) — used to mark **panels** with a distinct cast (WI 727) so panel-vs-solid reads at a glance,
+/// while keeping the material's albedo / normal / metallic-roughness detail.
+pub fn pbr_material_tinted(
+    material: Material,
+    tint: Color,
+    asset_server: &AssetServer,
+    materials: &mut Assets<StandardMaterial>,
+) -> Handle<StandardMaterial> {
+    pbr_material_with(material, tint, asset_server, materials)
+}
+
+/// Shared body of [`pbr_material`] / [`pbr_material_tinted`]: the material's bespoke PBR set with a
+/// caller-chosen `base_color` multiplier.
+fn pbr_material_with(
+    material: Material,
+    base_color: Color,
+    asset_server: &AssetServer,
+    materials: &mut Assets<StandardMaterial>,
+) -> Handle<StandardMaterial> {
+    let set = material_set_for(material);
     materials.add(StandardMaterial {
-        base_color: relaxed_base_color(visual.tint),
+        base_color,
         base_color_texture: Some(load_repeat(
             asset_server,
             format!("materials/{set}_albedo.png"),
