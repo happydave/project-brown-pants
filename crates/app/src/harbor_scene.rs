@@ -577,39 +577,86 @@ fn split_panels(craft: &VoxelCraft) -> (VoxelCraft, VoxelCraft) {
     (solid, panel)
 }
 
-/// A thin-plate render spec for each panel cell (WI 722): `(material, thin-axis, centre)` in lattice
-/// coords — **one** plate per panel, oriented along the **wall normal** (the axis with the fewest
-/// occupied neighbours, i.e. the direction the wall faces), seated flush with the exterior side when
-/// there is one. So a panel renders as the thin plate it forms, not a tinted cube.
-fn panel_plate_specs(craft: &VoxelCraft) -> Vec<(Material, usize, Vec3)> {
+/// The empty cells that are **outside** the hull (WI 723): a flood-fill from the expanded bounding-box
+/// border through empty cells, mirroring `compartments` — so the enclosed cavity is *not* included.
+/// Used to plate only the true outer surface.
+fn exterior_empty_cells(craft: &VoxelCraft) -> HashSet<IVec3> {
     let occupied: HashSet<IVec3> = craft.voxels.iter().map(|v| v.cell).collect();
+    if occupied.is_empty() {
+        return HashSet::new();
+    }
+    let (mut lo, mut hi) = (IVec3::MAX, IVec3::MIN);
+    for &c in &occupied {
+        lo = lo.min(c);
+        hi = hi.max(c);
+    }
+    lo -= IVec3::ONE;
+    hi += IVec3::ONE;
+    let in_bbox = |c: IVec3| {
+        c.x >= lo.x && c.x <= hi.x && c.y >= lo.y && c.y <= hi.y && c.z >= lo.z && c.z <= hi.z
+    };
+    let is_air = |c: IVec3| in_bbox(c) && !occupied.contains(&c);
+    let neighbours = [
+        IVec3::X,
+        IVec3::NEG_X,
+        IVec3::Y,
+        IVec3::NEG_Y,
+        IVec3::Z,
+        IVec3::NEG_Z,
+    ];
+    let mut exterior = HashSet::new();
+    let mut stack = Vec::new();
+    for x in lo.x..=hi.x {
+        for y in lo.y..=hi.y {
+            for z in lo.z..=hi.z {
+                let c = IVec3::new(x, y, z);
+                let border =
+                    x == lo.x || x == hi.x || y == lo.y || y == hi.y || z == lo.z || z == hi.z;
+                if border && is_air(c) && exterior.insert(c) {
+                    stack.push(c);
+                }
+            }
+        }
+    }
+    while let Some(c) = stack.pop() {
+        for off in neighbours {
+            let n = c + off;
+            if is_air(n) && exterior.insert(n) {
+                stack.push(n);
+            }
+        }
+    }
+    exterior
+}
+
+/// A thin-plate render spec for the hull's **outer surface** (WI 723): `(material, thin-axis, centre)`
+/// in lattice coords — a plate on each panel-cell face whose neighbour is **exterior** (outside the
+/// hull, not the enclosed cavity), seated flush on that grid boundary. Outer faces of a wall are
+/// coplanar/contiguous ⇒ one coherent thin shell (no exploded box); the cavity is not double-plated.
+fn panel_plate_specs(craft: &VoxelCraft) -> Vec<(Material, usize, Vec3)> {
+    let exterior = exterior_empty_cells(craft);
     let cs = craft.cell_size;
-    let inset = 0.5 * cs - 0.5 * cs * PANEL_FILL; // flush with the exterior face
-    let axes = [IVec3::X, IVec3::Y, IVec3::Z];
+    let inset = 0.5 * cs * (1.0 - PANEL_FILL); // seat flush against the exterior grid boundary
+    let dirs: [(IVec3, usize); 6] = [
+        (IVec3::X, 0),
+        (IVec3::NEG_X, 0),
+        (IVec3::Y, 1),
+        (IVec3::NEG_Y, 1),
+        (IVec3::Z, 2),
+        (IVec3::NEG_Z, 2),
+    ];
     let mut out = Vec::new();
     for v in &craft.voxels {
         if !craft.is_panel(v.cell) {
             continue;
         }
-        // Thin axis = the wall normal: the axis with the fewest occupied neighbours (the wall
-        // continues in-plane, so the in-plane axes have occupied neighbours).
-        let occ_count = |a: IVec3| {
-            occupied.contains(&(v.cell + a)) as i32 + occupied.contains(&(v.cell - a)) as i32
-        };
-        let thin = (0..3).min_by_key(|&i| occ_count(axes[i])).unwrap();
-        let a = axes[thin];
-        // Seat the plate flush with whichever side faces outward (empty); centre it if both/neither.
-        let dir = match (
-            !occupied.contains(&(v.cell + a)),
-            !occupied.contains(&(v.cell - a)),
-        ) {
-            (true, false) => 1.0,
-            (false, true) => -1.0,
-            _ => 0.0,
-        };
         let centre = (v.cell.as_dvec3() + DVec3::splat(0.5)) * cs;
-        let pos = centre + a.as_dvec3() * (dir * inset);
-        out.push((v.material, thin, pos.as_vec3()));
+        for (off, axis) in dirs {
+            if exterior.contains(&(v.cell + off)) {
+                let pos = centre + off.as_dvec3() * inset;
+                out.push((v.material, axis, pos.as_vec3()));
+            }
+        }
     }
     out
 }
@@ -890,45 +937,49 @@ mod tests {
         assert!(p2.voxels.is_empty());
     }
 
-    /// WI 722: one thin plate per panel cell; no panels ⇒ no plates.
+    /// WI 723: the exterior flood-fill excludes the enclosed cavity (so only the outer surface plates).
     #[test]
-    fn panel_plate_specs_one_plate_per_panel() {
-        // A lone panel cell ⇒ exactly one plate.
+    fn exterior_flood_excludes_the_cavity() {
+        let seed = seed_hull(); // a 7×5×11 sealed shell
+        let ext = exterior_empty_cells(&seed);
+        assert!(
+            ext.contains(&IVec3::new(-1, 2, 5)),
+            "outside the hull is exterior"
+        );
+        assert!(
+            !ext.contains(&IVec3::new(3, 2, 5)),
+            "the enclosed cavity is NOT exterior"
+        );
+        assert!(
+            !ext.contains(&IVec3::new(0, 2, 5)),
+            "a solid wall cell is not air"
+        );
+    }
+
+    /// WI 723: plates seat on the hull's **outer** faces only — coherent thin shell, no cavity
+    /// double-plating; no panels ⇒ no plates.
+    #[test]
+    fn panel_plate_specs_plates_outer_faces() {
+        // A lone panel cell: all 6 neighbours are exterior ⇒ 6 plates (a fully-skinned cube).
         let mut c = VoxelCraft::new(0.5);
         c.voxels.push(Voxel {
             cell: IVec3::ZERO,
             material: Material::ALUMINIUM,
         });
         c.set_panel(IVec3::ZERO, true);
-        assert_eq!(panel_plate_specs(&c).len(), 1);
+        assert_eq!(panel_plate_specs(&c).len(), 6);
 
-        // No panels ⇒ no plates (solid renders via the hull skin instead).
+        // No panels ⇒ no plates.
         let mut solid = c.clone();
         solid.panels.clear();
         assert!(panel_plate_specs(&solid).is_empty());
 
-        // The seed hull is all panels ⇒ one plate per voxel.
+        // The seed shell: at least one outer plate per wall cell, but far fewer than all 6 faces
+        // (internal + cavity faces are excluded — the fix for the exploded box).
         let seed = seed_hull();
-        assert_eq!(panel_plate_specs(&seed).len(), seed.voxels.len());
-
-        // A +X wall cell plates along X (the wall normal), not Y/Z (the in-plane axes have neighbours).
-        let mut wall = VoxelCraft::new(0.5);
-        for y in 0..3 {
-            for z in 0..3 {
-                let cell = IVec3::new(0, y, z);
-                wall.voxels.push(Voxel {
-                    cell,
-                    material: Material::ALUMINIUM,
-                });
-                wall.set_panel(cell, true);
-            }
-        }
-        // The middle cell (0,1,1): Y and Z have 2 occupied neighbours, X has 0 ⇒ thin axis = X (0).
-        let mid = panel_plate_specs(&wall)
-            .into_iter()
-            .find(|(_, _, pos)| (*pos - Vec3::new(0.25, 0.75, 0.75)).length() < 0.4)
-            .expect("middle cell plate");
-        assert_eq!(mid.1, 0, "the +X wall plates along X");
+        let n = panel_plate_specs(&seed).len();
+        assert!(n >= seed.voxels.len());
+        assert!(n < 6 * seed.voxels.len());
     }
 
     /// WI 720: the predictor agrees with the float — the panel seed predicts FLOAT (draft < 1), the
