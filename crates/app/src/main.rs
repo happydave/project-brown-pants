@@ -22,6 +22,7 @@
 //! - `cargo run -p sounding -- materials` — preview a generated PBR material set on lit geometry
 //! - `cargo run -p sounding -- terrainmesh` — preview a generated MoGe terrain relief (glTF)
 //! - `cargo run -p sounding -- gallery` — part catalog viewer: every mechanical-kit part laid out by category, click to inspect
+//! - `cargo run -p sounding -- harbor` — float a built hull on calm water by a dock: WI 705/711 righting + enclosed-volume buoyancy made visible
 //!
 //! The Toy 1–3 simulation and runtime bus run headless behind whichever scene is
 //! shown, so the companion still works. Per-scene controls are documented in
@@ -48,6 +49,7 @@ mod flooding_scene;
 mod gallery_scene;
 mod gamepad;
 mod ground;
+mod harbor_scene;
 mod land_scene;
 mod launch_scene;
 mod materials_scene;
@@ -74,6 +76,7 @@ use dive_scene::DiveScenePlugin;
 use editor::EditorPlugin;
 use flooding_scene::FloodingScenePlugin;
 use gallery_scene::GalleryScenePlugin;
+use harbor_scene::HarborScenePlugin;
 use land_scene::LandScenePlugin;
 use launch_scene::LaunchScenePlugin;
 use materials_scene::MaterialsScenePlugin;
@@ -106,6 +109,7 @@ enum Scene {
     Workshop,
     TerrainMesh,
     Gallery,
+    Harbor,
 }
 
 fn selected_scene() -> Scene {
@@ -128,6 +132,7 @@ fn selected_scene() -> Scene {
         Some("workshop") => Scene::Workshop,
         Some("terrainmesh") => Scene::TerrainMesh,
         Some("gallery") => Scene::Gallery,
+        Some("harbor") => Scene::Harbor,
         _ => Scene::Editor,
     }
 }
@@ -221,6 +226,9 @@ fn main() {
         }
         Scene::Gallery => {
             app.add_plugins(GalleryScenePlugin);
+        }
+        Scene::Harbor => {
+            app.add_plugins(HarborScenePlugin);
         }
         Scene::TerrainMesh => {
             app.add_plugins(TerrainMeshScenePlugin);
