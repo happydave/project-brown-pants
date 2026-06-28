@@ -953,11 +953,13 @@ fn harbor_drive_input(
     if keys.pressed(KeyCode::KeyS) {
         forward -= 1.0;
     }
+    // In the +Z-forward / +Y-up hull frame a positive `turn` yaws the bow to **port**, so `D` (steer
+    // right) contributes negative turn and `A` (steer left) positive — matching the player's L/R.
     if keys.pressed(KeyCode::KeyD) {
-        turn += 1.0; // bow to starboard
+        turn -= 1.0; // bow to starboard (right)
     }
     if keys.pressed(KeyCode::KeyA) {
-        turn -= 1.0; // bow to port
+        turn += 1.0; // bow to port (left)
     }
     rudder.set_turn(turn); // primary steering — yaw scales with speed
     mp.drive(forward, turn); // differential thrust — low-speed pivoting
