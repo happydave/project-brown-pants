@@ -674,7 +674,9 @@ pub struct VoxelCraft {
 /// The fraction of a cell a **panel** (thin plate) occupies, for mass and buoyancy displacement
 /// (WI 716). A panel weighs and displaces `PANEL_FILL ×` a solid cube of the same material — the lever
 /// that lets a real hull float without a magic-light material. Bounded `(0, 1]`; solid cubes are `1.0`.
-pub const PANEL_FILL: f64 = 0.2;
+/// `0.1` (a ~5 cm plate on a 0.5 m cell): a normal-scale panel hull floats at ~40 % draft under real
+/// mass (WI 717 tune); thinner than the WI 716 prototype's 0.2, closer to real plate-on-frame.
+pub const PANEL_FILL: f64 = 0.1;
 
 impl Default for VoxelCraft {
     fn default() -> Self {

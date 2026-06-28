@@ -6,10 +6,11 @@
 //! - **Build** (WI 707): the voxel editor (the `editor` module's systems under a state run-condition)
 //!   edits a hull lattice near the origin — mouse orbit/zoom, left-click place / right-click remove,
 //!   keyboard brush. The craft renders **solid** (`voxel_skin::skin_submeshes`).
-//! - **Float** (WI 706): the built lattice is assembled into an `ActiveBody` + `DivingCraft` and
-//!   **floats on calm water by a dock**, self-righting via the WI 705 buoyancy wrench + WI 711
-//!   enclosed-volume buoyancy + free-surface damping (the same `DescentPlugin` → `glide_step` the dive
-//!   uses). Mass is auto-set from the displaceable volume so the boat floats at a sensible draft.
+//! - **Float** (WI 706/717): the built lattice is assembled into an `ActiveBody` + `DivingCraft` at its
+//!   **real material mass** (WI 717 — no auto-ballast) and floats (or **sinks**) on calm water by a
+//!   dock, self-righting via the WI 705 buoyancy wrench + WI 711 enclosed-volume buoyancy + WI 716 thin
+//!   panels + free-surface damping (the same `DescentPlugin` → `glide_step` the dive uses). A light
+//!   **panel** hull floats; a heavy/solid one sinks to the sea floor — the harbor is the proving ground.
 //!
 //! Build and Float are different coordinate worlds (Build near the origin with the editor camera;
 //! Float in planetary coordinates with floating origin), so each spawns/despawns its own entities on
@@ -33,8 +34,8 @@ use sounding_sim::active::{ActiveBody, Gravity};
 use sounding_sim::fluid::FluidMedium;
 use sounding_sim::frame::{FrameId, WorldPos};
 use sounding_sim::medium::{
-    buoyancy_wrench, enclosed_cells, heel_angle, max_cross_section, DescentParams, DescentPlugin,
-    DivingCraft, GlideParams, DEFAULT_SLAM_COEFFICIENT,
+    buoyancy_wrench, heel_angle, max_cross_section, DescentParams, DescentPlugin, DivingCraft,
+    GlideParams, DEFAULT_SLAM_COEFFICIENT,
 };
 use sounding_sim::powertrain::MotorTier;
 use sounding_sim::sim::CentralBody;
@@ -53,10 +54,9 @@ const BODY: CentralBody = CentralBody::EARTHLIKE;
 const SUBSTEP_DT: f64 = 0.002;
 const MAX_SUBSTEPS: u32 = 64;
 
-/// Fraction of the fully-submerged displaced-water mass used as the hull's mass — its reserve
-/// buoyancy. ~0.4 floats the built hull at roughly 40 % draft (auto-ballast, so a build always floats
-/// at a sensible line; real-mass-matters + ballast control are later WIs — 709/713).
-const HULL_MASS_FRACTION: f64 = 0.4;
+/// Depth of the harbor sea floor below sea level, m (WI 717): a sinking hull rests here rather than
+/// falling toward the planet centre. Matches the rendered floor plane.
+const SEA_FLOOR_DEPTH: f64 = 8.0;
 
 /// The two harbor modes: float the built hull, or edit it.
 #[derive(States, Default, Debug, Clone, PartialEq, Eq, Hash)]
@@ -73,21 +73,25 @@ fn render_world(sim_pos: DVec3) -> DVec3 {
     sim_pos - DVec3::new(0.0, BODY.radius, 0.0)
 }
 
-/// The seed hull: a sealed pontoon (surface cells solid, interior enclosed air ⇒ floats, WI 711).
-/// Editor-scale 0.5 m cells ⇒ a 2.5 × 1.5 × 3.5 m starter boat the player can reshape.
+/// The seed hull: a sealed **panel** pontoon (WI 716/717) — surface cells are thin aluminium **panels**
+/// (light, so it floats honestly under real mass), enclosing air. Editor-scale 0.5 m cells ⇒ a
+/// 3.5 × 2.5 × 5.5 m starter boat the player can reshape. The same hull in **solid** cubes would sink —
+/// that is the game.
 fn seed_hull() -> VoxelCraft {
     let mut c = VoxelCraft::new(0.5);
-    let (w, h, l) = (5, 3, 7);
+    let (w, h, l) = (7, 5, 11);
     for x in 0..w {
         for y in 0..h {
             for z in 0..l {
                 let on_surface =
                     x == 0 || x == w - 1 || y == 0 || y == h - 1 || z == 0 || z == l - 1;
                 if on_surface {
+                    let cell = IVec3::new(x, y, z);
                     c.voxels.push(Voxel {
-                        cell: IVec3::new(x, y, z),
+                        cell,
                         material: Material::ALUMINIUM,
                     });
+                    c.set_panel(cell, true); // a thin hull plate, not a solid cube (WI 716)
                 }
             }
         }
@@ -247,18 +251,16 @@ fn toggle_mode(
     }
 }
 
-/// Builds the descent/glide parameters and the floating body for a hull lattice, auto-ballasted to
-/// float at `HULL_MASS_FRACTION` draft. `None` for an empty lattice.
+/// Builds the descent/glide parameters and the floating body for a hull lattice using its **real
+/// material mass** (WI 717 — no auto-ballast): a light panel hull floats, a heavy / solid one sinks.
+/// `None` for an empty lattice.
 fn assemble_float(craft: &VoxelCraft) -> Option<(ActiveBody, DivingCraft)> {
     let mp = craft.mass_properties()?;
-    let enclosed = enclosed_cells(craft);
-    let water_density = FluidMedium::EARTHLIKE.sample_altitude(-1.0).density;
-    let displaceable = craft.occupied_volume() + enclosed.len() as f64 * craft.cell_volume();
-    if displaceable <= 0.0 || mp.mass <= 0.0 {
+    if mp.mass <= 0.0 {
         return None;
     }
-    let mass = HULL_MASS_FRACTION * water_density * displaceable;
-    let inertia = mp.inertia * (mass / mp.mass);
+    let mass = mp.mass; // real mass — floating is earned, not granted
+    let inertia = mp.inertia;
     let descent = DescentParams {
         medium: FluidMedium::EARTHLIKE,
         mu: BODY.mu,
@@ -541,7 +543,7 @@ fn track_hull(
     mut readout: ResMut<HarborReadout>,
     mut hull: Query<
         (
-            &ActiveBody,
+            &mut ActiveBody,
             &DivingCraft,
             &mut WorldPlacement,
             &mut Transform,
@@ -549,9 +551,20 @@ fn track_hull(
         With<HullMarker>,
     >,
 ) {
-    let Ok((body, dc, mut wp, mut tf)) = hull.single_mut() else {
+    let Ok((mut body, dc, mut wp, mut tf)) = hull.single_mut() else {
         return;
     };
+
+    // Rest a sinking hull on the sea floor (WI 717): a net-negative hull descends and grounds here
+    // rather than falling toward the planet centre. Only engages well below the waterline, so a
+    // floating (or merely low) hull is untouched.
+    if body.position.length() - BODY.radius < -SEA_FLOOR_DEPTH {
+        let up = body.position.normalize_or(DVec3::Y);
+        body.position = up * (BODY.radius - SEA_FLOOR_DEPTH);
+        let into_floor = body.velocity.dot(up).min(0.0); // downward component
+        body.velocity -= into_floor * up;
+    }
+
     wp.0 = WorldPos::new(FrameId::CENTRAL_BODY, render_world(body.position));
     tf.rotation = body.orientation.as_quat();
 
@@ -618,8 +631,15 @@ fn follow_camera(
 
 fn update_hud(readout: Res<HarborReadout>, mut hud: Query<&mut Text, With<Hud>>) {
     if let Ok(mut text) = hud.single_mut() {
+        // Net buoyancy is the displaced weight minus the hull weight: ~0 floating at its waterline,
+        // strongly negative when fully submerged and unable to float (WI 717).
+        let status = if readout.net_buoyancy < -500.0 {
+            "SINKING"
+        } else {
+            "floating"
+        };
         text.0 = format!(
-            "harbor — Float (Enter: Build)\ndraft:    {:6.2} m\nheel:     {:6.1} deg\nnet buoy: {:8.0} N",
+            "harbor — Float (Enter: Build) — {status}\ndraft:    {:6.2} m\nheel:     {:6.1} deg\nnet buoy: {:8.0} N",
             readout.draft,
             readout.heel.to_degrees(),
             readout.net_buoyancy,
@@ -660,25 +680,56 @@ fn animate_water(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sounding_sim::medium::enclosed_cells;
 
+    /// Net buoyancy of a craft fully submerged (max buoyancy − real weight): >0 floats, <0 sinks.
+    fn net_buoyancy(craft: &VoxelCraft) -> f64 {
+        let mp = craft.mass_properties().unwrap();
+        let enc = enclosed_cells(craft);
+        let g = 9.81;
+        let deep = DVec3::new(0.0, BODY.radius - 100.0, 0.0);
+        let buoy = buoyancy_wrench(
+            craft,
+            mp.center_of_mass,
+            deep,
+            DQuat::IDENTITY,
+            BODY.radius,
+            0.0,
+            1_025.0,
+            g,
+            &enc,
+        )
+        .force
+        .length();
+        buoy - mp.mass * g
+    }
+
+    /// WI 717: the **panel** seed hull floats under **real mass**, while the same hull in **solid
+    /// cubes** sinks — the proving-ground contrast (no auto-ballast).
     #[test]
-    fn seed_hull_is_sealed_and_floats() {
-        let hull = seed_hull();
-        let enclosed = enclosed_cells(&hull);
+    fn the_panel_seed_floats_but_a_solid_hull_sinks() {
+        let seed = seed_hull();
+        assert!(!seed.panels.is_empty(), "the seed is built of panels");
+        assert!(net_buoyancy(&seed) > 0.0, "the panel seed hull floats");
+
+        let mut solid = seed.clone();
+        solid.panels.clear(); // same geometry, solid cubes
         assert!(
-            !enclosed.is_empty(),
-            "the seed hull encloses a sealed volume"
+            net_buoyancy(&solid) < 0.0,
+            "the same hull in solid cubes sinks"
         );
+    }
+
+    /// WI 717: the float body carries the craft's **real** mass (no auto-ballast).
+    #[test]
+    fn assemble_float_uses_real_mass() {
+        let seed = seed_hull();
+        let (body, _) = assemble_float(&seed).unwrap();
+        let real = seed.mass_properties().unwrap().mass;
         assert!(
-            assemble_float(&hull).is_some(),
-            "the seed hull assembles into a floating body"
-        );
-        let water = FluidMedium::EARTHLIKE.sample_altitude(-1.0).density;
-        let displaceable = hull.occupied_volume() + enclosed.len() as f64 * hull.cell_volume();
-        let mass = HULL_MASS_FRACTION * water * displaceable;
-        assert!(
-            water * displaceable > mass,
-            "fully-submerged buoyancy exceeds weight ⇒ floats"
+            (body.mass - real).abs() < 1e-9,
+            "float body uses real mass: {} vs {real}",
+            body.mass
         );
     }
 
