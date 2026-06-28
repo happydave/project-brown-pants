@@ -14,9 +14,10 @@
 //! wastes fuel for ~no thrust), rationed per tank exactly as [`crate::propulsion`]
 //! does. Thrust enters the simulation as a **wrench** (force along the mounted axis
 //! at the device's position → force + moment about the centre of mass) through
-//! [`crate::active::ActiveBody::integrate_wrench`] — the one force path. Steering
-//! emerges from geometry: **differential thrust** between laterally-offset thrusters
-//! makes a yaw moment, no dedicated rudder.
+//! [`crate::active::ActiveBody::integrate_wrench`] — the one force path. Low-speed
+//! steering emerges from geometry — **differential thrust** between laterally-offset
+//! thrusters makes a yaw moment — and the primary underway control is the [`Rudder`]
+//! (WI 725): a hydrodynamic surface aft of the CoM whose yaw scales with speed.
 //!
 //! Headless: the per-sub-step driver that reads throttle and applies the wrench is
 //! [`crate::medium::advance_descent`] (the harbor/dive share it); this module is the
@@ -185,6 +186,82 @@ impl MarinePropulsion {
         } else {
             0.0
         }
+    }
+}
+
+/// A **rudder** — a hydrodynamic steering surface aft of the centre of mass (WI 725).
+///
+/// Unlike the screw (a powered actuator), the rudder develops a **side force** purely from the water
+/// flowing past it: `½·ρ·v_fwd² · area · slope · δ` along the hull's lateral axis, where `v_fwd` is the
+/// **forward** speed (the dynamic pressure on the surface) and `δ` the deflection. Acting aft of the
+/// CoM it makes a **yaw moment** that scales with speed — nil at rest, sharper when faster — and
+/// **reverses in reverse** (the flow hits the other face). Zero out of the water (ρ = 0). It needs no
+/// power and no engine: a coasting or single-screw boat still steers. The same `½ρv²·C·area`
+/// medium-agnostic shape as [`crate::aero::lift_force`].
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Rudder {
+    /// Mount in the body frame, metres — **aft of the CoM** (along `−forward`) so the side force yaws.
+    pub mount: DVec3,
+    /// Forward (nose) unit axis in the body frame; the lateral force is ⟂ to this and to up.
+    pub forward: DVec3,
+    /// Plan area of the surface, m².
+    pub area: f64,
+    /// Lift-curve slope (side-force coefficient per radian of deflection).
+    pub slope: f64,
+    /// Maximum deflection, radians.
+    pub max_angle: f64,
+    /// Current commanded deflection, radians (signed; clamped to `±max_angle` on use).
+    pub angle: f64,
+}
+
+impl Rudder {
+    /// Set the deflection from a `turn` command in `[-1, 1]` (scaled to `±max_angle`).
+    pub fn set_turn(&mut self, turn: f64) {
+        self.angle = turn.clamp(-1.0, 1.0) * self.max_angle;
+    }
+
+    /// The rudder's steering **wrench** `(force, torque about the CoM)` in the **world** frame, given
+    /// the body pose + `velocity` and the [`FluidMedium`] sampled at the rudder's own world position.
+    /// Zero at rest, out of the water, or undeflected; reverses with reverse motion.
+    pub fn wrench(
+        &self,
+        medium: &FluidMedium,
+        surface_radius: f64,
+        body_position: DVec3,
+        orientation: DQuat,
+        velocity: DVec3,
+        com: DVec3,
+    ) -> (DVec3, DVec3) {
+        let angle = self.angle.clamp(-self.max_angle, self.max_angle);
+        if angle == 0.0 || self.area <= 0.0 {
+            return (DVec3::ZERO, DVec3::ZERO);
+        }
+        let arm = orientation * (self.mount - com);
+        let world = body_position + arm;
+        let density = medium
+            .sample_altitude(world.length() - surface_radius)
+            .density;
+        if density <= 0.0 {
+            return (DVec3::ZERO, DVec3::ZERO); // out of the water
+        }
+        let forward_world = (orientation * self.forward).normalize_or_zero();
+        let v_fwd = velocity.dot(forward_world); // signed forward speed
+        if v_fwd == 0.0 {
+            return (DVec3::ZERO, DVec3::ZERO); // no flow over the surface ⇒ no steering
+        }
+        // Side force ∝ forward dynamic pressure · area · slope · deflection, reversing with reverse
+        // motion (`v_fwd·|v_fwd|` is `v²` in magnitude and carries the sign of travel).
+        let q_signed = 0.5 * density * v_fwd * v_fwd.abs();
+        let up = if world.length() > 0.0 {
+            world / world.length()
+        } else {
+            DVec3::Y
+        };
+        // The hull's lateral (starboard) axis: forward × up.
+        let lateral = forward_world.cross(up).normalize_or_zero();
+        let force = lateral * (q_signed * self.area * self.slope * angle);
+        let torque = arm.cross(force);
+        (force, torque)
     }
 }
 
@@ -425,5 +502,159 @@ mod tests {
         let json = serde_json::to_string(&p).unwrap();
         let back: MarinePropulsion = serde_json::from_str(&json).unwrap();
         assert_eq!(p, back);
+    }
+
+    // --- WI 725: the rudder ---
+
+    /// A stern rudder (aft of the CoM, low, forward +Z), deflected hard over.
+    fn rudder() -> Rudder {
+        Rudder {
+            mount: DVec3::new(0.0, -0.5, -2.0),
+            forward: DVec3::Z,
+            area: 0.4,
+            slope: 6.0,
+            max_angle: 0.5,
+            angle: 0.0,
+        }
+    }
+
+    #[test]
+    fn rudder_yaw_scales_with_speed_and_is_zero_at_rest() {
+        let mut r = rudder();
+        r.set_turn(1.0); // hard over
+        let m = earthlike();
+        let surface = 600_000.0;
+        let pos = DVec3::new(0.0, surface - 3.0, 0.0); // rudder submerged
+                                                       // At rest: no flow ⇒ no steering.
+        let (_, t0) = r.wrench(&m, surface, pos, DQuat::IDENTITY, DVec3::ZERO, DVec3::ZERO);
+        assert_eq!(t0, DVec3::ZERO);
+        // Underway: a real yaw moment (dominant about up = +Y here), growing with v².
+        let (_, t1) = r.wrench(
+            &m,
+            surface,
+            pos,
+            DQuat::IDENTITY,
+            DVec3::new(0.0, 0.0, 3.0),
+            DVec3::ZERO,
+        );
+        let (_, t2) = r.wrench(
+            &m,
+            surface,
+            pos,
+            DQuat::IDENTITY,
+            DVec3::new(0.0, 0.0, 6.0),
+            DVec3::ZERO,
+        );
+        assert!(t1.length() > 0.0, "underway the rudder steers");
+        assert!(
+            t1.y.abs() > t1.x.abs() && t1.y.abs() > t1.z.abs(),
+            "yaw (about up) dominates: {t1:?}"
+        );
+        assert!(
+            (t2.length() - 4.0 * t1.length()).abs() < 1e-6 * t2.length(),
+            "v² scaling: {} vs {}",
+            t1.length(),
+            t2.length()
+        );
+    }
+
+    #[test]
+    fn rudder_negligible_out_of_the_water_and_zero_in_vacuum() {
+        let mut r = rudder();
+        r.set_turn(1.0);
+        let m = earthlike();
+        let surface = 600_000.0;
+        let vel = DVec3::new(0.0, 0.0, 6.0);
+        // Submerged: a strong bite.
+        let under = DVec3::new(0.0, surface - 3.0, 0.0);
+        let (fw, _) = r.wrench(&m, surface, under, DQuat::IDENTITY, vel, DVec3::ZERO);
+        // In air: density-scaled like the screw ⇒ a negligible fraction of the water bite.
+        let above = DVec3::new(0.0, surface + 5.0, 0.0);
+        let (fa, _) = r.wrench(&m, surface, above, DQuat::IDENTITY, vel, DVec3::ZERO);
+        assert!(fw.length() > 0.0);
+        assert!(
+            fa.length() < 0.01 * fw.length(),
+            "negligible bite in air: air {} vs water {}",
+            fa.length(),
+            fw.length()
+        );
+        // True vacuum: exactly zero.
+        let (fv, tv) = r.wrench(
+            &FluidMedium::VACUUM,
+            surface,
+            under,
+            DQuat::IDENTITY,
+            vel,
+            DVec3::ZERO,
+        );
+        assert_eq!(fv, DVec3::ZERO);
+        assert_eq!(tv, DVec3::ZERO);
+    }
+
+    #[test]
+    fn rudder_deflection_sign_and_reverse_flip_the_yaw() {
+        let m = earthlike();
+        let surface = 600_000.0;
+        let pos = DVec3::new(0.0, surface - 3.0, 0.0);
+        let fwd = DVec3::new(0.0, 0.0, 6.0);
+        let yaw = |angle: f64, vel: DVec3| {
+            let mut r = rudder();
+            r.angle = angle;
+            r.wrench(&m, surface, pos, DQuat::IDENTITY, vel, DVec3::ZERO)
+                .1
+                .y
+        };
+        // Opposite deflections ⇒ opposite yaw.
+        assert!(
+            yaw(0.4, fwd) * yaw(-0.4, fwd) < 0.0,
+            "deflection sign sets yaw"
+        );
+        // Same deflection in reverse ⇒ opposite yaw to forward.
+        let rev = DVec3::new(0.0, 0.0, -6.0);
+        assert!(
+            yaw(0.4, fwd) * yaw(0.4, rev) < 0.0,
+            "reverse flips the steering"
+        );
+    }
+
+    #[test]
+    fn rudder_steers_a_coasting_body_no_power() {
+        // A body coasting forward with a deflected rudder gains yaw — no engine, no resource.
+        let mut r = rudder();
+        r.set_turn(1.0);
+        let m = earthlike();
+        let surface = 600_000.0;
+        let mut body = ActiveBody::new(
+            DVec3::new(0.0, surface - 3.0, 0.0),
+            DVec3::new(0.0, 0.0, 6.0),
+            1_000.0,
+            DMat3::IDENTITY,
+        );
+        for _ in 0..50 {
+            let (f, t) = r.wrench(
+                &m,
+                surface,
+                body.position,
+                body.orientation,
+                body.velocity,
+                DVec3::ZERO,
+            );
+            body.integrate_wrench(f, t, 0.01);
+        }
+        assert!(
+            body.angular_velocity().length() > 0.0,
+            "the coasting hull turned under rudder alone: {:?}",
+            body.angular_velocity()
+        );
+        assert!(body.velocity.is_finite() && body.angular_velocity().is_finite());
+    }
+
+    #[test]
+    fn rudder_round_trips_through_serde() {
+        let mut r = rudder();
+        r.set_turn(0.5);
+        let json = serde_json::to_string(&r).unwrap();
+        let back: Rudder = serde_json::from_str(&json).unwrap();
+        assert_eq!(r, back);
     }
 }

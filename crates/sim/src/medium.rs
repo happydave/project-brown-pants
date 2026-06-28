@@ -801,6 +801,7 @@ fn advance_descent(
         Option<&mut CraftThermal>,
         Option<&mut crate::marine::MarinePropulsion>,
         Option<&mut crate::ballast::Ballast>,
+        Option<&crate::marine::Rudder>,
     )>,
 ) {
     if clock.paused {
@@ -815,11 +816,11 @@ fn advance_descent(
     let dt = sub.dt;
     let mut n = 0;
     while sub.accumulator >= dt && n < sub.max {
-        for (mut body, dc, thermal, marine, ballast) in &mut bodies {
+        for (mut body, dc, thermal, marine, ballast, rudder) in &mut bodies {
             // Marine propulsion (WI 708): a screw's thrust wrench, scaled by the medium
             // density at each thruster, drawn from its tanks — the external force into
             // `glide_step`. Absent component ⇒ zero (the dive path is unaffected).
-            let external = if let Some(mut mp) = marine {
+            let mut external = if let Some(mut mp) = marine {
                 mp.thrust_step(
                     &dc.glide.descent.medium,
                     dc.glide.descent.surface_radius,
@@ -831,6 +832,20 @@ fn advance_descent(
             } else {
                 (DVec3::ZERO, DVec3::ZERO)
             };
+            // Rudder (WI 725): a hydrodynamic steering wrench from the water flow — speed-
+            // dependent yaw, summed into the same external force. Works coasting/unpowered.
+            if let Some(r) = rudder {
+                let (rf, rt) = r.wrench(
+                    &dc.glide.descent.medium,
+                    dc.glide.descent.surface_radius,
+                    body.position,
+                    body.orientation,
+                    body.velocity,
+                    dc.com,
+                );
+                external.0 += rf;
+                external.1 += rt;
+            }
             // Ballast (WI 709): step fill/blow, fold the tank water mass + CoM into the
             // body on the floodwater precedent, and use the **wet** CoM for the descent
             // (so net buoyancy flips sign as it floods and it sits lower / trims). The

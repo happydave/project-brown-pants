@@ -35,7 +35,7 @@ use sounding_sim::active::{ActiveBody, Gravity};
 use sounding_sim::ballast::{Ballast, BallastCommand, BallastTank};
 use sounding_sim::fluid::FluidMedium;
 use sounding_sim::frame::{FrameId, WorldPos};
-use sounding_sim::marine::{MarinePropulsion, MarineThruster, ThrusterCommand};
+use sounding_sim::marine::{MarinePropulsion, MarineThruster, Rudder, ThrusterCommand};
 use sounding_sim::medium::{
     buoyancy_wrench, enclosed_cells, heel_angle, max_cross_section, DescentParams, DescentPlugin,
     DivingCraft, GlideParams, DEFAULT_SLAM_COEFFICIENT,
@@ -140,6 +140,8 @@ struct HarborReadout {
     fuel: f64,
     /// Ballast fill fraction in `[0, 1]` (WI 709).
     ballast: f64,
+    /// Rudder deflection, radians (WI 725).
+    rudder: f64,
 }
 
 // --- markers (teardown: tag only the root of each spawned tree) ---
@@ -328,6 +330,34 @@ fn synth_marine(craft: &VoxelCraft) -> MarinePropulsion {
     }
 }
 
+/// A synthesized rudder for a built hull (WI 725): a control surface aft at the stern (−Z, forward is
+/// +Z), low so it sits in the water. Area scales with the hull's beam×draft so bigger boats get more
+/// steering authority. Player-placed rudders await the WI 715 device palette.
+fn synth_rudder(craft: &VoxelCraft) -> Rudder {
+    let cs = craft.cell_size;
+    let (mut lo, mut hi) = (IVec3::MAX, IVec3::MIN);
+    for v in &craft.voxels {
+        lo = lo.min(v.cell);
+        hi = hi.max(v.cell);
+    }
+    let min_m = lo.as_dvec3() * cs;
+    let max_m = (hi.as_dvec3() + DVec3::ONE) * cs;
+    let beam = (max_m.x - min_m.x).max(cs);
+    let depth = (max_m.y - min_m.y).max(cs);
+    Rudder {
+        mount: DVec3::new(
+            0.5 * (min_m.x + max_m.x),
+            min_m.y + 0.5 * cs,  // low, in the water
+            min_m.z - 0.25 * cs, // just aft of the stern
+        ),
+        forward: DVec3::Z,
+        area: 0.25 * beam * depth, // a fraction of the stern cross-section
+        slope: 6.0,                // ~2π lift-curve slope per radian
+        max_angle: 0.6,            // ~34° hard over
+        angle: 0.0,
+    }
+}
+
 /// A synthesized ballast tank for a built hull (WI 709): one tank low at the keel, sized so a full
 /// flood **clearly overcomes the hull's reserve buoyancy** (≈1.5× the reserve), so flooding it sinks a
 /// boat that floats empty and blowing it surfaces — controllable dive/surface/hold. `dry_mass` is
@@ -404,10 +434,13 @@ fn enter_float(
         let marine = synth_marine(&craft);
         // A synthesized ballast tank (WI 709): flood to dive, blow to surface (no palette yet, WI 715).
         let ballast = synth_ballast(&craft);
+        // A synthesized rudder (WI 725): the primary underway steering surface.
+        let rudder = synth_rudder(&craft);
         let mut hull = commands.spawn((
             body,
             dc,
             marine,
+            rudder,
             Transform::default(),
             Visibility::default(),
             WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, start_render)),
@@ -549,7 +582,7 @@ fn enter_float(
 
     // HUD.
     commands.spawn((
-        Text::new("harbor — Float (Enter: Build)\nWASD: drive / steer   F/G: dive / surface\ndraft:  --\nheel:   --\nnet buoy: --\nthrust:  --   fuel: --\nballast: --"),
+        Text::new("harbor — Float (Enter: Build)\nWASD: drive / steer   F/G: dive / surface\ndraft:  --\nheel:   --\nnet buoy: --\nthrust:  --   fuel: --\nballast: --   rudder: --"),
         TextFont {
             font_size: 20.0,
             ..default()
@@ -899,14 +932,17 @@ fn track_hull(
     readout.net_buoyancy = load.force.length() - body.mass * g_local;
 }
 
-/// Player marine drive (WI 708): `W`/`S` throttle forward/reverse, `A`/`D` steer (differential
-/// thrust). Publishes net thrust + fuel fraction to the HUD readout.
+/// Player marine drive + steering (WI 708 + 725): `W`/`S` throttle forward/reverse, `A`/`D` steer.
+/// Steering deflects the **rudder** (the primary underway control — yaw grows with speed) and also
+/// biases **differential thrust** (so the boat still pivots at low speed / standstill). Publishes net
+/// thrust, fuel, and rudder angle to the HUD readout.
+#[allow(clippy::type_complexity)]
 fn harbor_drive_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut readout: ResMut<HarborReadout>,
-    mut hull: Query<&mut MarinePropulsion, With<HullMarker>>,
+    mut hull: Query<(&mut MarinePropulsion, &mut Rudder), With<HullMarker>>,
 ) {
-    let Ok(mut mp) = hull.single_mut() else {
+    let Ok((mut mp, mut rudder)) = hull.single_mut() else {
         return;
     };
     let mut forward = 0.0;
@@ -923,9 +959,11 @@ fn harbor_drive_input(
     if keys.pressed(KeyCode::KeyA) {
         turn -= 1.0; // bow to port
     }
-    mp.drive(forward, turn);
+    rudder.set_turn(turn); // primary steering — yaw scales with speed
+    mp.drive(forward, turn); // differential thrust — low-speed pivoting
     readout.thrust = mp.last_thrust;
     readout.fuel = mp.fuel_fraction();
+    readout.rudder = rudder.angle;
 }
 
 /// Player ballast control (WI 709): hold `F` to **flood** (dive), hold `G` to **blow** (surface),
@@ -999,13 +1037,14 @@ fn update_hud(readout: Res<HarborReadout>, mut hud: Query<&mut Text, With<Hud>>)
             "floating"
         };
         text.0 = format!(
-            "harbor — Float (Enter: Build) — {status}\nWASD: drive / steer   F/G: dive / surface\ndraft:    {:6.2} m\nheel:     {:6.1} deg\nnet buoy: {:8.0} N\nthrust:   {:8.0} N   fuel:    {:3.0}%\nballast:  {:3.0}%",
+            "harbor — Float (Enter: Build) — {status}\nWASD: drive / steer   F/G: dive / surface\ndraft:    {:6.2} m\nheel:     {:6.1} deg\nnet buoy: {:8.0} N\nthrust:   {:8.0} N   fuel:    {:3.0}%\nballast:  {:3.0}%   rudder: {:5.1} deg",
             readout.draft,
             readout.heel.to_degrees(),
             readout.net_buoyancy,
             readout.thrust,
             readout.fuel * 100.0,
             readout.ballast * 100.0,
+            readout.rudder.to_degrees(),
         );
     }
 }
@@ -1226,6 +1265,44 @@ mod tests {
         assert!(
             tq2.dot(up).abs() > 1e-3,
             "differential thrust steers: {tq2:?}"
+        );
+    }
+
+    /// WI 725: the synthesized rudder sits in the water aft of the hull and steers it **only when
+    /// moving** — a yaw moment under way, nothing at a standstill.
+    #[test]
+    fn synth_rudder_steers_the_moving_seed_hull_only_under_way() {
+        let seed = seed_hull();
+        let (body, dc) = assemble_float(&seed).unwrap();
+        let mut r = synth_rudder(&seed);
+        r.set_turn(1.0); // hard over
+        let m = FluidMedium::EARTHLIKE;
+
+        // At rest: no flow ⇒ no steering.
+        let (_, t_rest) = r.wrench(
+            &m,
+            BODY.radius,
+            body.position,
+            body.orientation,
+            DVec3::ZERO,
+            dc.com,
+        );
+        assert_eq!(t_rest, DVec3::ZERO, "no steering at a standstill");
+
+        // Under way (forward, the hull's +Z): a real yaw moment about the local up.
+        let forward = body.orientation * DVec3::Z;
+        let (_, t_move) = r.wrench(
+            &m,
+            BODY.radius,
+            body.position,
+            body.orientation,
+            forward * 5.0,
+            dc.com,
+        );
+        let up = body.position.normalize_or(DVec3::Y);
+        assert!(
+            t_move.dot(up).abs() > 1e-3,
+            "the rudder yaws the moving hull: {t_move:?}"
         );
     }
 
