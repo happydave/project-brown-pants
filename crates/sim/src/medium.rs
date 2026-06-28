@@ -517,12 +517,19 @@ impl GlideParams {
 /// and the restoring moment + damping trim the craft toward the flow. Every aero
 /// term is drawn from the one medium sample, so all vanish appropriately in
 /// vacuum/liquid with no medium-identity branch. Returns the medium sample.
+///
+/// `external` is a world-frame wrench `(force, torque about the CoM)` summed with the
+/// aero/hydro forces **before** the single integration step — the seam through which
+/// device forces enter (marine propulsion, WI 708). Pass `(DVec3::ZERO, DVec3::ZERO)`
+/// for none; the result is then identical to the pure aero/hydro descent.
+#[allow(clippy::too_many_arguments)]
 pub fn glide_step(
     body: &mut crate::active::ActiveBody,
     craft: &VoxelCraft,
     com: DVec3,
     enclosed: &[IVec3],
     params: &GlideParams,
+    external: (DVec3, DVec3),
     dt: f64,
 ) -> FluidSample {
     let p = &params.descent;
@@ -607,8 +614,8 @@ pub fn glide_step(
     );
 
     body.integrate_wrench(
-        gravity + drag + load.force + lift + wave + slam + damp_f,
-        restoring + damping + load.torque + damp_t,
+        gravity + drag + load.force + lift + wave + slam + damp_f + external.0,
+        restoring + damping + load.torque + damp_t + external.1,
         dt,
     );
     sample
@@ -791,6 +798,7 @@ fn advance_descent(
         &mut crate::active::ActiveBody,
         &DivingCraft,
         Option<&mut CraftThermal>,
+        Option<&mut crate::marine::MarinePropulsion>,
     )>,
 ) {
     if clock.paused {
@@ -805,8 +813,31 @@ fn advance_descent(
     let dt = sub.dt;
     let mut n = 0;
     while sub.accumulator >= dt && n < sub.max {
-        for (mut body, dc, thermal) in &mut bodies {
-            let sample = glide_step(&mut body, &dc.craft, dc.com, &dc.enclosed, &dc.glide, dt);
+        for (mut body, dc, thermal, marine) in &mut bodies {
+            // Marine propulsion (WI 708): a screw's thrust wrench, scaled by the medium
+            // density at each thruster, drawn from its tanks — the external force into
+            // `glide_step`. Absent component ⇒ zero (the dive path is unaffected).
+            let external = if let Some(mut mp) = marine {
+                mp.thrust_step(
+                    &dc.glide.descent.medium,
+                    dc.glide.descent.surface_radius,
+                    body.position,
+                    body.orientation,
+                    dc.com,
+                    dt,
+                )
+            } else {
+                (DVec3::ZERO, DVec3::ZERO)
+            };
+            let sample = glide_step(
+                &mut body,
+                &dc.craft,
+                dc.com,
+                &dc.enclosed,
+                &dc.glide,
+                external,
+                dt,
+            );
             // A craft carrying thermal state heats from the same medium sample and
             // motion the descent just used (WI 691) — a passive overlay (no force
             // feedback this slice), so the trajectory is unchanged.
@@ -1596,7 +1627,15 @@ mod tests {
 
         let dt = 0.004;
         for _ in 0..2_000 {
-            glide_step(&mut body, &craft, com, &[], &glide, dt);
+            glide_step(
+                &mut body,
+                &craft,
+                com,
+                &[],
+                &glide,
+                (DVec3::ZERO, DVec3::ZERO),
+                dt,
+            );
             descent_step(&mut ballistic, &craft, com, &[], &descent, dt);
         }
 
@@ -1639,7 +1678,15 @@ mod tests {
         let mut late_max = 0.0_f64;
         let mut max_omega = 0.0_f64;
         for i in 0..4_000 {
-            glide_step(&mut body, &craft, com, &[], &glide, dt);
+            glide_step(
+                &mut body,
+                &craft,
+                com,
+                &[],
+                &glide,
+                (DVec3::ZERO, DVec3::ZERO),
+                dt,
+            );
             let a = aoa(body.orientation, glide.forward_local, body.velocity);
             if i < 1_000 {
                 early_max = early_max.max(a);
@@ -1679,7 +1726,15 @@ mod tests {
         );
         g_air.orientation = aligned;
         let mut d_air = g_air;
-        let s = glide_step(&mut g_air, &craft, com, &[], &glide, 0.004);
+        let s = glide_step(
+            &mut g_air,
+            &craft,
+            com,
+            &[],
+            &glide,
+            (DVec3::ZERO, DVec3::ZERO),
+            0.004,
+        );
         descent_step(&mut d_air, &craft, com, &[], &descent, 0.004);
         assert_eq!(s.medium, MediumKind::Atmosphere);
         assert!(
@@ -1697,7 +1752,15 @@ mod tests {
         );
         g_w.orientation = aligned;
         let mut d_w = g_w;
-        let sw = glide_step(&mut g_w, &craft, com, &[], &glide, 0.004);
+        let sw = glide_step(
+            &mut g_w,
+            &craft,
+            com,
+            &[],
+            &glide,
+            (DVec3::ZERO, DVec3::ZERO),
+            0.004,
+        );
         descent_step(&mut d_w, &craft, com, &[], &descent, 0.004);
         assert_eq!(sw.medium, MediumKind::Liquid);
         assert!(

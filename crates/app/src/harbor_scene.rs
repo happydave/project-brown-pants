@@ -34,11 +34,13 @@ use bevy::prelude::*;
 use sounding_sim::active::{ActiveBody, Gravity};
 use sounding_sim::fluid::FluidMedium;
 use sounding_sim::frame::{FrameId, WorldPos};
+use sounding_sim::marine::{MarinePropulsion, MarineThruster, ThrusterCommand};
 use sounding_sim::medium::{
     buoyancy_wrench, enclosed_cells, heel_angle, max_cross_section, DescentParams, DescentPlugin,
     DivingCraft, GlideParams, DEFAULT_SLAM_COEFFICIENT,
 };
 use sounding_sim::powertrain::MotorTier;
+use sounding_sim::resource::{Reservoir, ReservoirId, ResourceGraph, ResourceType};
 use sounding_sim::sim::CentralBody;
 use sounding_sim::voxel::{Axis, Material, Voxel, VoxelCraft, PANEL_FILL};
 
@@ -125,12 +127,16 @@ fn orbit_offset(yaw: f32, pitch: f32, dist: f32) -> Vec3 {
     Vec3::new(sy * cp, sp, cy * cp) * dist
 }
 
-/// The Float HUD readout (WI 705 hydrostatic gauges).
+/// The Float HUD readout (WI 705 hydrostatic gauges + WI 708 marine drive).
 #[derive(Resource, Default)]
 struct HarborReadout {
     draft: f64,
     heel: f64,
     net_buoyancy: f64,
+    /// Net marine thrust, N (WI 708).
+    thrust: f64,
+    /// Fuel/charge fraction in `[0, 1]` (WI 708).
+    fuel: f64,
 }
 
 // --- markers (teardown: tag only the root of each spawned tree) ---
@@ -211,6 +217,7 @@ impl Plugin for HarborScenePlugin {
             .add_systems(
                 Update,
                 (
+                    harbor_drive_input,
                     track_hull,
                     harbor_camera_input,
                     follow_camera,
@@ -280,6 +287,43 @@ fn assemble_float(craft: &VoxelCraft) -> Option<(ActiveBody, DivingCraft)> {
     ))
 }
 
+/// A synthesized marine drive for a built hull (WI 708): a port + starboard screw pair low at the
+/// stern (the −Z face; forward is +Z, the glide forward axis), mounted near the keel so they sit in
+/// the water. Differential throttle steers (a yaw couple from the ±X offset). Sized to push the
+/// editor-scale starter boat; player-placed thrusters await the WI 715 device palette.
+fn synth_marine(craft: &VoxelCraft) -> MarinePropulsion {
+    let cs = craft.cell_size;
+    let (mut lo, mut hi) = (IVec3::MAX, IVec3::MIN);
+    for v in &craft.voxels {
+        lo = lo.min(v.cell);
+        hi = hi.max(v.cell);
+    }
+    let min_m = lo.as_dvec3() * cs;
+    let max_m = (hi.as_dvec3() + DVec3::ONE) * cs;
+    let centre_x = 0.5 * (min_m.x + max_m.x);
+    let beam = (max_m.x - min_m.x).max(cs);
+    let stern_z = min_m.z + 0.5 * cs; // just inside the stern (the −Z end)
+    let keel_y = min_m.y + 0.5 * cs; // near the bottom row, so the screws are submerged
+    let off = 0.30 * beam;
+    let screw = |x: f64| MarineThruster {
+        tank: ReservoirId(0),
+        max_thrust: 5_000.0,
+        reference_density: 1_025.0, // water surface — full thrust submerged, ~none in air
+        max_draw: 4.0,
+        mount: DVec3::new(x, keel_y, stern_z),
+        axis: DVec3::Z, // push forward (+Z)
+    };
+    MarinePropulsion {
+        graph: ResourceGraph {
+            reservoirs: vec![Reservoir::new(ResourceType(0), 1_500.0, 1_500.0)],
+            ..Default::default()
+        },
+        thrusters: vec![screw(centre_x + off), screw(centre_x - off)],
+        commands: vec![ThrusterCommand::default(); 2],
+        last_thrust: 0.0,
+    }
+}
+
 /// Enters Float: assemble the built hull and spawn the floating waterfront (WI 706 + 707).
 fn enter_float(
     mut commands: Commands,
@@ -296,10 +340,14 @@ fn enter_float(
     if let Some((body, dc)) = assemble_float(&editor.craft) {
         let com_off = -dc.com.as_vec3();
         let craft = dc.craft.clone();
+        // A synthesized stern drive (WI 708): no device palette yet (WI 715), so any built hull
+        // gets a port+starboard screw pair so it can sail and steer (differential thrust).
+        let marine = synth_marine(&craft);
         commands
             .spawn((
                 body,
                 dc,
+                marine,
                 Transform::default(),
                 Visibility::default(),
                 WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, start_render)),
@@ -438,7 +486,7 @@ fn enter_float(
 
     // HUD.
     commands.spawn((
-        Text::new("harbor — Float (Enter: Build)\ndraft:  --\nheel:   --\nnet buoy: --"),
+        Text::new("harbor — Float (Enter: Build)\nWASD: drive / steer\ndraft:  --\nheel:   --\nnet buoy: --\nthrust:  --   fuel: --"),
         TextFont {
             font_size: 20.0,
             ..default()
@@ -788,6 +836,35 @@ fn track_hull(
     readout.net_buoyancy = load.force.length() - body.mass * g_local;
 }
 
+/// Player marine drive (WI 708): `W`/`S` throttle forward/reverse, `A`/`D` steer (differential
+/// thrust). Publishes net thrust + fuel fraction to the HUD readout.
+fn harbor_drive_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut readout: ResMut<HarborReadout>,
+    mut hull: Query<&mut MarinePropulsion, With<HullMarker>>,
+) {
+    let Ok(mut mp) = hull.single_mut() else {
+        return;
+    };
+    let mut forward = 0.0;
+    let mut turn = 0.0;
+    if keys.pressed(KeyCode::KeyW) {
+        forward += 1.0;
+    }
+    if keys.pressed(KeyCode::KeyS) {
+        forward -= 1.0;
+    }
+    if keys.pressed(KeyCode::KeyD) {
+        turn += 1.0; // bow to starboard
+    }
+    if keys.pressed(KeyCode::KeyA) {
+        turn -= 1.0; // bow to port
+    }
+    mp.drive(forward, turn);
+    readout.thrust = mp.last_thrust;
+    readout.fuel = mp.fuel_fraction();
+}
+
 /// Middle-drag orbit (L/R swapped per Dave), wheel zoom.
 fn harbor_camera_input(
     motion: Res<AccumulatedMouseMotion>,
@@ -839,10 +916,12 @@ fn update_hud(readout: Res<HarborReadout>, mut hud: Query<&mut Text, With<Hud>>)
             "floating"
         };
         text.0 = format!(
-            "harbor — Float (Enter: Build) — {status}\ndraft:    {:6.2} m\nheel:     {:6.1} deg\nnet buoy: {:8.0} N",
+            "harbor — Float (Enter: Build) — {status}\nWASD: drive / steer\ndraft:    {:6.2} m\nheel:     {:6.1} deg\nnet buoy: {:8.0} N\nthrust:   {:8.0} N   fuel: {:3.0}%",
             readout.draft,
             readout.heel.to_degrees(),
             readout.net_buoyancy,
+            readout.thrust,
+            readout.fuel * 100.0,
         );
     }
 }
@@ -1018,6 +1097,52 @@ mod tests {
     #[test]
     fn an_empty_lattice_does_not_assemble() {
         assert!(assemble_float(&VoxelCraft::new(0.5)).is_none());
+    }
+
+    /// WI 708: the synthesized stern drive sits in the water on the floated seed hull and pushes it
+    /// **forward** (+Z), drawing fuel — and steers (a yaw couple) under differential throttle.
+    #[test]
+    fn synth_marine_drives_the_seed_hull_forward_and_steers() {
+        let seed = seed_hull();
+        let (body, dc) = assemble_float(&seed).unwrap();
+        let mut mp = synth_marine(&seed);
+        let fuel0 = mp.fuel();
+
+        // Full ahead: forward thrust, fuel drawn.
+        mp.drive(1.0, 0.0);
+        let (f, tq) = mp.thrust_step(
+            &FluidMedium::EARTHLIKE,
+            BODY.radius,
+            body.position,
+            body.orientation,
+            dc.com,
+            0.1,
+        );
+        assert!(
+            f.length() > 0.0,
+            "the keel screws are submerged and push: {f:?}"
+        );
+        // Forward is +Z in the body frame; the world thrust is mostly along the hull's forward axis.
+        let forward_world = body.orientation * DVec3::Z;
+        assert!(f.dot(forward_world) > 0.0, "drives forward");
+        assert!(mp.fuel() < fuel0, "fuel drawn under power");
+        assert!(tq.length() >= 0.0);
+
+        // Differential throttle yaws (nonzero steering moment about up).
+        mp.drive(0.4, 0.6);
+        let (_f2, tq2) = mp.thrust_step(
+            &FluidMedium::EARTHLIKE,
+            BODY.radius,
+            body.position,
+            body.orientation,
+            dc.com,
+            0.1,
+        );
+        let up = body.position.normalize_or(DVec3::Y);
+        assert!(
+            tq2.dot(up).abs() > 1e-3,
+            "differential thrust steers: {tq2:?}"
+        );
     }
 
     #[test]

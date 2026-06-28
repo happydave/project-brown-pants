@@ -49,6 +49,21 @@ pub struct Telemetry {
     /// gauges. Additive/serde-defaulted: snapshots without it deserialize to `None`.
     #[serde(default)]
     pub hydro: Option<HydrostaticTelemetry>,
+    /// Marine-propulsion state of the live craft (WI 708), when a scene drives a screw
+    /// (the harbor). Net thrust and fuel/charge fraction. Additive/serde-defaulted:
+    /// snapshots without it deserialize to `None`.
+    #[serde(default)]
+    pub marine: Option<MarineTelemetry>,
+}
+
+/// The live craft's marine-propulsion readout on the bus (WI 708): the surface-drive
+/// gauges — how hard the screw is pushing and how much fuel/charge remains.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub struct MarineTelemetry {
+    /// Net thrust magnitude developed by the marine thrusters, N (zero out of the water).
+    pub thrust: f64,
+    /// Fuel/charge fill fraction in `[0, 1]`.
+    pub fuel_fraction: f64,
 }
 
 /// The live craft's hydrostatic state on the bus (WI 705): the surface-vessel readout that makes
@@ -328,6 +343,7 @@ impl Telemetry {
             rover: None,
             thermal: None,
             hydro: None,
+            marine: None,
         }
     }
 
@@ -362,6 +378,13 @@ impl Telemetry {
     /// draft/heel/net-buoyancy readout onto `capture`.
     pub fn with_hydro(mut self, hydro: HydrostaticTelemetry) -> Self {
         self.hydro = Some(hydro);
+        self
+    }
+
+    /// Attach marine-propulsion state to this snapshot (WI 708). Builder-style, so a
+    /// scene driving a screw can layer the thrust/fuel readout onto `capture`.
+    pub fn with_marine(mut self, marine: MarineTelemetry) -> Self {
+        self.marine = Some(marine);
         self
     }
 }
