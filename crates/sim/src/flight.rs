@@ -20,7 +20,9 @@ use crate::contact::{ground_contact_wrench, ContactParams};
 use crate::control::{ControlSystem, ControlTier};
 use crate::fluid::{FluidMedium, FluidSample};
 use crate::launch::LaunchPad;
-use crate::medium::{buoyancy_force, drag_force, submerged_volume, GlideParams};
+use crate::medium::{
+    buoyancy_wrench, drag_force, free_surface_damping, GlideParams, FREE_SURFACE_DAMPING,
+};
 use crate::propulsion::Propulsion;
 use crate::voxel::VoxelCraft;
 use glam::{DQuat, DVec3};
@@ -223,14 +225,35 @@ pub fn flight_step(
         params.drag_area,
         params.drag_coefficient,
     );
-    let sub_vol = submerged_volume(
+    // Buoyancy is a distributed wrench (WI 705) — the same engine the dive/harbor use (WI 712,
+    // Split B1): force + a righting/trim moment, so a craft on water rights and settles in every
+    // flight scene, not only the dive. Enclosed-compartment air is empty here (D1): no flight scene
+    // floats a hollow hull yet, so this is identical to the old central force for every current
+    // craft (a solid body in air/on land has zero submerged displacement).
+    let load = buoyancy_wrench(
         voxels,
         com,
         body.position,
         body.orientation,
         params.surface_radius,
+        0.0, // calm water (WI 705 seam): wave-time threads sim time here
+        sample.density,
+        g_local,
+        &[],
     );
-    let buoyancy = buoyancy_force(sample.density, sub_vol, g_local, up);
+    // Free-surface damping (WI 705): heave/roll/yaw dissipation the bulk drag leaves undamped.
+    let (damp_f, damp_t) = free_surface_damping(
+        voxels,
+        com,
+        body.position,
+        body.orientation,
+        body.velocity,
+        body.angular_velocity(),
+        params.surface_radius,
+        0.0,
+        sample.density,
+        FREE_SURFACE_DAMPING,
+    );
 
     // Thrust (force + moment about the CoM).
     let (thrust, thrust_torque) = propulsion.thrust_step(body.orientation, com, dt);
@@ -276,8 +299,8 @@ pub fn flight_step(
     let g = &mut propulsion.graph;
     g.integrate(g.time + dt);
 
-    let mut force = gravity + drag + buoyancy + thrust + lift;
-    let mut torque = thrust_torque + lift_torque + att_torque;
+    let mut force = gravity + drag + load.force + thrust + lift + damp_f;
+    let mut torque = thrust_torque + lift_torque + att_torque + load.torque + damp_t;
 
     // Ground collision (WI 592): when a scene supplies a ground plane, add the penalty
     // contact wrench (craft shape derived from the voxels, placed at the CoM). `None`
@@ -658,6 +681,86 @@ mod tests {
             lift: None,
             ground: None,
         }
+    }
+
+    /// A wide flat plate (beam-spread along X), no propulsion/attitude — a hull for buoyancy tests.
+    fn raft() -> FlightCraft {
+        let mut voxels = VoxelCraft::new(1.0);
+        for x in -2..=2 {
+            voxels.voxels.push(Voxel {
+                cell: IVec3::new(x, 0, 0),
+                material: Material::COMPOSITE,
+            });
+        }
+        let mp = voxels.mass_properties().unwrap();
+        FlightCraft {
+            dry_mass: mp.mass,
+            dry_com: mp.center_of_mass,
+            voxels,
+            propulsion: Propulsion::default(),
+            attitude: AttitudePilot {
+                sas: Sas::default(),
+                manual: DVec3::ZERO,
+                authority: 0.0,
+                recapture_on_release: false,
+                actuators: AttitudeControl {
+                    wheels: None,
+                    rcs: None,
+                },
+            },
+            control: crate::control::ControlSystem::crewed_manual(),
+            autopilot: None,
+        }
+    }
+
+    /// WI 712 (Split B1): `flight_step` now buoys via the distributed `buoyancy_wrench`, so a heeled
+    /// hull at the waterline develops a **righting moment** — where the old central `buoyancy_force`
+    /// produced none. A +Z roll submerges the −X side, whose upward buoyancy yields `torque_z < 0`.
+    #[test]
+    fn flight_buoyancy_rights_a_heeled_hull_on_water() {
+        let mut craft = raft();
+        let mp = craft.voxels.mass_properties().unwrap();
+        let mut body =
+            ActiveBody::from_mass_properties(DVec3::new(0.0, BODY.radius, 0.0), DVec3::ZERO, &mp);
+        body.orientation = DQuat::from_rotation_z(0.2); // heel about the roll axis
+        let mut pad = LaunchPad::resting(BODY.radius);
+        pad.released = true; // integrate freely (not pad-held) so the hull can rotate
+        for _ in 0..5 {
+            flight_step(&mut body, &mut craft, &params(1.0), &mut pad, 1.0 / 240.0);
+        }
+        let omega = body.angular_velocity();
+        assert!(
+            omega.z < -1e-9,
+            "buoyancy produces a restoring spin opposing the +Z heel; got omega.z = {}",
+            omega.z
+        );
+        assert!(
+            omega.is_finite(),
+            "no kraken: angular velocity stays finite"
+        );
+    }
+
+    /// WI 712: in air (above sea level) the buoyancy contribution is zero — no submerged cells — so
+    /// the swap does not perturb ascent. From rest with no thrust/attitude, the hull stays unspun.
+    #[test]
+    fn flight_buoyancy_is_inert_in_air() {
+        let mut craft = raft();
+        let mp = craft.voxels.mass_properties().unwrap();
+        let mut body = ActiveBody::from_mass_properties(
+            DVec3::new(0.0, BODY.radius + 5_000.0, 0.0),
+            DVec3::ZERO,
+            &mp,
+        );
+        body.orientation = DQuat::from_rotation_z(0.2);
+        let mut pad = LaunchPad::resting(BODY.radius);
+        pad.released = true;
+        for _ in 0..5 {
+            flight_step(&mut body, &mut craft, &params(1.0), &mut pad, 1.0 / 240.0);
+        }
+        assert!(
+            body.angular_velocity().length() < 1e-9,
+            "no buoyancy torque in air: the hull does not spin"
+        );
     }
 
     #[test]
