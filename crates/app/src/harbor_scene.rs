@@ -48,6 +48,7 @@ use sounding_sim::resource::{Reservoir, ReservoirId, ResourceGraph, ResourceType
 use sounding_sim::sim::CentralBody;
 use sounding_sim::voxel::{Axis, Material, Voxel, VoxelCraft, PANEL_FILL};
 
+use crate::build::{self, BuildEntity, BuildHud, BuildMesh};
 use crate::editor::{
     draw_editor, editor_input, mouse_build, mouse_orbit_input, orbit_camera, update_hover, Brush,
     EditorState, HoverState, OrbitCam, PointerOnPalette,
@@ -318,14 +319,6 @@ fn build_flood_state(craft: &VoxelCraft, com: DVec3, ballast: Option<&Ballast>) 
 #[derive(Component)]
 struct FloatEntity;
 
-/// Tags an entity owned by Build mode (despawned on leaving Build).
-#[derive(Component)]
-struct BuildEntity;
-
-/// Tags a solid mesh rendering part of the Build craft (rebuilt on edit).
-#[derive(Component)]
-struct BuildMesh;
-
 /// The floating hull (its `ActiveBody` is the physics body).
 #[derive(Component)]
 struct HullMarker;
@@ -333,10 +326,6 @@ struct HullMarker;
 /// The Float HUD text.
 #[derive(Component)]
 struct Hud;
-
-/// The Build HUD text.
-#[derive(Component)]
-struct BuildHud;
 
 /// The animated calm-water patch.
 #[derive(Component)]
@@ -386,7 +375,7 @@ impl Plugin for HarborScenePlugin {
             .add_systems(OnEnter(HarborMode::Float), enter_float)
             .add_systems(OnExit(HarborMode::Float), exit_float)
             .add_systems(OnEnter(HarborMode::Build), enter_build)
-            .add_systems(OnExit(HarborMode::Build), exit_build)
+            .add_systems(OnExit(HarborMode::Build), build::exit_build)
             .add_systems(Update, toggle_mode)
             .add_systems(
                 Update,
@@ -410,10 +399,13 @@ impl Plugin for HarborScenePlugin {
                     editor_input,
                     mouse_orbit_input,
                     update_hover,
+                    build::track_pointer_over_palette,
+                    build::palette_click,
                     mouse_build,
                     orbit_camera,
                     sync_build_meshes,
                     draw_editor,
+                    build::update_palette_highlight,
                     update_build_hud,
                 )
                     .chain()
@@ -874,31 +866,27 @@ fn enter_build(mut commands: Commands) {
         Transform::from_xyz(6.0, 12.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y),
         BuildEntity,
     ));
+    // HUD at top-right to clear the left-edge palette (WI 738).
     commands.spawn((
         Text::new(
             "harbor — Build (Enter: Float)\nmouse: orbit/zoom · L-click place · R-click remove\nT: panel mode (thin, light) · Tab: material",
         ),
         TextFont {
-            font_size: 20.0,
+            font_size: 18.0,
             ..default()
         },
         TextColor(Color::srgb(0.9, 0.95, 1.0)),
         Node {
             position_type: PositionType::Absolute,
             top: Val::Px(10.0),
-            left: Val::Px(12.0),
+            right: Val::Px(12.0),
             ..default()
         },
         BuildHud,
         BuildEntity,
     ));
-}
-
-fn exit_build(mut commands: Commands, entities: Query<Entity, With<BuildEntity>>) {
-    // Build meshes carry `BuildEntity` too, so this clears the whole Build world.
-    for e in &entities {
-        commands.entity(e).despawn();
-    }
+    // The shared clickable palette (WI 738): the harbor gains the workshop's left-edge palette.
+    build::spawn_palette(&mut commands);
 }
 
 /// Rebuilds the solid Build-craft meshes whenever the lattice changes (or after re-entering Build),

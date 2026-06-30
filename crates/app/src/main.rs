@@ -37,6 +37,7 @@ use sounding_sim::sim::{CentralBody, OrbitPlugin};
 
 mod autopilot_scene;
 mod break_scene;
+mod build;
 mod bus;
 mod collide_scene;
 mod compartments_scene;
