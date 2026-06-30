@@ -869,7 +869,7 @@ fn enter_build(mut commands: Commands) {
     // HUD at top-right to clear the left-edge palette (WI 738).
     commands.spawn((
         Text::new(
-            "harbor — Build (Enter: Float)\nmouse: orbit/zoom · L-click place · R-click remove\nT: panel mode (thin, light) · Tab: material",
+            "harbor — Build (Enter: Float)\nmouse: orbit/zoom · L-click place · R-click remove · click palette (left) to pick\nT: panel mode (thin, light) · Tab: material",
         ),
         TextFont {
             font_size: 18.0,
@@ -1121,7 +1121,7 @@ fn update_build_hud(editor: Res<EditorState>, mut hud: Query<&mut Text, With<Bui
             "will SINK".to_string()
         };
         text.0 = format!(
-            "harbor — Build (Enter: Float)\nmouse: orbit/zoom · L-click place · R-click remove\nT: place mode — {mode} · Tab: material\ncells: {cells}  panels: {panels}\n>> {prediction} <<"
+            "harbor — Build (Enter: Float)\nmouse: orbit/zoom · L-click place · R-click remove · click palette (left) to pick\nT: place mode — {mode} · Tab: material\ncells: {cells}  panels: {panels}\n>> {prediction} <<"
         );
     }
 }
