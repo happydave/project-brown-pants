@@ -14,11 +14,12 @@
 //!   maps to the same locus of directions from either face), and the field is
 //!   sampled at the resulting 3D direction — so there is no parameterization seam.
 //! - Chunks at differing LOD meet without holes because each chunk carries a
-//!   **skirt**: its border ring is duplicated and pushed radially inward by a
-//!   depth proportional to the node's world edge length, so the coarser side of a
-//!   boundary (the longer edge, the larger deviation) always grows a proportionally
-//!   deeper wall that covers the gap. The traversal therefore need not keep the
-//!   quadtree 2:1-balanced.
+//!   **skirt**: its border ring is duplicated and pushed radially inward by a depth
+//!   sized to the chunk's own **relief** (max−min elevation). A boundary gap is
+//!   bounded by the relief the chunks span, so a relief-sized skirt covers it while
+//!   staying buried under the terrain — sizing it to the node's *width* instead grew
+//!   kilometre-tall walls on coarse chunks that showed as a "waffle" at grazing
+//!   angles (WI 773). The traversal need not keep the quadtree 2:1-balanced.
 //!
 //! **Precision.** A chunk's vertex positions are `f32` **relative to the node's
 //! centre world point** (returned separately as `f64`), so per-vertex values stay
@@ -27,8 +28,14 @@
 use crate::surface_field::SurfaceField;
 use glam::{DVec3, Vec2, Vec3};
 
-/// Skirt depth as a fraction of a node's world edge length.
-const SKIRT_FACTOR: f64 = 0.5;
+/// Skirt depth as a multiple of a chunk's own **relief** (max−min elevation). A
+/// chunk's worst LOD-boundary gap is bounded by the relief it spans (never by its
+/// width), so a relief-sized skirt covers the gap while staying buried — sizing it
+/// to the node's edge length instead grows kilometre-tall walls on coarse chunks
+/// that read as a "waffle" at grazing angles.
+const SKIRT_RELIEF_FACTOR: f64 = 1.5;
+/// A small floor (metres) so a near-flat chunk still has a non-degenerate skirt.
+const SKIRT_FLOOR: f64 = 2.0;
 /// Split when the camera is within this many node-edge-lengths of a node.
 pub const SPLIT_RANGE_FACTOR: f64 = 2.5;
 /// Default per-chunk grid resolution (quads per side; vertices = res+1).
@@ -242,6 +249,32 @@ pub fn should_split(node: QuadNode, camera_world: DVec3, radius: f64, max_level:
     dist < size * SPLIT_RANGE_FACTOR
 }
 
+/// The skirt depth (metres) for a chunk spanning `relief` metres of elevation —
+/// enough to cover the worst LOD-boundary gap (bounded by the relief) plus a small
+/// floor, and no more.
+pub fn skirt_depth_for_relief(relief: f64) -> f64 {
+    SKIRT_RELIEF_FACTOR * relief.max(0.0) + SKIRT_FLOOR
+}
+
+/// The relief (max−min elevation, metres) a chunk spans at resolution `res` — the
+/// basis for its skirt depth. Matches the range `build_chunk` computes internally.
+pub fn chunk_relief(field: &SurfaceField, node: QuadNode, res: u32) -> f64 {
+    let res = res.max(1);
+    let (u0, u1, v0, v1) = node.uv_rect();
+    let lerp = |a: f64, b: f64, t: f64| a + (b - a) * t;
+    let (mut min_e, mut max_e) = (f64::INFINITY, f64::NEG_INFINITY);
+    for b in 0..=res {
+        let vv = lerp(v0, v1, b as f64 / res as f64);
+        for a in 0..=res {
+            let uu = lerp(u0, u1, a as f64 / res as f64);
+            let e = field.elevation(direction(node.face, uu, vv));
+            min_e = min_e.min(e);
+            max_e = max_e.max(e);
+        }
+    }
+    (max_e - min_e).max(0.0)
+}
+
 /// Builds the chunk mesh for `node` at grid resolution `res` (quads per side),
 /// sampling `field`. Deterministic and pure: identical inputs → identical buffers.
 pub fn build_chunk(field: &SurfaceField, node: QuadNode, res: u32) -> ChunkMesh {
@@ -259,9 +292,11 @@ pub fn build_chunk(field: &SurfaceField, node: QuadNode, res: u32) -> ChunkMesh 
     let mut normals = Vec::with_capacity(vert_count);
     let mut uvs = Vec::with_capacity(vert_count);
 
-    // Surface grid: sample the field at each (u, v) direction.
+    // Surface grid: sample the field at each (u, v) direction. Track the elevation
+    // range so the skirt can be sized to this chunk's relief.
     let lerp = |a: f64, b: f64, t: f64| a + (b - a) * t;
     let mut world_of = Vec::with_capacity(vert_count); // f64 world points, for skirt reuse
+    let (mut min_elev, mut max_elev) = (f64::INFINITY, f64::NEG_INFINITY);
     for b in 0..=res {
         let tv = b as f64 / res as f64;
         let vv = lerp(v0, v1, tv);
@@ -270,6 +305,8 @@ pub fn build_chunk(field: &SurfaceField, node: QuadNode, res: u32) -> ChunkMesh 
             let uu = lerp(u0, u1, tu);
             let dir = direction(node.face, uu, vv);
             let elev = field.elevation(dir);
+            min_elev = min_elev.min(elev);
+            max_elev = max_elev.max(elev);
             let world = dir * (radius + elev);
             world_of.push((dir, world));
             positions.push((world - center).as_vec3().to_array());
@@ -289,8 +326,10 @@ pub fn build_chunk(field: &SurfaceField, node: QuadNode, res: u32) -> ChunkMesh 
     }
 
     // Skirt: a wall hanging inward from each border edge, deep enough to cover the
-    // coarser-neighbour gap (depth scales with the node's world edge length).
-    let skirt_depth = SKIRT_FACTOR * node.edge_len(radius);
+    // LOD-boundary gap (bounded by this chunk's relief), but no deeper — so it stays
+    // buried under the terrain instead of showing as a wall.
+    let relief = (max_elev - min_elev).max(0.0);
+    let skirt_depth = skirt_depth_for_relief(relief);
     add_skirt(
         res,
         &world_of,
@@ -558,7 +597,7 @@ mod tests {
             i: 3,
             j: 4,
         };
-        let skirt_depth = SKIRT_FACTOR * coarse.edge_len(R);
+        let skirt_depth = skirt_depth_for_relief(chunk_relief(&f, coarse, 24));
         // Sample the surface along one edge; measure max radial dip below the chord
         // between the edge endpoints (a fine neighbour would resolve this dip).
         let (u0, u1, v0, _v1) = coarse.uv_rect();
