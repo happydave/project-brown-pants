@@ -51,7 +51,7 @@ impl Archetype {
     }
 
     /// A filesystem/id-friendly slug.
-    fn slug(self) -> &'static str {
+    pub fn slug(self) -> &'static str {
         match self {
             Archetype::Moon => "moon",
             Archetype::RockyPlanet => "rocky",

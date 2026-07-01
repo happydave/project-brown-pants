@@ -23,6 +23,7 @@
 //! - `cargo run -p sounding -- terrainmesh` — preview a generated MoGe terrain relief (glTF)
 //! - `cargo run -p sounding -- gallery` — part catalog viewer: every mechanical-kit part laid out by category, click to inspect
 //! - `cargo run -p sounding -- harbor` — float a built hull on calm water by a dock: WI 705/711 righting + enclosed-volume buoyancy made visible
+//! - `cargo run -p sounding -- surface [seed] [archetype]` — fly a generated body from orbit to its streamed procedural surface (quadtree LOD, WI 764)
 //!
 //! The Toy 1–3 simulation and runtime bus run headless behind whichever scene is
 //! shown, so the companion still works. Per-scene controls are documented in
@@ -66,6 +67,7 @@ mod scene_cam;
 mod scene_water;
 mod skins_scene;
 mod sparkline;
+mod surface_scene;
 mod terrain_mesh_scene;
 mod voxel_skin;
 mod wind_tunnel_scene;
@@ -89,6 +91,7 @@ use planet::PlanetPlugin;
 use play_scene::PlayScenePlugin;
 use rover_scene::RoverScenePlugin;
 use skins_scene::SkinsScenePlugin;
+use surface_scene::SurfaceScenePlugin;
 use terrain_mesh_scene::TerrainMeshScenePlugin;
 use wind_tunnel_scene::WindTunnelScenePlugin;
 use workshop_scene::WorkshopScenePlugin;
@@ -116,6 +119,7 @@ enum Scene {
     TerrainMesh,
     Gallery,
     Harbor,
+    Surface,
 }
 
 fn selected_scene() -> Scene {
@@ -140,6 +144,7 @@ fn selected_scene() -> Scene {
         Some("terrainmesh") => Scene::TerrainMesh,
         Some("gallery") => Scene::Gallery,
         Some("harbor") => Scene::Harbor,
+        Some("surface") => Scene::Surface,
         _ => Scene::Editor,
     }
 }
@@ -242,6 +247,9 @@ fn main() {
         }
         Scene::TerrainMesh => {
             app.add_plugins(TerrainMeshScenePlugin);
+        }
+        Scene::Surface => {
+            app.add_plugins(SurfaceScenePlugin);
         }
     }
 
