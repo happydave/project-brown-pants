@@ -193,6 +193,24 @@ impl QuadNode {
             },
         ]
     }
+
+    /// Whether this node **contains** `other` — same face, this node at an equal
+    /// or coarser level, and `other` lies within this node's `(u, v)` sub-rect.
+    /// (A node contains itself.) Used to gate a chunk's despawn on its replacement
+    /// coverage being resident.
+    pub fn contains(self, other: QuadNode) -> bool {
+        if self.face != other.face || self.level > other.level {
+            return false;
+        }
+        let shift = other.level - self.level;
+        (other.i >> shift) == self.i && (other.j >> shift) == self.j
+    }
+
+    /// Whether this node and `other` cover any common area — i.e. one contains the
+    /// other (they are the same node, ancestor/descendant, or disjoint).
+    pub fn overlaps(self, other: QuadNode) -> bool {
+        self.contains(other) || other.contains(self)
+    }
 }
 
 /// A built chunk's render buffers. Positions/normals/UVs are parallel arrays;
@@ -451,6 +469,43 @@ mod tests {
         let child = parent.children()[0];
         let (cu0, cu1, _, _) = child.uv_rect();
         assert!(((cu1 - cu0) - (pu1 - pu0) / 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn node_containment_and_overlap() {
+        let parent = QuadNode {
+            face: CubeFace::PosZ,
+            level: 2,
+            i: 1,
+            j: 2,
+        };
+        // A node contains itself and each of its descendants.
+        assert!(parent.contains(parent));
+        for child in parent.children() {
+            assert!(parent.contains(child), "parent must contain its child");
+            assert!(child.overlaps(parent) && parent.overlaps(child));
+            // The child does not contain the parent (finer can't cover coarser).
+            assert!(!child.contains(parent));
+        }
+        // A grandchild is still contained.
+        let grandchild = parent.children()[3].children()[0];
+        assert!(parent.contains(grandchild));
+        // Different face never overlaps.
+        let other_face = QuadNode {
+            face: CubeFace::NegZ,
+            level: 2,
+            i: 1,
+            j: 2,
+        };
+        assert!(!parent.overlaps(other_face));
+        // A sibling (same level, different index) does not overlap.
+        let sibling = QuadNode {
+            face: CubeFace::PosZ,
+            level: 2,
+            i: 0,
+            j: 2,
+        };
+        assert!(!parent.overlaps(sibling));
     }
 
     #[test]
