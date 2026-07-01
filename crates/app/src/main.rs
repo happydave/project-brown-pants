@@ -61,6 +61,8 @@ mod planet;
 mod play_scene;
 mod replay;
 mod rover_scene;
+mod scene_cam;
+mod scene_water;
 mod skins_scene;
 mod sparkline;
 mod terrain_mesh_scene;

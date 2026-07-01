@@ -15,10 +15,8 @@
 
 use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::Tonemapping;
-use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::light::{light_consts::lux, AtmosphereEnvironmentMapLight};
 use bevy::math::{DVec2, DVec3};
-use bevy::mesh::VertexAttributeValues;
 use bevy::pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium};
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
@@ -38,6 +36,8 @@ use sounding_sim::voxel::{Axis, Material, Voxel, VoxelCraft};
 
 use crate::bus::DiveThermal;
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
+use crate::scene_cam::{self, OrbitFollowCam};
+use crate::scene_water::{self, WaterPatch, WaveSpec};
 
 /// Ambient / radiative-sink temperature for the dive, K.
 const DIVE_AMBIENT: f64 = 250.0;
@@ -121,37 +121,18 @@ struct DiveReadout {
     net_buoyancy: f64,
 }
 
-/// Mouse-driven orbit/zoom state for the follow camera (WI 702): the eye sits at
-/// `craft + orbit_offset(yaw, pitch, dist)`. The default reproduces the historical fixed
-/// `(18, 8, 18)` view, so the scene opens unchanged.
-#[derive(Resource)]
-struct DiveCam {
-    /// Orbit yaw about the craft (radians).
-    yaw: f32,
-    /// Orbit pitch above the horizon (radians), clamped away from the poles.
-    pitch: f32,
-    /// Eye distance from the craft (metres).
-    dist: f32,
-}
-
-impl Default for DiveCam {
-    fn default() -> Self {
-        // Matches the previous fixed offset (18, 8, 18): yaw = π/4, a gentle downward pitch,
-        // distance ≈ 26.68 m.
-        Self {
-            yaw: std::f32::consts::FRAC_PI_4,
-            pitch: 0.305,
-            dist: 26.683,
-        }
+/// The dive's follow-camera config (WI 714): the default reproduces the historical fixed
+/// `(18, 8, 18)` view (yaw = π/4, gentle downward pitch, distance ≈ 26.68 m).
+fn dive_cam() -> OrbitFollowCam {
+    OrbitFollowCam {
+        yaw: std::f32::consts::FRAC_PI_4,
+        pitch: 0.305,
+        dist: 26.683,
+        yaw_sign: 1.0,
+        pitch_limit: 1.4,
+        dist_min: 5.0,
+        dist_max: 2_000.0,
     }
-}
-
-/// The camera eye offset from the orbit target for a yaw/pitch/distance (WI 702) — the
-/// spherical-to-cartesian the gallery/editor orbit cameras use. Pure (unit-tested).
-fn orbit_offset(yaw: f32, pitch: f32, dist: f32) -> Vec3 {
-    let (sy, cy) = yaw.sin_cos();
-    let (sp, cp) = pitch.sin_cos();
-    Vec3::new(sy * cp, sp, cy * cp) * dist
 }
 
 /// Marks the heads-up readout.
@@ -185,15 +166,15 @@ impl Plugin for DiveScenePlugin {
             })
             .init_resource::<SteamAssets>()
             .init_resource::<SplashAssets>()
-            .init_resource::<DiveCam>()
+            .insert_resource(dive_cam())
             .add_systems(Startup, setup_scene)
             .add_systems(
                 Update,
                 (
                     track_craft,
                     track_thermal,
-                    dive_camera_input,
-                    follow_camera,
+                    scene_cam::orbit_follow_input,
+                    scene_cam::orbit_follow_camera,
                     update_hud,
                 )
                     .chain(),
@@ -202,8 +183,8 @@ impl Plugin for DiveScenePlugin {
             .add_systems(Update, (emit_steam, update_steam))
             // Water-entry splash (WI 699, temporary): a one-shot spray burst on splashdown.
             .add_systems(Update, (emit_splash, update_splash))
-            // Water surface (WI 703): a local animated patch ripples + follows the camera.
-            .add_systems(Update, animate_water);
+            // Water surface (WI 703): a local animated patch ripples + follows the camera (WI 714).
+            .add_systems(Update, scene_water::animate_water);
     }
 }
 
@@ -262,6 +243,7 @@ fn setup_scene(
             Transform::default(),
             WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, start_render)),
             CraftMarker,
+            scene_cam::CameraTarget, // the follow camera tracks the craft (WI 714)
         ));
     }
     // Coast down under warp; the entry trigger drops it to 1 at the interface.
@@ -329,7 +311,9 @@ fn setup_scene(
             FrameId::CENTRAL_BODY,
             DVec3::new(start_render.x, 0.0, start_render.z),
         )),
-        WaterPatch,
+        WaterPatch {
+            wave: WaveSpec::OPEN_OCEAN,
+        },
     ));
 
     // The sun: raw sunlight the atmosphere filters.
@@ -494,50 +478,6 @@ fn glow_color(skin_temp: f64) -> LinearRgba {
     }
     // Red leads, green follows (→orange/yellow), blue last (→white); brightness grows.
     LinearRgba::rgb(x * 8.0, x * x * 8.0, x * x * x * 8.0)
-}
-
-/// Reads mouse input into the orbit camera state (WI 702): middle-drag orbits (yaw/pitch),
-/// the wheel zooms (distance) — the editor/gallery convention, leaving left/right free.
-fn dive_camera_input(
-    motion: Res<AccumulatedMouseMotion>,
-    scroll: Res<AccumulatedMouseScroll>,
-    buttons: Res<ButtonInput<MouseButton>>,
-    mut cam: ResMut<DiveCam>,
-) {
-    if buttons.pressed(MouseButton::Middle) {
-        cam.yaw += motion.delta.x * 0.01;
-        cam.pitch = (cam.pitch + motion.delta.y * 0.01).clamp(-1.4, 1.4);
-    }
-    if scroll.delta.y != 0.0 {
-        // Zoom step scales with distance so it stays usable close in and far out.
-        cam.dist = (cam.dist - scroll.delta.y * cam.dist * 0.1).clamp(5.0, 2_000.0);
-    }
-}
-
-/// Keeps the anchor camera orbiting/zooming the craft's render position (WI 702): the eye is
-/// `craft + orbit_offset(DiveCam)`, still tracking the craft every frame.
-#[allow(clippy::type_complexity)] // disjoint Bevy queries (craft vs. camera)
-fn follow_camera(
-    cam: Res<DiveCam>,
-    craft: Query<&WorldPlacement, (With<CraftMarker>, Without<AnchorCamera>)>,
-    mut camera: Query<
-        (&mut Transform, &mut WorldPlacement),
-        (With<AnchorCamera>, Without<CraftMarker>),
-    >,
-) {
-    let Ok(craft_wp) = craft.single() else {
-        return;
-    };
-    let Ok((mut tf, mut placement)) = camera.single_mut() else {
-        return;
-    };
-    let target = craft_wp.0.pos;
-    let eye = target + orbit_offset(cam.yaw, cam.pitch, cam.dist).as_dvec3();
-    placement.0 = WorldPos::new(FrameId::CENTRAL_BODY, eye);
-    let look_dir = (target - eye).as_vec3().normalize_or_zero();
-    if look_dir != Vec3::ZERO {
-        tf.rotation = Transform::default().looking_to(look_dir, Vec3::Y).rotation;
-    }
 }
 
 fn update_hud(readout: Res<DiveReadout>, mut hud: Query<&mut Text, With<Hud>>) {
@@ -853,56 +793,9 @@ fn update_splash(
 const WATER_HALF: f32 = 160.0;
 /// Plane subdivisions per side — the wave grid resolution.
 const WATER_SUBDIV: u32 = 64;
-/// Peak wave amplitude, metres: the surface oscillates within ±this.
-const WATER_AMPLITUDE: f32 = 0.55;
 
-/// The animated near-surface water patch (WI 703).
-#[derive(Component)]
-struct WaterPatch;
-
-/// Height of the water surface at local patch coordinate `(x, z)` and time `t` (WI 703) — a
-/// small sum of travelling sine waves, **bounded** by [`WATER_AMPLITUDE`] (the component
-/// weights sum to 1). Pure (unit-tested); computed in the patch's local frame so the surface
-/// ripples in place rather than scrolling as the camera moves.
-fn wave_height(x: f32, z: f32, t: f32) -> f32 {
-    let w1 = (x * 0.08 + t * 1.1).sin();
-    let w2 = (z * 0.11 - t * 0.9).sin();
-    let w3 = ((x + z) * 0.05 + t * 0.7).sin();
-    WATER_AMPLITUDE * (0.45 * w1 + 0.35 * w2 + 0.20 * w3)
-}
-
-/// Keeps the water patch under the view (follows the camera's X/Z at sea level) and ripples
-/// its surface each frame by [`wave_height`], recomputing normals (WI 703).
-#[allow(clippy::type_complexity)] // disjoint Bevy queries (camera vs. patch)
-fn animate_water(
-    time: Res<Time>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    camera: Query<&WorldPlacement, (With<AnchorCamera>, Without<WaterPatch>)>,
-    mut patch: Query<(&Mesh3d, &mut WorldPlacement), (With<WaterPatch>, Without<AnchorCamera>)>,
-) {
-    let Ok(cam_wp) = camera.single() else {
-        return;
-    };
-    let Ok((mesh3d, mut wp)) = patch.single_mut() else {
-        return;
-    };
-    // Follow the camera horizontally at sea level (render Y = 0).
-    let c = cam_wp.0.pos;
-    wp.0 = WorldPos::new(FrameId::CENTRAL_BODY, DVec3::new(c.x, 0.0, c.z));
-    // Ripple the surface in the patch's local frame.
-    let t = time.elapsed_secs();
-    let Some(mesh) = meshes.get_mut(&mesh3d.0) else {
-        return;
-    };
-    if let Some(VertexAttributeValues::Float32x3(positions)) =
-        mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION)
-    {
-        for p in positions.iter_mut() {
-            p[1] = wave_height(p[0], p[2], t);
-        }
-    }
-    mesh.compute_normals();
-}
+// The water patch + wave motion are the shared `scene_water` module (WI 714); the dive uses the
+// `WaveSpec::OPEN_OCEAN` preset on its `scene_water::WaterPatch`.
 
 #[cfg(test)]
 mod tests {
@@ -931,56 +824,5 @@ mod tests {
         // Full intensity reached by the full-speed mark.
         assert!((splash_intensity(SPLASH_FULL) - 1.0).abs() < 1e-9);
     }
-
-    #[test]
-    fn orbit_offset_default_reproduces_the_legacy_view() {
-        let cam = DiveCam::default();
-        let off = orbit_offset(cam.yaw, cam.pitch, cam.dist);
-        // The default reproduces the historical fixed (18, 8, 18) offset.
-        assert!((off.x - 18.0).abs() < 0.1, "x = {}", off.x);
-        assert!((off.y - 8.0).abs() < 0.1, "y = {}", off.y);
-        assert!((off.z - 18.0).abs() < 0.1, "z = {}", off.z);
-        // Magnitude equals the orbit distance.
-        assert!((off.length() - cam.dist).abs() < 1e-3);
-
-        // Pitching up raises the eye; pitching down lowers it.
-        let up = orbit_offset(cam.yaw, cam.pitch + 0.3, cam.dist);
-        assert!(up.y > off.y, "more pitch raises the eye");
-        // Zooming changes the distance, not the direction.
-        let near = orbit_offset(cam.yaw, cam.pitch, cam.dist * 0.5);
-        assert!((near.length() - cam.dist * 0.5).abs() < 1e-3);
-        assert!(
-            off.normalize().distance(near.normalize()) < 1e-5,
-            "zoom keeps the view direction"
-        );
-        // Orbiting yaw rotates the eye around the target (the x/z direction changes).
-        let spun = orbit_offset(cam.yaw + 1.0, cam.pitch, cam.dist);
-        assert!(
-            (spun.x - off.x).abs() > 1.0 || (spun.z - off.z).abs() > 1.0,
-            "yaw orbits horizontally"
-        );
-    }
-
-    #[test]
-    fn wave_height_is_bounded_and_animates() {
-        // Bounded by the amplitude over a grid of positions and times, and deterministic.
-        let mut moved = false;
-        for &x in &[-160.0, -40.0, 0.0, 37.0, 160.0_f32] {
-            for &z in &[-160.0, -12.0, 0.0, 88.0, 160.0_f32] {
-                for &t in &[0.0, 0.5, 1.7, 3.3, 10.0_f32] {
-                    let h = wave_height(x, z, t);
-                    assert!(
-                        h.abs() <= WATER_AMPLITUDE + 1e-5,
-                        "wave exceeded amplitude: {h} at ({x},{z},{t})"
-                    );
-                    assert_eq!(h, wave_height(x, z, t), "deterministic");
-                }
-                // The surface actually animates: at least one time differs from t=0.
-                if (wave_height(x, z, 0.0) - wave_height(x, z, 1.3)).abs() > 1e-4 {
-                    moved = true;
-                }
-            }
-        }
-        assert!(moved, "the surface must animate over time");
-    }
+    // The orbit-camera and wave-height unit tests moved to `scene_cam` / `scene_water` (WI 714).
 }

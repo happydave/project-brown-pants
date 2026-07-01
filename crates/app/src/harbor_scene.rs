@@ -23,10 +23,8 @@ use std::f32::consts::FRAC_PI_4;
 
 use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::Tonemapping;
-use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::light::{light_consts::lux, AtmosphereEnvironmentMapLight};
 use bevy::math::{DQuat, DVec3};
-use bevy::mesh::VertexAttributeValues;
 use bevy::pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium};
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
@@ -54,6 +52,8 @@ use crate::editor::{
     EditorState, HoverState, OrbitCam, PointerOnPalette,
 };
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
+use crate::scene_cam::{self, OrbitFollowCam};
+use crate::scene_water::{self, WaterPatch, WaveSpec};
 use crate::voxel_skin::{
     materials_present, pbr_material, pbr_material_tinted, skin_submeshes, VoxelSkin,
 };
@@ -109,29 +109,18 @@ fn seed_hull() -> VoxelCraft {
     c
 }
 
-/// Mouse-driven orbit/zoom state for the Float camera (the editor/gallery convention).
-#[derive(Resource)]
-struct HarborCam {
-    yaw: f32,
-    pitch: f32,
-    dist: f32,
-}
-
-impl Default for HarborCam {
-    fn default() -> Self {
-        Self {
-            yaw: FRAC_PI_4,
-            pitch: 0.3,
-            dist: 22.0,
-        }
+/// The harbor's Float follow-camera config (WI 714): the editor/gallery orbit convention, with the
+/// harbor's inverted horizontal drag and tighter zoom range.
+fn harbor_cam() -> OrbitFollowCam {
+    OrbitFollowCam {
+        yaw: FRAC_PI_4,
+        pitch: 0.3,
+        dist: 22.0,
+        yaw_sign: -1.0,
+        pitch_limit: 1.3,
+        dist_min: 6.0,
+        dist_max: 600.0,
     }
-}
-
-/// Spherical orbit offset (shared math with the dive/gallery cameras).
-fn orbit_offset(yaw: f32, pitch: f32, dist: f32) -> Vec3 {
-    let (sy, cy) = yaw.sin_cos();
-    let (sp, cp) = pitch.sin_cos();
-    Vec3::new(sy * cp, sp, cy * cp) * dist
 }
 
 /// The Float HUD readout (WI 705 hydrostatic gauges + WI 708 marine drive).
@@ -327,23 +316,10 @@ struct HullMarker;
 #[derive(Component)]
 struct Hud;
 
-/// The animated calm-water patch.
-#[derive(Component)]
-struct WaterPatch;
-
 const WATER_HALF: f32 = 160.0;
 const WATER_SUBDIV: u32 = 64;
-/// Calm harbor: a much smaller amplitude than the open-ocean dive (WI 703 used 0.55).
-const WATER_AMPLITUDE: f32 = 0.12;
-
-/// Height of the calm water surface at local patch coordinate `(x, z)` and time `t` — bounded summed
-/// sines (weights sum to 1). Pure; computed in the patch's local frame so it ripples in place.
-fn wave_height(x: f32, z: f32, t: f32) -> f32 {
-    let w1 = (x * 0.10 + t * 0.7).sin();
-    let w2 = (z * 0.13 - t * 0.6).sin();
-    let w3 = ((x + z) * 0.06 + t * 0.5).sin();
-    WATER_AMPLITUDE * (0.45 * w1 + 0.35 * w2 + 0.20 * w3)
-}
+// The water patch + wave motion are the shared `scene_water` module (WI 714); the harbor uses the
+// `WaveSpec::CALM_HARBOR` preset on its `scene_water::WaterPatch`.
 
 /// The harbor boat-workshop scene (`-- harbor`, WI 706 + 707).
 pub struct HarborScenePlugin;
@@ -365,7 +341,7 @@ impl Plugin for HarborScenePlugin {
             .init_resource::<HoverState>()
             .init_resource::<PointerOnPalette>()
             .init_resource::<HarborReadout>()
-            .init_resource::<HarborCam>()
+            .insert_resource(harbor_cam())
             .init_resource::<FloodState>()
             .insert_resource(Gravity { mu: BODY.mu })
             .add_plugins(DescentPlugin {
@@ -385,10 +361,10 @@ impl Plugin for HarborScenePlugin {
                     harbor_breach_input,
                     harbor_flood_step,
                     track_hull,
-                    harbor_camera_input,
-                    follow_camera,
+                    scene_cam::orbit_follow_input,
+                    scene_cam::orbit_follow_camera,
                     update_hud,
-                    animate_water,
+                    scene_water::animate_water,
                 )
                     .chain()
                     .run_if(in_state(HarborMode::Float)),
@@ -630,6 +606,7 @@ fn enter_float(
             Visibility::default(),
             WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, start_render)),
             HullMarker,
+            scene_cam::CameraTarget, // the follow camera tracks the hull (WI 714)
             FloatEntity,
         ));
         if let Some(b) = ballast {
@@ -769,7 +746,9 @@ fn enter_float(
             FrameId::CENTRAL_BODY,
             DVec3::new(start_render.x, 0.0, start_render.z),
         )),
-        WaterPatch,
+        WaterPatch {
+            wave: WaveSpec::CALM_HARBOR,
+        },
         FloatEntity,
     ));
 
@@ -832,7 +811,7 @@ fn enter_float(
     ));
 
     // HDR camera with the atmosphere, orbiting the hull.
-    let eye = start_render + orbit_offset(FRAC_PI_4, 0.3, 22.0).as_dvec3();
+    let eye = start_render + scene_cam::orbit_offset(FRAC_PI_4, 0.3, 22.0).as_dvec3();
     commands.spawn((
         Camera3d::default(),
         Transform::from_translation(eye.as_vec3()).looking_at(start_render.as_vec3(), Vec3::Y),
@@ -1341,46 +1320,6 @@ fn harbor_flood_step(
 }
 
 /// Middle-drag orbit (L/R swapped per Dave), wheel zoom.
-fn harbor_camera_input(
-    motion: Res<AccumulatedMouseMotion>,
-    scroll: Res<AccumulatedMouseScroll>,
-    buttons: Res<ButtonInput<MouseButton>>,
-    mut cam: ResMut<HarborCam>,
-) {
-    if buttons.pressed(MouseButton::Middle) {
-        cam.yaw -= motion.delta.x * 0.01;
-        cam.pitch = (cam.pitch + motion.delta.y * 0.01).clamp(-1.3, 1.3);
-    }
-    if scroll.delta.y != 0.0 {
-        cam.dist = (cam.dist - scroll.delta.y * cam.dist * 0.1).clamp(6.0, 600.0);
-    }
-}
-
-/// Keeps the anchor camera orbiting the hull's render position.
-#[allow(clippy::type_complexity)]
-fn follow_camera(
-    cam: Res<HarborCam>,
-    hull: Query<&WorldPlacement, (With<HullMarker>, Without<AnchorCamera>)>,
-    mut camera: Query<
-        (&mut Transform, &mut WorldPlacement),
-        (With<AnchorCamera>, Without<HullMarker>),
-    >,
-) {
-    let Ok(hull_wp) = hull.single() else {
-        return;
-    };
-    let Ok((mut tf, mut placement)) = camera.single_mut() else {
-        return;
-    };
-    let target = hull_wp.0.pos;
-    let eye = target + orbit_offset(cam.yaw, cam.pitch, cam.dist).as_dvec3();
-    placement.0 = WorldPos::new(FrameId::CENTRAL_BODY, eye);
-    let look_dir = (target - eye).as_vec3().normalize_or_zero();
-    if look_dir != Vec3::ZERO {
-        tf.rotation = Transform::default().looking_to(look_dir, Vec3::Y).rotation;
-    }
-}
-
 fn update_hud(readout: Res<HarborReadout>, mut hud: Query<&mut Text, With<Hud>>) {
     if let Ok(mut text) = hud.single_mut() {
         // Net buoyancy is the displaced weight minus the hull weight: ~0 floating at its waterline,
@@ -1402,36 +1341,6 @@ fn update_hud(readout: Res<HarborReadout>, mut hud: Query<&mut Text, With<Hud>>)
             readout.flood * 100.0,
         );
     }
-}
-
-/// Follows the camera horizontally at sea level and ripples the calm patch each frame.
-#[allow(clippy::type_complexity)]
-fn animate_water(
-    time: Res<Time>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    camera: Query<&WorldPlacement, (With<AnchorCamera>, Without<WaterPatch>)>,
-    mut patch: Query<(&Mesh3d, &mut WorldPlacement), (With<WaterPatch>, Without<AnchorCamera>)>,
-) {
-    let Ok(cam_wp) = camera.single() else {
-        return;
-    };
-    let Ok((mesh3d, mut wp)) = patch.single_mut() else {
-        return;
-    };
-    let c = cam_wp.0.pos;
-    wp.0 = WorldPos::new(FrameId::CENTRAL_BODY, DVec3::new(c.x, 0.0, c.z));
-    let t = time.elapsed_secs();
-    let Some(mesh) = meshes.get_mut(&mesh3d.0) else {
-        return;
-    };
-    if let Some(VertexAttributeValues::Float32x3(positions)) =
-        mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION)
-    {
-        for p in positions.iter_mut() {
-            p[1] = wave_height(p[0], p[2], t);
-        }
-    }
-    mesh.compute_normals();
 }
 
 #[cfg(test)]
@@ -1905,12 +1814,5 @@ mod tests {
         b.step(100.0);
         assert!(net(&b) > 0.0, "blown again ⇒ floats (reversible)");
     }
-
-    #[test]
-    fn wave_height_is_calm_and_bounded() {
-        const _: () = assert!(WATER_AMPLITUDE < 0.2);
-        for &(x, z, t) in &[(0.0, 0.0, 0.0), (12.0, -7.0, 3.0), (-30.0, 40.0, 9.0)] {
-            assert!(wave_height(x, z, t).abs() <= WATER_AMPLITUDE + 1e-6);
-        }
-    }
+    // The wave-height unit test moved to `scene_water` (WI 714).
 }
