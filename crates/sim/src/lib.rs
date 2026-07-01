@@ -13,6 +13,7 @@ pub mod autopilot;
 pub mod ballast;
 pub mod body_asset;
 pub mod body_library;
+pub mod bodygen;
 pub mod breakage;
 pub mod collision;
 pub mod collision_detect;

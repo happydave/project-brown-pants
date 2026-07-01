@@ -36,6 +36,7 @@ use sounding_sim::orbit::Orbit;
 use sounding_sim::sim::{CentralBody, OrbitPlugin};
 
 mod autopilot_scene;
+mod bodies_scene;
 mod break_scene;
 mod build;
 mod bus;
@@ -71,6 +72,7 @@ mod wind_tunnel_scene;
 mod workshop_scene;
 
 use autopilot_scene::AutopilotScenePlugin;
+use bodies_scene::BodiesScenePlugin;
 use break_scene::BreakScenePlugin;
 use collide_scene::CollideScenePlugin;
 use compartments_scene::CompartmentsScenePlugin;
@@ -94,6 +96,7 @@ use workshop_scene::WorkshopScenePlugin;
 /// Which toy scene the windowed app shows.
 enum Scene {
     Editor,
+    Bodies,
     Planet,
     Rover,
     Dive,
@@ -117,6 +120,7 @@ enum Scene {
 
 fn selected_scene() -> Scene {
     match std::env::args().nth(1).as_deref() {
+        Some("bodies") => Scene::Bodies,
         Some("planet") => Scene::Planet,
         Some("rover") => Scene::Rover,
         Some("dive") => Scene::Dive,
@@ -178,6 +182,9 @@ fn main() {
     match selected_scene() {
         Scene::Editor => {
             app.add_plugins(EditorPlugin);
+        }
+        Scene::Bodies => {
+            app.add_plugins(BodiesScenePlugin);
         }
         Scene::Planet => {
             app.add_plugins(PlanetPlugin);
