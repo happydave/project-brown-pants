@@ -20,9 +20,7 @@ use crate::contact::{ground_contact_wrench, ContactParams};
 use crate::control::{ControlSystem, ControlTier};
 use crate::fluid::{FluidMedium, FluidSample};
 use crate::launch::LaunchPad;
-use crate::medium::{
-    buoyancy_wrench, drag_force, free_surface_damping, GlideParams, FREE_SURFACE_DAMPING,
-};
+use crate::medium::{core_active_wrench, GlideParams};
 use crate::propulsion::Propulsion;
 use crate::voxel::VoxelCraft;
 use glam::{DQuat, DVec3};
@@ -207,53 +205,22 @@ pub fn flight_step(
     body.mass = wet.mass;
     let com = wet.center_of_mass;
 
-    let r = body.position.length();
-    let up = if r > 0.0 { body.position / r } else { DVec3::Y };
-    let altitude = r - params.surface_radius;
-    let sample = params.medium.sample_altitude(altitude);
-    let g_local = if r > 0.0 { params.mu / (r * r) } else { 0.0 };
-
-    // Central forces: gravity, drag, buoyancy.
-    let gravity = if r > 0.0 {
-        -params.mu * body.mass / (r * r) * up
-    } else {
-        DVec3::ZERO
-    };
-    let drag = drag_force(
-        &sample,
-        body.velocity,
+    // Shared core (WI 737): gravity + drag + distributed righting buoyancy + free-surface damping —
+    // the same engine the dive/harbor use (WI 712 B1). Enclosed-compartment air is empty here (D1): no
+    // flight scene floats a hollow hull yet, so this is identical to the old central force for every
+    // current craft (a solid body in air/on land has zero submerged displacement).
+    let core = core_active_wrench(
+        voxels,
+        com,
+        body,
+        &params.medium,
+        params.surface_radius,
+        params.mu,
         params.drag_area,
         params.drag_coefficient,
-    );
-    // Buoyancy is a distributed wrench (WI 705) — the same engine the dive/harbor use (WI 712,
-    // Split B1): force + a righting/trim moment, so a craft on water rights and settles in every
-    // flight scene, not only the dive. Enclosed-compartment air is empty here (D1): no flight scene
-    // floats a hollow hull yet, so this is identical to the old central force for every current
-    // craft (a solid body in air/on land has zero submerged displacement).
-    let load = buoyancy_wrench(
-        voxels,
-        com,
-        body.position,
-        body.orientation,
-        params.surface_radius,
-        0.0, // calm water (WI 705 seam): wave-time threads sim time here
-        sample.density,
-        g_local,
         &[],
     );
-    // Free-surface damping (WI 705): heave/roll/yaw dissipation the bulk drag leaves undamped.
-    let (damp_f, damp_t) = free_surface_damping(
-        voxels,
-        com,
-        body.position,
-        body.orientation,
-        body.velocity,
-        body.angular_velocity(),
-        params.surface_radius,
-        0.0,
-        sample.density,
-        FREE_SURFACE_DAMPING,
-    );
+    let sample = core.sample;
 
     // Thrust (force + moment about the CoM).
     let (thrust, thrust_torque) = propulsion.thrust_step(body.orientation, com, dt);
@@ -299,8 +266,8 @@ pub fn flight_step(
     let g = &mut propulsion.graph;
     g.integrate(g.time + dt);
 
-    let mut force = gravity + drag + load.force + thrust + lift + damp_f;
-    let mut torque = thrust_torque + lift_torque + att_torque + load.torque + damp_t;
+    let mut force = core.wrench.force + thrust + lift;
+    let mut torque = core.wrench.torque + thrust_torque + lift_torque + att_torque;
 
     // Ground collision (WI 592): when a scene supplies a ground plane, add the penalty
     // contact wrench (craft shape derived from the voxels, placed at the CoM). `None`

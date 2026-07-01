@@ -548,6 +548,114 @@ fn gravity_force(mass: f64, position: DVec3, mu: f64) -> DVec3 {
     -mu * mass * position / (r2 * r)
 }
 
+/// A net force + torque about the centre of mass — the contract currency of the active force
+/// contributors (convergence Split B2, WI 737). Each contributor returns a `Wrench` (zero outside its
+/// regime), and an assembly is their additive sum, so a shared force is defined once and felt in every
+/// active path. `From<(force, torque)>` lets existing tuple-returning terms compose.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Wrench {
+    pub force: DVec3,
+    pub torque: DVec3,
+}
+
+impl Wrench {
+    pub const ZERO: Self = Self {
+        force: DVec3::ZERO,
+        torque: DVec3::ZERO,
+    };
+}
+
+impl std::ops::Add for Wrench {
+    type Output = Self;
+    fn add(self, o: Self) -> Self {
+        Self {
+            force: self.force + o.force,
+            torque: self.torque + o.torque,
+        }
+    }
+}
+
+impl std::ops::AddAssign for Wrench {
+    fn add_assign(&mut self, o: Self) {
+        self.force += o.force;
+        self.torque += o.torque;
+    }
+}
+
+impl From<(DVec3, DVec3)> for Wrench {
+    fn from((force, torque): (DVec3, DVec3)) -> Self {
+        Self { force, torque }
+    }
+}
+
+/// The output of the shared core contributor: the core wrench, the medium sample at the craft, and the
+/// buoyancy load (callers read `submerged_volume` for the slam gate).
+#[derive(Clone, Copy, Debug)]
+pub struct CoreWrench {
+    pub wrench: Wrench,
+    pub sample: FluidSample,
+    pub buoyancy: BuoyancyLoad,
+}
+
+/// The **shared, self-gating core** of every active force path (convergence Split B2, WI 737):
+/// gravity + drag + distributed buoyancy (righting wrench) + free-surface damping, all from the one
+/// medium field. Each term is zero outside its regime (buoyancy/damping vanish out of water, drag at
+/// rest/in vacuum), so this is safe to run on any craft. Returns the core wrench, the medium sample,
+/// and the buoyancy load. `descent_step`, `glide_step`, and `flight_step` compose their own terms
+/// (slam / lift / thrust / attitude / …) on top of this.
+#[allow(clippy::too_many_arguments)]
+pub fn core_active_wrench(
+    craft: &VoxelCraft,
+    com: DVec3,
+    body: &crate::active::ActiveBody,
+    medium: &FluidMedium,
+    surface_radius: f64,
+    mu: f64,
+    drag_area: f64,
+    drag_coefficient: f64,
+    enclosed: &[IVec3],
+) -> CoreWrench {
+    let r = body.position.length();
+    let altitude = r - surface_radius;
+    let sample = medium.sample_altitude(altitude);
+    let g_local = if r > 0.0 { mu / (r * r) } else { 0.0 };
+
+    let gravity = gravity_force(body.mass, body.position, mu);
+    let drag = drag_force(&sample, body.velocity, drag_area, drag_coefficient);
+    let buoyancy = buoyancy_wrench(
+        craft,
+        com,
+        body.position,
+        body.orientation,
+        surface_radius,
+        0.0, // calm water (WI 705 seam): wave-time threads sim time here
+        sample.density,
+        g_local,
+        enclosed,
+    );
+    let (damp_f, damp_t) = free_surface_damping(
+        craft,
+        com,
+        body.position,
+        body.orientation,
+        body.velocity,
+        body.angular_velocity(),
+        surface_radius,
+        0.0,
+        sample.density,
+        FREE_SURFACE_DAMPING,
+    );
+
+    CoreWrench {
+        wrench: Wrench {
+            force: gravity + drag + buoyancy.force + damp_f,
+            torque: buoyancy.torque + damp_t,
+        },
+        sample,
+        buoyancy,
+    }
+}
+
 /// Advance the active body one step under **gravity + drag + buoyancy**, all
 /// drawn from the one medium field, and return the medium sample at the craft
 /// (so the caller knows the medium and ambient pressure). `com` is the craft's
@@ -563,29 +671,17 @@ pub fn descent_step(
 ) -> FluidSample {
     let r = body.position.length();
     let up = if r > 0.0 { body.position / r } else { DVec3::Y };
-    let altitude = r - params.surface_radius;
-    let sample = params.medium.sample_altitude(altitude);
-    let g_local = if r > 0.0 { params.mu / (r * r) } else { 0.0 };
 
-    let gravity = gravity_force(body.mass, body.position, params.mu);
-    let drag = drag_force(
-        &sample,
-        body.velocity,
-        params.drag_area,
-        params.drag_coefficient,
-    );
-    // Buoyancy as a distributed wrench (WI 705): force + righting/trim moment over the graded
-    // submerged cells, so the craft self-rights and settles to a waterline rather than bobbing
-    // as a point mass. The force matches the old central buoyancy; the moment is the new term.
-    let load = buoyancy_wrench(
+    // Shared core (WI 737): gravity + drag + distributed righting buoyancy + free-surface damping.
+    let core = core_active_wrench(
         craft,
         com,
-        body.position,
-        body.orientation,
+        body,
+        &params.medium,
         params.surface_radius,
-        0.0, // calm water (WI 705 seam): wave-time threads sim time here
-        sample.density,
-        g_local,
+        params.mu,
+        params.drag_area,
+        params.drag_coefficient,
         enclosed,
     );
     // Water-entry slam (WI 700): a transient impact while the craft straddles the surface. The gate
@@ -593,7 +689,7 @@ pub fn descent_step(
     // [0,1].
     let displaceable = craft.occupied_volume() + enclosed.len() as f64 * craft.cell_volume();
     let submerged_fraction = if displaceable > 0.0 {
-        load.submerged_volume / displaceable
+        core.buoyancy.submerged_volume / displaceable
     } else {
         0.0
     };
@@ -608,27 +704,9 @@ pub fn descent_step(
         params.slam_coefficient,
     );
 
-    // Free-surface damping (WI 705): settle the heave/roll the conservative buoyant spring would
-    // otherwise ring (bulk drag damps only the CoM velocity, not roll about it).
-    let (damp_f, damp_t) = free_surface_damping(
-        craft,
-        com,
-        body.position,
-        body.orientation,
-        body.velocity,
-        body.angular_velocity(),
-        params.surface_radius,
-        0.0,
-        sample.density,
-        FREE_SURFACE_DAMPING,
-    );
-
-    body.integrate_wrench(
-        gravity + drag + load.force + slam + damp_f,
-        load.torque + damp_t,
-        dt,
-    );
-    sample
+    let w = core.wrench + Wrench::from((slam, DVec3::ZERO));
+    body.integrate_wrench(w.force, w.torque, dt);
+    core.sample
 }
 
 /// A unit vector along an [`Axis`].
@@ -727,25 +805,20 @@ pub fn glide_step(
     let p = &params.descent;
     let r = body.position.length();
     let up = if r > 0.0 { body.position / r } else { DVec3::Y };
-    let altitude = r - p.surface_radius;
-    let sample = p.medium.sample_altitude(altitude);
-    let g_local = if r > 0.0 { p.mu / (r * r) } else { 0.0 };
 
-    // Central forces: gravity, drag. Buoyancy is a distributed wrench (WI 705) — its force is
-    // central but it now also contributes a righting/trim moment (added to the aero moment below).
-    let gravity = gravity_force(body.mass, body.position, p.mu);
-    let drag = drag_force(&sample, body.velocity, p.drag_area, p.drag_coefficient);
-    let load = buoyancy_wrench(
+    // Shared core (WI 737): gravity + drag + distributed righting buoyancy + free-surface damping.
+    let core = core_active_wrench(
         craft,
         com,
-        body.position,
-        body.orientation,
+        body,
+        &p.medium,
         p.surface_radius,
-        0.0, // calm water (WI 705 seam): wave-time threads sim time here
-        sample.density,
-        g_local,
+        p.mu,
+        p.drag_area,
+        p.drag_coefficient,
         enclosed,
     );
+    let sample = core.sample;
 
     // Aero forces from the one area curve: lift ⊥ to the flow, transonic wave drag.
     let forward_world = body.orientation * params.forward_local;
@@ -775,7 +848,7 @@ pub fn glide_step(
     // total displaceable volume (solid + enclosed, WI 711).
     let displaceable = craft.occupied_volume() + enclosed.len() as f64 * craft.cell_volume();
     let submerged_fraction = if displaceable > 0.0 {
-        load.submerged_volume / displaceable
+        core.buoyancy.submerged_volume / displaceable
     } else {
         0.0
     };
@@ -790,26 +863,12 @@ pub fn glide_step(
         p.slam_coefficient,
     );
 
-    // Free-surface damping (WI 705): settle heave/roll on the water (the bulk drag + aero pitch
-    // damping do not damp roll about the CoM).
-    let (damp_f, damp_t) = free_surface_damping(
-        craft,
-        com,
-        body.position,
-        body.orientation,
-        body.velocity,
-        body.angular_velocity(),
-        p.surface_radius,
-        0.0,
-        sample.density,
-        FREE_SURFACE_DAMPING,
-    );
-
-    body.integrate_wrench(
-        gravity + drag + load.force + lift + wave + slam + damp_f + external.0,
-        restoring + damping + load.torque + damp_t + external.1,
-        dt,
-    );
+    // Compose: core + aero (lift/wave force, restoring/damping moment) + slam + the external
+    // (marine/ballast/open-cavity) wrench.
+    let w = core.wrench
+        + Wrench::from((lift + wave + slam, restoring + damping))
+        + Wrench::from(external);
+    body.integrate_wrench(w.force, w.torque, dt);
     sample
 }
 
@@ -1116,6 +1175,55 @@ fn advance_descent(
 mod tests {
     use super::*;
     use crate::active::ActiveBody;
+
+    #[test]
+    fn wrench_composes_additively() {
+        let a = Wrench::from((DVec3::X, DVec3::Y));
+        let b = Wrench::from((DVec3::new(0.0, 2.0, 0.0), DVec3::new(0.0, 0.0, 3.0)));
+        let mut s = Wrench::ZERO;
+        s += a;
+        s += b;
+        assert_eq!(s, a + b);
+        assert_eq!((a + b).force, DVec3::new(1.0, 2.0, 0.0));
+        assert_eq!((a + b).torque, DVec3::new(0.0, 1.0, 3.0));
+        // Order-independent (additive contributors).
+        assert_eq!(a + b, b + a);
+    }
+
+    #[test]
+    fn core_active_wrench_is_inert_in_vacuum() {
+        // A craft in vacuum, far from any body: only gravity contributes; drag/buoyancy/damping are
+        // zero (no medium, nothing submerged), so the core wrench is pure central gravity, no torque.
+        let mut craft = VoxelCraft::new(1.0);
+        craft.voxels.push(Voxel {
+            cell: IVec3::ZERO,
+            material: Material::ALUMINIUM,
+        });
+        let mp = craft.mass_properties().unwrap();
+        let body = ActiveBody::from_mass_properties(
+            DVec3::new(0.0, CentralBody::EARTHLIKE.radius + 1_000_000.0, 0.0),
+            DVec3::ZERO,
+            &mp,
+        );
+        let core = core_active_wrench(
+            &craft,
+            mp.center_of_mass,
+            &body,
+            &FluidMedium::EARTHLIKE,
+            CentralBody::EARTHLIKE.radius,
+            CentralBody::EARTHLIKE.mu,
+            1.0,
+            1.0,
+            &[],
+        );
+        assert!(core.wrench.force.length() > 0.0, "gravity pulls it down");
+        assert!(
+            core.wrench.force.dot(body.position.normalize()) < 0.0,
+            "gravity is toward the body (−up)"
+        );
+        assert!(core.wrench.torque.length() < 1e-12, "no torque in vacuum");
+        assert_eq!(core.buoyancy.submerged_volume, 0.0, "nothing submerged");
+    }
     use crate::command::FlightControlPlugin;
     use crate::fluid::{FluidMedium, MediumKind};
     use crate::handoff::{GearState, HandoffPlugin};
