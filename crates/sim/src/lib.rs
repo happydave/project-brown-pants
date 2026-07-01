@@ -40,6 +40,7 @@ pub mod rover;
 pub mod session;
 pub mod sim;
 pub mod surface;
+pub mod surface_field;
 pub mod system;
 pub mod telemetry;
 pub mod terrain;
