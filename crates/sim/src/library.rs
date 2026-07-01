@@ -137,7 +137,7 @@ pub fn save_craft(dir: &Path, name: &str, craft: &VoxelCraft) -> Result<PathBuf,
 
 /// Reads a saved craft document from `path` and returns its craft. Accepts any
 /// craft-scope kind (Craft / Subassembly / Blueprint) so a legacy single-file craft
-/// still loads; a [`Payload::WorldSave`] is rejected as the wrong scope.
+/// still loads; a non-craft scope (world save or body asset) is rejected as wrong.
 pub fn load_craft(path: &Path) -> Result<VoxelCraft, LibraryError> {
     let bytes = std::fs::read_to_string(path).map_err(|e| LibraryError::Io(e.to_string()))?;
     craft_from_document(&bytes)
@@ -148,9 +148,9 @@ pub fn load_craft(path: &Path) -> Result<VoxelCraft, LibraryError> {
 pub fn craft_from_document(json: &str) -> Result<VoxelCraft, LibraryError> {
     match SavedDocument::from_json(json)?.payload {
         Payload::Craft(c) | Payload::Subassembly(c) | Payload::Blueprint(c) => Ok(c.craft),
-        Payload::WorldSave(_) => Err(LibraryError::Format(FormatError::Malformed(
-            "expected a craft-scope document, found a world save".to_string(),
-        ))),
+        Payload::WorldSave(_) | Payload::BodyAsset(_) => Err(LibraryError::Format(
+            FormatError::Malformed("expected a craft-scope document".to_string()),
+        )),
     }
 }
 
@@ -179,7 +179,7 @@ pub fn list_crafts(dir: &Path) -> Vec<CraftEntry> {
             Ok(bytes) => match SavedDocument::from_json(&bytes) {
                 Ok(doc) => match doc.payload {
                     Payload::Craft(c) | Payload::Subassembly(c) | Payload::Blueprint(c) => c.name,
-                    Payload::WorldSave(_) => continue,
+                    Payload::WorldSave(_) | Payload::BodyAsset(_) => continue,
                 },
                 Err(_) => continue,
             },

@@ -978,7 +978,7 @@ fn craft_to_json(craft: &VoxelCraft, kind: Kind) -> Result<String, FormatError> 
 fn craft_from_json(json: &str) -> Option<VoxelCraft> {
     match SavedDocument::from_json(json).ok()?.payload {
         Payload::Craft(c) | Payload::Subassembly(c) | Payload::Blueprint(c) => Some(c.craft),
-        Payload::WorldSave(_) => None,
+        Payload::WorldSave(_) | Payload::BodyAsset(_) => None,
     }
 }
 

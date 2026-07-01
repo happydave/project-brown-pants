@@ -11,6 +11,8 @@ pub mod aero;
 pub mod attitude;
 pub mod autopilot;
 pub mod ballast;
+pub mod body_asset;
+pub mod body_library;
 pub mod breakage;
 pub mod collision;
 pub mod collision_detect;

@@ -17,6 +17,7 @@
 //! world-coordinate types plus metadata, and reserves empty, opaque containers
 //! that later toys fill in (a future format-version change).
 
+use crate::body_asset::BodyAsset;
 use crate::frame::WorldPos;
 use crate::voxel::VoxelCraft;
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,9 @@ pub enum Kind {
     Subassembly,
     Blueprint,
     WorldSave,
+    /// A celestial body asset (WI 760) — added additively; the format version is
+    /// unchanged because existing documents are untouched by a new payload variant.
+    BodyAsset,
 }
 
 /// A craft-scope serialized subgraph. A craft, a subassembly, and a blueprint are
@@ -100,6 +104,9 @@ pub enum Payload {
     Subassembly(CraftSubgraph),
     Blueprint(CraftSubgraph),
     WorldSave(WorldPayload),
+    /// A celestial body asset (WI 760): the intrinsic, reusable definition of a
+    /// planet/moon (no placement). Carried by its own [`BodyAsset`] payload.
+    BodyAsset(BodyAsset),
 }
 
 impl Payload {
@@ -110,6 +117,7 @@ impl Payload {
             Payload::Subassembly(_) => Kind::Subassembly,
             Payload::Blueprint(_) => Kind::Blueprint,
             Payload::WorldSave(_) => Kind::WorldSave,
+            Payload::BodyAsset(_) => Kind::BodyAsset,
         }
     }
 }
@@ -247,6 +255,20 @@ mod tests {
             assert_eq!(doc, back);
             assert_eq!(back.kind(), kind);
         }
+    }
+
+    #[test]
+    fn body_asset_round_trips_through_the_envelope() {
+        use crate::body_asset::BodyAsset;
+        let doc = SavedDocument::new(Payload::BodyAsset(BodyAsset::earthlike()));
+        let back = SavedDocument::from_json(&doc.to_json().unwrap()).unwrap();
+        assert_eq!(back.format_version, FORMAT_VERSION);
+        assert_eq!(back.kind(), Kind::BodyAsset);
+        let Payload::BodyAsset(a) = &back.payload else {
+            panic!("expected a body asset");
+        };
+        assert_eq!(a.id, "earthlike");
+        assert_eq!(a.central_body().mu, crate::sim::CentralBody::EARTHLIKE.mu);
     }
 
     #[test]
