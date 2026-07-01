@@ -24,6 +24,7 @@
 //! - `cargo run -p sounding -- gallery` — part catalog viewer: every mechanical-kit part laid out by category, click to inspect
 //! - `cargo run -p sounding -- harbor` — float a built hull on calm water by a dock: WI 705/711 righting + enclosed-volume buoyancy made visible
 //! - `cargo run -p sounding -- surface [seed] [archetype]` — fly a generated body from orbit to its streamed procedural surface (quadtree LOD, WI 764)
+//! - `cargo run -p sounding -- moon` — land and drive a rover on a generated cratered moon: analytic-surface contact (WI 765) under the WI 764 render
 //!
 //! The Toy 1–3 simulation and runtime bus run headless behind whichever scene is
 //! shown, so the companion still works. Per-scene controls are documented in
@@ -56,6 +57,7 @@ mod harbor_scene;
 mod land_scene;
 mod launch_scene;
 mod materials_scene;
+mod moon_scene;
 mod overlay;
 mod parts;
 mod pause;
@@ -87,6 +89,7 @@ use harbor_scene::HarborScenePlugin;
 use land_scene::LandScenePlugin;
 use launch_scene::LaunchScenePlugin;
 use materials_scene::MaterialsScenePlugin;
+use moon_scene::MoonScenePlugin;
 use planet::PlanetPlugin;
 use play_scene::PlayScenePlugin;
 use rover_scene::RoverScenePlugin;
@@ -120,6 +123,7 @@ enum Scene {
     Gallery,
     Harbor,
     Surface,
+    Moon,
 }
 
 fn selected_scene() -> Scene {
@@ -145,6 +149,7 @@ fn selected_scene() -> Scene {
         Some("gallery") => Scene::Gallery,
         Some("harbor") => Scene::Harbor,
         Some("surface") => Scene::Surface,
+        Some("moon") => Scene::Moon,
         _ => Scene::Editor,
     }
 }
@@ -250,6 +255,9 @@ fn main() {
         }
         Scene::Surface => {
             app.add_plugins(SurfaceScenePlugin);
+        }
+        Scene::Moon => {
+            app.add_plugins(MoonScenePlugin);
         }
     }
 

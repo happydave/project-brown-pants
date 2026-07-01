@@ -15,8 +15,8 @@
 
 use crate::active::ActiveBody;
 use crate::collision::BoxShape;
+use crate::contact_surface::ContactSurface;
 use crate::powertrain::{build_powertrain, RoverPowertrain};
-use crate::terrain::Terrain;
 use crate::voxel::{DeviceKind, PartKind, RimSpec, SuspensionSpec, TireSpec, VoxelCraft};
 use glam::{DMat3, DQuat, DVec3, IVec3};
 
@@ -444,8 +444,11 @@ impl Rover {
         }
     }
 
-    /// Advances the rover by one sub-step `dt` over `terrain` (semi-implicit).
-    pub fn step(&mut self, terrain: &Terrain, dt: f64) {
+    /// Advances the rover by one sub-step `dt` over `terrain` (semi-implicit). The
+    /// surface is any [`ContactSurface`] (WI 765): the flat [`Terrain`] or the
+    /// spherical [`SurfacePatch`](crate::contact_surface::SurfacePatch) — a
+    /// surface-source swap, not a change to the force law.
+    pub fn step<S: ContactSurface>(&mut self, terrain: &S, dt: f64) {
         let r = DMat3::from_quat(self.body.orientation);
         let body_fwd = r * DVec3::Z;
         let body_up = r * DVec3::Y;
@@ -720,7 +723,7 @@ impl Rover {
     /// normal driving (the wheels hold the hull clear). A sharp discontinuity (the ramp-lip cliff) is the
     /// one case point-sampling cannot fully resolve — the mid-speed "toss" is a known, deferred limitation
     /// (WI 636, reopened): point-penalty over the tall incline can redirect forward motion upward.
-    fn hull_terrain_contacts(&self, terrain: &Terrain) -> Vec<(DVec3, DVec3, f64)> {
+    fn hull_terrain_contacts<S: ContactSurface>(&self, terrain: &S) -> Vec<(DVec3, DVec3, f64)> {
         let r = DMat3::from_quat(self.body.orientation);
         self.hull_points
             .iter()
@@ -821,20 +824,26 @@ impl Rover {
     }
 
     /// Height of the body origin above the terrain directly beneath it.
-    pub fn height_above_terrain(&self, terrain: &Terrain) -> f64 {
+    pub fn height_above_terrain<S: ContactSurface>(&self, terrain: &S) -> f64 {
         self.body.position.y - terrain.height(self.body.position.x, self.body.position.z)
     }
 
     /// Whether the rover is airborne (WI 630): every still-live wheel is clear of the ground (beyond
     /// its full suspension reach). Used by the app to detect a hard landing for fall damage. A rover
     /// with no live wheels is treated as airborne (nothing holds it up).
-    pub fn airborne(&self, terrain: &Terrain) -> bool {
+    pub fn airborne<S: ContactSurface>(&self, terrain: &S) -> bool {
         let r = DMat3::from_quat(self.body.orientation);
         self.wheels.iter().filter(|w| !w.inert).all(|w| {
             let hub = self.body.position + r * w.mount;
             let clearance = hub.y - terrain.height(hub.x, hub.z);
             clearance > w.rest_length + w.radius + 0.02
         })
+    }
+
+    /// The number of hull-shell contact points (WI 765): the per-step surface-query count is bounded by
+    /// `3·(wheels + hull_points)` — independent of the surface's crater/chunk content (design R8).
+    pub fn hull_point_count(&self) -> usize {
+        self.hull_points.len()
     }
 
     /// Coordinated **counter-steer** for the wheels in `steer` (indices). Each steered wheel's angle
@@ -1372,6 +1381,7 @@ fn tire_forces(slip_ratio: f64, slip_angle: f64, fmax: f64, c_long: f64, c_lat: 
 mod tests {
     use super::*;
     use crate::surface::SurfaceMaterial;
+    use crate::terrain::Terrain;
     use crate::voxel::{
         Device, DeviceKind, Material, Part, PartKind, RimSpec, SuspensionSpec, TireSpec, Voxel,
         VoxelCraft, WheelPart,
@@ -1576,9 +1586,10 @@ mod tests {
         assert!(asm.rover.wheels.iter().all(|w| w.rigid_suspension));
     }
 
-    /// A 3×5 chassis built as four component stations with the given suspension + tire (rim default,
-    /// all-drive, front-steer), assembled resting just above flat terrain (WI 630 Phase B helper).
-    fn station_assembly(susp: SuspensionSpec, tire: TireSpec, terrain: &Terrain) -> RoverAssembly {
+    /// The 3×5 four-station editor-scale chassis (rim default, all-drive, front-steer) used by the
+    /// stability fixtures — just the craft, before placement (WI 765 extracted it so the analytic-sphere
+    /// acceptance test can reuse the exact shipping build on a [`SurfacePatch`]).
+    fn station_craft(susp: SuspensionSpec, tire: TireSpec) -> VoxelCraft {
         let mut craft = VoxelCraft::new(0.5);
         for x in 0..3 {
             for z in 0..5 {
@@ -1619,6 +1630,13 @@ mod tests {
                 station: Some(id),
             });
         }
+        craft
+    }
+
+    /// A 3×5 chassis built as four component stations with the given suspension + tire (rim default,
+    /// all-drive, front-steer), assembled resting just above flat terrain (WI 630 Phase B helper).
+    fn station_assembly(susp: SuspensionSpec, tire: TireSpec, terrain: &Terrain) -> RoverAssembly {
+        let craft = station_craft(susp, tire);
         let ground = terrain.height(0.0, 0.0);
         assemble_rover(&craft, DVec3::new(0.0, ground + 0.9, 0.0), 9.81).expect("stations ⇒ rover")
     }
@@ -4239,5 +4257,176 @@ mod tests {
         let mp = craft.mass_properties().unwrap();
         let rover = rover_at(&terrain, 0.0, 0.0, 0.0);
         assert!((rover.body.mass - mp.mass).abs() < 1e-9);
+    }
+
+    // --- WI 765: analytic-sphere contact (the acceptance milestone) ---
+
+    /// A landing direction with genuine — but drivable — local slope, so the acceptance test lands on
+    /// real relief (a crater rim / hillside) rather than a near-flat patch. On a large body the field's
+    /// features span tens of km, so an arbitrary spot can be nearly flat; scanning for slope makes the
+    /// kraken bounds a real gate.
+    fn sloped_landing_dir(field: &crate::surface_field::SurfaceField) -> DVec3 {
+        let mut best = (0.0f64, DVec3::Y);
+        for i in 0..4000 {
+            let a = i as f64 * 0.618_033_988_75 * std::f64::consts::TAU;
+            let y = -1.0 + 2.0 * (i as f64 + 0.5) / 4000.0;
+            let r = (1.0 - y * y).max(0.0).sqrt();
+            let d = DVec3::new(r * a.cos(), y, r * a.sin());
+            let slope = 1.0 - field.normal(d).dot(d).clamp(-1.0, 1.0);
+            // A real slope, but not a near-cliff — keep it drivable.
+            if slope > best.0 && slope < 0.10 {
+                best = (slope, d);
+            }
+        }
+        best.1
+    }
+
+    #[test]
+    fn rover_lands_parks_and_drives_on_the_analytic_sphere_without_the_kraken() {
+        // THE ACCEPTANCE MILESTONE: a light editor-scale rover lands on, rests on, and drives across a
+        // *generated cratered moon's* analytic surface field without the kraken — per-axis ω bounded, no
+        // launch, finite everywhere — validated against the analytic surface (a `SurfacePatch`), not a
+        // mesh. Same force law as the flat-terrain suite; only the surface source is the sphere.
+        use crate::bodygen::{generate, Archetype};
+        use crate::contact_surface::{ContactSurface, SurfacePatch};
+        use crate::surface_field::SurfaceField;
+
+        let asset = generate(918_273_645, Archetype::Moon);
+        let field = SurfaceField::from_asset(&asset);
+        let g = (asset.mu / (asset.radius * asset.radius)).max(1.0); // the moon's surface gravity
+
+        let up0 = sloped_landing_dir(&field);
+        let patch = SurfacePatch::new(field, up0);
+        // The landing site is genuinely sloped (else the test would be trivially flat).
+        let slope = 1.0 - patch.normal(0.0, 0.0).y;
+        assert!(
+            slope > 0.004,
+            "landing site should have real slope, got {slope}"
+        );
+
+        let craft = station_craft(SuspensionSpec::for_cell_size(0.5), TireSpec::new(0.1));
+        let ground = patch.height(0.0, 0.0);
+
+        // Regime 1+2 — land (small drop) then park.
+        let spawn_y = ground + 1.5;
+        let mut rover = assemble_rover(&craft, DVec3::new(0.0, spawn_y, 0.0), g)
+            .expect("rover")
+            .rover;
+        let (mut mx, mut my, mut mz, mut max_y) = (0.0f64, 0.0f64, 0.0f64, f64::MIN);
+        for step in 0..24_000 {
+            rover.step(&patch, DT);
+            assert!(
+                rover.body.position.is_finite() && rover.body.velocity.is_finite(),
+                "non-finite at step {step}"
+            );
+            max_y = max_y.max(rover.body.position.y);
+            if step > 6_000 {
+                let w = rover.body.angular_velocity();
+                mx = mx.max(w.x.abs());
+                my = my.max(w.y.abs());
+                mz = mz.max(w.z.abs());
+            }
+        }
+        // Per-axis kraken bound (bound each axis, the project's rover-testing lesson).
+        assert!(
+            mx < 3.0 && my < 3.0 && mz < 3.0,
+            "tumbled while landing/parked: ω=({mx:.2},{my:.2},{mz:.2})"
+        );
+        // No launch: never flung above the spawn height.
+        assert!(
+            max_y < spawn_y + 1.0,
+            "flung upward (kraken): max_y {max_y:.1} vs spawn {spawn_y:.1}"
+        );
+        // Parked: bounded (does not run away) and near-rest on the gentle slope.
+        assert!(
+            rover.body.velocity.length() < 1.5,
+            "did not settle: |v| {:.2}",
+            rover.body.velocity.length()
+        );
+
+        // Regime 3 — drive across the cratered surface.
+        let asm = assemble_rover(&craft, DVec3::new(0.0, ground + 0.9, 0.0), g).expect("rover");
+        let (mut rover, drive) = (asm.rover, asm.drive);
+        for &i in &drive {
+            rover.wheels[i].drive_torque = rover.body.mass * 2.0;
+        }
+        let start = rover.body.position;
+        let (mut dx, mut dy, mut dz) = (0.0f64, 0.0f64, 0.0f64);
+        for step in 0..24_000 {
+            rover.step(&patch, DT);
+            assert!(
+                rover.body.position.is_finite() && rover.body.velocity.is_finite(),
+                "non-finite while driving at step {step}"
+            );
+            if step > 2_000 {
+                let w = rover.body.angular_velocity();
+                dx = dx.max(w.x.abs());
+                dy = dy.max(w.y.abs());
+                dz = dz.max(w.z.abs());
+            }
+        }
+        assert!(
+            dx < 5.0 && dy < 5.0 && dz < 5.0,
+            "tumbled while driving: ω=({dx:.2},{dy:.2},{dz:.2})"
+        );
+        // It actually drove somewhere on the surface (didn't stay stuck).
+        let travelled = (rover.body.position - start).length();
+        assert!(
+            travelled > 1.0,
+            "rover did not drive across the surface: {travelled:.2} m"
+        );
+    }
+
+    #[test]
+    fn per_step_surface_queries_are_bounded_independent_of_craters() {
+        // Design R8: the per-frame surface-query count is bounded by the vehicle (wheels + hull points),
+        // NOT by the surface's crater/chunk content. A counting `ContactSurface` decorator proves the
+        // per-step count stays within `3·(wheels + hull_points)` — a bound with no crater/chunk term.
+        use crate::contact_surface::{ContactSurface, SurfacePatch};
+        use crate::surface::SurfaceMaterial;
+        use crate::surface_field::SurfaceField;
+        use std::cell::Cell;
+
+        struct Counting<'a, S: ContactSurface> {
+            inner: &'a S,
+            n: Cell<usize>,
+        }
+        impl<S: ContactSurface> ContactSurface for Counting<'_, S> {
+            fn height(&self, x: f64, z: f64) -> f64 {
+                self.n.set(self.n.get() + 1);
+                self.inner.height(x, z)
+            }
+            fn normal(&self, x: f64, z: f64) -> DVec3 {
+                self.n.set(self.n.get() + 1);
+                self.inner.normal(x, z)
+            }
+            fn material_at(&self, x: f64, z: f64) -> SurfaceMaterial {
+                self.n.set(self.n.get() + 1);
+                self.inner.material_at(x, z)
+            }
+        }
+
+        let craft = station_craft(SuspensionSpec::for_cell_size(0.5), TireSpec::new(0.1));
+        let field = SurfaceField::new(2024, 800_000.0);
+        let patch = SurfacePatch::new(field, DVec3::new(0.2, 0.9, 0.3));
+        let ground = patch.height(0.0, 0.0);
+        let mut rover = assemble_rover(&craft, DVec3::new(0.0, ground + 0.9, 0.0), 2.0)
+            .expect("rover")
+            .rover;
+        for _ in 0..200 {
+            rover.step(&patch, DT); // settle onto the surface
+        }
+        let counting = Counting {
+            inner: &patch,
+            n: Cell::new(0),
+        };
+        rover.step(&counting, DT);
+        let queries = counting.n.get();
+        let bound = 3 * (rover.wheels.len() + rover.hull_point_count());
+        assert!(
+            queries <= bound,
+            "per-step surface queries {queries} exceed the vehicle bound {bound} (must be crater/chunk-independent)"
+        );
+        assert!(queries > 0, "expected some surface queries");
     }
 }
