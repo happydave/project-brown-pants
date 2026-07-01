@@ -27,7 +27,7 @@ use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::light::{light_consts::lux, AtmosphereEnvironmentMapLight};
 use bevy::math::DVec3;
 use bevy::mesh::{Indices, PrimitiveTopology};
-use bevy::pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium};
+use bevy::pbr::{Atmosphere, AtmosphereMode, AtmosphereSettings, ScatteringMedium};
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::tasks::{block_on, futures_lite::future, AsyncComputeTaskPool, Task};
@@ -291,7 +291,16 @@ fn setup(
                 ground_albedo: Vec3::from_array(a.ground_albedo),
                 medium: scattering.add(ScatteringMedium::default()),
             },
-            AtmosphereSettings::default(),
+            // Raymarch the sky instead of the default lookup-texture path: the
+            // sky-view LUT is singular at the zenith, so looking straight up
+            // renders its texel grid as a "waffle". Raymarching integrates the
+            // scattering numerically (Bevy's recommended mode for planets seen from
+            // orbit), removing the artifact at a higher per-frame cost (watch the
+            // F4 FPS graph).
+            AtmosphereSettings {
+                rendering_method: AtmosphereMode::Raymarched,
+                ..default()
+            },
             AtmosphereEnvironmentMapLight::default(),
         ));
     }
