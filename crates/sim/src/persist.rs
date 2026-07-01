@@ -19,6 +19,7 @@
 
 use crate::body_asset::BodyAsset;
 use crate::frame::WorldPos;
+use crate::system::System;
 use crate::voxel::VoxelCraft;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -26,6 +27,12 @@ use std::fmt;
 /// Current on-disk format version. Increments **only** on a schema change — it is
 /// deliberately independent of the crate's semantic version (which bumps one
 /// patch per work item). A monotonic integer is what makes it a migration signal.
+///
+/// **Additive-variant rule:** adding a new [`Payload`]/[`Kind`] variant does **not**
+/// bump this. Existing documents are byte-unchanged by a new variant, and an older
+/// build meeting the new kind rejects it as an unknown kind (`Malformed`). A version
+/// bump is reserved for changes to an *existing* payload's shape (which would require
+/// a migration arm). `BodyAsset` (WI 760) and `System` (WI 761) were added additively.
 pub const FORMAT_VERSION: u32 = 1;
 
 /// What a serialized artifact is used as. One format, several uses.
@@ -39,6 +46,8 @@ pub enum Kind {
     /// A celestial body asset (WI 760) — added additively; the format version is
     /// unchanged because existing documents are untouched by a new payload variant.
     BodyAsset,
+    /// A star system (WI 761): body-asset references + placements. Added additively.
+    System,
 }
 
 /// A craft-scope serialized subgraph. A craft, a subassembly, and a blueprint are
@@ -107,6 +116,9 @@ pub enum Payload {
     /// A celestial body asset (WI 760): the intrinsic, reusable definition of a
     /// planet/moon (no placement). Carried by its own [`BodyAsset`] payload.
     BodyAsset(BodyAsset),
+    /// A star system (WI 761): body-asset references + placements that compile to a
+    /// `Universe`.
+    System(System),
 }
 
 impl Payload {
@@ -118,6 +130,7 @@ impl Payload {
             Payload::Blueprint(_) => Kind::Blueprint,
             Payload::WorldSave(_) => Kind::WorldSave,
             Payload::BodyAsset(_) => Kind::BodyAsset,
+            Payload::System(_) => Kind::System,
         }
     }
 }
@@ -269,6 +282,20 @@ mod tests {
         };
         assert_eq!(a.id, "earthlike");
         assert_eq!(a.central_body().mu, crate::sim::CentralBody::EARTHLIKE.mu);
+    }
+
+    #[test]
+    fn system_round_trips_through_the_envelope() {
+        use crate::system::System;
+        let sys = System::single_body("sol", "Sol", "earthlike");
+        let doc = SavedDocument::new(Payload::System(sys.clone()));
+        let back = SavedDocument::from_json(&doc.to_json().unwrap()).unwrap();
+        assert_eq!(back.format_version, FORMAT_VERSION);
+        assert_eq!(back.kind(), Kind::System);
+        let Payload::System(s) = &back.payload else {
+            panic!("expected a system");
+        };
+        assert_eq!(s, &sys);
     }
 
     #[test]

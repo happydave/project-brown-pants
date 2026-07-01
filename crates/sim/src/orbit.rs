@@ -7,6 +7,7 @@
 //! later work.
 
 use glam::DVec2;
+use serde::{Deserialize, Serialize};
 use std::f64::consts::{PI, TAU};
 
 /// A bound (elliptical) two-body orbit in the plane, about a fixed central body
@@ -16,7 +17,7 @@ use std::f64::consts::{PI, TAU};
 /// gravitational parameter (one body in this toy, so it is carried here for
 /// self-contained evaluation). `sense` is the motion direction: `+1.0` for
 /// counter-clockwise (prograde), `-1.0` for clockwise (retrograde).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Orbit {
     /// Gravitational parameter (μ = G·M) of the central body.
     pub mu: f64,

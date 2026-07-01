@@ -39,6 +39,7 @@ pub mod rover;
 pub mod session;
 pub mod sim;
 pub mod surface;
+pub mod system;
 pub mod telemetry;
 pub mod terrain;
 pub mod thermal;
