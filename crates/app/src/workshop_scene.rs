@@ -468,6 +468,11 @@ struct MoonRender {
     radius: f64,
     gravity: f64,
     name: String,
+    /// True until the near ground has streamed in (WI 777): the rover is frozen and a "Loading
+    /// terrain…" indicator shows, so it doesn't sit on invisible ground while chunks build.
+    loading: bool,
+    /// Frames spent loading — a safety timeout so loading always ends even if the streamer stalls.
+    load_frames: u32,
 }
 
 impl MoonRender {
@@ -1774,7 +1779,17 @@ fn clear_rover_telemetry(mut grounded: ResMut<GroundedRover>) {
     grounded.0 = None;
 }
 
-fn step_workshop(time: Res<Time>, mut clock: ResMut<SimClock>, mut world: ResMut<WorkshopWorld>) {
+fn step_workshop(
+    time: Res<Time>,
+    mut clock: ResMut<SimClock>,
+    moon: Option<Res<MoonRender>>,
+    mut world: ResMut<WorkshopWorld>,
+) {
+    // Hold the rover frozen while the moon terrain streams in (WI 777): it rests on the analytic
+    // surface regardless, but freezing avoids it sitting/settling on not-yet-rendered ground.
+    if moon.as_ref().is_some_and(|m| m.loading) {
+        return;
+    }
     // Paused (WI 638): freeze the active physics. Camera, HUD, and inspection stay live. While paused,
     // a step (WI 643) advances a bounded chunk; `frame_step_dt` returns `None` to stay frozen.
     let Some(frame_dt) = crate::pause::frame_step_dt(&mut clock, &time) else {
@@ -2225,6 +2240,8 @@ fn build_test_ground(
             radius,
             gravity,
             name: format!("Moonlet {:04X}", (moon_mode.seed & 0xFFFF) as u16),
+            loading: true,
+            load_frames: 0,
         };
         (TestGround::Moon(patch), gravity, Some(mr))
     } else {
@@ -2250,20 +2267,31 @@ fn moon_stream(
         return;
     };
     let anchor_body = moon.patch.local_to_world(rs.rover.body.position);
-    let MoonRender {
-        field,
-        streamer,
-        material,
-        ..
-    } = &mut *moon;
-    surface_stream::stream(
-        streamer,
-        &mut commands,
-        &mut meshes,
-        field,
-        anchor_body,
-        material,
-    );
+    {
+        let MoonRender {
+            field,
+            streamer,
+            material,
+            ..
+        } = &mut *moon;
+        surface_stream::stream(
+            streamer,
+            &mut commands,
+            &mut meshes,
+            field,
+            anchor_body,
+            material,
+        );
+    }
+    // Release the load gate (WI 777) once the near ground is resident: all pending builds drained with
+    // at least one chunk up, or a safety timeout (~15 s at 60 fps) so it never hangs.
+    if moon.loading {
+        moon.load_frames += 1;
+        let ready = moon.streamer.pending_count() == 0 && moon.streamer.live_count() > 0;
+        if ready || moon.load_frames > 900 {
+            moon.loading = false;
+        }
+    }
 }
 
 /// Position the streamed moon chunks in the rover-anchored render frame each frame (WI 775), so they
@@ -2679,12 +2707,24 @@ fn draw_rover(mut gizmos: Gizmos, world: Res<WorkshopWorld>) {
 }
 
 fn update_test_hud(
+    time: Res<Time>,
     world: Res<WorkshopWorld>,
     clock: Res<SimClock>,
     cam: Res<crate::replay::ReplayCam>,
     moon: Option<Res<MoonRender>>,
+    mut fps: Local<f32>,
     mut hud: Query<&mut Text, With<TestHud>>,
 ) {
+    // Smoothed FPS readout (WI 777) so the streaming/shadow cost is measurable at a glance.
+    let dt = time.delta_secs();
+    if dt > 1e-6 {
+        let inst = 1.0 / dt;
+        *fps = if *fps <= 0.0 {
+            inst
+        } else {
+            *fps * 0.9 + inst * 0.1
+        };
+    }
     // Scene tag + scale cue (WI 775): on a moon, show the body's name, radius, and surface gravity so
     // the vastness reads (the vehicle is a metres-scale reference against a ~1000-km body).
     let scene_tag = match &moon {
@@ -2708,6 +2748,18 @@ fn update_test_hud(
     } else {
         crate::pause::paused_banner(&clock).to_string()
     };
+    // Append the FPS number and, while a moon Test is still streaming its ground in, a loading
+    // indicator (WI 777).
+    let loading = moon.as_ref().is_some_and(|m| m.loading);
+    let paused = format!(
+        "{paused} · {:.0} fps{}",
+        *fps,
+        if loading {
+            "\n⏳ Loading terrain…"
+        } else {
+            ""
+        }
+    );
     if let Ok(mut text) = hud.single_mut() {
         if let Some(rs) = &world.rover {
             // Chassis fractured (WI 629): the rover is debris — show the wreck state, not drive stats.
