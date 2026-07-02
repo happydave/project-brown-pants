@@ -28,12 +28,20 @@
 use crate::surface_field::SurfaceField;
 use glam::{DVec3, Vec2, Vec3};
 
-/// Skirt depth as a multiple of a chunk's own **relief** (max−min elevation). A
-/// chunk's worst LOD-boundary gap is bounded by the relief it spans (never by its
-/// width), so a relief-sized skirt covers the gap while staying buried — sizing it
-/// to the node's edge length instead grows kilometre-tall walls on coarse chunks
-/// that read as a "waffle" at grazing angles.
-const SKIRT_RELIEF_FACTOR: f64 = 1.5;
+/// Skirt depth as a multiple of a chunk's own **relief** (max−min elevation). The
+/// terrain gap against a finer/coarser neighbour is bounded by the relief the chunks
+/// span, so a relief-sized skirt covers the *terrain* part of the gap. (Sizing the
+/// skirt to the node's edge length instead grows kilometre-tall walls on coarse
+/// chunks that read as a "waffle" at grazing angles — WI 773.)
+const SKIRT_RELIEF_FACTOR: f64 = 2.0;
+/// Skirt depth as a multiple of the chunk's own **curvature sagitta** (how far a
+/// straight edge chord sinks below the spherical surface). A one-level-coarser
+/// neighbour spans twice the edge, so its chord sinks ~4× as far below the true
+/// surface; the finer chunk (whose edge is on the surface) must reach down past it,
+/// or the seam cracks open — the concentric LOD "cliffs" seen on a large body from
+/// altitude (WI 779). ≥4 covers a coarser neighbour; 6 leaves margin. This term is
+/// ~0 at max LOD (tiny edges near the surface), so it never revives the WI 773 waffle.
+const SKIRT_CURVATURE_FACTOR: f64 = 6.0;
 /// A small floor (metres) so a near-flat chunk still has a non-degenerate skirt.
 const SKIRT_FLOOR: f64 = 2.0;
 /// Split when the camera is within this many node-edge-lengths of a node.
@@ -249,11 +257,24 @@ pub fn should_split(node: QuadNode, camera_world: DVec3, radius: f64, max_level:
     dist < size * SPLIT_RANGE_FACTOR
 }
 
-/// The skirt depth (metres) for a chunk spanning `relief` metres of elevation —
-/// enough to cover the worst LOD-boundary gap (bounded by the relief) plus a small
-/// floor, and no more.
-pub fn skirt_depth_for_relief(relief: f64) -> f64 {
-    SKIRT_RELIEF_FACTOR * relief.max(0.0) + SKIRT_FLOOR
+/// How far the straight chord of an edge of chord-length `edge_len` sinks below the
+/// spherical surface of the given `radius` — the sagitta `R·(1 − cos(θ/2))` for an
+/// edge subtending angle `θ ≈ edge_len / radius`. This is the geometric part of an
+/// LOD-boundary gap that terrain relief does not account for.
+pub fn edge_sagitta(edge_len: f64, radius: f64) -> f64 {
+    let radius = radius.max(1.0);
+    let half_angle = 0.5 * edge_len / radius;
+    radius * (1.0 - half_angle.cos())
+}
+
+/// The skirt depth (metres) for a chunk spanning `relief` metres of elevation with a
+/// chord edge of `edge_len` on a body of `radius` — enough to cover the worst
+/// LOD-boundary gap against a one-level-coarser neighbour (its terrain relief *plus*
+/// its curvature sagitta, ~4× this chunk's own), plus a small floor, and no more.
+pub fn skirt_depth_for(relief: f64, edge_len: f64, radius: f64) -> f64 {
+    SKIRT_RELIEF_FACTOR * relief.max(0.0)
+        + SKIRT_CURVATURE_FACTOR * edge_sagitta(edge_len, radius)
+        + SKIRT_FLOOR
 }
 
 /// The relief (max−min elevation, metres) a chunk spans at resolution `res` — the
@@ -326,10 +347,12 @@ pub fn build_chunk(field: &SurfaceField, node: QuadNode, res: u32) -> ChunkMesh 
     }
 
     // Skirt: a wall hanging inward from each border edge, deep enough to cover the
-    // LOD-boundary gap (bounded by this chunk's relief), but no deeper — so it stays
-    // buried under the terrain instead of showing as a wall.
+    // LOD-boundary gap against a one-level-coarser neighbour — its terrain relief
+    // (bounded by this chunk's relief) *and* its curvature sagitta (the chord of a
+    // coarse edge sinks ~4× this chunk's sagitta below the true surface) — but no
+    // deeper, so it stays buried instead of standing up as a wall.
     let relief = (max_elev - min_elev).max(0.0);
-    let skirt_depth = skirt_depth_for_relief(relief);
+    let skirt_depth = skirt_depth_for(relief, node.edge_len(radius), radius);
     add_skirt(
         res,
         &world_of,
@@ -597,7 +620,7 @@ mod tests {
             i: 3,
             j: 4,
         };
-        let skirt_depth = skirt_depth_for_relief(chunk_relief(&f, coarse, 24));
+        let skirt_depth = skirt_depth_for(chunk_relief(&f, coarse, 24), coarse.edge_len(R), R);
         // Sample the surface along one edge; measure max radial dip below the chord
         // between the edge endpoints (a fine neighbour would resolve this dip).
         let (u0, u1, v0, _v1) = coarse.uv_rect();
@@ -623,6 +646,39 @@ mod tests {
         assert!(
             skirt_depth >= max_dip,
             "skirt {skirt_depth} must cover edge dip {max_dip}"
+        );
+    }
+
+    #[test]
+    fn skirt_covers_a_coarser_neighbours_curvature_sagitta() {
+        // On a large body the dominant LOD seam is curvature, not relief: a coarse
+        // neighbour renders a shared edge as a chord that sinks below the sphere by
+        // its sagitta, so the FINE chunk (edge on the true surface) must reach down
+        // past that chord. A relief-only skirt (WI 773) misses this and cracks open
+        // into the concentric "cliffs" of WI 779. Verify the fine chunk's skirt
+        // covers the sagitta of a one-level-coarser neighbour (twice the edge span).
+        let radius = 730_000.0;
+        let f = SurfaceField::new(7, radius);
+        let fine = QuadNode {
+            face: CubeFace::PosZ,
+            level: 6,
+            i: 20,
+            j: 20,
+        };
+        let edge_len = fine.edge_len(radius);
+        let relief = chunk_relief(&f, fine, DEFAULT_RESOLUTION);
+        let depth = skirt_depth_for(relief, edge_len, radius);
+        let coarse_sagitta = edge_sagitta(2.0 * edge_len, radius);
+        assert!(
+            depth >= coarse_sagitta,
+            "skirt {depth} must cover coarse-neighbour sagitta {coarse_sagitta}"
+        );
+        // And the term is negligible at max LOD (tiny edges near the surface) so it
+        // cannot revive the WI 773 waffle: a metre-scale edge yields a sub-metre
+        // curvature contribution.
+        assert!(
+            edge_sagitta(4.0, radius) < 0.01,
+            "curvature term must vanish for tiny edges (no WI 773 waffle regression)"
         );
     }
 
