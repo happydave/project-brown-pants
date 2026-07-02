@@ -525,6 +525,11 @@ pub fn build_chunk(field: &SurfaceField, node: QuadNode, res: u32) -> ChunkMesh 
 /// Appends the border skirt: for each border grid vertex, a duplicate pushed
 /// radially inward by `skirt_depth`; walls connect consecutive border vertices to
 /// their skirt duplicates. The wall's `-radial` drop hides LOD-boundary gaps.
+///
+/// Skirt vertices **inherit the border vertex's normal and UV** (WI 786): the exposed
+/// portion of a wall then shades exactly like the adjacent surface (invisible) instead of
+/// as a dark inward-facing band — the residual LOD-boundary "cliff" was mostly this shading.
+/// (Cesium's technique; the wall geometry/depth is unchanged, so crack coverage is preserved.)
 #[allow(clippy::too_many_arguments)]
 fn add_skirt(
     res: u32,
@@ -553,14 +558,18 @@ fn add_skirt(
         ring.push(grid_idx(0, b));
     }
 
-    // A skirt duplicate for each ring vertex, pushed inward along its direction.
+    // A skirt duplicate for each ring vertex, pushed inward along its direction. The
+    // duplicate inherits the border vertex's normal + UV (WI 786) so the wall shades like
+    // the surface, not as a dark inward-facing band.
     let skirt_base = positions.len() as u32;
     for &gi in &ring {
         let (dir, world) = world_of[gi];
         let dropped = world - dir * skirt_depth;
+        let border_normal = normals[gi];
+        let border_uv = uvs[gi];
         positions.push((dropped - center).as_vec3().to_array());
-        normals.push((-dir).as_vec3().to_array());
-        uvs.push([0.0, 0.0]);
+        normals.push(border_normal);
+        uvs.push(border_uv);
     }
 
     // Walls: quad (top_k, top_k+1, skirt_k+1, skirt_k) as two triangles.
@@ -981,6 +990,65 @@ mod tests {
             edge_sagitta(4.0, radius) < 0.01,
             "curvature term must vanish for tiny edges (no WI 773 waffle regression)"
         );
+    }
+
+    #[test]
+    fn skirt_vertices_inherit_border_normal_and_uv() {
+        // WI 786: each skirt (dropped-ring) vertex takes its border vertex's normal + UV,
+        // so an exposed wall shades like the surface (not a dark inward `-radial` band).
+        let f = field();
+        let node = QuadNode {
+            face: CubeFace::PosZ,
+            level: 4,
+            i: 5,
+            j: 6,
+        };
+        let res = 8u32; // even (build_chunk forces even; already even here)
+        let m = build_chunk(&f, node, res);
+        let n = res + 1;
+        let vert_count = (n * n) as usize;
+        let grid_idx = |a: u32, b: u32| (b * n + a) as usize;
+        // Rebuild the border ring in add_skirt's order (bottom → right → top → left).
+        let mut ring: Vec<usize> = Vec::new();
+        for a in 0..=res {
+            ring.push(grid_idx(a, 0));
+        }
+        for b in 1..=res {
+            ring.push(grid_idx(res, b));
+        }
+        for a in (0..res).rev() {
+            ring.push(grid_idx(a, res));
+        }
+        for b in (1..res).rev() {
+            ring.push(grid_idx(0, b));
+        }
+        assert_eq!(
+            m.normals.len(),
+            vert_count + ring.len(),
+            "grid + one skirt vertex per ring vertex"
+        );
+        for (k, &gi) in ring.iter().enumerate() {
+            let sk = vert_count + k;
+            assert_eq!(m.normals[sk], m.normals[gi], "skirt normal inherits border");
+            assert_eq!(m.uvs[sk], m.uvs[gi], "skirt uv inherits border");
+            // Sanity: border normals point outward (not the old inward `-dir`).
+            let dir = direction(
+                node.face,
+                {
+                    let (u0, u1, _, _) = node.uv_rect();
+                    u0 + (u1 - u0) * (gi as u32 % n) as f64 / res as f64
+                },
+                {
+                    let (_, _, v0, v1) = node.uv_rect();
+                    v0 + (v1 - v0) * (gi as u32 / n) as f64 / res as f64
+                },
+            );
+            let normal = Vec3::from_array(m.normals[sk]).as_dvec3();
+            assert!(
+                normal.dot(dir) > 0.0,
+                "skirt normal faces outward like the surface"
+            );
+        }
     }
 
     #[test]
