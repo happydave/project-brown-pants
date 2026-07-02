@@ -49,6 +49,7 @@ use sounding_sim::collision::{
 use sounding_sim::collision_detect::contacts;
 use sounding_sim::command::{Command, SasMode};
 use sounding_sim::contact::{body_contact_wrench, ground_contact_wrench, ContactParams};
+use sounding_sim::contact_surface::{ContactSurface, SurfacePatch};
 use sounding_sim::control::{assemble_control, BatterySpec, ControlComputer};
 use sounding_sim::flight::{flight_step, FlightCraft, FlightParams, GroundContact};
 use sounding_sim::fluid::FluidMedium;
@@ -62,6 +63,7 @@ use sounding_sim::rover::{
     assemble_rover, ContactSite, Rover, RoverAssembly, Wheel, SUBSTEP_DT as ROVER_SUBSTEP_DT,
 };
 use sounding_sim::sim::{CentralBody, SimClock};
+use sounding_sim::surface_field::SurfaceField;
 use sounding_sim::telemetry::RoverTelemetry;
 use sounding_sim::terrain::{Ramp, Terrain};
 use sounding_sim::voxel::{
@@ -83,6 +85,7 @@ use crate::parts::{
     part_kind_name, part_up_correction, spawn_part_mesh, REFERENCE_CELL,
 };
 use crate::replay::Replayable;
+use crate::surface_stream::{self, ChunkCenter, ChunkStreamer, StreamedChunk};
 use crate::voxel_skin::{pbr_material, skin_submeshes, VoxelSkin};
 
 const BODY: CentralBody = CentralBody::EARTHLIKE;
@@ -373,12 +376,112 @@ impl ImpactWatch {
     }
 }
 
+/// Whether the workshop Test drives on a generated moon (WI 775), and its seed. Set once at launch
+/// from the `-- workshop moon [seed]` argument; when off (the default), Test uses the flat pad and every
+/// existing behaviour is unchanged.
+#[derive(Resource, Clone, Copy)]
+struct MoonMode {
+    on: bool,
+    seed: u64,
+}
+
+/// Radius (m) of the workshop's drivable moonlet (WI 775) — small enough that the field's
+/// planetary-wavelength craters/relief read at rover scale and the horizon curves.
+const MOONLET_RADIUS: f64 = 12_000.0;
+/// Surface gravity (m/s²) of the moonlet — low, moon-like.
+const MOONLET_GRAVITY: f64 = 1.6;
+
+/// Parse `-- workshop moon [seed]` (WI 775): the moon ground is opt-in, so plain `-- workshop` stays
+/// on the flat pad.
+fn parse_moon_mode() -> MoonMode {
+    let args: Vec<String> = std::env::args().collect();
+    let after: Vec<&String> = args
+        .iter()
+        .skip_while(|a| *a != "workshop")
+        .skip(1)
+        .collect();
+    let on = after.first().map(|s| s.as_str()) == Some("moon");
+    let seed = after
+        .get(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(918_273_645);
+    MoonMode { on, seed }
+}
+
+/// The Test-mode ground the rover contacts (WI 775): the flat pad [`Terrain`] or a spherical
+/// [`SurfacePatch`] over a generated moon's analytic field. Both are a [`ContactSurface`], so the rover
+/// step and every ground query route through one abstraction — a surface-source swap (WI 765), not a
+/// force-law change. `Copy` so it threads through the step exactly as the old `Terrain` did.
+#[derive(Clone, Copy)]
+enum TestGround {
+    Flat(Terrain),
+    Moon(SurfacePatch),
+}
+
+impl ContactSurface for TestGround {
+    fn height(&self, x: f64, z: f64) -> f64 {
+        match self {
+            TestGround::Flat(t) => t.height(x, z),
+            TestGround::Moon(p) => p.height(x, z),
+        }
+    }
+    fn normal(&self, x: f64, z: f64) -> DVec3 {
+        match self {
+            TestGround::Flat(t) => ContactSurface::normal(t, x, z),
+            TestGround::Moon(p) => p.normal(x, z),
+        }
+    }
+    fn material_at(&self, x: f64, z: f64) -> sounding_sim::surface::SurfaceMaterial {
+        match self {
+            TestGround::Flat(t) => t.material_at(x, z),
+            TestGround::Moon(p) => p.material_at(x, z),
+        }
+    }
+}
+
+impl TestGround {
+    /// The flat pad terrain, if this is the flat ground (for the pad-only render/affordances).
+    fn flat(&self) -> Option<&Terrain> {
+        match self {
+            TestGround::Flat(t) => Some(t),
+            TestGround::Moon(_) => None,
+        }
+    }
+    fn is_moon(&self) -> bool {
+        matches!(self, TestGround::Moon(_))
+    }
+}
+
+/// The moon Test render state (WI 775): the analytic field, the streamer, and the render mapping — held
+/// only while driving on a moon (inserted on Test enter, removed on exit). The rover's *contact* ground
+/// is the `SurfacePatch` in [`RoverState`]; this is the *visual* half.
+#[derive(Resource)]
+struct MoonRender {
+    field: SurfaceField,
+    patch: SurfacePatch,
+    /// Body-centre world offset (`(0,-radius,0)`), so the landing site is at the world origin.
+    body_center: DVec3,
+    streamer: ChunkStreamer,
+    material: Handle<StandardMaterial>,
+    radius: f64,
+    gravity: f64,
+    name: String,
+}
+
+impl MoonRender {
+    /// World position of a rover local-frame point (patch frame → body-centred → world).
+    fn rover_world(&self, local: DVec3) -> DVec3 {
+        self.body_center + self.patch.local_to_world(local)
+    }
+}
+
 /// The grounded workshop Test state for a **rover** build (WI 607): the assembled rover, its
-/// (flat) pad terrain, the drivetrain groups, the source lattice (for reset), and a substep
-/// accumulator. Present only when the build is a rover; the rocket path leaves it `None`.
+/// ground (flat pad or a moon `SurfacePatch`, WI 775), the drivetrain groups, the source lattice (for
+/// reset), and a substep accumulator. Present only when the build is a rover; the rocket path leaves it
+/// `None`.
 struct RoverState {
     rover: Rover,
-    terrain: Terrain,
+    ground: TestGround,
     drive: Vec<usize>,
     steer: Vec<usize>,
     lattice: VoxelCraft,
@@ -637,25 +740,24 @@ impl WorkshopWorld {
     /// A Test world **driving** an assembled rover (WI 607), resting on a flat pad terrain. The
     /// rocket fields carry a harmless placeholder craft (never stepped — the rover branch handles
     /// stepping/render/input); `rover` is `Some`.
-    fn rover(asm: RoverAssembly, lattice: VoxelCraft) -> Self {
+    fn rover(asm: RoverAssembly, lattice: VoxelCraft, ground: TestGround) -> Self {
         let mut world = Self::new();
-        let terrain = Terrain {
-            amplitude: 0.0,
-            // A 30° wedge off to the side to drive up and launch off (WI 630 test affordance): steer
-            // left, climb it, and catch air over the lip to check the rover tumbles when it should.
-            ramp: Some(ROVER_TEST_RAMP),
-            ..Default::default()
+        // Pad-only obstacles (WI 610) apply on the flat pad; the moon patch has none.
+        let obstacles = if ground.is_moon() {
+            Vec::new()
+        } else {
+            rover_obstacles()
         };
         let mut rover = asm.rover;
         let com = lattice
             .mass_properties()
             .map(|mp| mp.center_of_mass)
             .unwrap_or(DVec3::ZERO);
-        // Rest the rover on the pad: place the CoM (`body.position`) high enough that **both** every
-        // wheel hub sits at its suspension free length above the surface **and** the chassis bottom
-        // clears the ground — so it never spawns partly underground (the "front falls through" bug),
-        // then it settles a little under load.
-        let ground = terrain.height(0.0, 0.0);
+        // Rest the rover on the ground under the origin: place the CoM (`body.position`) high enough
+        // that **both** every wheel hub sits at its suspension free length above the surface **and** the
+        // chassis bottom clears the ground — so it never spawns partly underground (the "front falls
+        // through" bug), then it settles a little under load.
+        let ground_h = ContactSurface::height(&ground, 0.0, 0.0);
         let wheel_drop = rover
             .wheels
             .iter()
@@ -667,11 +769,11 @@ impl WorkshopWorld {
             lattice.voxels.iter().map(|v| v.cell.y).min().unwrap_or(0) as f64 * lattice.cell_size;
         let chassis_drop = com.y - min_cell_y;
         let drop = wheel_drop.max(chassis_drop) + 0.05;
-        rover.body.position = DVec3::new(0.0, ground + drop, 0.0);
+        rover.body.position = DVec3::new(0.0, ground_h + drop, 0.0);
         let spin_angle = vec![0.0; rover.wheels.len()];
         world.rover = Some(RoverState {
             rover,
-            terrain,
+            ground,
             drive: asm.drive,
             steer: asm.steer,
             lattice,
@@ -679,7 +781,7 @@ impl WorkshopWorld {
             throttle: 0.0,
             brake: 0.0,
             accumulator: 0.0,
-            obstacles: rover_obstacles(),
+            obstacles,
             track: Vec::new(),
             record: 0,
             com,
@@ -703,8 +805,10 @@ impl WorkshopWorld {
     fn reset(&mut self) {
         if let Some(rs) = &self.rover {
             let lattice = rs.lattice.clone();
-            if let Some(asm) = assemble_rover(&lattice, DVec3::ZERO, ROVER_GRAVITY) {
-                *self = Self::rover(asm, lattice);
+            let ground = rs.ground;
+            let gravity = rs.rover.gravity; // keep the moon's (or pad's) gravity across a reset
+            if let Some(asm) = assemble_rover(&lattice, DVec3::ZERO, gravity) {
+                *self = Self::rover(asm, lattice, ground);
                 return;
             }
         }
@@ -891,6 +995,7 @@ impl Plugin for WorkshopScenePlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(FloatingOriginPlugin)
             .init_state::<WorkshopMode>()
+            .insert_resource(parse_moon_mode())
             .insert_resource(WorkshopWorld::new())
             // Seed Build with the default flyable lattice (a control point + engine + battery +
             // tank), so it can be edited and immediately Tested.
@@ -959,6 +1064,8 @@ impl Plugin for WorkshopScenePlugin {
                     follow_camera,
                     rover_chase_camera,
                     draw_rover,
+                    moon_stream.run_if(moon_active),
+                    moon_reposition_chunks.run_if(moon_active),
                     update_test_hud,
                     update_overlay,
                 )
@@ -1182,6 +1289,7 @@ fn sync_build_meshes(
 
 // --- Test mode ---
 
+#[allow(clippy::too_many_arguments)]
 fn enter_test(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
@@ -1190,28 +1298,49 @@ fn enter_test(
     mut scattering: ResMut<Assets<ScatteringMedium>>,
     mut world: ResMut<WorkshopWorld>,
     editor: Res<EditorState>,
+    moon_mode: Res<MoonMode>,
 ) {
     // Drive **what was built** if it is a rover (the build has wheel parts): assemble a rover and
-    // run the rover Test path (rover-anchored gizmos + a fixed chase camera, the proven
-    // `-- rover` rendering). The rover-vs-rocket discriminator is `assemble_rover` returning Some.
-    if let Some(asm) = assemble_rover(&editor.craft, DVec3::ZERO, ROVER_GRAVITY) {
-        *world = WorkshopWorld::rover(asm, editor.craft.clone());
-        // A fixed chase camera: the rover is rendered anchored at its own position, so a static
-        // camera keeps it framed while the terrain scrolls beneath it.
+    // run the rover Test path. On the flat pad this is rover-anchored gizmos + a fixed chase camera
+    // (the proven `-- rover` rendering); on a moon (`-- workshop moon`, WI 775) it is the WI 764
+    // streamer + a floating-origin chase camera. The rover-vs-rocket discriminator is `assemble_rover`
+    // returning Some.
+    if assemble_rover(&editor.craft, DVec3::ZERO, ROVER_GRAVITY).is_some() {
+        // The Test ground: flat pad, or a generated moon `SurfacePatch` + its render state.
+        let (ground, gravity, moon) = build_test_ground(&moon_mode, &mut materials);
+        let asm = assemble_rover(&editor.craft, DVec3::ZERO, gravity)
+            .expect("rover discriminator already matched");
+        *world = WorkshopWorld::rover(asm, editor.craft.clone(), ground);
+        // The rover renders **rover-anchored** (meshes at `local − body.position`, fixed chase camera)
+        // in both modes; the moon streams textured chunks in that same anchor frame (WI 775), so the
+        // camera + rover-mesh pipeline are unchanged. On the moon we only brighten the sun + add camera
+        // ambient (airless: no atmosphere) and insert the render state.
+        let (illum, ambient) = if moon.is_some() {
+            (14_000.0, 120.0)
+        } else {
+            (8_000.0, 0.0)
+        };
         commands.spawn((
             Camera3d::default(),
             Transform::from_xyz(0.0, 7.0, -16.0).looking_at(Vec3::new(0.0, 1.0, 4.0), Vec3::Y),
+            AmbientLight {
+                brightness: ambient,
+                ..default()
+            },
             RoverTestCam,
             TestEntity,
         ));
         commands.spawn((
             DirectionalLight {
-                illuminance: 8_000.0,
+                illuminance: illum,
                 ..default()
             },
             Transform::from_xyz(6.0, 14.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
             TestEntity,
         ));
+        if let Some(mr) = moon {
+            commands.insert_resource(mr);
+        }
         commands.spawn((
             Text::new("workshop · TEST (rover)"),
             TextFont {
@@ -1340,25 +1469,28 @@ fn enter_test(
                     TestEntity,
                 ));
             }
-            // Test ramp (WI 630): a wedge to drive up and launch off the lip.
-            let r = ROVER_TEST_RAMP;
-            let slope_len = (r.run / r.angle.cos()) as f32;
-            let ramp_mesh = meshes.add(Mesh::from(Cuboid::new(
-                (r.half_width * 2.0) as f32,
-                0.15,
-                slope_len,
-            )));
-            commands.spawn((
-                Mesh3d(ramp_mesh),
-                MeshMaterial3d(materials.add(StandardMaterial {
-                    base_color: Color::srgb(0.50, 0.45, 0.30),
-                    perceptual_roughness: 1.0,
-                    ..default()
-                })),
-                Transform::default(),
-                RoverRampMesh,
-                TestEntity,
-            ));
+            // Test ramp (WI 630): a wedge to drive up and launch off the lip — flat pad only (the moon
+            // has no ramp, WI 775).
+            if rs.ground.flat().is_some() {
+                let r = ROVER_TEST_RAMP;
+                let slope_len = (r.run / r.angle.cos()) as f32;
+                let ramp_mesh = meshes.add(Mesh::from(Cuboid::new(
+                    (r.half_width * 2.0) as f32,
+                    0.15,
+                    slope_len,
+                )));
+                commands.spawn((
+                    Mesh3d(ramp_mesh),
+                    MeshMaterial3d(materials.add(StandardMaterial {
+                        base_color: Color::srgb(0.50, 0.45, 0.30),
+                        perceptual_roughness: 1.0,
+                        ..default()
+                    })),
+                    Transform::default(),
+                    RoverRampMesh,
+                    TestEntity,
+                ));
+            }
         }
         return;
     }
@@ -1432,8 +1564,18 @@ fn enter_test(
 #[allow(clippy::type_complexity)]
 fn exit_test(
     mut commands: Commands,
-    q: Query<Entity, Or<(With<TestEntity>, With<CraftMarker>, With<FragmentMarker>)>>,
+    q: Query<
+        Entity,
+        Or<(
+            With<TestEntity>,
+            With<CraftMarker>,
+            With<FragmentMarker>,
+            With<StreamedChunk>,
+        )>,
+    >,
 ) {
+    // Also drops the moon render state (streamed chunks are despawned above via StreamedChunk, WI 775).
+    commands.remove_resource::<MoonRender>();
     for e in &q {
         commands.entity(e).despawn();
     }
@@ -1672,7 +1814,7 @@ fn step_workshop(time: Res<Time>, mut clock: ResMut<SimClock>, mut world: ResMut
             w.brake = brake;
         }
         rs.accumulator += frame_dt;
-        let terrain = rs.terrain;
+        let terrain = rs.ground;
         // Rover↔obstacle contact (WI 610): the rover collision shape vs. each static obstacle,
         // injected as an external wrench per sub-step (the seam — `rover.step` integrates it). The
         // shape is the chassis hull ∪ the live wheels' swept proxies (WI 631c), so a tire pushes off
@@ -1816,7 +1958,7 @@ fn step_workshop(time: Res<Time>, mut clock: ResMut<SimClock>, mut world: ResMut
             // the rover, end driving, and stop stepping the (now-gone) rover this frame.
             if let Some(mut frags) = fracture_pending.take() {
                 let bp = rs.rover.body.position;
-                rs.debris_ground_y = rs.terrain.height(bp.x, bp.z);
+                rs.debris_ground_y = ContactSurface::height(&rs.ground, bp.x, bp.z);
                 // Bleed momentum (WI 674): the break absorbs energy, so the pieces keep only a
                 // fraction of the impact velocity rather than rocketing off at the full ram speed.
                 for (_, b) in &mut frags {
@@ -1905,8 +2047,11 @@ fn step_workshop(time: Res<Time>, mut clock: ResMut<SimClock>, mut world: ResMut
             rs.record += 1;
             if rs.record.is_multiple_of(48) {
                 let p = rs.rover.body.position;
-                rs.track
-                    .push(DVec3::new(p.x, rs.terrain.height(p.x, p.z), p.z));
+                rs.track.push(DVec3::new(
+                    p.x,
+                    ContactSurface::height(&rs.ground, p.x, p.z),
+                    p.z,
+                ));
                 if rs.track.len() > 400 {
                     rs.track.remove(0);
                 }
@@ -2034,6 +2179,97 @@ fn track_meshes(
     }
 }
 
+/// Build the Test ground (WI 775): the flat pad `Terrain` (with the launch ramp), or — with
+/// `-- workshop moon` — a generated cratered moon's `SurfacePatch` (landing at field-direction +Y so
+/// the patch's local frame == the render frame) plus its [`MoonRender`] streaming state. Returns the
+/// ground, the surface gravity to assemble the rover at, and the moon render state (if any).
+fn build_test_ground(
+    moon_mode: &MoonMode,
+    materials: &mut Assets<StandardMaterial>,
+) -> (TestGround, f64, Option<MoonRender>) {
+    if moon_mode.on {
+        // A small **moonlet** (not a 200–2000 km body): the field's features are planetary-wavelength,
+        // so on a big body the surface is dead-flat at rover scale. A ~12 km radius makes the horizon
+        // curvature and the (now km-scale) craters visible to drive across, while the analytic contact
+        // is identical. Finer eye-level surface detail is a field-content follow-up (WI 763 territory).
+        let radius = MOONLET_RADIUS;
+        let gravity = MOONLET_GRAVITY;
+        let field = SurfaceField::new(moon_mode.seed, radius);
+        let patch = SurfacePatch::new(field, DVec3::Y);
+        let material = materials.add(StandardMaterial {
+            base_color: Color::srgb(0.52, 0.52, 0.55),
+            perceptual_roughness: 1.0,
+            ..default()
+        });
+        let mr = MoonRender {
+            field,
+            patch,
+            body_center: DVec3::new(0.0, -radius, 0.0),
+            streamer: ChunkStreamer::default(),
+            material,
+            radius,
+            gravity,
+            name: format!("Moonlet {:04X}", (moon_mode.seed & 0xFFFF) as u16),
+        };
+        (TestGround::Moon(patch), gravity, Some(mr))
+    } else {
+        let terrain = Terrain {
+            amplitude: 0.0,
+            // A 30° wedge off to the side to drive up and launch off (WI 630 test affordance).
+            ramp: Some(ROVER_TEST_RAMP),
+            ..Default::default()
+        };
+        (TestGround::Flat(terrain), ROVER_GRAVITY, None)
+    }
+}
+
+/// Stream the textured moon surface (WI 775): advance the WI 764 CDLOD streamer with the rover as the
+/// LOD anchor. Runs only while a moon Test is active (the `MoonRender` resource exists).
+fn moon_stream(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut moon: ResMut<MoonRender>,
+    world: Res<WorkshopWorld>,
+) {
+    let Some(rs) = &world.rover else {
+        return;
+    };
+    let anchor_body = moon.patch.local_to_world(rs.rover.body.position);
+    let MoonRender {
+        field,
+        streamer,
+        material,
+        ..
+    } = &mut *moon;
+    surface_stream::stream(
+        streamer,
+        &mut commands,
+        &mut meshes,
+        field,
+        anchor_body,
+        material,
+    );
+}
+
+/// Position the streamed moon chunks in the rover-anchored render frame each frame (WI 775), so they
+/// share the frame the rover meshes render in (rover at the render origin, world scrolling beneath).
+fn moon_reposition_chunks(
+    moon: Res<MoonRender>,
+    world: Res<WorkshopWorld>,
+    mut chunks: Query<(&ChunkCenter, &mut Transform), With<StreamedChunk>>,
+) {
+    let Some(rs) = &world.rover else {
+        return;
+    };
+    let anchor_world = moon.rover_world(rs.rover.body.position);
+    surface_stream::reposition(moon.body_center, anchor_world, &mut chunks);
+}
+
+/// Whether a moon Test is active (its render state exists).
+fn moon_active(moon: Option<Res<MoonRender>>) -> bool {
+    moon.is_some()
+}
+
 fn follow_camera(
     world: Res<WorkshopWorld>,
     look: Res<ChaseLook>,
@@ -2086,7 +2322,12 @@ fn reset_chase_look(mut look: ResMut<ChaseLook>) {
 /// rule: on the ground when in contact, else hanging at full suspension droop (so an airborne wheel
 /// stays with the rover instead of shadowing the terrain). The returned normal aligns the axle: the
 /// terrain normal when the tyre touches, the body up while airborne.
-fn wheel_render_pose(w: &Wheel, hub: DVec3, terrain: &Terrain, up: DVec3) -> (DVec3, DVec3) {
+fn wheel_render_pose(
+    w: &Wheel,
+    hub: DVec3,
+    terrain: &impl ContactSurface,
+    up: DVec3,
+) -> (DVec3, DVec3) {
     let ground = terrain.height(hub.x, hub.z);
     if w.unsprung_mass > 0.0 {
         let axle_y = hub.y - w.axle_drop;
@@ -2183,7 +2424,7 @@ fn track_rover_meshes(
             // relative to the radius it was built at.
             tf.scale = Vec3::splat((w.radius as f32 / tag.1).clamp(0.05, 1.0));
             let hub = body.position + q * w.mount;
-            let (center, align_normal) = wheel_render_pose(w, hub, &rs.terrain, up);
+            let (center, align_normal) = wheel_render_pose(w, hub, &rs.ground, up);
             // Include the bent-rim steer/camber bias (WI 631b) so a damaged wheel visibly points off.
             let steer_rot = DQuat::from_axis_angle(up, w.steer + w.steer_bias);
             let heading = steer_rot * fwd;
@@ -2320,7 +2561,9 @@ fn track_rover_debris(
 /// top face is the surface the wheels climb.
 fn track_ramp_mesh(world: Res<WorkshopWorld>, mut q: Query<&mut Transform, With<RoverRampMesh>>) {
     let Some(rs) = &world.rover else { return };
-    let Some(r) = rs.terrain.ramp else { return };
+    let Some(r) = rs.ground.flat().and_then(|t| t.ramp) else {
+        return;
+    };
     let anchor = rs.render_anchor();
     // Centre of the inclined slab (base terrain is flat here, so y is half the peak height).
     let center = DVec3::new(
@@ -2345,27 +2588,28 @@ fn draw_rover(mut gizmos: Gizmos, world: Res<WorkshopWorld>) {
     let body = &rs.rover.body;
     let anchor = rs.render_anchor();
     let to_render = |p: DVec3| (p - anchor).as_vec3();
-    let terrain = &rs.terrain;
-
     // Terrain grid, **world-locked** (snapped to world coordinates) so it scrolls under the rover as
     // it drives — a rover-relative grid looks identical everywhere on flat ground (the "feels like
-    // sitting still" bug).
-    let step = 1.0;
-    let n = 18;
-    let base_x = (anchor.x / step).round() * step;
-    let base_z = (anchor.z / step).round() * step;
-    let grid = Color::srgb(0.30, 0.26, 0.22);
-    for i in -n..=n {
-        let mut row = Vec::new();
-        let mut col = Vec::new();
-        for j in -n..=n {
-            let (xi, zj) = (base_x + i as f64 * step, base_z + j as f64 * step);
-            let (xj, zi) = (base_x + j as f64 * step, base_z + i as f64 * step);
-            row.push(to_render(DVec3::new(xi, terrain.height(xi, zj), zj)));
-            col.push(to_render(DVec3::new(xj, terrain.height(xj, zi), zi)));
+    // sitting still" bug). Flat pad only: on a moon (WI 775) the streamed textured chunks are the
+    // visible ground, so the wireframe grid is skipped.
+    if let Some(terrain) = rs.ground.flat() {
+        let step = 1.0;
+        let n = 18;
+        let base_x = (anchor.x / step).round() * step;
+        let base_z = (anchor.z / step).round() * step;
+        let grid = Color::srgb(0.30, 0.26, 0.22);
+        for i in -n..=n {
+            let mut row = Vec::new();
+            let mut col = Vec::new();
+            for j in -n..=n {
+                let (xi, zj) = (base_x + i as f64 * step, base_z + j as f64 * step);
+                let (xj, zi) = (base_x + j as f64 * step, base_z + i as f64 * step);
+                row.push(to_render(DVec3::new(xi, terrain.height(xi, zj), zj)));
+                col.push(to_render(DVec3::new(xj, terrain.height(xj, zi), zi)));
+            }
+            gizmos.linestrip(row, grid);
+            gizmos.linestrip(col, grid);
         }
-        gizmos.linestrip(row, grid);
-        gizmos.linestrip(col, grid);
     }
 
     // Breadcrumb trail (world-space) — recedes behind the rover as it moves.
@@ -2400,7 +2644,7 @@ fn draw_rover(mut gizmos: Gizmos, world: Res<WorkshopWorld>) {
             continue;
         }
         let hub = body.position + body.orientation * w.mount;
-        let (center, align_normal) = wheel_render_pose(w, hub, terrain, up);
+        let (center, align_normal) = wheel_render_pose(w, hub, &rs.ground, up);
         let steer_rot = DQuat::from_axis_angle(up, w.steer);
         let heading = steer_rot * (body.orientation * DVec3::Z);
         let forward = (heading - align_normal * heading.dot(align_normal)).normalize_or_zero();
@@ -2423,8 +2667,22 @@ fn update_test_hud(
     world: Res<WorkshopWorld>,
     clock: Res<SimClock>,
     cam: Res<crate::replay::ReplayCam>,
+    moon: Option<Res<MoonRender>>,
     mut hud: Query<&mut Text, With<TestHud>>,
 ) {
+    // Scene tag + scale cue (WI 775): on a moon, show the body's name, radius, and surface gravity so
+    // the vastness reads (the vehicle is a metres-scale reference against a ~1000-km body).
+    let scene_tag = match &moon {
+        Some(mr) => format!(
+            "rover · MOON {} · r {:.0} km · g {:.2} m/s\u{b2} · chunks {}(+{})",
+            mr.name,
+            mr.radius / 1000.0,
+            mr.gravity,
+            mr.streamer.live_count(),
+            mr.streamer.pending_count(),
+        ),
+        None => "rover".to_string(),
+    };
     // A clear paused banner (WI 638); during replay (WI 648) show the scrub position instead.
     let paused = if cam.is_playback() {
         format!(
@@ -2446,12 +2704,12 @@ fn update_test_hud(
                     .map(|r| format!("\n{}", r.hud_line()))
                     .unwrap_or_default();
                 text.0 = format!(
-                    "workshop · TEST (rover){paused}\n💥 CHASSIS FRACTURED — {pieces} piece(s)\ndriving ended · Backspace → BUILD to rebuild{impact}"
+                    "workshop · TEST ({scene_tag}){paused}\n💥 CHASSIS FRACTURED — {pieces} piece(s)\ndriving ended · Backspace → BUILD to rebuild{impact}"
                 );
                 return;
             }
             let speed = rs.rover.body.velocity.length();
-            let height = rs.rover.height_above_terrain(&rs.terrain);
+            let height = rs.rover.height_above_terrain(&rs.ground);
             let live = rs.rover.wheels.iter().filter(|w| !w.inert).count();
             let impact = rs
                 .last_impact
@@ -2473,7 +2731,7 @@ fn update_test_hud(
                 })
                 .unwrap_or_default();
             text.0 = format!(
-                "workshop · TEST (rover){paused}\nspeed:  {speed:6.2} m/s\nheight: {height:6.2} m\nwheels: {live}/{}{tires}\n{}:  {:3.0}%{impact}",
+                "workshop · TEST ({scene_tag}){paused}\nspeed:  {speed:6.2} m/s\nheight: {height:6.2} m\nwheels: {live}/{}{tires}\n{}:  {:3.0}%{impact}",
                 rs.rover.wheels.len(),
                 rs.powertrain.label(),
                 rs.powertrain.fraction() * 100.0,
@@ -2588,7 +2846,14 @@ mod tests {
         assert_eq!(asm.rover.wheels.len(), 4);
         assert_eq!(asm.steer.len(), 2);
 
-        let world = WorkshopWorld::rover(asm, v);
+        let world = WorkshopWorld::rover(
+            asm,
+            v,
+            TestGround::Flat(Terrain {
+                amplitude: 0.0,
+                ..Default::default()
+            }),
+        );
         let rs = world.rover.as_ref().expect("rover world");
         // Rests on the pad: the CoM sits above the flat surface (height 0), finite.
         assert!(rs.rover.body.position.y > 0.0 && rs.rover.body.position.y.is_finite());

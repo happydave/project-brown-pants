@@ -18,7 +18,7 @@
 //! - `cargo run -p sounding -- land` — drop a craft and watch the collision response bring it to rest
 //! - `cargo run -p sounding -- collide` — fire a craft at another (and a debris pile) — craft↔craft collision
 //! - `cargo run -p sounding -- crash` — ram a frangible craft into a block — breakage-on-impact (it shatters)
-//! - `cargo run -p sounding -- workshop` — grounded build-and-test sandbox: Build (edit a craft) ↔ Test (fly what you built, with live ground collision), toggle with Enter
+//! - `cargo run -p sounding -- workshop` — grounded build-and-test sandbox: Build (edit a craft) ↔ Test (fly what you built, with live ground collision), toggle with Enter. Add `moon [seed]` (`-- workshop moon`) to Test a built rover on a generated cratered moon (WI 775)
 //! - `cargo run -p sounding -- materials` — preview a generated PBR material set on lit geometry
 //! - `cargo run -p sounding -- terrainmesh` — preview a generated MoGe terrain relief (glTF)
 //! - `cargo run -p sounding -- gallery` — part catalog viewer: every mechanical-kit part laid out by category, click to inspect
@@ -70,6 +70,7 @@ mod scene_water;
 mod skins_scene;
 mod sparkline;
 mod surface_scene;
+mod surface_stream;
 mod terrain_mesh_scene;
 mod voxel_skin;
 mod wind_tunnel_scene;
