@@ -31,6 +31,10 @@ live in the project's `tickets` repository under `docs/projects/sounding/`.
 - Run with dev tooling (Bevy Remote Protocol over HTTP): `cargo run -p sounding --features dev`
 - Test the headless core (no display required): `cargo test -p sounding_sim`
 - Quality gates: `cargo fmt --all --check` and `cargo clippy --all-targets`
+- Dev-build performance: the dev profile optimizes dependencies and the sim crate (root `Cargo.toml`
+  `[profile.dev...]`, WI 778) so a debug `cargo run` runs the engine + procedural surface at a playable
+  frame rate. The **first** build after a clean/checkout is slower (deps compile optimized once), then
+  cached; release builds are unaffected.
 
 ## Toy 5 — voxel ship editor
 
