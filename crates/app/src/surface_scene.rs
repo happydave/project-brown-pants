@@ -26,10 +26,19 @@ use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::light::{light_consts::lux, AtmosphereEnvironmentMapLight};
 use bevy::math::DVec3;
-use bevy::mesh::{Indices, PrimitiveTopology};
-use bevy::pbr::{Atmosphere, AtmosphereMode, AtmosphereSettings, ScatteringMedium};
+use bevy::mesh::{
+    Indices, MeshVertexAttribute, MeshVertexBufferLayoutRef, PrimitiveTopology, VertexFormat,
+};
+use bevy::pbr::{
+    Atmosphere, AtmosphereMode, AtmosphereSettings, ExtendedMaterial, MaterialExtension,
+    MaterialExtensionKey, MaterialExtensionPipeline, MaterialPlugin, ScatteringMedium,
+};
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
+use bevy::render::render_resource::{
+    AsBindGroup, RenderPipelineDescriptor, SpecializedMeshPipelineError,
+};
+use bevy::shader::ShaderRef;
 use bevy::tasks::{block_on, futures_lite::future, AsyncComputeTaskPool, Task};
 use std::collections::HashMap;
 
@@ -38,8 +47,8 @@ use sounding_sim::bodygen::{generate, Archetype};
 use sounding_sim::frame::{FrameId, WorldPos};
 use sounding_sim::surface_field::SurfaceField;
 use sounding_sim::surface_mesh::{
-    build_chunk, should_split, AtmosphereParams, ChunkMesh, QuadNode, DEFAULT_MAX_LEVEL,
-    DEFAULT_RESOLUTION,
+    build_chunk, morph_range, nominal_edge_len, should_split, AtmosphereParams, ChunkMesh,
+    QuadNode, DEFAULT_MAX_LEVEL, DEFAULT_RESOLUTION,
 };
 
 use crate::floating_origin::{
@@ -52,12 +61,53 @@ const UPLOAD_BUDGET: usize = 6;
 /// New mesh-build tasks spawned per frame (bounds the async backlog).
 const SPAWN_BUDGET: usize = 12;
 
+/// Custom vertex attribute: each surface vertex's CDLOD morph target (its position on
+/// the parent/coarser grid), consumed by the geomorph vertex shader at `@location(8)`.
+const ATTRIBUTE_MORPH_TARGET: MeshVertexAttribute =
+    MeshVertexAttribute::new("MorphTarget", 0x4d4f_5250_5447, VertexFormat::Float32x3);
+
+/// StandardMaterial extended with a CDLOD geomorph vertex shader. The extension uniform
+/// carries the per-level morph ramp `(start, end, _, _)` (camera-distance metres).
+type SurfaceGeomorph = ExtendedMaterial<StandardMaterial, GeomorphExt>;
+
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default)]
+struct GeomorphExt {
+    // Vertex-visible: the geomorph ramp is read in the vertex shader.
+    #[uniform(100, visibility(vertex))]
+    morph_range: Vec4,
+}
+
+impl MaterialExtension for GeomorphExt {
+    fn vertex_shader() -> ShaderRef {
+        "shaders/surface_geomorph.wgsl".into()
+    }
+
+    fn specialize(
+        _pipeline: &MaterialExtensionPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        layout: &MeshVertexBufferLayoutRef,
+        _key: MaterialExtensionKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        // Add the morph-target attribute (@location 8) alongside the standard ones so
+        // the custom vertex shader's input matches the uploaded mesh layout.
+        let vertex_layout = layout.0.get_layout(&[
+            Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
+            Mesh::ATTRIBUTE_NORMAL.at_shader_location(1),
+            Mesh::ATTRIBUTE_UV_0.at_shader_location(2),
+            ATTRIBUTE_MORPH_TARGET.at_shader_location(8),
+        ])?;
+        descriptor.vertex.buffers = vec![vertex_layout];
+        Ok(())
+    }
+}
+
 /// The procedural-surface streaming scene.
 pub struct SurfaceScenePlugin;
 
 impl Plugin for SurfaceScenePlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(FloatingOriginPlugin)
+            .add_plugins(MaterialPlugin::<SurfaceGeomorph>::default())
             .init_resource::<DebugOverlay>()
             .init_resource::<StreamStats>()
             .init_resource::<SurfaceTelemetry>()
@@ -88,9 +138,14 @@ struct SurfaceBody {
     center_world: DVec3,
 }
 
-/// The shared surface material (relief comes from per-vertex normals).
+/// The surface material: a base `StandardMaterial` config plus one geomorph material
+/// per LOD level (cached), so every chunk of a level shares an identical morph ramp
+/// (same-level shared edges stay matched) and streaming does not leak material assets.
 #[derive(Resource)]
-struct SurfaceMat(Handle<StandardMaterial>);
+struct SurfaceMat {
+    base: StandardMaterial,
+    by_level: HashMap<u32, Handle<SurfaceGeomorph>>,
+}
 
 /// Live (uploaded), in-flight (meshing), and built-but-not-yet-uploaded (ready)
 /// chunk state, keyed by quadtree node. The `ready` queue holds completed builds
@@ -102,7 +157,8 @@ struct ChunkStreamer {
     ready: Vec<(QuadNode, ChunkMesh)>,
 }
 
-/// Marks a streamed chunk entity (root-only despawn marker).
+/// Marks a streamed chunk entity (root-only despawn marker). The CDLOD morph factor is
+/// computed per-vertex in the geomorph shader, so no per-chunk node data is needed here.
 #[derive(Component)]
 struct SurfaceChunk;
 
@@ -239,22 +295,19 @@ fn body_tint(asset: &BodyAsset) -> Color {
     }
 }
 
-fn setup(
-    mut commands: Commands,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut scattering: ResMut<Assets<ScatteringMedium>>,
-) {
+fn setup(mut commands: Commands, mut scattering: ResMut<Assets<ScatteringMedium>>) {
     let (seed, archetype) = parse_args();
     let asset = generate(seed, archetype);
     let field = SurfaceField::from_asset(&asset);
     let radius = asset.radius;
     let center_world = DVec3::new(0.0, -radius, 0.0);
 
-    let material = materials.add(StandardMaterial {
+    // Base surface material config; per-level geomorph materials are built on demand.
+    let base_material = StandardMaterial {
         base_color: body_tint(&asset),
         perceptual_roughness: 1.0,
         ..default()
-    });
+    };
 
     // Sun (raw pre-scattering sunlight, the atmosphere's input).
     commands.spawn((
@@ -357,7 +410,10 @@ fn setup(
         field,
         center_world,
     });
-    commands.insert_resource(SurfaceMat(material));
+    commands.insert_resource(SurfaceMat {
+        base: base_material,
+        by_level: HashMap::new(),
+    });
     commands.insert_resource(ChunkStreamer::default());
 }
 
@@ -425,12 +481,13 @@ fn desired_leaves(camera_body: DVec3, radius: f64) -> Vec<QuadNode> {
 
 /// The CDLOD streaming step: compute desired leaves, enqueue new chunk builds
 /// off-thread, upload completed ones under budget, and despawn merged/stale nodes.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn stream_surface(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut mat: ResMut<SurfaceMat>,
+    mut geomorph_materials: ResMut<Assets<SurfaceGeomorph>>,
     body: Res<SurfaceBody>,
-    mat: Res<SurfaceMat>,
     mut streamer: ResMut<ChunkStreamer>,
     mut stats: ResMut<StreamStats>,
     camera: Query<&WorldPlacement, With<AnchorCamera>>,
@@ -473,10 +530,23 @@ fn stream_surface(
         }
         let mesh = to_bevy_mesh(&mut meshes, &chunk);
         let world = body.center_world + chunk.center;
+        // Per-level geomorph material (built once per level, shared by all its chunks).
+        let level = node.level;
+        if !mat.by_level.contains_key(&level) {
+            let (start, end) = morph_range(nominal_edge_len(level, radius));
+            let handle = geomorph_materials.add(SurfaceGeomorph {
+                base: mat.base.clone(),
+                extension: GeomorphExt {
+                    morph_range: Vec4::new(start, end, 0.0, 0.0),
+                },
+            });
+            mat.by_level.insert(level, handle);
+        }
+        let material = mat.by_level[&level].clone();
         let entity = commands
             .spawn((
                 Mesh3d(mesh),
-                MeshMaterial3d(mat.0.clone()),
+                MeshMaterial3d(material),
                 Transform::default(),
                 WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, world)),
                 SurfaceChunk,
@@ -540,7 +610,9 @@ fn stream_surface(
     };
 }
 
-/// Builds a Bevy `Mesh` from the headless chunk buffers.
+/// Builds a Bevy `Mesh` from the headless chunk buffers, including the CDLOD morph
+/// target as a custom vertex attribute (`ATTRIBUTE_MORPH_TARGET`, `@location(8)`) that
+/// the geomorph vertex shader blends toward per vertex.
 fn to_bevy_mesh(meshes: &mut Assets<Mesh>, chunk: &ChunkMesh) -> Handle<Mesh> {
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
@@ -549,6 +621,7 @@ fn to_bevy_mesh(meshes: &mut Assets<Mesh>, chunk: &ChunkMesh) -> Handle<Mesh> {
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, chunk.positions.clone());
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, chunk.normals.clone());
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, chunk.uvs.clone());
+    mesh.insert_attribute(ATTRIBUTE_MORPH_TARGET, chunk.morph_targets.clone());
     mesh.insert_indices(Indices::U32(chunk.indices.clone()));
     meshes.add(mesh)
 }

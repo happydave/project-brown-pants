@@ -228,8 +228,8 @@ impl QuadNode {
     }
 }
 
-/// A built chunk's render buffers. Positions/normals/UVs are parallel arrays;
-/// `indices` triangulates them. Positions are `f32` **relative to `center`**.
+/// A built chunk's render buffers. Positions/normals/UVs/morph-targets are parallel
+/// arrays; `indices` triangulates them. Positions are `f32` **relative to `center`**.
 #[derive(Clone, Debug)]
 pub struct ChunkMesh {
     /// The node's centre world point (metres, body-centred), the placement anchor.
@@ -240,6 +240,13 @@ pub struct ChunkMesh {
     pub normals: Vec<[f32; 3]>,
     /// Vertex texture coordinates.
     pub uvs: Vec<[f32; 2]>,
+    /// CDLOD morph targets: each vertex's position on the parent (one-level-coarser)
+    /// grid, `f32` relative to `center`. Blending `positions → morph_targets` by a
+    /// distance-driven factor collapses the chunk onto the coarse geometry, so a
+    /// fully-morphed fine chunk matches its coarse neighbour (no seam) and level
+    /// changes are continuous (no pop). Skirt vertices carry their own position
+    /// (skirts do not morph).
+    pub morph_targets: Vec<[f32; 3]>,
     /// Triangle indices (three per triangle).
     pub indices: Vec<u32>,
 }
@@ -255,6 +262,43 @@ pub fn should_split(node: QuadNode, camera_world: DVec3, radius: f64, max_level:
     let dist = (camera_world - center_world).length();
     let size = node.edge_len(radius);
     dist < size * SPLIT_RANGE_FACTOR
+}
+
+/// Fraction of a chunk's resident distance band (nearest → merge) over which it
+/// morphs toward its parent. The factor is 0 up to `(1 − MORPH_REGION)` of the band
+/// and ramps to 1 at the far (merge) edge — so a chunk is fully morphed to the coarse
+/// shape exactly where it borders a one-level-coarser neighbour (seamless seam) and
+/// where it merges into its parent (no pop), and its finer children spawn fully
+/// morphed at their far edge (no pop on split).
+pub const MORPH_REGION: f64 = 0.35;
+
+/// The camera-distance `(start, end)` (metres) of the CDLOD morph ramp for a chunk of
+/// world edge `edge_len`. The chunk's resident band is `[R·edge, 2·R·edge]`
+/// (`R = SPLIT_RANGE_FACTOR`); morph is 0 up to `start` and ramps to 1 at `end` (the far
+/// / merge edge), covering the top `MORPH_REGION` of the band. The render vertex shader
+/// applies `smoothstep(start, end, per_vertex_distance)` so the factor is continuous in
+/// space — shared edge vertices (same distance, same range) get the same factor and
+/// stay matched, and a chunk reaches full morph exactly where it borders a coarser
+/// neighbour or merges.
+pub fn morph_range(edge_len: f64) -> (f32, f32) {
+    let near = SPLIT_RANGE_FACTOR * edge_len;
+    let far = 2.0 * near; // = SPLIT_RANGE_FACTOR * parent edge_len
+    let start = far - MORPH_REGION * (far - near);
+    (start as f32, far as f32)
+}
+
+/// A representative world edge length (metres) for all chunks at `level`, sampled at a
+/// mid-face node so the per-level morph ramp is shared by every chunk of that level —
+/// so same-level neighbours use an identical ramp and their shared edges match exactly.
+pub fn nominal_edge_len(level: u32, radius: f64) -> f64 {
+    let c = (1u32 << level) / 2;
+    QuadNode {
+        face: CubeFace::PosZ,
+        level,
+        i: c,
+        j: c,
+    }
+    .edge_len(radius)
 }
 
 /// How far the straight chord of an edge of chord-length `edge_len` sinks below the
@@ -298,8 +342,13 @@ pub fn chunk_relief(field: &SurfaceField, node: QuadNode, res: u32) -> f64 {
 
 /// Builds the chunk mesh for `node` at grid resolution `res` (quads per side),
 /// sampling `field`. Deterministic and pure: identical inputs → identical buffers.
+///
+/// `res` is forced **even** (odd rounded up): CDLOD morph targets need the parent
+/// grid to sample every other vertex, so the border indices (0 and `res`) must be
+/// even and each interior odd vertex must sit between two even neighbours.
 pub fn build_chunk(field: &SurfaceField, node: QuadNode, res: u32) -> ChunkMesh {
     let res = res.max(1);
+    let res = res + (res & 1); // even: parent grid uses every other vertex
     let (u0, u1, v0, v1) = node.uv_rect();
     let radius = field.radius();
     let n = (res + 1) as usize;
@@ -346,6 +395,32 @@ pub fn build_chunk(field: &SurfaceField, node: QuadNode, res: u32) -> ChunkMesh 
         }
     }
 
+    // CDLOD morph targets: for each surface vertex, the position it would occupy on
+    // the parent (coarser) grid — the bilinear interpolation of the surrounding
+    // even-index vertices (itself when both indices are even; the midpoint of two
+    // even neighbours on an edge; the average of the four even corners in a cell).
+    // The parent samples the even vertices, which coincide with these even surface
+    // vertices, so this equals the coarse neighbour's geometry. Computed from the
+    // `world_of` grid already sampled — no extra field evaluation.
+    let world_at = |a: u32, b: u32| world_of[(b * (res + 1) + a) as usize].1;
+    let mut morph_targets = Vec::with_capacity(vert_count);
+    for b in 0..=res {
+        for a in 0..=res {
+            let target = match (a & 1, b & 1) {
+                (0, 0) => world_at(a, b),
+                (1, 0) => 0.5 * (world_at(a - 1, b) + world_at(a + 1, b)),
+                (0, 1) => 0.5 * (world_at(a, b - 1) + world_at(a, b + 1)),
+                _ => {
+                    0.25 * (world_at(a - 1, b - 1)
+                        + world_at(a + 1, b - 1)
+                        + world_at(a - 1, b + 1)
+                        + world_at(a + 1, b + 1))
+                }
+            };
+            morph_targets.push((target - center).as_vec3().to_array());
+        }
+    }
+
     // Skirt: a wall hanging inward from each border edge, deep enough to cover the
     // LOD-boundary gap against a one-level-coarser neighbour — its terrain relief
     // (bounded by this chunk's relief) *and* its curvature sagitta (the chord of a
@@ -364,11 +439,16 @@ pub fn build_chunk(field: &SurfaceField, node: QuadNode, res: u32) -> ChunkMesh 
         &mut indices,
     );
 
+    // Skirt vertices do not morph: their target is their own position, so the morph
+    // blend is a no-op on the skirt regardless of the chunk's morph factor.
+    morph_targets.extend_from_slice(&positions[vert_count..]);
+
     ChunkMesh {
         center,
         positions,
         normals,
         uvs,
+        morph_targets,
         indices,
     }
 }
@@ -583,8 +663,127 @@ mod tests {
         let b = build_chunk(&f, node, 8);
         assert_eq!(a.positions, b.positions);
         assert_eq!(a.normals, b.normals);
+        assert_eq!(a.morph_targets, b.morph_targets);
         assert_eq!(a.indices, b.indices);
         assert_eq!(a.center, b.center);
+    }
+
+    #[test]
+    fn morph_range_brackets_the_top_of_the_resident_band() {
+        // Resident band is [2.5·edge, 5·edge]; the ramp ends at the far/merge edge and
+        // starts MORPH_REGION back from it, entirely inside the band.
+        let edge = 1000.0;
+        let near = SPLIT_RANGE_FACTOR * edge;
+        let far = 2.0 * near;
+        let (start, end) = morph_range(edge);
+        assert!(
+            (end as f64 - far).abs() < 1e-3,
+            "ramp ends at the merge edge"
+        );
+        assert!(
+            start as f64 > near,
+            "ramp starts inside the band (after near)"
+        );
+        assert!(start < end, "start precedes end");
+        let expected_start = far - MORPH_REGION * (far - near);
+        assert!((start as f64 - expected_start).abs() < 1e-3);
+    }
+
+    #[test]
+    fn nominal_edge_len_matches_a_mid_face_node() {
+        for level in 0..6u32 {
+            let e = nominal_edge_len(level, R);
+            assert!(e > 0.0 && e.is_finite());
+            // Coarser levels have longer edges.
+            if level > 0 {
+                assert!(e < nominal_edge_len(level - 1, R));
+            }
+        }
+    }
+
+    #[test]
+    fn morph_targets_are_the_parent_grid_interpolation() {
+        // Even/even vertices morph to themselves (they coincide with parent samples);
+        // odd vertices morph to the average of their even neighbours (the coarse
+        // chord). On a sphere that average sits below the surface, so an odd vertex
+        // actually moves inward under morph.
+        let f = field();
+        let node = QuadNode {
+            face: CubeFace::PosX,
+            level: 3,
+            i: 3,
+            j: 2,
+        };
+        let res = 8u32;
+        let m = build_chunk(&f, node, res);
+        assert_eq!(m.morph_targets.len(), m.positions.len());
+        let gi = |a: u32, b: u32| (b * (res + 1) + a) as usize;
+        let pos = |a: u32, b: u32| Vec3::from_array(m.positions[gi(a, b)]).as_dvec3();
+        let tgt = |a: u32, b: u32| Vec3::from_array(m.morph_targets[gi(a, b)]).as_dvec3();
+        let mut moved = false;
+        for b in 0..=res {
+            for a in 0..=res {
+                let expected = match (a & 1, b & 1) {
+                    (0, 0) => pos(a, b),
+                    (1, 0) => 0.5 * (pos(a - 1, b) + pos(a + 1, b)),
+                    (0, 1) => 0.5 * (pos(a, b - 1) + pos(a, b + 1)),
+                    _ => {
+                        0.25 * (pos(a - 1, b - 1)
+                            + pos(a + 1, b - 1)
+                            + pos(a - 1, b + 1)
+                            + pos(a + 1, b + 1))
+                    }
+                };
+                assert!(
+                    (tgt(a, b) - expected).length() < 0.5,
+                    "morph target ({a},{b}) off parent-grid interpolation"
+                );
+                if (a & 1, b & 1) == (0, 0) {
+                    assert_eq!(m.morph_targets[gi(a, b)], m.positions[gi(a, b)]);
+                } else if (tgt(a, b) - pos(a, b)).length() > 1.0 {
+                    moved = true;
+                }
+            }
+        }
+        assert!(
+            moved,
+            "odd vertices should morph away from the true surface"
+        );
+    }
+
+    #[test]
+    fn fully_morphed_child_edge_matches_the_parent_edge() {
+        // The seam-matching property: a child chunk fully morphed to its parent grid
+        // reproduces the parent's rendered edge exactly, so at a LOD boundary the
+        // fine (fully-morphed) edge coincides with the coarse neighbour — no step.
+        let f = field();
+        let parent = QuadNode {
+            face: CubeFace::PosZ,
+            level: 3,
+            i: 2,
+            j: 5,
+        };
+        let child = parent.children()[0]; // shares the parent's u0/v0 corner + edges
+        let res = 8u32;
+        let p = build_chunk(&f, parent, res);
+        let c = build_chunk(&f, child, res);
+        let gi = |a: u32, b: u32| (b * (res + 1) + a) as usize;
+        // World point of a parent surface vertex on its b=0 edge.
+        let parent_edge = |ci: u32| p.center + Vec3::from_array(p.positions[gi(ci, 0)]).as_dvec3();
+        // World point of the child's fully-morphed b=0 edge vertex.
+        let child_morphed =
+            |a: u32| c.center + Vec3::from_array(c.morph_targets[gi(a, 0)]).as_dvec3();
+        for a in 0..=res {
+            let expected = if a & 1 == 0 {
+                parent_edge(a / 2)
+            } else {
+                0.5 * (parent_edge((a - 1) / 2) + parent_edge(a.div_ceil(2)))
+            };
+            assert!(
+                (child_morphed(a) - expected).length() < 1.0,
+                "child morphed edge vertex {a} does not lie on the parent edge"
+            );
+        }
     }
 
     #[test]
