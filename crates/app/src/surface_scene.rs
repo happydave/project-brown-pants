@@ -52,6 +52,7 @@ use sounding_sim::surface_mesh::{
 };
 use sounding_sim::surface_scan::resident_leaves;
 
+use crate::debug_control::{DebugCameraContext, DebugControllable, DebugOverlayState};
 use crate::floating_origin::{
     render_translation, AnchorCamera, FloatingOrigin, FloatingOriginPlugin, WorldPlacement,
 };
@@ -109,7 +110,6 @@ impl Plugin for SurfaceScenePlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(FloatingOriginPlugin)
             .add_plugins(MaterialPlugin::<SurfaceGeomorph>::default())
-            .init_resource::<DebugOverlay>()
             .init_resource::<StreamStats>()
             .init_resource::<SurfaceTelemetry>()
             .add_systems(Startup, setup)
@@ -162,10 +162,6 @@ struct ChunkStreamer {
 /// computed per-vertex in the geomorph shader, so no per-chunk node data is needed here.
 #[derive(Component)]
 struct SurfaceChunk;
-
-/// Whether the debug overlay (LOD wireframe + contact patch) is shown.
-#[derive(Resource, Default)]
-struct DebugOverlay(bool);
 
 #[derive(Component)]
 struct HudText;
@@ -335,6 +331,8 @@ fn setup(mut commands: Commands, mut scattering: ResMut<Assets<ScatteringMedium>
             DVec3::new(0.0, start_alt, start_alt * 0.4),
         )),
         AnchorCamera,
+        // Drivable over the bus for headless visual diagnosis (WI 784).
+        DebugControllable,
     ));
     // Per-body atmosphere (R5, data-driven): airless bodies get no atmosphere.
     if let Some(a) = AtmosphereParams::from_asset(&asset) {
@@ -416,6 +414,9 @@ fn setup(mut commands: Commands, mut scattering: ResMut<Assets<ScatteringMedium>
         by_level: HashMap::new(),
     });
     commands.insert_resource(ChunkStreamer::default());
+    // Body frame for bus-driven debug camera placement (WI 784): body-relative poses
+    // resolve against this centre + radius.
+    commands.insert_resource(DebugCameraContext(Some((center_world, radius))));
 }
 
 /// Toggle the telemetry box (`F4`), then — decimated to a readable rate — sample
@@ -673,7 +674,7 @@ fn fly_camera(
 }
 
 /// Toggles the debug overlay with `F3`.
-fn toggle_overlay(keys: Res<ButtonInput<KeyCode>>, mut overlay: ResMut<DebugOverlay>) {
+fn toggle_overlay(keys: Res<ButtonInput<KeyCode>>, mut overlay: ResMut<DebugOverlayState>) {
     if keys.just_pressed(KeyCode::F3) {
         overlay.0 = !overlay.0;
     }
@@ -682,7 +683,7 @@ fn toggle_overlay(keys: Res<ButtonInput<KeyCode>>, mut overlay: ResMut<DebugOver
 /// Debug overlay (R7): resident chunk outlines coloured by LOD level, plus the
 /// contact-patch sample (surface point + outward normal) under the camera nadir.
 fn draw_overlay(
-    overlay: Res<DebugOverlay>,
+    overlay: Res<DebugOverlayState>,
     origin: Res<FloatingOrigin>,
     body: Res<SurfaceBody>,
     streamer: Res<ChunkStreamer>,
@@ -739,7 +740,7 @@ fn lod_color(level: u32) -> Color {
 /// Updates the HUD each frame.
 fn hud(
     body: Res<SurfaceBody>,
-    overlay: Res<DebugOverlay>,
+    overlay: Res<DebugOverlayState>,
     streamer: Res<ChunkStreamer>,
     camera: Query<&WorldPlacement, With<AnchorCamera>>,
     mut text: Query<&mut Text, With<HudText>>,

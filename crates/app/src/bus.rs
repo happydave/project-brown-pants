@@ -4,11 +4,14 @@
 //! returns a bounded ring of recent snapshots as a JSON array (WI 644);
 //! `POST /command` injects a JSON [`Command`] into the executor (malformed input →
 //! HTTP 400); `GET /screenshot` triggers a framebuffer capture saved to a file the
-//! caller reads back (WI 647); `POST /replay` drives the Tier-B replay cam (WI 648). The server
+//! caller reads back (WI 647); `POST /replay` drives the Tier-B replay cam (WI 648);
+//! `POST /camera` + `POST /debug` drive the debug camera / overlays and `GET /camera`
+//! returns the current camera pose (WI 784). The server
 //! runs on its own thread, bridged to Bevy by channels, so network I/O never
 //! blocks the sim loop. This is the **runtime** surface — distinct from the
 //! dev-gated Bevy Remote Protocol god-mode surface.
 
+use crate::debug_control::{DebugCameraState, DebugCommand};
 use crate::replay::ReplayCommand;
 use bevy::diagnostic::DiagnosticsStore;
 use bevy::prelude::*;
@@ -60,6 +63,17 @@ struct ScreenshotPath(String);
 #[derive(Resource)]
 struct BusReplayRx(Mutex<Receiver<ReplayCommand>>);
 
+/// Debug camera/overlay actions received by the server thread (WI 784), drained into
+/// `DebugCommand` messages — so the assistant can frame + inspect visual artifacts
+/// (`POST /camera`, `POST /debug`) without a human at the keyboard.
+#[derive(Resource)]
+struct BusDebugRx(Mutex<Receiver<DebugCommand>>);
+
+/// The latest debug-camera pose JSON, written by Bevy (`publish_camera`) and served by the
+/// server thread at `GET /camera` (WI 784) so an agent can read where it framed.
+#[derive(Resource)]
+struct BusCamera(Arc<Mutex<String>>);
+
 /// Bridge from an active scene to the bus publisher (WI 569): the latest active-craft
 /// autonomy snapshot. A scene that owns a `FlightCraft` (e.g. `-- play`, `-- autopilot`)
 /// writes it each frame; `publish_telemetry` attaches it. `None` ⇒ orbit-only telemetry.
@@ -95,6 +109,8 @@ impl Plugin for BusPlugin {
         let (tx, rx) = mpsc::channel::<Command>();
         let (shot_tx, shot_rx) = mpsc::channel::<()>();
         let (replay_tx, replay_rx) = mpsc::channel::<ReplayCommand>();
+        let (debug_tx, debug_rx) = mpsc::channel::<DebugCommand>();
+        let camera = Arc::new(Mutex::new("{\"available\":false}".to_owned()));
         // An absolute path next to the working directory, so the (same-machine) MCP can read it back.
         let shot_path = std::env::current_dir()
             .unwrap_or_default()
@@ -106,7 +122,10 @@ impl Plugin for BusPlugin {
             Ok(server) => {
                 let shared = telemetry.clone();
                 let path = shot_path.clone();
-                thread::spawn(move || serve(server, shared, tx, shot_tx, replay_tx, path));
+                let cam = camera.clone();
+                thread::spawn(move || {
+                    serve(server, shared, tx, shot_tx, replay_tx, debug_tx, cam, path)
+                });
                 info!("bus: listening on http://127.0.0.1:{}", self.port);
             }
             Err(e) => warn!(
@@ -120,9 +139,12 @@ impl Plugin for BusPlugin {
             .insert_resource(BusScreenshotRx(Mutex::new(shot_rx)))
             .insert_resource(ScreenshotPath(shot_path))
             .insert_resource(BusReplayRx(Mutex::new(replay_rx)))
+            .insert_resource(BusDebugRx(Mutex::new(debug_rx)))
+            .insert_resource(BusCamera(camera))
             .init_resource::<ActiveFlight>()
             .init_resource::<GroundedRover>()
             .init_resource::<DiveThermal>()
+            .init_resource::<DebugCameraState>()
             .add_systems(
                 Update,
                 (
@@ -130,6 +152,8 @@ impl Plugin for BusPlugin {
                     drain_commands,
                     drain_screenshots,
                     drain_replays,
+                    drain_debug,
+                    publish_camera,
                 ),
             );
     }
@@ -143,6 +167,8 @@ fn serve(
     tx: Sender<Command>,
     shot_tx: Sender<()>,
     replay_tx: Sender<ReplayCommand>,
+    debug_tx: Sender<DebugCommand>,
+    camera: Arc<Mutex<String>>,
     shot_path: String,
 ) {
     for mut request in server.incoming_requests() {
@@ -151,7 +177,8 @@ fn serve(
         let mut body = String::new();
         let _ = request.as_reader().read_to_string(&mut body);
         let (status, payload) = handle_request(
-            &method, &url, &body, &telemetry, &tx, &shot_tx, &replay_tx, &shot_path,
+            &method, &url, &body, &telemetry, &tx, &shot_tx, &replay_tx, &debug_tx, &camera,
+            &shot_path,
         );
         let _ = request.respond(Response::from_string(payload).with_status_code(status));
     }
@@ -167,6 +194,8 @@ fn handle_request(
     tx: &Sender<Command>,
     shot_tx: &Sender<()>,
     replay_tx: &Sender<ReplayCommand>,
+    debug_tx: &Sender<DebugCommand>,
+    camera: &Mutex<String>,
     shot_path: &str,
 ) -> (u16, String) {
     match (method, url) {
@@ -207,6 +236,22 @@ fn handle_request(
             }
             Err(e) => (400, format!(r#"{{"error":"{e}"}}"#)),
         },
+        // Debug camera control (WI 784): `/camera` for placement/aim, `/debug` for overlays.
+        // Both carry a `DebugCommand`; the split is purely for the caller's clarity.
+        ("POST", "/camera") | ("POST", "/debug") => {
+            match serde_json::from_str::<DebugCommand>(body) {
+                Ok(cmd) => {
+                    let _ = debug_tx.send(cmd);
+                    (200, r#"{"ok":true}"#.to_owned())
+                }
+                Err(e) => (400, format!(r#"{{"error":"{e}"}}"#)),
+            }
+        }
+        ("GET", "/camera") => {
+            // The latest published debug-camera pose (or `{"available":false}`).
+            let pose = camera.lock().unwrap();
+            (200, pose.clone())
+        }
         _ => (404, r#"{"error":"not found"}"#.to_owned()),
     }
 }
@@ -292,6 +337,23 @@ fn drain_replays(rx: Res<BusReplayRx>, mut out: MessageWriter<ReplayCommand>) {
     }
 }
 
+/// Drains debug camera/overlay actions received over the bus into `DebugCommand` messages
+/// (WI 784), applied by `crate::debug_control::apply_debug_commands`.
+fn drain_debug(rx: Res<BusDebugRx>, mut out: MessageWriter<DebugCommand>) {
+    if let Ok(rx) = rx.0.lock() {
+        while let Ok(cmd) = rx.try_recv() {
+            out.write(cmd);
+        }
+    }
+}
+
+/// Publishes the current debug-camera pose JSON for `GET /camera` (WI 784).
+fn publish_camera(bus: Res<BusCamera>, state: Res<DebugCameraState>) {
+    if let (Ok(json), Ok(mut slot)) = (serde_json::to_string(&*state), bus.0.lock()) {
+        *slot = json;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,7 +362,7 @@ mod tests {
         Mutex::new(items.iter().map(|s| s.to_string()).collect())
     }
 
-    /// Route a request with throwaway command / screenshot / replay channels.
+    /// Route a request with throwaway command / screenshot / replay / debug channels.
     fn route(
         method: &str,
         url: &str,
@@ -310,6 +372,8 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let (stx, _srx) = mpsc::channel();
         let (rtx, _rrx) = mpsc::channel();
+        let (dtx, _drx) = mpsc::channel();
+        let camera = Mutex::new(r#"{"available":false}"#.to_owned());
         handle_request(
             method,
             url,
@@ -318,6 +382,8 @@ mod tests {
             &tx,
             &stx,
             &rtx,
+            &dtx,
+            &camera,
             "/tmp/shot.png",
         )
     }
@@ -369,6 +435,8 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let (stx, srx) = mpsc::channel();
         let (rtx, _rrx) = mpsc::channel();
+        let (dtx, _drx) = mpsc::channel();
+        let camera = Mutex::new(String::new());
         let (status, body) = handle_request(
             "GET",
             "/screenshot",
@@ -377,6 +445,8 @@ mod tests {
             &tx,
             &stx,
             &rtx,
+            &dtx,
+            &camera,
             "/tmp/shot.png",
         );
         assert_eq!(status, 200);
@@ -392,6 +462,8 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let (stx, _srx) = mpsc::channel();
         let (rtx, _rrx) = mpsc::channel();
+        let (dtx, _drx) = mpsc::channel();
+        let camera = Mutex::new(String::new());
         let (status, _) = handle_request(
             "POST",
             "/command",
@@ -400,6 +472,8 @@ mod tests {
             &tx,
             &stx,
             &rtx,
+            &dtx,
+            &camera,
             "/tmp/shot.png",
         );
         assert_eq!(status, 200);
@@ -412,6 +486,8 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let (stx, _srx) = mpsc::channel();
         let (rtx, rrx) = mpsc::channel();
+        let (dtx, _drx) = mpsc::channel();
+        let camera = Mutex::new(String::new());
         let (status, _) = handle_request(
             "POST",
             "/replay",
@@ -420,10 +496,79 @@ mod tests {
             &tx,
             &stx,
             &rtx,
+            &dtx,
+            &camera,
             "/tmp/shot.png",
         );
         assert_eq!(status, 200);
         assert_eq!(rrx.try_recv().unwrap(), ReplayCommand::Scrub(-2));
+    }
+
+    #[test]
+    fn post_camera_and_debug_are_accepted_and_forwarded() {
+        let telemetry = ring(&[]);
+        let (tx, _rx) = mpsc::channel();
+        let (stx, _srx) = mpsc::channel();
+        let (rtx, _rrx) = mpsc::channel();
+        let (dtx, drx) = mpsc::channel();
+        let camera = Mutex::new(r#"{"available":true}"#.to_owned());
+        // POST /camera → a DebugCommand on the debug channel.
+        let (status, _) = handle_request(
+            "POST",
+            "/camera",
+            r#"{"named_pose":"nadir_200km"}"#,
+            &telemetry,
+            &tx,
+            &stx,
+            &rtx,
+            &dtx,
+            &camera,
+            "/tmp/shot.png",
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            drx.try_recv().unwrap(),
+            DebugCommand::NamedPose("nadir_200km".to_owned())
+        );
+        // POST /debug (overlay) uses the same channel.
+        let (status, _) = handle_request(
+            "POST",
+            "/debug",
+            r#"{"set_overlay":{"lod":true}}"#,
+            &telemetry,
+            &tx,
+            &stx,
+            &rtx,
+            &dtx,
+            &camera,
+            "/tmp/shot.png",
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            drx.try_recv().unwrap(),
+            DebugCommand::SetOverlay { lod: Some(true) }
+        );
+        // GET /camera returns the published pose JSON.
+        let (status, body) = handle_request(
+            "GET",
+            "/camera",
+            "",
+            &telemetry,
+            &tx,
+            &stx,
+            &rtx,
+            &dtx,
+            &camera,
+            "/tmp/shot.png",
+        );
+        assert_eq!(status, 200);
+        assert_eq!(body, r#"{"available":true}"#);
+    }
+
+    #[test]
+    fn post_malformed_camera_is_rejected() {
+        let (status, _) = route("POST", "/camera", "not json", &ring(&[]));
+        assert_eq!(status, 400);
     }
 
     #[test]

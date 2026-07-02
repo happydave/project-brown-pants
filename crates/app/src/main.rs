@@ -46,6 +46,7 @@ mod collide_scene;
 mod compartments_scene;
 mod craft_library;
 mod crash_scene;
+mod debug_control;
 mod dive_scene;
 mod editor;
 mod floating_origin;
@@ -188,7 +189,8 @@ fn main() {
         .add_plugins(FlightControlPlugin)
         .add_plugins(SimDiagnosticsPlugin)
         .add_plugins(bus::BusPlugin::default())
-        .add_plugins(replay::ReplayPlugin);
+        .add_plugins(replay::ReplayPlugin)
+        .add_plugins(debug_control::DebugControlPlugin);
 
     match selected_scene() {
         Scene::Editor => {

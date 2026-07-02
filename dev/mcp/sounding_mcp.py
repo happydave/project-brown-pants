@@ -99,6 +99,52 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "set_camera",
+        "description": (
+            "Position/aim the scene's debug camera (POST /camera, WI 784) — for scenes with a "
+            "controllable camera (start: `-- surface`). `command` is a serialized DebugCommand, e.g. "
+            '{"set_orbit": {"altitude_m": 8000, "lat_deg": 12, "lon_deg": -30, "look": "nadir"}} '
+            '(look = "nadir" | "horizon" | {"direction": [x,y,z]}); '
+            '{"named_pose": "grazing_horizon_6km"}; '
+            '{"set_pose": {"position": [x,y,z], "look_at": [x,y,z]}} (metres from body centre); or '
+            '{"nudge": {"forward_m": 100, "yaw_deg": 5}}. Then get_screenshot; read get_camera for the '
+            "resulting pose. No-op in scenes without a controllable camera."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "object", "description": "A serialized DebugCommand."}
+            },
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "set_overlay",
+        "description": (
+            "Toggle debug overlays (POST /debug, WI 784). `command` is a DebugCommand, e.g. "
+            '{"set_overlay": {"lod": true}} to show the LOD/chunk wireframe overlay (F3). Pair with '
+            "get_screenshot to see which LOD levels meet at a seam."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "object", "description": "A serialized DebugCommand (set_overlay)."}
+            },
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "get_camera",
+        "description": (
+            "Read the debug camera's current pose (GET /camera, WI 784): body-relative position, "
+            "altitude, and look direction, or {\"available\": false} in scenes without a controllable "
+            "camera. Use to confirm where set_camera framed before screenshotting."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
 ]
 
 
@@ -161,6 +207,18 @@ def _call_tool(name: str, arguments: dict) -> dict:
             if command is None:
                 raise ValueError("send_command requires a `command` object")
             text = _http_post("/command", json.dumps(command))
+        elif name == "set_camera":
+            command = arguments.get("command")
+            if command is None:
+                raise ValueError("set_camera requires a `command` (DebugCommand)")
+            text = _http_post("/camera", json.dumps(command))
+        elif name == "set_overlay":
+            command = arguments.get("command")
+            if command is None:
+                raise ValueError("set_overlay requires a `command` (DebugCommand)")
+            text = _http_post("/debug", json.dumps(command))
+        elif name == "get_camera":
+            text = _http_get("/camera")
         else:
             raise ValueError(f"unknown tool: {name}")
         return {"content": [{"type": "text", "text": text}]}
