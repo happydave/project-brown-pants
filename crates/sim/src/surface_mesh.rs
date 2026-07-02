@@ -264,32 +264,101 @@ pub fn should_split(node: QuadNode, camera_world: DVec3, radius: f64, max_level:
     dist < size * SPLIT_RANGE_FACTOR
 }
 
-/// Fraction of a chunk's resident distance band (nearest → merge) over which it
-/// morphs toward its parent. The factor is 0 up to `(1 − MORPH_REGION)` of the band
-/// and ramps to 1 at the far (merge) edge — so a chunk is fully morphed to the coarse
-/// shape exactly where it borders a one-level-coarser neighbour (seamless seam) and
-/// where it merges into its parent (no pop), and its finer children spawn fully
-/// morphed at their far edge (no pop on split).
-pub const MORPH_REGION: f64 = 0.35;
+/// How far a chunk's shared boundary can sit from its node **centre**, as a fraction of
+/// the node's edge — half an edge. A node's LOD split test uses its centre distance, but
+/// the edge it shares with a neighbour spans centre ± half-edge; the morph ramp must
+/// account for that offset (WI 783). See [`morph_range`].
+const EDGE_OFFSET_FACTOR: f64 = 0.5;
 
-/// The camera-distance `(start, end)` (metres) of the CDLOD morph ramp for a chunk of
-/// world edge `edge_len`. The chunk's resident band is `[R·edge, 2·R·edge]`
-/// (`R = SPLIT_RANGE_FACTOR`); morph is 0 up to `start` and ramps to 1 at `end` (the far
-/// / merge edge), covering the top `MORPH_REGION` of the band. The render vertex shader
-/// applies `smoothstep(start, end, per_vertex_distance)` so the factor is continuous in
-/// space — shared edge vertices (same distance, same range) get the same factor and
-/// stay matched, and a chunk reaches full morph exactly where it borders a coarser
-/// neighbour or merges.
-pub fn morph_range(edge_len: f64) -> (f32, f32) {
-    let near = SPLIT_RANGE_FACTOR * edge_len;
-    let far = 2.0 * near; // = SPLIT_RANGE_FACTOR * parent edge_len
-    let start = far - MORPH_REGION * (far - near);
-    (start as f32, far as f32)
+/// The smallest world edge length (metres) among all nodes at `level` — the face-corner
+/// node `(i=0, j=0)`, since the spherified-cube map compresses toward face corners
+/// (verified exact against a full-face scan, WI 783). A level-`level` node stops
+/// splitting (and can thus expose a coarser neighbour to a finer chunk) at the earliest
+/// when its edge is this small.
+pub fn min_edge_len(level: u32, radius: f64) -> f64 {
+    QuadNode {
+        face: CubeFace::PosZ,
+        level,
+        i: 0,
+        j: 0,
+    }
+    .edge_len(radius)
+}
+
+/// The largest world edge length (metres) among all nodes at `level`. The maximum lies in
+/// the face's last column/row (the spherified-cube stretches most away from face centres;
+/// verified against a full-face scan, WI 783), so it is found by scanning that 1-D border
+/// — exactly for shallow levels, and by a bounded subsample for deep ones where the edge
+/// length varies smoothly (the tiny sampling error is immaterial: deep-level morph windows
+/// are wide). A level-`level` node stops splitting at the latest when its edge is this
+/// large.
+pub fn max_edge_len(level: u32, radius: f64) -> f64 {
+    let side = 1u32 << level;
+    // Cap the number of samples so deep levels stay cheap; the border edge length is
+    // smooth there, so subsampling misses the true max by a negligible amount.
+    let step = (side / 2048).max(1);
+    let mut mx = 0.0f64;
+    let mut k = 0u32;
+    while k < side {
+        // Last column (i = side−1) and last row (j = side−1).
+        mx = mx.max(
+            QuadNode {
+                face: CubeFace::PosZ,
+                level,
+                i: side - 1,
+                j: k,
+            }
+            .edge_len(radius),
+        );
+        mx = mx.max(
+            QuadNode {
+                face: CubeFace::PosZ,
+                level,
+                i: k,
+                j: side - 1,
+            }
+            .edge_len(radius),
+        );
+        k += step;
+    }
+    mx
+}
+
+/// The camera-distance `(start, end)` (metres) of the CDLOD morph ramp for chunks at
+/// `level` on a body of `radius`. Two constraints make an LOD boundary seamless (WI 783):
+/// where a chunk borders a **coarser** neighbour it must be **fully** morphed to the
+/// parent shape (factor 1), and where it borders a **finer** neighbour it must be
+/// **un**-morphed (factor 0) — because the finer side morphs to *this* chunk's un-morphed
+/// geometry. Those two boundary families are separated in distance, so the ramp is placed
+/// in the quiet zone between them:
+/// - `end` = `(SPLIT_RANGE_FACTOR − EDGE_OFFSET) · min_edge_len(level−1)`: the nearest a
+///   one-level-coarser neighbour can appear (its smallest node stops splitting at
+///   `SPLIT_RANGE_FACTOR · min_edge`, and the shared edge is up to half a node nearer).
+///   Fully morphed by here ⇒ no step against a coarser neighbour.
+/// - `start` = `(SPLIT_RANGE_FACTOR + EDGE_OFFSET) · max_edge_len(level)`: the farthest a
+///   finer-neighbour boundary of *this* level can sit. Un-morphed until here ⇒ a finer
+///   neighbour (morphing to this chunk) still matches.
+///
+/// The range depends only on `level`, so same-level neighbours share an identical factor
+/// and their shared edges stay matched. The render vertex shader applies
+/// `smoothstep(start, end, per_vertex_distance)`, continuous in space. Level 0 never
+/// borders a coarser neighbour, so it never morphs (a disjoint range beyond any real
+/// distance yields factor 0).
+pub fn morph_range(level: u32, radius: f64) -> (f32, f32) {
+    if level == 0 {
+        // No coarser neighbour ever borders a root; keep it un-morphed with a
+        // well-formed (start < end) range beyond any real camera distance.
+        return (1.0e12, 2.0e12);
+    }
+    let start = (SPLIT_RANGE_FACTOR + EDGE_OFFSET_FACTOR) * max_edge_len(level, radius);
+    let end = (SPLIT_RANGE_FACTOR - EDGE_OFFSET_FACTOR) * min_edge_len(level - 1, radius);
+    (start as f32, end as f32)
 }
 
 /// A representative world edge length (metres) for all chunks at `level`, sampled at a
-/// mid-face node so the per-level morph ramp is shared by every chunk of that level —
-/// so same-level neighbours use an identical ramp and their shared edges match exactly.
+/// mid-face node — a per-level scale roughly midway between [`min_edge_len`] and
+/// [`max_edge_len`]. (The morph ramp is anchored on the min/max extremes, not this; kept
+/// as a convenient level scale and used in tests.)
 pub fn nominal_edge_len(level: u32, radius: f64) -> f64 {
     let c = (1u32 << level) / 2;
     QuadNode {
@@ -669,24 +738,57 @@ mod tests {
     }
 
     #[test]
-    fn morph_range_brackets_the_top_of_the_resident_band() {
-        // Resident band is [2.5·edge, 5·edge]; the ramp ends at the far/merge edge and
-        // starts MORPH_REGION back from it, entirely inside the band.
-        let edge = 1000.0;
-        let near = SPLIT_RANGE_FACTOR * edge;
-        let far = 2.0 * near;
-        let (start, end) = morph_range(edge);
+    fn morph_ramp_sits_in_the_quiet_zone_between_transitions() {
+        // WI 783: the ramp must complete before the nearest coarser-neighbour boundary
+        // (`end`) and not start until past the farthest finer-neighbour boundary of this
+        // level (`start`), so a chunk is fully morphed against a coarser neighbour and
+        // un-morphed against a finer one. Verify the ramp is well-formed (start < end) at
+        // every non-root level and that the anchors match the geometric definition.
+        for level in 1..18u32 {
+            let (start, end) = morph_range(level, R);
+            let (start, end) = (start as f64, end as f64);
+            assert!(
+                start < end,
+                "level {level}: start ({start}) precedes end ({end})"
+            );
+            let expect_start = (SPLIT_RANGE_FACTOR + EDGE_OFFSET_FACTOR) * max_edge_len(level, R);
+            let expect_end = (SPLIT_RANGE_FACTOR - EDGE_OFFSET_FACTOR) * min_edge_len(level - 1, R);
+            assert!(
+                (start - expect_start).abs() < 1.0,
+                "level {level}: start anchor"
+            );
+            assert!((end - expect_end).abs() < 1.0, "level {level}: end anchor");
+        }
+        // Level 0 never morphs: the range is beyond any real distance, so factor is 0.
+        let (s0, e0) = morph_range(0, R);
         assert!(
-            (end as f64 - far).abs() < 1e-3,
-            "ramp ends at the merge edge"
+            s0 < e0 && s0 as f64 > 1.0e9,
+            "root is effectively un-morphed"
         );
-        assert!(
-            start as f64 > near,
-            "ramp starts inside the band (after near)"
-        );
-        assert!(start < end, "start precedes end");
-        let expected_start = far - MORPH_REGION * (far - near);
-        assert!((start as f64 - expected_start).abs() < 1e-3);
+    }
+
+    #[test]
+    fn max_and_min_edge_len_bracket_the_face() {
+        // min = face-corner node; max in the last column/row. Both bracket every node.
+        for level in 1..7u32 {
+            let side = 1u32 << level;
+            let (mn, mx) = (min_edge_len(level, R), max_edge_len(level, R));
+            for i in 0..side {
+                for j in 0..side {
+                    let e = QuadNode {
+                        face: CubeFace::PosZ,
+                        level,
+                        i,
+                        j,
+                    }
+                    .edge_len(R);
+                    assert!(
+                        e >= mn - 1.0 && e <= mx + 1.0,
+                        "edge {e} outside [{mn},{mx}]"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

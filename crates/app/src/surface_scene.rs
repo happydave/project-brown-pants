@@ -47,8 +47,8 @@ use sounding_sim::bodygen::{generate, Archetype};
 use sounding_sim::frame::{FrameId, WorldPos};
 use sounding_sim::surface_field::SurfaceField;
 use sounding_sim::surface_mesh::{
-    build_chunk, morph_range, nominal_edge_len, AtmosphereParams, ChunkMesh, QuadNode,
-    DEFAULT_MAX_LEVEL, DEFAULT_RESOLUTION,
+    build_chunk, morph_range, AtmosphereParams, ChunkMesh, QuadNode, DEFAULT_MAX_LEVEL,
+    DEFAULT_RESOLUTION,
 };
 use sounding_sim::surface_scan::resident_leaves;
 
@@ -526,7 +526,7 @@ fn stream_surface(
         // Per-level geomorph material (built once per level, shared by all its chunks).
         let level = node.level;
         if !mat.by_level.contains_key(&level) {
-            let (start, end) = morph_range(nominal_edge_len(level, radius));
+            let (start, end) = morph_range(level, radius);
             let handle = geomorph_materials.add(SurfaceGeomorph {
                 base: mat.base.clone(),
                 extension: GeomorphExt {

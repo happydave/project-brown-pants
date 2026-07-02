@@ -7,19 +7,19 @@
 //! skirts (WI 779). A *seam* is where two adjacent chunks render **different** surface
 //! positions at the boundary they share. Because the renderer's geometry is fully
 //! determined by pure functions in [`crate::surface_mesh`] (`build_chunk`, `morph_range`,
-//! `nominal_edge_len`, `should_split`), this disagreement is computable here.
+//! `should_split`), this disagreement is computable here.
 //!
 //! The scan reproduces exactly what the WI 780 shader draws: a vertex at base-relative
 //! position `b` with morph target `t` renders at `b + f·(t − b)`, where
 //! `f = smoothstep(start, end, |camera − b_world|)` and
-//! `(start, end) = morph_range(nominal_edge_len(level))`. Skirts are a *cover* for
+//! `(start, end) = morph_range(level, radius)`. Skirts are a *cover* for
 //! residual gaps, not surface, so the primary metric is the surface gap; the report also
 //! notes the finer chunk's skirt depth for context.
 
 use crate::surface_field::SurfaceField;
 use crate::surface_mesh::{
-    build_chunk, chunk_relief, direction, morph_range, nominal_edge_len, should_split,
-    skirt_depth_for, CubeFace, QuadNode, DEFAULT_MAX_LEVEL, DEFAULT_RESOLUTION,
+    build_chunk, chunk_relief, direction, morph_range, should_split, skirt_depth_for, CubeFace,
+    QuadNode, DEFAULT_MAX_LEVEL, DEFAULT_RESOLUTION,
 };
 use glam::{DVec3, Vec3};
 
@@ -163,7 +163,7 @@ fn build_leaf(
     let res = res.max(1);
     let res = res + (res & 1); // build_chunk forces even; mirror it for indexing
     let (u0, u1, v0, v1) = node.uv_rect();
-    let (start, end) = morph_range(nominal_edge_len(node.level, radius));
+    let (start, end) = morph_range(node.level, radius);
     let (start, end) = (start as f64, end as f64);
 
     let vert = |a: u32, b: u32| -> EdgeVert {
@@ -389,12 +389,14 @@ mod tests {
     }
 
     #[test]
-    fn detects_lod_boundary_seam_at_low_altitude() {
-        // Characterization (WI 783): a low pose with deep T-junctions has a boundary gap
-        // well above the seamless floor — proof the detector fires. Passes today by
-        // asserting the tear EXISTS; when WI 783 makes the transition continuous this
-        // flips to `worst_gap < SEAMLESS_TOL` (the regression guard). No red test lands.
-        const SEAMLESS_TOL: f64 = 5.0; // metres; above the ~0.1 m f32 coincidence floor
+    fn lod_boundary_is_seamless_at_low_altitude() {
+        // Regression guard (WI 783): this low pose with deep T-junctions had a ~3248 m
+        // boundary tear before the quiet-zone morph ramp; it is now down to the coarsest
+        // level's scan floor. The residual is scan *interpolation* error at level-1 edges
+        // (~500 km): O(1/res²) — ~150 m at res 24, ~40 m at res 48 — not a render step, so
+        // the tolerance sits above that floor and far below the pre-fix tear. If this ever
+        // fails, the CDLOD morph ramp regressed.
+        const SEAM_TOL: f64 = 250.0; // metres; > ~150 m coarse-level scan floor, ≪ 3248 m tear
         let f = field();
         let report = scan_seams(
             &f,
@@ -404,11 +406,10 @@ mod tests {
         );
         assert!(report.leaf_count > 20, "low pose subdivides deeply");
         assert!(
-            report.worst_gap > SEAMLESS_TOL,
-            "expected a detectable LOD seam (WI 783); worst_gap = {} m (tol {} m). \
-             If this now fails, 783 may be fixed — flip to `< SEAMLESS_TOL`.",
+            report.worst_gap < SEAM_TOL,
+            "LOD boundary should be seamless (WI 783); worst_gap = {} m exceeds {} m",
             report.worst_gap,
-            SEAMLESS_TOL
+            SEAM_TOL
         );
     }
 }
