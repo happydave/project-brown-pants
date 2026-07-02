@@ -758,10 +758,11 @@ fn hud(
         "off (airless)"
     };
     **t = format!(
-        "SURFACE (-- surface)\n\
+        "SURFACE (-- surface)  v{ver}\n\
          body: {name}\nradius: {rkm:.0} km\naltitude: {akm:.1} km\n\
          chunks: {live} live, {pend} meshing\natmosphere: {atmo}\n\n\
          W/A/S/D move \u{b7} R/F up/down \u{b7} arrows look \u{b7} F3 overlay [{ov}]",
+        ver = env!("CARGO_PKG_VERSION"),
         name = body.asset.name,
         rkm = body.field.radius() / 1000.0,
         akm = alt / 1000.0,
