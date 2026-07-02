@@ -19,3 +19,18 @@ glam = { version = "0.30", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sounding_sim = { path = "crates/sim" }
+
+# Dev-build performance (WI 778). A plain `cargo run` is a debug build; at opt-level 0 the engine and
+# the procedural surface field (multi-octave noise + craters, sampled thousands of times per frame by
+# the rover contact) are ~10-50x slower than optimized — the classic Bevy dev pitfall (moon Test ran
+# ~12 fps). Optimize **dependencies** and the **headless sim crate** (the hot noise/physics code) even
+# in debug, while keeping the app crate light so incremental rebuilds of scene code stay fast. First
+# build is slower (deps compile optimized once, then cached); release is unaffected.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.sounding_sim]
+opt-level = 3
