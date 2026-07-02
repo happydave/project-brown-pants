@@ -385,9 +385,11 @@ struct MoonMode {
     seed: u64,
 }
 
-/// Radius (m) of the workshop's drivable moonlet (WI 775) — small enough that the field's
-/// planetary-wavelength craters/relief read at rover scale and the horizon curves.
-const MOONLET_RADIUS: f64 = 12_000.0;
+/// Radius (m) of the workshop's drivable moonlet (WI 775/776). Kept **above** the surface field's
+/// amplitude-clamp threshold (~20 km) so crater walls stay in the WI 765-proven *drivable* slope
+/// regime (below it the clamp forces 300 m of relief onto a tiny body → steep, un-driveable in low g),
+/// while small enough that the horizon curves and km-scale craters are visible.
+const MOONLET_RADIUS: f64 = 30_000.0;
 /// Surface gravity (m/s²) of the moonlet — low, moon-like.
 const MOONLET_GRAVITY: f64 = 1.6;
 
@@ -756,8 +758,14 @@ impl WorkshopWorld {
         // Rest the rover on the ground under the origin: place the CoM (`body.position`) high enough
         // that **both** every wheel hub sits at its suspension free length above the surface **and** the
         // chassis bottom clears the ground — so it never spawns partly underground (the "front falls
-        // through" bug), then it settles a little under load.
-        let ground_h = ContactSurface::height(&ground, 0.0, 0.0);
+        // through" bug), then it settles a little under load. Use the **highest** terrain under any
+        // wheel (not just the CoM), so on relief (a moon) no wheel spawns buried and knocks the rover
+        // into a tumble (WI 776).
+        let ground_h = rover
+            .wheels
+            .iter()
+            .map(|w| ContactSurface::height(&ground, w.mount.x, w.mount.z))
+            .fold(ContactSurface::height(&ground, 0.0, 0.0), f64::max);
         let wheel_drop = rover
             .wheels
             .iter()
@@ -1315,8 +1323,12 @@ fn enter_test(
         // in both modes; the moon streams textured chunks in that same anchor frame (WI 775), so the
         // camera + rover-mesh pipeline are unchanged. On the moon we only brighten the sun + add camera
         // ambient (airless: no atmosphere) and insert the render state.
-        let (illum, ambient) = if moon.is_some() {
-            (14_000.0, 120.0)
+        // On the moon: brighter sun + a low ambient (airless, no atmosphere), and **cast shadows** so
+        // relief and the rover read against the surface (WI 776 — a shadowless flat grey looked like
+        // void). Flat pad keeps its original lighting.
+        let is_moon = moon.is_some();
+        let (illum, ambient) = if is_moon {
+            (14_000.0, 90.0)
         } else {
             (8_000.0, 0.0)
         };
@@ -1333,6 +1345,7 @@ fn enter_test(
         commands.spawn((
             DirectionalLight {
                 illuminance: illum,
+                shadows_enabled: is_moon,
                 ..default()
             },
             Transform::from_xyz(6.0, 14.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
@@ -2190,14 +2203,16 @@ fn build_test_ground(
     if moon_mode.on {
         // A small **moonlet** (not a 200–2000 km body): the field's features are planetary-wavelength,
         // so on a big body the surface is dead-flat at rover scale. A ~12 km radius makes the horizon
-        // curvature and the (now km-scale) craters visible to drive across, while the analytic contact
-        // is identical. Finer eye-level surface detail is a field-content follow-up (WI 763 territory).
+        // curvature and the km-scale craters visible to drive across, while the analytic contact is
+        // identical. Finer eye-level surface detail is a field-content follow-up (WI 763 territory).
         let radius = MOONLET_RADIUS;
         let gravity = MOONLET_GRAVITY;
         let field = SurfaceField::new(moon_mode.seed, radius);
         let patch = SurfacePatch::new(field, DVec3::Y);
+        // Warm regolith so the surface reads as ground (a grey material vanished against the grey
+        // background, WI 776); shadows (enabled on the moon sun) then give it relief/contrast.
         let material = materials.add(StandardMaterial {
-            base_color: Color::srgb(0.52, 0.52, 0.55),
+            base_color: Color::srgb(0.60, 0.50, 0.38),
             perceptual_roughness: 1.0,
             ..default()
         });
