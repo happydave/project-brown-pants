@@ -47,9 +47,10 @@ use sounding_sim::bodygen::{generate, Archetype};
 use sounding_sim::frame::{FrameId, WorldPos};
 use sounding_sim::surface_field::SurfaceField;
 use sounding_sim::surface_mesh::{
-    build_chunk, morph_range, nominal_edge_len, should_split, AtmosphereParams, ChunkMesh,
-    QuadNode, DEFAULT_MAX_LEVEL, DEFAULT_RESOLUTION,
+    build_chunk, morph_range, nominal_edge_len, AtmosphereParams, ChunkMesh, QuadNode,
+    DEFAULT_MAX_LEVEL, DEFAULT_RESOLUTION,
 };
+use sounding_sim::surface_scan::resident_leaves;
 
 use crate::floating_origin::{
     render_translation, AnchorCamera, FloatingOrigin, FloatingOriginPlugin, WorldPlacement,
@@ -467,16 +468,8 @@ fn update_telemetry(
 /// The desired resident **leaf** set: traverse the six face roots, splitting where
 /// the camera is close, and collect the leaves.
 fn desired_leaves(camera_body: DVec3, radius: f64) -> Vec<QuadNode> {
-    let mut leaves = Vec::new();
-    let mut stack: Vec<QuadNode> = QuadNode::roots().to_vec();
-    while let Some(node) = stack.pop() {
-        if should_split(node, camera_body, radius, DEFAULT_MAX_LEVEL) {
-            stack.extend_from_slice(&node.children());
-        } else {
-            leaves.push(node);
-        }
-    }
-    leaves
+    // Single source of truth with the headless seam scan (WI 785).
+    resident_leaves(camera_body, radius, DEFAULT_MAX_LEVEL)
 }
 
 /// The CDLOD streaming step: compute desired leaves, enqueue new chunk builds

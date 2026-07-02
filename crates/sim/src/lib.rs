@@ -43,6 +43,7 @@ pub mod sim;
 pub mod surface;
 pub mod surface_field;
 pub mod surface_mesh;
+pub mod surface_scan;
 pub mod system;
 pub mod telemetry;
 pub mod terrain;
