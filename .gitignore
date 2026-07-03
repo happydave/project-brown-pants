@@ -6,3 +6,5 @@
 /subassembly.json
 # Named craft library (WI 675) — runtime vehicle saves
 /saves/
+# local screenshots
+/*.png
