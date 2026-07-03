@@ -143,6 +143,21 @@ pub enum ContentError {
         field: String,
         element: String,
     },
+    /// Two settings scalars share a name (one frozen value per name; scenario
+    /// layering is a WI 550 decision, deliberately not made here).
+    DuplicateScalar { name: String },
+    /// A balance scalar's bound field has no content-defined value when the
+    /// settings bake applies — the scalar would *originate* a physical
+    /// quantity rather than modify one (the physical-truth seam, WI 549).
+    SeamViolation {
+        scalar: String,
+        record: String,
+        field: String,
+    },
+    /// A record references something outside the catalog that does not
+    /// resolve (today: a body record's world-building library slug; WI 550
+    /// extends this to scenario → pack/blueprint references).
+    UnresolvedReference { record: String, reference: String },
 }
 
 impl fmt::Display for ContentError {
@@ -197,6 +212,17 @@ impl fmt::Display for ContentError {
                 f,
                 "override delete on record `{record}` field `{field}`: element `{element}` is not present"
             ),
+            ContentError::DuplicateScalar { name } => {
+                write!(f, "duplicate balance-scalar name `{name}`")
+            }
+            ContentError::SeamViolation { scalar, record, field } => write!(
+                f,
+                "balance scalar `{scalar}` would originate (not modify) record `{record}` field `{field}`: \
+                 no content record defines that quantity — a scalar may only multiply a physically-defined value"
+            ),
+            ContentError::UnresolvedReference { record, reference } => {
+                write!(f, "record `{record}` references unresolved `{reference}`")
+            }
         }
     }
 }
@@ -572,10 +598,45 @@ enum SetValue {
 }
 
 // ---------------------------------------------------------------------------
+// Settings (WI 549) — named balance scalars, frozen first, baked at merge.
+// ---------------------------------------------------------------------------
+
+/// A settings document as authored: named balance scalars. Its grammar can
+/// express **only multiplication factors** — the physical-truth seam in
+/// structural form (a scalar cannot set, extend, or delete; it can only
+/// modify a physically-defined quantity, and baking rejects the residual
+/// originate-by-multiplying-nothing case as a [`ContentError::SeamViolation`]).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSettings {
+    /// Document *format* version — must equal [`CONTENT_FORMAT_VERSION`].
+    format: u32,
+    /// The source's identity (shares one namespace with pack/set ids).
+    id: String,
+    /// The named scalars, applied in declaration order (documents in id order).
+    scalars: Vec<RawScalar>,
+}
+
+/// One named balance scalar: a proportional factor bound to a target field.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawScalar {
+    /// The scalar's name — frozen once per composition, surfaced in
+    /// provenance and [`Catalog::settings`] for telemetry ("real × modifier").
+    name: String,
+    /// The proportional factor (1.0 is a legal identity knob).
+    factor: f64,
+    /// What it multiplies: the 548 target vocabulary plus a field name.
+    target: Target,
+    field: String,
+}
+
+// ---------------------------------------------------------------------------
 // Provenance — where every resolved value came from, and what it displaced.
 // ---------------------------------------------------------------------------
 
-/// A value source: the defining pack, or an override set at a phase.
+/// A value source: the defining pack, an override set at a phase, or a
+/// settings scalar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceRef {
     /// Authored in a pack's record definition.
@@ -585,6 +646,8 @@ pub enum SourceRef {
         source: String,
         phase: OverridePhase,
     },
+    /// Multiplied by a named balance scalar during the settings bake (WI 549).
+    Setting { source: String, scalar: String },
 }
 
 /// A value as recorded in provenance shadows.
@@ -729,8 +792,13 @@ pub struct Entry {
 pub struct Catalog {
     pub pack_id: String,
     pub pack_version: String,
-    /// All source ids (packs, then override sets) in ladder order.
+    /// All source ids (settings, then packs, then override sets — the
+    /// design's ladder numbering) in resolution order.
     pub sources: Vec<String>,
+    /// The frozen balance scalars (name → factor, WI 549): resolved before
+    /// any data phase, immutable, readable by later layers/telemetry. The
+    /// records below already have them baked in — the sim never sees these.
+    pub settings: BTreeMap<String, f64>,
     records: BTreeMap<String, Entry>,
 }
 
@@ -751,7 +819,40 @@ impl Catalog {
     /// slice is irrelevant — ordering is derived from declared phases,
     /// dependencies, and ids only.
     pub fn merge(pack_texts: &[&str], override_texts: &[&str]) -> Result<Catalog, ContentError> {
-        merge_composition(pack_texts, override_texts)
+        merge_composition(pack_texts, &[], override_texts)
+    }
+
+    /// Merge a full composition: packs, **settings documents** (named balance
+    /// scalars, WI 549), and override sets. Scalar values freeze before any
+    /// data phase; their baked multiplies apply right after definitions,
+    /// before every override phase (the design's ladder order). Input order
+    /// of any slice is irrelevant.
+    pub fn compose(
+        pack_texts: &[&str],
+        settings_texts: &[&str],
+        override_texts: &[&str],
+    ) -> Result<Catalog, ContentError> {
+        merge_composition(pack_texts, settings_texts, override_texts)
+    }
+
+    /// Detector (WI 549): every body record's world-building library slug
+    /// must be among `known_slugs` (the caller lists the library — the merge
+    /// itself stays filesystem-free). Fails loudly naming record + slug.
+    pub fn validate_body_refs(
+        &self,
+        known_slugs: &std::collections::BTreeSet<String>,
+    ) -> Result<(), ContentError> {
+        for (id, entry) in &self.records {
+            if let Record::Body(b) = &entry.record {
+                if !known_slugs.contains(&b.body_slug) {
+                    return Err(ContentError::UnresolvedReference {
+                        record: id.clone(),
+                        reference: b.body_slug.clone(),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Look up a concrete record by id.
@@ -942,6 +1043,41 @@ fn chain_reaches(id: &str, base: &str, raws: &BTreeMap<String, RawRecord>) -> bo
     false
 }
 
+/// Expand an override/scalar target to concrete record ids, deterministically
+/// (sorted-id order — `raws` is an ordered map). Shared by the settings bake
+/// and the override ladder so selector semantics cannot drift apart.
+fn expand_target(
+    target: &Target,
+    raws: &BTreeMap<String, RawRecord>,
+) -> Result<Vec<String>, ContentError> {
+    Ok(match target {
+        Target::Id(id) => {
+            if !raws.contains_key(id) {
+                return Err(ContentError::UnknownTarget {
+                    target: target.describe(),
+                });
+            }
+            vec![id.clone()]
+        }
+        Target::Kind(kind) => raws
+            .iter()
+            .filter(|(_, r)| r.kind() == *kind)
+            .map(|(id, _)| id.clone())
+            .collect(),
+        Target::Base(base) => {
+            if !raws.contains_key(base) {
+                return Err(ContentError::UnknownTarget {
+                    target: target.describe(),
+                });
+            }
+            raws.keys()
+                .filter(|id| chain_reaches(id, base, raws))
+                .cloned()
+                .collect()
+        }
+    })
+}
+
 /// Apply one op to one record's field, updating the provenance ledger.
 fn apply_op(
     rec: &mut RawRecord,
@@ -1043,11 +1179,13 @@ fn apply_op(
     Ok(())
 }
 
-/// The full merge pipeline: parse → order sources → collect definitions →
-/// apply the override ladder (on raw records) → resolve inheritance →
-/// validate → build per-field provenance.
+/// The full merge pipeline: parse → freeze settings → order sources →
+/// collect definitions → bake settings scalars → apply the override ladder
+/// (on raw records) → resolve inheritance → validate → build per-field
+/// provenance.
 fn merge_composition(
     pack_texts: &[&str],
+    settings_texts: &[&str],
     override_texts: &[&str],
 ) -> Result<Catalog, ContentError> {
     // Parse + format-check every document.
@@ -1059,6 +1197,14 @@ fn merge_composition(
         }
         packs.push(p);
     }
+    let mut settings_docs = Vec::with_capacity(settings_texts.len());
+    for text in settings_texts {
+        let s: RawSettings = ron::from_str(text).map_err(|e| ContentError::Parse(e.to_string()))?;
+        if s.format != CONTENT_FORMAT_VERSION {
+            return Err(ContentError::Format { found: s.format });
+        }
+        settings_docs.push(s);
+    }
     let mut sets = Vec::with_capacity(override_texts.len());
     for text in override_texts {
         let s: RawOverrideSet =
@@ -1069,15 +1215,34 @@ fn merge_composition(
         sets.push(s);
     }
 
-    // One source-id namespace across packs and override sets.
+    // One source-id namespace across settings, packs, and override sets.
     let mut source_ids = HashSet::new();
-    for id in packs
+    for id in settings_docs
         .iter()
-        .map(|p| &p.id)
+        .map(|s| &s.id)
+        .chain(packs.iter().map(|p| &p.id))
         .chain(sets.iter().map(|s| &s.id))
     {
         if !source_ids.insert(id.clone()) {
             return Err(ContentError::DuplicateSource { id: id.clone() });
+        }
+    }
+
+    // Ladder step 1 — settings: resolve and FREEZE scalar values before any
+    // data phase (documents in id order; duplicate names are an error — one
+    // frozen value per name).
+    settings_docs.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut settings: BTreeMap<String, f64> = BTreeMap::new();
+    for doc in &settings_docs {
+        for scalar in &doc.scalars {
+            if settings
+                .insert(scalar.name.clone(), scalar.factor)
+                .is_some()
+            {
+                return Err(ContentError::DuplicateScalar {
+                    name: scalar.name.clone(),
+                });
+            }
         }
     }
 
@@ -1126,6 +1291,37 @@ fn merge_composition(
         }
     }
 
+    // Settings BAKE (WI 549): the frozen scalars multiply physical content as
+    // the first writes after definitions — before every override phase — on
+    // raw records, so a base binding re-flows like any 548 override. The
+    // grammar admits only multiplication; the residual seam case (a scalar
+    // multiplying a field no content record defines = originating) is
+    // rejected here with the scalar's name attached.
+    let mut prov: HashMap<(String, String), FieldProvenance> = HashMap::new();
+    for doc in &settings_docs {
+        for scalar in &doc.scalars {
+            let source = SourceRef::Setting {
+                source: doc.id.clone(),
+                scalar: scalar.name.clone(),
+            };
+            let op = Op::Multiply(scalar.factor);
+            for id in expand_target(&scalar.target, &raws)? {
+                let defining_pack = defining[&id].pack_id.clone();
+                let rec = raws.get_mut(&id).expect("expanded from this map");
+                apply_op(rec, &scalar.field, &op, &source, &defining_pack, &mut prov).map_err(
+                    |e| match e {
+                        ContentError::UnsetField { record, field } => ContentError::SeamViolation {
+                            scalar: scalar.name.clone(),
+                            record,
+                            field,
+                        },
+                        other => other,
+                    },
+                )?;
+            }
+        }
+    }
+
     // Phases: patches → scenario → local. Within a phase: topo by declared
     // same-phase depends, then id.
     let mut set_order: Vec<usize> = Vec::with_capacity(sets.len());
@@ -1150,8 +1346,7 @@ fn merge_composition(
     // Every set has one of the three phases, so every set was ordered.
     debug_assert_eq!(set_order.len(), sets.len());
 
-    // Apply the ladder on raw (pre-inheritance) records.
-    let mut prov: HashMap<(String, String), FieldProvenance> = HashMap::new();
+    // Apply the override ladder on raw (pre-inheritance) records.
     for &idx in &set_order {
         let set = &sets[idx];
         let source = SourceRef::Override {
@@ -1159,34 +1354,7 @@ fn merge_composition(
             phase: set.phase,
         };
         for ov in &set.overrides {
-            // Expand the target deterministically (sorted ids).
-            let ids: Vec<String> = match &ov.target {
-                Target::Id(id) => {
-                    if !raws.contains_key(id) {
-                        return Err(ContentError::UnknownTarget {
-                            target: ov.target.describe(),
-                        });
-                    }
-                    vec![id.clone()]
-                }
-                Target::Kind(kind) => raws
-                    .iter()
-                    .filter(|(_, r)| r.kind() == *kind)
-                    .map(|(id, _)| id.clone())
-                    .collect(),
-                Target::Base(base) => {
-                    if !raws.contains_key(base) {
-                        return Err(ContentError::UnknownTarget {
-                            target: ov.target.describe(),
-                        });
-                    }
-                    raws.keys()
-                        .filter(|id| chain_reaches(id, base, &raws))
-                        .cloned()
-                        .collect()
-                }
-            };
-            for id in ids {
+            for id in expand_target(&ov.target, &raws)? {
                 let defining_pack = defining[&id].pack_id.clone();
                 let rec = raws.get_mut(&id).expect("expanded from this map");
                 apply_op(rec, &ov.field, &ov.op, &source, &defining_pack, &mut prov)?;
@@ -1247,12 +1415,15 @@ fn merge_composition(
     }
 
     let (pack_id, pack_version) = first_pack.unwrap_or_default();
-    let mut sources = pack_order;
+    // Ladder numbering: settings, then packs, then override sets.
+    let mut sources: Vec<String> = settings_docs.iter().map(|s| s.id.clone()).collect();
+    sources.extend(pack_order);
     sources.extend(set_order.iter().map(|&i| sets[i].id.clone()));
     Ok(Catalog {
         pack_id,
         pack_version,
         sources,
+        settings,
         records,
     })
 }
@@ -2083,5 +2254,209 @@ mod tests {
             other => panic!("expected resource, got {other:?}"),
         }
         assert_eq!(cat.sources, vec!["core", "example-scenario"]);
+    }
+
+    // ------------------------------------------------------------------
+    // WI 549 — settings stage, physical-truth seam, detectors.
+    // ------------------------------------------------------------------
+
+    /// A minimal settings document.
+    fn settings_doc(id: &str, scalars: &str) -> String {
+        format!("(format: 1, id: \"{id}\", scalars: [{scalars}])")
+    }
+
+    #[test]
+    fn scalar_bakes_at_merge_with_frozen_set_and_provenance() {
+        let p = pack(&format!("{}{}", engine_base(), engine_variant()));
+        let s = settings_doc(
+            "bal",
+            r#"( name: "fuel_efficiency", factor: 0.7, target: Id("engine_base"), field: "exhaust_velocity" ),"#,
+        );
+        let cat = Catalog::compose(&[&p], &[&s], &[]).unwrap();
+        // Baked into the resolved physical value, re-flowed to the variant;
+        // the sim-facing record carries no scalar anywhere.
+        assert_eq!(engine_ev(&cat, "v"), 3200.0 * 0.7);
+        // Frozen set exposed by name.
+        assert_eq!(cat.settings.get("fuel_efficiency"), Some(&0.7));
+        // Provenance: winning source names document + scalar; shadow holds
+        // the authored physical value (real × modifier for telemetry).
+        let fp = &cat.get("v").unwrap().field_provenance["exhaust_velocity"];
+        assert_eq!(
+            fp.source,
+            SourceRef::Setting {
+                source: "bal".into(),
+                scalar: "fuel_efficiency".into()
+            }
+        );
+        assert_eq!(fp.shadows[0].value, ProvValue::Number(3200.0));
+        assert_eq!(fp.shadows[0].source, SourceRef::Pack { id: "test".into() });
+        // Settings resolve before packs in the ladder listing.
+        assert_eq!(cat.sources, vec!["bal", "test"]);
+    }
+
+    #[test]
+    fn stacked_scalars_multiply_cumulatively_with_chain() {
+        let p = pack(&format!("{}{}", engine_base(), engine_variant()));
+        let s = settings_doc(
+            "bal",
+            r#"( name: "a", factor: 0.5, target: Id("engine_base"), field: "exhaust_velocity" ),
+               ( name: "b", factor: 0.5, target: Id("engine_base"), field: "exhaust_velocity" ),"#,
+        );
+        let cat = Catalog::compose(&[&p], &[&s], &[]).unwrap();
+        assert_eq!(engine_ev(&cat, "v"), 3200.0 * 0.25);
+        let fp = &cat.get("v").unwrap().field_provenance["exhaust_velocity"];
+        // Newest displaced first: a's product (1600), then the authored 3200.
+        assert_eq!(fp.shadows.len(), 2);
+        assert_eq!(fp.shadows[0].value, ProvValue::Number(1600.0));
+        assert_eq!(fp.shadows[1].value, ProvValue::Number(3200.0));
+    }
+
+    #[test]
+    fn scalars_apply_before_override_phases() {
+        let p = pack(&format!("{}{}", engine_base(), engine_variant()));
+        let s = settings_doc(
+            "bal",
+            r#"( name: "eff", factor: 0.5, target: Id("engine_base"), field: "exhaust_velocity" ),"#,
+        );
+        // A local override multiplies the already-scaled value.
+        let local = override_set(
+            "house",
+            "Local",
+            "",
+            r#"( target: Id("engine_base"), field: "exhaust_velocity", op: Multiply(2.0) ),"#,
+        );
+        let cat = Catalog::compose(&[&p], &[&s], &[&local]).unwrap();
+        assert_eq!(engine_ev(&cat, "v"), 3200.0); // 3200 × 0.5 × 2.0
+        let fp = &cat.get("v").unwrap().field_provenance["exhaust_velocity"];
+        assert_eq!(
+            fp.source,
+            SourceRef::Override {
+                source: "house".into(),
+                phase: OverridePhase::Local
+            }
+        );
+        assert_eq!(fp.shadows[0].value, ProvValue::Number(1600.0));
+        assert!(matches!(fp.shadows[0].source, SourceRef::Setting { .. }));
+    }
+
+    #[test]
+    fn seam_violation_scalar_cannot_originate() {
+        // The variant's exhaust velocity is unset (flows from the base) — a
+        // scalar bound to it would originate, not modify.
+        let p = pack(&format!("{}{}", engine_base(), engine_variant()));
+        let s = settings_doc(
+            "bal",
+            r#"( name: "eff", factor: 0.7, target: Id("v"), field: "exhaust_velocity" ),"#,
+        );
+        match Catalog::compose(&[&p], &[&s], &[]) {
+            Err(ContentError::SeamViolation {
+                scalar,
+                record,
+                field,
+            }) => {
+                assert_eq!(
+                    (scalar.as_str(), record.as_str(), field.as_str()),
+                    ("eff", "v", "exhaust_velocity")
+                );
+            }
+            other => panic!("expected SeamViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_scalar_name_rejected_across_documents() {
+        let p = pack(engine_base());
+        let s1 = settings_doc(
+            "bal_a",
+            r#"( name: "eff", factor: 0.7, target: Id("engine_base"), field: "exhaust_velocity" ),"#,
+        );
+        let s2 = settings_doc(
+            "bal_b",
+            r#"( name: "eff", factor: 0.9, target: Id("engine_base"), field: "exhaust_velocity" ),"#,
+        );
+        match Catalog::compose(&[&p], &[&s1, &s2], &[]) {
+            Err(ContentError::DuplicateScalar { name }) => assert_eq!(name, "eff"),
+            other => panic!("expected DuplicateScalar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scalar_bindings_validate_like_overrides() {
+        let p = pack(engine_base());
+        let ghost = settings_doc(
+            "bal",
+            r#"( name: "eff", factor: 0.7, target: Id("ghost"), field: "exhaust_velocity" ),"#,
+        );
+        assert!(matches!(
+            Catalog::compose(&[&p], &[&ghost], &[]),
+            Err(ContentError::UnknownTarget { .. })
+        ));
+        let bad_field = settings_doc(
+            "bal",
+            r#"( name: "eff", factor: 0.7, target: Id("engine_base"), field: "warp_factor" ),"#,
+        );
+        assert!(matches!(
+            Catalog::compose(&[&p], &[&bad_field], &[]),
+            Err(ContentError::UnknownField { .. })
+        ));
+    }
+
+    #[test]
+    fn unresolved_body_reference_detector() {
+        use std::collections::BTreeSet;
+        let p = pack(r#"Body(( id: "start_moon", body: "training-moon" )),"#);
+        let cat = Catalog::from_ron_str(&p).unwrap();
+        let known: BTreeSet<String> = ["training-moon".to_string()].into();
+        assert!(cat.validate_body_refs(&known).is_ok());
+        let empty = BTreeSet::new();
+        match cat.validate_body_refs(&empty) {
+            Err(ContentError::UnresolvedReference { record, reference }) => {
+                assert_eq!(
+                    (record.as_str(), reference.as_str()),
+                    ("start_moon", "training-moon")
+                );
+            }
+            other => panic!("expected UnresolvedReference, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compose_is_deterministic_under_input_permutation() {
+        let p1 = pack_named("alpha", "", engine_base());
+        let p2 = pack_named("beta", "depends: [\"alpha\"],", engine_variant());
+        let s1 = settings_doc(
+            "bal_a",
+            r#"( name: "eff", factor: 0.9, target: Id("engine_base"), field: "exhaust_velocity" ),"#,
+        );
+        let s2 = settings_doc(
+            "bal_b",
+            r#"( name: "dens", factor: 1.1, target: Id("v"), field: "density" ),"#,
+        );
+        let ov = override_set(
+            "scn",
+            "Scenario",
+            "",
+            r#"( target: Id("engine_base"), field: "exhaust_velocity", op: Multiply(2.0) ),"#,
+        );
+        let a = Catalog::compose(&[&p1, &p2], &[&s1, &s2], &[&ov]).unwrap();
+        let b = Catalog::compose(&[&p2, &p1], &[&s2, &s1], &[&ov]).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.sources, vec!["bal_a", "bal_b", "alpha", "beta", "scn"]);
+    }
+
+    #[test]
+    fn shipped_example_settings_composes_over_core() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content");
+        let core = std::fs::read_to_string(root.join("packs/core.ron")).unwrap();
+        let bal = std::fs::read_to_string(root.join("settings/example-settings.ron")).unwrap();
+        let scn = std::fs::read_to_string(root.join("overrides/example-scenario.ron")).unwrap();
+        let cat = Catalog::compose(&[&core], &[&bal], &[&scn]).expect("full composition merges");
+        // 3200 × 0.85 (settings bake) × 0.9 (scenario multiply), via the base.
+        assert_eq!(engine_ev(&cat, "lf_engine_small"), 3200.0 * 0.85 * 0.9);
+        assert_eq!(cat.settings.get("engine_efficiency"), Some(&0.85));
+        assert_eq!(
+            cat.sources,
+            vec!["example-settings", "core", "example-scenario"]
+        );
     }
 }

@@ -1,0 +1,19 @@
+// Example settings document (WI 549) — named balance scalars, the tuning
+// knobs of a composition. A scalar can ONLY multiply a physically-defined
+// quantity (the physical-truth seam): the resolved catalog holds final
+// physical values, the sim never sees scalars, and provenance keeps the
+// authored value + the named modifier for honest educational telemetry.
+(
+    format: 1,
+    id: "example-settings",
+    scalars: [
+        // Family-wide engine efficiency knob: multiplies the abstract base's
+        // exhaust velocity, re-flowing to every engine that inherits it.
+        (
+            name: "engine_efficiency",
+            factor: 0.85,
+            target: Id("engine_base"),
+            field: "exhaust_velocity",
+        ),
+    ],
+)

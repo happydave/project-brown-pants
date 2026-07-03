@@ -17,10 +17,14 @@ live in the project's `tickets` repository under `docs/projects/sounding/`.
   rendering (the `bevy` umbrella) and wraps the core.
 - [content/](content/) — authored **content documents** (RON): `packs/` hold typed
   device / material / resource / body-reference records the sim looks up by id
-  (WI 547; real physical quantities only), and `overrides/` hold tuning documents —
+  (WI 547; real physical quantities only); `overrides/` hold tuning documents —
   set / multiply / extend / delete field ops resolved through a deterministic
-  named-phase merge ladder with per-value provenance (WI 548). `packs/core.ron` +
-  `overrides/example-scenario.ron` are the first of each.
+  named-phase merge ladder with per-value provenance (WI 548); `settings/` hold
+  **named balance scalars** that can only *multiply* physically-defined values,
+  frozen first and baked into the resolved catalog with the real value + named
+  modifier kept in provenance (WI 549 — the physical-truth seam).
+  `packs/core.ron`, `overrides/example-scenario.ron`, and
+  `settings/example-settings.ron` are the first of each.
 
 ## Prerequisites
 
