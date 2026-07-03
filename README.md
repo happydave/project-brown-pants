@@ -15,9 +15,12 @@ live in the project's `tickets` repository under `docs/projects/sounding/`.
   libraries. The simulation logic lives here.
 - [crates/app/](crates/app/) — `sounding`, the windowed Bevy application. Pulls in
   rendering (the `bevy` umbrella) and wraps the core.
-- [content/](content/) — authored **content packs** (RON): typed device / material /
-  resource / body-reference records the sim looks up by id (WI 547). `packs/core.ron`
-  is the first pack; real physical quantities only — balance tuning layers on later.
+- [content/](content/) — authored **content documents** (RON): `packs/` hold typed
+  device / material / resource / body-reference records the sim looks up by id
+  (WI 547; real physical quantities only), and `overrides/` hold tuning documents —
+  set / multiply / extend / delete field ops resolved through a deterministic
+  named-phase merge ladder with per-value provenance (WI 548). `packs/core.ron` +
+  `overrides/example-scenario.ron` are the first of each.
 
 ## Prerequisites
 

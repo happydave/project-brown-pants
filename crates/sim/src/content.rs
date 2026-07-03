@@ -1,4 +1,4 @@
-//! Content catalog + RON asset-pack loader (WI 547).
+//! Content catalog + RON asset packs: loader, override model, merge ladder (WIs 547/548).
 //!
 //! The foundation of the content layer (content aspect, Slice 0): a flat
 //! namespace of **typed, identified records** — devices, materials, resources,
@@ -6,42 +6,70 @@
 //! hardcoding instances. Records carry **real physical parameters only** (the
 //! quantities the sim already consumes: a material *is* a [`Material`], an
 //! engine spec mirrors [`crate::propulsion::Engine`], a motor spec mirrors
-//! [`crate::powertrain::MotorSpec`]); balance scalars and overrides arrive with
-//! WIs 548/549 and are **never** stored here.
+//! [`crate::powertrain::MotorSpec`]); balance scalars arrive with WI 549 and
+//! are **never** stored here.
 //!
 //! An **asset pack** is a versioned, hand-authored RON document: a manifest
-//! (id + version + content-format version) plus records. Records support
-//! ParentName-style **abstract-base inheritance** (the CDDA/RimWorld pattern):
-//! a record may name a `parent` of the same kind; unset fields inherit the
-//! parent's resolved values, declared fields override, and resolution happens
-//! **after** the whole pack is read so declaration order never matters. A
-//! parent may be abstract *or* concrete — `abstract: true` controls only
-//! whether the record appears in the resolved catalog.
+//! (id + version + content-format version + optional `depends`) plus records.
+//! Records support ParentName-style **abstract-base inheritance** (the
+//! CDDA/RimWorld pattern): a record may name a `parent` of the same kind;
+//! unset fields inherit the parent's resolved values, declared fields
+//! override, and resolution happens **after** the whole composition is read,
+//! so declaration order never matters. A parent may be abstract *or* concrete
+//! — `abstract: true` controls only whether the record appears in the
+//! resolved catalog.
+//!
+//! **The override model + merge ladder (WI 548).** Every tunable field is
+//! reachable by one field-operation mechanism — **set / multiply / extend /
+//! delete** over an inherited base, with the proportional **multiply** as the
+//! first-class tuning primitive. Overrides live in **override sets** (RON
+//! documents declaring a source id + a **phase**) and resolve through the
+//! deterministic **named-phase ladder**: settings (reserved for WI 549) →
+//! base packs (record *definitions*) → pack-to-pack patches → scenario →
+//! player/local — never by file-discovery or input order. Within a phase,
+//! sources order by declared dependencies (topological) then stable id;
+//! later writes win and every displaced value is recorded. **The ladder runs
+//! on raw (pre-inheritance) records**, so an override targeting an abstract
+//! base *re-flows to every variant* (the design's bulk-tuning-by-one-line
+//! property); inheritance then resolves, then validation. Structural fields
+//! (`id`, `parent`, `abstract`, `class`) are not override targets — overrides
+//! tune values, never topology.
+//!
+//! **Per-value provenance:** every resolved value traces to the source +
+//! phase that produced it, with the ordered chain of values it shadowed
+//! (newest displaced first, down to the pack-authored original or an explicit
+//! `Unset`). Inherited fields carry the provenance of the value they
+//! inherited, so a variant tuned via its base still traces to that override.
 //!
 //! **Content is data, never code** (untrusted-pack safety): the loader
 //! deserializes and validates; nothing in a pack can execute. Failures are
-//! **loud and typed** — parse errors, an unknown format version, duplicate ids,
-//! unknown/cyclic/kind-mismatched parents, and missing or inapplicable fields
-//! all fail the load naming the offender; records are never silently skipped.
-//! Unknown fields and unknown record kinds are rejected (authored artifacts
-//! deserve typo-loudness; forward-compat relaxation is a deliberate later
-//! migration decision, unlike the reserved-container idiom of
-//! [`crate::persist`], which serves machine-written saves).
+//! **loud and typed** — parse errors, an unknown format version, duplicate
+//! ids/sources, unknown dependencies or dependency cycles, unknown or cyclic
+//! or kind-mismatched parents, unknown/structural/type-mismatched override
+//! targets, and missing or inapplicable fields all fail the load naming the
+//! offender; records are never silently skipped. Unknown fields and unknown
+//! record kinds are rejected (authored artifacts deserve typo-loudness;
+//! forward-compat relaxation is a deliberate later migration decision, unlike
+//! the reserved-container idiom of [`crate::persist`], which serves
+//! machine-written saves).
 //!
-//! The pack **format version** ([`CONTENT_FORMAT_VERSION`]) is a separate line
-//! from [`crate::persist::FORMAT_VERSION`]: authored packs and machine-written
-//! saves are different artifact classes with different migration pressure. The
-//! pack's own `version` field is an opaque identity string in this slice
-//! (recorded and surfaced in provenance; ordering/migration semantics deferred).
+//! The pack **format version** ([`CONTENT_FORMAT_VERSION`]) is a separate
+//! line from [`crate::persist::FORMAT_VERSION`]: authored packs and
+//! machine-written saves are different artifact classes with different
+//! migration pressure. Adding the override-set document type followed
+//! `persist`'s additive rule (existing pack files are unchanged). A pack's
+//! own `version` field is an opaque identity string in this slice.
 //!
 //! **Body records reference, never define** (content design Currency Addendum
-//! 2026-07-02): a body record carries the identity of a world-building library
-//! asset ([`crate::body_library`] slug); world-building owns body data, content
-//! composes it.
+//! 2026-07-02): a body record carries the identity of a world-building
+//! library asset ([`crate::body_library`] slug); world-building owns body
+//! data, content composes it.
 //!
-//! Loading is **deterministic**: the catalog is ordered storage (a `BTreeMap`),
-//! so the same pack bytes always produce the same catalog — the foundation for
-//! WI 549's merge-determinism assertion. Headless and rendering-free.
+//! Merging is **deterministic**: ordering is a function of declared phases,
+//! dependencies, and ids only, and the catalog is ordered storage — the same
+//! documents produce the same catalog in any input order (asserted in test).
+//! Headless and rendering-free. The sim does not consume the catalog yet
+//! (WI 550's scope).
 
 use crate::voxel::{Material, Thermal};
 use serde::Deserialize;
@@ -49,28 +77,39 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 
-/// Version of the authored pack *format* (not of any pack's content). Rejected
-/// loudly when a pack declares anything else. Increments only on a schema
-/// change to the pack document shape.
+/// Version of the authored content-document *format* (packs and override
+/// sets; not of any pack's content). Rejected loudly when a document declares
+/// anything else. Increments only on a schema change to the document shapes.
 pub const CONTENT_FORMAT_VERSION: u32 = 1;
+
+/// Field names that overrides may never target: record identity and
+/// inheritance topology are definitions, not tunables.
+const STRUCTURAL_FIELDS: [&str; 4] = ["id", "parent", "abstract", "class"];
 
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
-/// Why a pack failed to load. Every variant names its offender — a pack never
-/// loads partially and records are never silently dropped.
+/// Why a composition failed to load. Every variant names its offender — a
+/// merge never completes partially and records are never silently dropped.
 #[derive(Debug)]
 pub enum ContentError {
-    /// The pack file could not be read.
+    /// A document file could not be read.
     Io(std::io::Error),
-    /// The RON text failed to parse (includes position context from `ron`).
+    /// RON text failed to parse (includes position context from `ron`).
     Parse(String),
-    /// The pack declares a content-format version this build does not know.
+    /// A document declares a content-format version this build does not know.
     Format { found: u32 },
-    /// Two records share an id (the namespace is flat across kinds).
+    /// Two records share an id (the namespace is flat across kinds and packs).
     DuplicateId { id: String },
-    /// A record names a parent id that does not exist in the pack.
+    /// Two source documents (packs / override sets) share an id.
+    DuplicateSource { id: String },
+    /// A source names a dependency that is not among the supplied documents
+    /// (packs depend on packs; override sets on same-phase sets).
+    UnknownDependency { source: String, depends_on: String },
+    /// Source dependencies form a cycle.
+    DependencyCycle { source: String },
+    /// A record names a parent id that does not exist in the composition.
     UnknownParent { child: String, parent: String },
     /// A record names a parent of a different record kind.
     KindMismatch { child: String, parent: String },
@@ -82,33 +121,82 @@ pub enum ContentError {
     /// A device record carries a field that does not apply to its class
     /// (an authoring error caught loudly, like unknown fields).
     InapplicableField { id: String, field: &'static str },
+    /// An override's target matches nothing (unknown record id or base id).
+    UnknownTarget { target: String },
+    /// An override names a field the targeted record's kind does not have.
+    UnknownField { record: String, field: String },
+    /// An override targets a structural field (identity/topology — not tunable).
+    StructuralField { record: String, field: String },
+    /// An override's operation does not fit the field's type.
+    TypeMismatch {
+        record: String,
+        field: String,
+        op: &'static str,
+    },
+    /// `multiply`/`extend`/`delete` hit a field with no value at that point in
+    /// the ladder (the value flows from a parent later — target the defining
+    /// base instead, which re-flows to every variant).
+    UnsetField { record: String, field: String },
+    /// `delete` named a list element that is not present.
+    AbsentElement {
+        record: String,
+        field: String,
+        element: String,
+    },
 }
 
 impl fmt::Display for ContentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ContentError::Io(e) => write!(f, "content pack io error: {e}"),
-            ContentError::Parse(msg) => write!(f, "content pack parse error: {msg}"),
+            ContentError::Io(e) => write!(f, "content document io error: {e}"),
+            ContentError::Parse(msg) => write!(f, "content document parse error: {msg}"),
             ContentError::Format { found } => write!(
                 f,
                 "unsupported content format version {found} (this build reads {CONTENT_FORMAT_VERSION})"
             ),
             ContentError::DuplicateId { id } => write!(f, "duplicate record id `{id}`"),
+            ContentError::DuplicateSource { id } => write!(f, "duplicate source id `{id}`"),
+            ContentError::UnknownDependency { source, depends_on } => {
+                write!(f, "source `{source}` depends on unknown source `{depends_on}`")
+            }
+            ContentError::DependencyCycle { source } => {
+                write!(f, "dependency cycle through source `{source}`")
+            }
             ContentError::UnknownParent { child, parent } => {
                 write!(f, "record `{child}` names unknown parent `{parent}`")
             }
             ContentError::KindMismatch { child, parent } => {
                 write!(f, "record `{child}` names parent `{parent}` of a different kind")
             }
-            ContentError::Cycle { id } => {
-                write!(f, "inheritance cycle through record `{id}`")
-            }
+            ContentError::Cycle { id } => write!(f, "inheritance cycle through record `{id}`"),
             ContentError::MissingField { id, field } => {
                 write!(f, "record `{id}` is missing required field `{field}`")
             }
             ContentError::InapplicableField { id, field } => {
                 write!(f, "record `{id}` carries field `{field}` inapplicable to its class")
             }
+            ContentError::UnknownTarget { target } => {
+                write!(f, "override targets unknown {target}")
+            }
+            ContentError::UnknownField { record, field } => {
+                write!(f, "override on record `{record}` names unknown field `{field}`")
+            }
+            ContentError::StructuralField { record, field } => write!(
+                f,
+                "override on record `{record}` targets structural field `{field}` (identity/topology is not tunable)"
+            ),
+            ContentError::TypeMismatch { record, field, op } => {
+                write!(f, "override op `{op}` does not fit field `{field}` of record `{record}`")
+            }
+            ContentError::UnsetField { record, field } => write!(
+                f,
+                "override on record `{record}` field `{field}` has no value at this point in the ladder \
+                 (it flows from a parent; target the defining base instead — a base override re-flows to every variant)"
+            ),
+            ContentError::AbsentElement { record, field, element } => write!(
+                f,
+                "override delete on record `{record}` field `{field}`: element `{element}` is not present"
+            ),
         }
     }
 }
@@ -119,16 +207,19 @@ impl std::error::Error for ContentError {}
 // Raw (authored) forms — permissive all-`Option` shapes the loader reads.
 // ---------------------------------------------------------------------------
 
-/// The pack document as authored: manifest + records.
+/// The pack document as authored: manifest + record definitions.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPack {
-    /// Pack *format* version — must equal [`CONTENT_FORMAT_VERSION`].
+    /// Document *format* version — must equal [`CONTENT_FORMAT_VERSION`].
     format: u32,
     /// The pack's identity.
     id: String,
     /// The pack's own version — an opaque identity string in this slice.
     version: String,
+    /// Other pack ids this pack orders after (intra-phase determinism).
+    #[serde(default)]
+    depends: Vec<String>,
     /// The authored records, any order (resolution is order-independent).
     records: Vec<RawRecord>,
 }
@@ -140,6 +231,15 @@ enum RawRecord {
     Material(RawMaterial),
     Resource(RawResource),
     Body(RawBody),
+}
+
+/// A record kind — the override target-selector vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum RecordKind {
+    Device,
+    Material,
+    Resource,
+    Body,
 }
 
 impl RawRecord {
@@ -165,6 +265,14 @@ impl RawRecord {
             RawRecord::Material(r) => r.is_abstract,
             RawRecord::Resource(r) => r.is_abstract,
             RawRecord::Body(r) => r.is_abstract,
+        }
+    }
+    fn kind(&self) -> RecordKind {
+        match self {
+            RawRecord::Device(_) => RecordKind::Device,
+            RawRecord::Material(_) => RecordKind::Material,
+            RawRecord::Resource(_) => RecordKind::Resource,
+            RawRecord::Body(_) => RecordKind::Body,
         }
     }
 
@@ -228,6 +336,10 @@ struct RawDevice {
     motor_mass: Option<f64>,
     #[serde(default)]
     draw: Option<f64>,
+    /// Inert metadata tags (WI 548) — the first list field; a content-filter
+    /// hook for later work. `None` inherits; an authored list replaces.
+    #[serde(default)]
+    tags: Option<Vec<String>>,
 }
 
 impl RawDevice {
@@ -245,6 +357,7 @@ impl RawDevice {
             top_speed: self.top_speed.or(p.top_speed),
             motor_mass: self.motor_mass.or(p.motor_mass),
             draw: self.draw.or(p.draw),
+            tags: self.tags.or_else(|| p.tags.clone()),
         }
     }
 }
@@ -279,6 +392,9 @@ struct RawMaterial {
     latent_heat: Option<f64>,
     #[serde(default)]
     ablator_fraction: Option<f64>,
+    /// Inert metadata tags (WI 548).
+    #[serde(default)]
+    tags: Option<Vec<String>>,
 }
 
 impl RawMaterial {
@@ -296,6 +412,7 @@ impl RawMaterial {
             ablation_temp: self.ablation_temp.or(p.ablation_temp),
             latent_heat: self.latent_heat.or(p.latent_heat),
             ablator_fraction: self.ablator_fraction.or(p.ablator_fraction),
+            tags: self.tags.or_else(|| p.tags.clone()),
         }
     }
 }
@@ -314,6 +431,9 @@ struct RawResource {
     /// Economy-facing tradability (inert until the economy sibling lands).
     #[serde(default)]
     tradable: Option<bool>,
+    /// Inert metadata tags (WI 548).
+    #[serde(default)]
+    tags: Option<Vec<String>>,
 }
 
 impl RawResource {
@@ -324,6 +444,7 @@ impl RawResource {
             is_abstract: self.is_abstract,
             density: self.density.or(p.density),
             tradable: self.tradable.or(p.tradable),
+            tags: self.tags.or_else(|| p.tags.clone()),
         }
     }
 }
@@ -340,6 +461,9 @@ struct RawBody {
     /// **references** a library asset; it never defines body physical data.
     #[serde(default)]
     body: Option<String>,
+    /// Inert metadata tags (WI 548).
+    #[serde(default)]
+    tags: Option<Vec<String>>,
 }
 
 impl RawBody {
@@ -349,21 +473,158 @@ impl RawBody {
             parent: self.parent,
             is_abstract: self.is_abstract,
             body: self.body.or_else(|| p.body.clone()),
+            tags: self.tags.or_else(|| p.tags.clone()),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Override sets (WI 548) — authored tuning documents on the merge ladder.
+// ---------------------------------------------------------------------------
+
+/// The ladder phase an override set belongs to. Settings (WI 549) precedes
+/// these; base packs (definitions) sit between settings and `Patch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum OverridePhase {
+    /// Pack-to-pack adjustments (a compatibility pack tuning another pack).
+    Patch,
+    /// A scenario's tuning of the packs it enables.
+    Scenario,
+    /// House rules — reserved last; local edits win and are never depended on.
+    Local,
+}
+
+impl OverridePhase {
+    fn rank(self) -> u8 {
+        match self {
+            OverridePhase::Patch => 0,
+            OverridePhase::Scenario => 1,
+            OverridePhase::Local => 2,
+        }
+    }
+}
+
+/// An override-set document as authored.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOverrideSet {
+    /// Document *format* version — must equal [`CONTENT_FORMAT_VERSION`].
+    format: u32,
+    /// The source's identity (shares one namespace with pack ids).
+    id: String,
+    /// Which ladder phase this set applies in.
+    phase: OverridePhase,
+    /// Same-phase set ids this source orders after.
+    #[serde(default)]
+    depends: Vec<String>,
+    /// The overrides, applied in authored order.
+    overrides: Vec<RawOverride>,
+}
+
+/// One field operation.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOverride {
+    target: Target,
+    field: String,
+    op: Op,
+}
+
+/// What an override applies to.
+#[derive(Debug, Deserialize)]
+enum Target {
+    /// One record by id (abstract bases are legal targets — the canonical
+    /// family-tuning move: a base write re-flows to every variant).
+    Id(String),
+    /// Every record of a kind (zero matches is legal).
+    Kind(RecordKind),
+    /// Every record whose inheritance chain reaches the named base
+    /// (the base itself excluded; zero inheritors is legal).
+    Base(String),
+}
+
+impl Target {
+    fn describe(&self) -> String {
+        match self {
+            Target::Id(id) => format!("record id `{id}`"),
+            Target::Kind(k) => format!("kind {k:?}"),
+            Target::Base(id) => format!("base `{id}`"),
+        }
+    }
+}
+
+/// The four field operations. `Set` operands are explicitly typed (RON-safe).
+#[derive(Debug, Deserialize)]
+enum Op {
+    Set(SetValue),
+    Multiply(f64),
+    Extend(Vec<String>),
+    Delete(String),
+}
+
+/// A typed `set` operand.
+#[derive(Debug, Deserialize)]
+enum SetValue {
+    Number(f64),
+    Bool(bool),
+    Text(String),
+    List(Vec<String>),
+}
+
+// ---------------------------------------------------------------------------
+// Provenance — where every resolved value came from, and what it displaced.
+// ---------------------------------------------------------------------------
+
+/// A value source: the defining pack, or an override set at a phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceRef {
+    /// Authored in a pack's record definition.
+    Pack { id: String },
+    /// Written by an override set.
+    Override {
+        source: String,
+        phase: OverridePhase,
+    },
+}
+
+/// A value as recorded in provenance shadows.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProvValue {
+    Number(f64),
+    Bool(bool),
+    Text(String),
+    List(Vec<String>),
+    /// The field had no value (it was defined by the shadowing write).
+    Unset,
+}
+
+/// A displaced value and the source that had produced it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Shadow {
+    pub value: ProvValue,
+    pub source: SourceRef,
+}
+
+/// Per-field provenance: the winning source plus the ordered chain of
+/// displaced values (newest displaced first, ending at the pack-authored
+/// original or an [`ProvValue::Unset`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldProvenance {
+    pub source: SourceRef,
+    pub shadows: Vec<Shadow>,
 }
 
 // ---------------------------------------------------------------------------
 // Resolved records — fully-typed, real physical parameters.
 // ---------------------------------------------------------------------------
 
-/// Where a resolved record came from — the provenance seed WI 548's merge
-/// ladder extends (per-value provenance with shadowing arrives there).
+/// Where a resolved record was defined — the record-level origin (per-field
+/// detail lives in [`Entry::field_provenance`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Provenance {
-    /// Id of the pack that supplied the record.
+    /// Id of the pack that defined the record.
     pub pack_id: String,
-    /// The pack's (opaque) version string.
+    /// That pack's (opaque) version string.
     pub pack_version: String,
 }
 
@@ -402,6 +663,8 @@ pub struct DeviceRecord {
     /// Bulk density, kg/m³ — mass is `density × cell³` (WI 615 shape).
     pub density: f64,
     pub spec: DeviceSpec,
+    /// Inert metadata tags.
+    pub tags: Vec<String>,
 }
 
 /// A resolved material record — the payload is the *actual* sim material type.
@@ -409,6 +672,8 @@ pub struct DeviceRecord {
 pub struct MaterialRecord {
     pub id: String,
     pub material: Material,
+    /// Inert metadata tags.
+    pub tags: Vec<String>,
 }
 
 /// A resolved resource record.
@@ -419,6 +684,8 @@ pub struct ResourceRecord {
     pub density: Option<f64>,
     /// Economy-facing flag; inert until the economy sibling (WI 552).
     pub tradable: bool,
+    /// Inert metadata tags.
+    pub tags: Vec<String>,
 }
 
 /// A resolved body-reference record: identity linkage into the world-building
@@ -428,6 +695,8 @@ pub struct BodyRefRecord {
     pub id: String,
     /// [`crate::body_library`] slug of the referenced body asset.
     pub body_slug: String,
+    /// Inert metadata tags.
+    pub tags: Vec<String>,
 }
 
 /// A resolved, concrete content record.
@@ -439,37 +708,50 @@ pub enum Record {
     Body(BodyRefRecord),
 }
 
-/// A catalog entry: the record plus its provenance.
+/// A catalog entry: the record, its defining pack, and per-field provenance
+/// (each authored-or-overridden value's winning source + shadow chain;
+/// inherited fields carry the provenance of the value they inherited).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
     pub record: Record,
     pub provenance: Provenance,
+    pub field_provenance: BTreeMap<String, FieldProvenance>,
 }
 
-/// The resolved catalog of one loaded pack: concrete records by id, in
+/// The resolved catalog of a merged composition: concrete records by id, in
 /// deterministic (ordered) storage. Abstract bases are resolution inputs, not
 /// content — they do not appear here.
+///
+/// `pack_id`/`pack_version` carry the single pack on the 547 single-pack
+/// path; on a multi-pack merge they carry the **first base pack in resolution
+/// order** (compat surface). `sources` lists every source id in ladder order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Catalog {
     pub pack_id: String,
     pub pack_version: String,
+    /// All source ids (packs, then override sets) in ladder order.
+    pub sources: Vec<String>,
     records: BTreeMap<String, Entry>,
 }
 
 impl Catalog {
-    /// Load a pack from RON text.
+    /// Load a single pack from RON text (no overrides — the WI 547 path).
     pub fn from_ron_str(source: &str) -> Result<Catalog, ContentError> {
-        let raw: RawPack = ron::from_str(source).map_err(|e| ContentError::Parse(e.to_string()))?;
-        if raw.format != CONTENT_FORMAT_VERSION {
-            return Err(ContentError::Format { found: raw.format });
-        }
-        resolve(raw)
+        Catalog::merge(&[source], &[])
     }
 
-    /// Load a pack from a RON file on disk.
+    /// Load a single pack from a RON file on disk.
     pub fn load(path: &Path) -> Result<Catalog, ContentError> {
         let text = std::fs::read_to_string(path).map_err(ContentError::Io)?;
         Catalog::from_ron_str(&text)
+    }
+
+    /// Merge a composition: pack documents (record definitions) plus override
+    /// sets, resolved through the named-phase ladder. Input order of either
+    /// slice is irrelevant — ordering is derived from declared phases,
+    /// dependencies, and ids only.
+    pub fn merge(pack_texts: &[&str], override_texts: &[&str]) -> Result<Catalog, ContentError> {
+        merge_composition(pack_texts, override_texts)
     }
 
     /// Look up a concrete record by id.
@@ -494,56 +776,490 @@ impl Catalog {
 }
 
 // ---------------------------------------------------------------------------
-// Resolution — after-load inheritance merge + validation.
+// Field access — one table drives ops, shadow capture, and provenance walks.
 // ---------------------------------------------------------------------------
 
-/// Merge every record's inheritance chain (memoized, cycle-checked), then
-/// validate concrete records into the catalog.
-fn resolve(raw: RawPack) -> Result<Catalog, ContentError> {
-    // Flat namespace: duplicate ids are an authoring error across kinds too.
-    let mut by_id: HashMap<String, RawRecord> = HashMap::new();
-    for r in raw.records {
-        let id = r.id().to_string();
-        if by_id.insert(id.clone(), r).is_some() {
-            return Err(ContentError::DuplicateId { id });
+/// A mutable, typed view of one raw-record field.
+enum Slot<'a> {
+    Num(&'a mut Option<f64>),
+    Flag(&'a mut Option<bool>),
+    Text(&'a mut Option<String>),
+    List(&'a mut Option<Vec<String>>),
+}
+
+impl Slot<'_> {
+    fn value(&self) -> Option<ProvValue> {
+        match self {
+            Slot::Num(v) => v.map(ProvValue::Number),
+            Slot::Flag(v) => v.map(ProvValue::Bool),
+            Slot::Text(v) => (**v).clone().map(ProvValue::Text),
+            Slot::List(v) => (**v).clone().map(ProvValue::List),
+        }
+    }
+}
+
+/// The overridable fields of a record, as `(name, slot)` accessors. One table
+/// per kind; drives op application and the per-field provenance walk alike.
+fn slot<'a>(rec: &'a mut RawRecord, field: &str) -> Option<Slot<'a>> {
+    match rec {
+        RawRecord::Device(d) => match field {
+            "density" => Some(Slot::Num(&mut d.density)),
+            "exhaust_velocity" => Some(Slot::Num(&mut d.exhaust_velocity)),
+            "max_mass_flow" => Some(Slot::Num(&mut d.max_mass_flow)),
+            "capacity" => Some(Slot::Num(&mut d.capacity)),
+            "max_torque" => Some(Slot::Num(&mut d.max_torque)),
+            "top_speed" => Some(Slot::Num(&mut d.top_speed)),
+            "motor_mass" => Some(Slot::Num(&mut d.motor_mass)),
+            "draw" => Some(Slot::Num(&mut d.draw)),
+            "tags" => Some(Slot::List(&mut d.tags)),
+            _ => None,
+        },
+        RawRecord::Material(m) => match field {
+            "density" => Some(Slot::Num(&mut m.density)),
+            "strength" => Some(Slot::Num(&mut m.strength)),
+            "specific_heat" => Some(Slot::Num(&mut m.specific_heat)),
+            "conductivity" => Some(Slot::Num(&mut m.conductivity)),
+            "emissivity" => Some(Slot::Num(&mut m.emissivity)),
+            "max_temp" => Some(Slot::Num(&mut m.max_temp)),
+            "ablation_temp" => Some(Slot::Num(&mut m.ablation_temp)),
+            "latent_heat" => Some(Slot::Num(&mut m.latent_heat)),
+            "ablator_fraction" => Some(Slot::Num(&mut m.ablator_fraction)),
+            "tags" => Some(Slot::List(&mut m.tags)),
+            _ => None,
+        },
+        RawRecord::Resource(r) => match field {
+            "density" => Some(Slot::Num(&mut r.density)),
+            "tradable" => Some(Slot::Flag(&mut r.tradable)),
+            "tags" => Some(Slot::List(&mut r.tags)),
+            _ => None,
+        },
+        RawRecord::Body(b) => match field {
+            "body" => Some(Slot::Text(&mut b.body)),
+            "tags" => Some(Slot::List(&mut b.tags)),
+            _ => None,
+        },
+    }
+}
+
+/// The overridable field names of a kind (drives the provenance walk).
+fn field_names(kind: RecordKind) -> &'static [&'static str] {
+    match kind {
+        RecordKind::Device => &[
+            "density",
+            "exhaust_velocity",
+            "max_mass_flow",
+            "capacity",
+            "max_torque",
+            "top_speed",
+            "motor_mass",
+            "draw",
+            "tags",
+        ],
+        RecordKind::Material => &[
+            "density",
+            "strength",
+            "specific_heat",
+            "conductivity",
+            "emissivity",
+            "max_temp",
+            "ablation_temp",
+            "latent_heat",
+            "ablator_fraction",
+            "tags",
+        ],
+        RecordKind::Resource => &["density", "tradable", "tags"],
+        RecordKind::Body => &["body", "tags"],
+    }
+}
+
+/// Read a field's current raw value without mutating (provenance walk).
+fn peek(rec: &RawRecord, field: &str) -> Option<Option<ProvValue>> {
+    // Safe: `slot` only hands out references; we clone the value and drop it.
+    let mut clone = rec.clone();
+    slot(&mut clone, field).map(|s| s.value())
+}
+
+// ---------------------------------------------------------------------------
+// The merge ladder (WI 548).
+// ---------------------------------------------------------------------------
+
+/// Order a set of sources topologically by their declared dependencies,
+/// smallest-id-first among ready nodes (deterministic Kahn).
+fn topo_order(
+    deps: &BTreeMap<String, Vec<String>>, // source id -> depends-on ids
+) -> Result<Vec<String>, ContentError> {
+    for (source, ds) in deps {
+        for d in ds {
+            if !deps.contains_key(d) {
+                return Err(ContentError::UnknownDependency {
+                    source: source.clone(),
+                    depends_on: d.clone(),
+                });
+            }
+        }
+    }
+    let mut remaining: BTreeMap<String, HashSet<String>> = deps
+        .iter()
+        .map(|(id, ds)| (id.clone(), ds.iter().cloned().collect()))
+        .collect();
+    let mut order = Vec::with_capacity(deps.len());
+    while !remaining.is_empty() {
+        // Smallest id whose dependencies are all placed.
+        let ready = remaining
+            .iter()
+            .find(|(_, ds)| ds.is_empty())
+            .map(|(id, _)| id.clone());
+        let Some(id) = ready else {
+            // Every remaining node waits on another: a cycle exists. Name the
+            // smallest still-blocked source for determinism (it is either a
+            // cycle member or depends on one).
+            let source = remaining.keys().next().expect("non-empty").clone();
+            return Err(ContentError::DependencyCycle { source });
+        };
+        remaining.remove(&id);
+        for ds in remaining.values_mut() {
+            ds.remove(&id);
+        }
+        order.push(id);
+    }
+    Ok(order)
+}
+
+/// Does `id`'s inheritance chain reach `base`? (Existence of all parents has
+/// been validated; a visited set guards against cycles, which error later.)
+fn chain_reaches(id: &str, base: &str, raws: &BTreeMap<String, RawRecord>) -> bool {
+    let mut seen = HashSet::new();
+    let mut cur = id;
+    while let Some(parent) = raws.get(cur).and_then(|r| r.parent()) {
+        if !seen.insert(parent.to_string()) {
+            return false; // cycle — reported by inheritance resolution
+        }
+        if parent == base {
+            return true;
+        }
+        cur = parent;
+    }
+    false
+}
+
+/// Apply one op to one record's field, updating the provenance ledger.
+fn apply_op(
+    rec: &mut RawRecord,
+    field: &str,
+    op: &Op,
+    source: &SourceRef,
+    defining_pack: &str,
+    prov: &mut HashMap<(String, String), FieldProvenance>,
+) -> Result<(), ContentError> {
+    let record_id = rec.id().to_string();
+    if STRUCTURAL_FIELDS.contains(&field) {
+        return Err(ContentError::StructuralField {
+            record: record_id,
+            field: field.to_string(),
+        });
+    }
+    let parentless = rec.parent().is_none();
+    let Some(mut s) = slot(rec, field) else {
+        return Err(ContentError::UnknownField {
+            record: record_id,
+            field: field.to_string(),
+        });
+    };
+    let old = s.value();
+    let mismatch = |op: &'static str| ContentError::TypeMismatch {
+        record: record_id.clone(),
+        field: field.to_string(),
+        op,
+    };
+    let unset = || ContentError::UnsetField {
+        record: record_id.clone(),
+        field: field.to_string(),
+    };
+    match (&mut s, op) {
+        (Slot::Num(v), Op::Set(SetValue::Number(n))) => **v = Some(*n),
+        (Slot::Flag(v), Op::Set(SetValue::Bool(b))) => **v = Some(*b),
+        (Slot::Text(v), Op::Set(SetValue::Text(t))) => **v = Some(t.clone()),
+        (Slot::List(v), Op::Set(SetValue::List(l))) => **v = Some(l.clone()),
+        (_, Op::Set(_)) => return Err(mismatch("set")),
+        (Slot::Num(v), Op::Multiply(factor)) => match **v {
+            Some(cur) => **v = Some(cur * factor),
+            None => return Err(unset()),
+        },
+        (_, Op::Multiply(_)) => return Err(mismatch("multiply")),
+        (Slot::List(v), Op::Extend(items)) => match v {
+            Some(list) => list.extend(items.iter().cloned()),
+            None if parentless => **v = Some(items.clone()),
+            None => return Err(unset()),
+        },
+        (_, Op::Extend(_)) => return Err(mismatch("extend")),
+        (Slot::List(v), Op::Delete(item)) => {
+            let list = match v {
+                Some(list) => list,
+                None if parentless => {
+                    return Err(ContentError::AbsentElement {
+                        record: record_id,
+                        field: field.to_string(),
+                        element: item.clone(),
+                    })
+                }
+                None => return Err(unset()),
+            };
+            match list.iter().position(|e| e == item) {
+                Some(i) => {
+                    list.remove(i);
+                }
+                None => {
+                    return Err(ContentError::AbsentElement {
+                        record: record_id,
+                        field: field.to_string(),
+                        element: item.clone(),
+                    })
+                }
+            }
+        }
+        (_, Op::Delete(_)) => return Err(mismatch("delete")),
+    }
+    // Provenance: the displaced value's source is whoever last wrote it (or
+    // the defining pack for an authored/unset original).
+    let key = (record_id, field.to_string());
+    let prior_source = prov
+        .get(&key)
+        .map(|p| p.source.clone())
+        .unwrap_or(SourceRef::Pack {
+            id: defining_pack.to_string(),
+        });
+    let entry = prov.entry(key).or_insert_with(|| FieldProvenance {
+        source: prior_source.clone(),
+        shadows: Vec::new(),
+    });
+    entry.shadows.insert(
+        0,
+        Shadow {
+            value: old.unwrap_or(ProvValue::Unset),
+            source: prior_source,
+        },
+    );
+    entry.source = source.clone();
+    Ok(())
+}
+
+/// The full merge pipeline: parse → order sources → collect definitions →
+/// apply the override ladder (on raw records) → resolve inheritance →
+/// validate → build per-field provenance.
+fn merge_composition(
+    pack_texts: &[&str],
+    override_texts: &[&str],
+) -> Result<Catalog, ContentError> {
+    // Parse + format-check every document.
+    let mut packs = Vec::with_capacity(pack_texts.len());
+    for text in pack_texts {
+        let p: RawPack = ron::from_str(text).map_err(|e| ContentError::Parse(e.to_string()))?;
+        if p.format != CONTENT_FORMAT_VERSION {
+            return Err(ContentError::Format { found: p.format });
+        }
+        packs.push(p);
+    }
+    let mut sets = Vec::with_capacity(override_texts.len());
+    for text in override_texts {
+        let s: RawOverrideSet =
+            ron::from_str(text).map_err(|e| ContentError::Parse(e.to_string()))?;
+        if s.format != CONTENT_FORMAT_VERSION {
+            return Err(ContentError::Format { found: s.format });
+        }
+        sets.push(s);
+    }
+
+    // One source-id namespace across packs and override sets.
+    let mut source_ids = HashSet::new();
+    for id in packs
+        .iter()
+        .map(|p| &p.id)
+        .chain(sets.iter().map(|s| &s.id))
+    {
+        if !source_ids.insert(id.clone()) {
+            return Err(ContentError::DuplicateSource { id: id.clone() });
         }
     }
 
-    // Deterministic order: resolve ids sorted (BTreeMap), not hash order.
-    let ordered: BTreeMap<String, RawRecord> = by_id.into_iter().collect();
+    // Phase: base packs. Order by declared dependencies, then id.
+    let pack_deps: BTreeMap<String, Vec<String>> = packs
+        .iter()
+        .map(|p| (p.id.clone(), p.depends.clone()))
+        .collect();
+    let pack_order = topo_order(&pack_deps)?;
+    let mut packs_by_id: HashMap<String, RawPack> =
+        packs.into_iter().map(|p| (p.id.clone(), p)).collect();
 
-    let mut merged: HashMap<String, RawRecord> = HashMap::new();
-    for id in ordered.keys() {
-        let mut visiting = HashSet::new();
-        merge_chain(id, &ordered, &mut merged, &mut visiting)?;
+    // Collect record definitions (defined once, anywhere).
+    let mut raws: BTreeMap<String, RawRecord> = BTreeMap::new();
+    let mut defining: HashMap<String, Provenance> = HashMap::new();
+    let mut first_pack: Option<(String, String)> = None;
+    for pack_id in &pack_order {
+        let pack = packs_by_id.remove(pack_id).expect("ordered from this set");
+        if first_pack.is_none() {
+            first_pack = Some((pack.id.clone(), pack.version.clone()));
+        }
+        for r in pack.records {
+            let id = r.id().to_string();
+            if raws.insert(id.clone(), r).is_some() {
+                return Err(ContentError::DuplicateId { id });
+            }
+            defining.insert(
+                id,
+                Provenance {
+                    pack_id: pack.id.clone(),
+                    pack_version: pack.version.clone(),
+                },
+            );
+        }
     }
 
-    let provenance = Provenance {
-        pack_id: raw.id.clone(),
-        pack_version: raw.version.clone(),
-    };
+    // Parent existence is needed before base-selector expansion.
+    for (id, r) in &raws {
+        if let Some(parent) = r.parent() {
+            if !raws.contains_key(parent) {
+                return Err(ContentError::UnknownParent {
+                    child: id.clone(),
+                    parent: parent.to_string(),
+                });
+            }
+        }
+    }
+
+    // Phases: patches → scenario → local. Within a phase: topo by declared
+    // same-phase depends, then id.
+    let mut set_order: Vec<usize> = Vec::with_capacity(sets.len());
+    for phase in [
+        OverridePhase::Patch,
+        OverridePhase::Scenario,
+        OverridePhase::Local,
+    ] {
+        let phase_deps: BTreeMap<String, Vec<String>> = sets
+            .iter()
+            .filter(|s| s.phase == phase)
+            .map(|s| (s.id.clone(), s.depends.clone()))
+            .collect();
+        for id in topo_order(&phase_deps)? {
+            let idx = sets
+                .iter()
+                .position(|s| s.id == id)
+                .expect("ordered from this set");
+            set_order.push(idx);
+        }
+    }
+    // Every set has one of the three phases, so every set was ordered.
+    debug_assert_eq!(set_order.len(), sets.len());
+
+    // Apply the ladder on raw (pre-inheritance) records.
+    let mut prov: HashMap<(String, String), FieldProvenance> = HashMap::new();
+    for &idx in &set_order {
+        let set = &sets[idx];
+        let source = SourceRef::Override {
+            source: set.id.clone(),
+            phase: set.phase,
+        };
+        for ov in &set.overrides {
+            // Expand the target deterministically (sorted ids).
+            let ids: Vec<String> = match &ov.target {
+                Target::Id(id) => {
+                    if !raws.contains_key(id) {
+                        return Err(ContentError::UnknownTarget {
+                            target: ov.target.describe(),
+                        });
+                    }
+                    vec![id.clone()]
+                }
+                Target::Kind(kind) => raws
+                    .iter()
+                    .filter(|(_, r)| r.kind() == *kind)
+                    .map(|(id, _)| id.clone())
+                    .collect(),
+                Target::Base(base) => {
+                    if !raws.contains_key(base) {
+                        return Err(ContentError::UnknownTarget {
+                            target: ov.target.describe(),
+                        });
+                    }
+                    raws.keys()
+                        .filter(|id| chain_reaches(id, base, &raws))
+                        .cloned()
+                        .collect()
+                }
+            };
+            for id in ids {
+                let defining_pack = defining[&id].pack_id.clone();
+                let rec = raws.get_mut(&id).expect("expanded from this map");
+                apply_op(rec, &ov.field, &ov.op, &source, &defining_pack, &mut prov)?;
+            }
+        }
+    }
+
+    // Resolve inheritance (after the ladder — base writes re-flow), validate.
+    let mut merged: HashMap<String, RawRecord> = HashMap::new();
+    for id in raws.keys() {
+        let mut visiting = HashSet::new();
+        merge_chain(id, &raws, &mut merged, &mut visiting)?;
+    }
+
     let mut records = BTreeMap::new();
-    for (id, _) in ordered {
-        let m = &merged[&id];
+    for id in raws.keys() {
+        let m = &merged[id];
         if m.is_abstract() {
             continue; // bases are inheritance targets, not content
         }
         let record = validate(m)?;
+        // Per-field provenance: each present field traces to the chain member
+        // whose (post-ladder) raw value supplied it.
+        let mut field_provenance = BTreeMap::new();
+        for &field in field_names(m.kind()) {
+            let mut cur = id.as_str();
+            loop {
+                let raw = &raws[cur];
+                match peek(raw, field) {
+                    Some(Some(_)) => {
+                        let fp = prov
+                            .get(&(cur.to_string(), field.to_string()))
+                            .cloned()
+                            .unwrap_or_else(|| FieldProvenance {
+                                source: SourceRef::Pack {
+                                    id: defining[cur].pack_id.clone(),
+                                },
+                                shadows: Vec::new(),
+                            });
+                        field_provenance.insert(field.to_string(), fp);
+                        break;
+                    }
+                    _ => match raw.parent() {
+                        Some(p) => cur = p,
+                        None => break, // unset everywhere (optional field)
+                    },
+                }
+            }
+        }
         records.insert(
-            id,
+            id.clone(),
             Entry {
                 record,
-                provenance: provenance.clone(),
+                provenance: defining[id].clone(),
+                field_provenance,
             },
         );
     }
 
+    let (pack_id, pack_version) = first_pack.unwrap_or_default();
+    let mut sources = pack_order;
+    sources.extend(set_order.iter().map(|&i| sets[i].id.clone()));
     Ok(Catalog {
-        pack_id: raw.id,
-        pack_version: raw.version,
+        pack_id,
+        pack_version,
+        sources,
         records,
     })
 }
+
+// ---------------------------------------------------------------------------
+// Inheritance resolution + validation (WI 547).
+// ---------------------------------------------------------------------------
 
 /// Compute the fully-merged raw form of `id` (its fields with every ancestor
 /// folded in), memoizing results and detecting cycles/unknown parents.
@@ -597,6 +1313,7 @@ fn validate(m: &RawRecord) -> Result<Record, ContentError> {
                 id: d.id.clone(),
                 density,
                 spec,
+                tags: d.tags.clone().unwrap_or_default(),
             }))
         }
         RawRecord::Material(mt) => {
@@ -620,16 +1337,19 @@ fn validate(m: &RawRecord) -> Result<Record, ContentError> {
             Ok(Record::Material(MaterialRecord {
                 id: mt.id.clone(),
                 material,
+                tags: mt.tags.clone().unwrap_or_default(),
             }))
         }
         RawRecord::Resource(r) => Ok(Record::Resource(ResourceRecord {
             id: r.id.clone(),
             density: r.density,
             tradable: r.tradable.unwrap_or(false),
+            tags: r.tags.clone().unwrap_or_default(),
         })),
         RawRecord::Body(b) => Ok(Record::Body(BodyRefRecord {
             id: b.id.clone(),
             body_slug: b.body.clone().ok_or_else(|| missing(&b.id, "body"))?,
+            tags: b.tags.clone().unwrap_or_default(),
         })),
     }
 }
@@ -645,7 +1365,6 @@ fn device_spec(d: &RawDevice, class: DeviceClass) -> Result<DeviceSpec, ContentE
         id: d.id.clone(),
         field,
     };
-    // (field value, name, applicable-to) — checked against the resolved class.
     let engine = matches!(class, DeviceClass::Engine);
     let tanklike = matches!(class, DeviceClass::Tank | DeviceClass::Battery);
     let motor = matches!(class, DeviceClass::Motor);
@@ -707,9 +1426,41 @@ mod tests {
         )
     }
 
+    /// A minimal pack with an explicit id (multi-pack tests).
+    fn pack_named(id: &str, extra: &str, records: &str) -> String {
+        format!(
+            "#![enable(implicit_some)]\n(format: 1, id: \"{id}\", version: \"1\", {extra} records: [{records}])"
+        )
+    }
+
+    /// A minimal override set.
+    fn override_set(id: &str, phase: &str, extra: &str, overrides: &str) -> String {
+        format!("(format: 1, id: \"{id}\", phase: {phase}, {extra} overrides: [{overrides}])")
+    }
+
     fn engine_base() -> &'static str {
         r#"Device(( id: "engine_base", abstract: true, class: Engine, exhaust_velocity: 3200.0 )),"#
     }
+
+    fn engine_variant() -> &'static str {
+        r#"Device(( id: "v", parent: "engine_base", density: 3000.0, max_mass_flow: 1.0 )),"#
+    }
+
+    fn engine_ev(cat: &Catalog, id: &str) -> f64 {
+        match &cat.get(id).unwrap().record {
+            Record::Device(d) => match d.spec {
+                DeviceSpec::Engine {
+                    exhaust_velocity, ..
+                } => exhaust_velocity,
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // WI 547 — single-pack loading, inheritance, validation.
+    // ------------------------------------------------------------------
 
     #[test]
     fn shipped_core_pack_loads_and_resolves() {
@@ -783,38 +1534,22 @@ mod tests {
 
     #[test]
     fn editing_a_base_reflows_to_variants() {
-        let variant =
-            r#"Device(( id: "v", parent: "engine_base", density: 3000.0, max_mass_flow: 1.0 )),"#;
-        let a = pack(&format!("{}{variant}", engine_base()));
+        let a = pack(&format!("{}{}", engine_base(), engine_variant()));
         let b = pack(&format!(
-            "{}{variant}",
-            engine_base().replace("3200.0", "4400.0")
+            "{}{}",
+            engine_base().replace("3200.0", "4400.0"),
+            engine_variant()
         ));
         let va = Catalog::from_ron_str(&a).unwrap();
         let vb = Catalog::from_ron_str(&b).unwrap();
-        let ev = |cat: &Catalog| match &cat.get("v").unwrap().record {
-            Record::Device(d) => match d.spec {
-                DeviceSpec::Engine {
-                    exhaust_velocity, ..
-                } => exhaust_velocity,
-                _ => unreachable!(),
-            },
-            _ => unreachable!(),
-        };
-        assert_eq!(ev(&va), 3200.0);
-        assert_eq!(ev(&vb), 4400.0);
+        assert_eq!(engine_ev(&va, "v"), 3200.0);
+        assert_eq!(engine_ev(&vb, "v"), 4400.0);
     }
 
     #[test]
     fn declaration_order_does_not_matter() {
-        let fwd = pack(&format!(
-            "{}Device(( id: \"v\", parent: \"engine_base\", density: 1.0, max_mass_flow: 1.0 )),",
-            engine_base()
-        ));
-        let rev = pack(&format!(
-            "Device(( id: \"v\", parent: \"engine_base\", density: 1.0, max_mass_flow: 1.0 )),{}",
-            engine_base()
-        ));
+        let fwd = pack(&format!("{}{}", engine_base(), engine_variant()));
+        let rev = pack(&format!("{}{}", engine_variant(), engine_base()));
         assert_eq!(
             Catalog::from_ron_str(&fwd).unwrap(),
             Catalog::from_ron_str(&rev).unwrap()
@@ -973,13 +1708,380 @@ mod tests {
     #[test]
     fn loading_is_deterministic() {
         let src = pack(&format!(
-            "{}Device(( id: \"v\", parent: \"engine_base\", density: 1.0, max_mass_flow: 1.0 )),
-             Resource(( id: \"fuel\", density: 800.0 )),",
-            engine_base()
+            "{}{}Resource(( id: \"fuel\", density: 800.0 )),",
+            engine_base(),
+            engine_variant()
         ));
         let a = Catalog::from_ron_str(&src).unwrap();
         let b = Catalog::from_ron_str(&src).unwrap();
         assert_eq!(a, b);
         assert_eq!(a.ids().collect::<Vec<_>>(), vec!["fuel", "v"]);
+    }
+
+    // ------------------------------------------------------------------
+    // WI 548 — override model + merge ladder + provenance.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn base_multiply_reflows_to_variant_with_provenance() {
+        let p = pack(&format!("{}{}", engine_base(), engine_variant()));
+        let s = override_set(
+            "scn",
+            "Scenario",
+            "",
+            r#"( target: Id("engine_base"), field: "exhaust_velocity", op: Multiply(0.5) ),"#,
+        );
+        let cat = Catalog::merge(&[&p], &[&s]).unwrap();
+        assert_eq!(engine_ev(&cat, "v"), 1600.0);
+        // The inherited field's provenance traces to the base's override.
+        let fp = &cat.get("v").unwrap().field_provenance["exhaust_velocity"];
+        assert_eq!(
+            fp.source,
+            SourceRef::Override {
+                source: "scn".into(),
+                phase: OverridePhase::Scenario
+            }
+        );
+        assert_eq!(
+            fp.shadows,
+            vec![Shadow {
+                value: ProvValue::Number(3200.0),
+                source: SourceRef::Pack { id: "test".into() }
+            }]
+        );
+    }
+
+    #[test]
+    fn later_phase_shadows_earlier_and_chain_is_recorded() {
+        let p = pack(&format!("{}{}", engine_base(), engine_variant()));
+        let scn = override_set(
+            "scn",
+            "Scenario",
+            "",
+            r#"( target: Id("engine_base"), field: "exhaust_velocity", op: Multiply(0.5) ),"#,
+        );
+        let local = override_set(
+            "house",
+            "Local",
+            "",
+            r#"( target: Id("engine_base"), field: "exhaust_velocity", op: Set(Number(9000.0)) ),"#,
+        );
+        let cat = Catalog::merge(&[&p], &[&local, &scn]).unwrap();
+        assert_eq!(engine_ev(&cat, "v"), 9000.0);
+        let fp = &cat.get("v").unwrap().field_provenance["exhaust_velocity"];
+        assert_eq!(
+            fp.source,
+            SourceRef::Override {
+                source: "house".into(),
+                phase: OverridePhase::Local
+            }
+        );
+        // Newest displaced first: the scenario's 1600, then the pack's 3200.
+        assert_eq!(fp.shadows.len(), 2);
+        assert_eq!(fp.shadows[0].value, ProvValue::Number(1600.0));
+        assert_eq!(
+            fp.shadows[0].source,
+            SourceRef::Override {
+                source: "scn".into(),
+                phase: OverridePhase::Scenario
+            }
+        );
+        assert_eq!(fp.shadows[1].value, ProvValue::Number(3200.0));
+        assert_eq!(fp.shadows[1].source, SourceRef::Pack { id: "test".into() });
+    }
+
+    #[test]
+    fn multiply_on_unset_variant_field_errors_with_guidance() {
+        let p = pack(&format!("{}{}", engine_base(), engine_variant()));
+        let s = override_set(
+            "scn",
+            "Scenario",
+            "",
+            r#"( target: Id("v"), field: "exhaust_velocity", op: Multiply(0.5) ),"#,
+        );
+        match Catalog::merge(&[&p], &[&s]) {
+            Err(ContentError::UnsetField { record, field }) => {
+                assert_eq!((record.as_str(), field.as_str()), ("v", "exhaust_velocity"));
+            }
+            other => panic!("expected UnsetField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn intra_phase_dependency_order_wins() {
+        let p = pack(&format!("{}{}", engine_base(), engine_variant()));
+        let a = override_set(
+            "patch_a",
+            "Patch",
+            "",
+            r#"( target: Id("engine_base"), field: "exhaust_velocity", op: Set(Number(1000.0)) ),"#,
+        );
+        // patch_b declares it comes after patch_a, so its write wins.
+        let b = override_set(
+            "patch_b",
+            "Patch",
+            "depends: [\"patch_a\"],",
+            r#"( target: Id("engine_base"), field: "exhaust_velocity", op: Set(Number(2000.0)) ),"#,
+        );
+        // Input order must not matter.
+        let cat = Catalog::merge(&[&p], &[&b, &a]).unwrap();
+        assert_eq!(engine_ev(&cat, "v"), 2000.0);
+        let fp = &cat.get("v").unwrap().field_provenance["exhaust_velocity"];
+        assert_eq!(fp.shadows[0].value, ProvValue::Number(1000.0));
+    }
+
+    #[test]
+    fn merge_is_deterministic_under_input_permutation() {
+        let p1 = pack_named("alpha", "", engine_base());
+        let p2 = pack_named(
+            "beta",
+            "depends: [\"alpha\"],",
+            r#"Device(( id: "v", parent: "engine_base", density: 3000.0, max_mass_flow: 1.0 )),"#,
+        );
+        let s1 = override_set(
+            "scn",
+            "Scenario",
+            "",
+            r#"( target: Id("engine_base"), field: "exhaust_velocity", op: Multiply(2.0) ),"#,
+        );
+        let s2 = override_set(
+            "house",
+            "Local",
+            "",
+            r#"( target: Kind(Device), field: "tags", op: Set(List(["tuned"])) ),"#,
+        );
+        let a = Catalog::merge(&[&p1, &p2], &[&s1, &s2]).unwrap();
+        let b = Catalog::merge(&[&p2, &p1], &[&s2, &s1]).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.sources, vec!["alpha", "beta", "scn", "house"]);
+        assert_eq!(a.pack_id, "alpha");
+    }
+
+    #[test]
+    fn set_defines_an_unset_field() {
+        // The variant has no authored capacity... but capacity is not an
+        // engine field; use a tank whose density comes from an override.
+        let p = pack(r#"Device(( id: "t", class: Tank, capacity: 100.0 )),"#);
+        let s = override_set(
+            "patch",
+            "Patch",
+            "",
+            r#"( target: Id("t"), field: "density", op: Set(Number(500.0)) ),"#,
+        );
+        let cat = Catalog::merge(&[&p], &[&s]).unwrap();
+        match &cat.get("t").unwrap().record {
+            Record::Device(d) => assert_eq!(d.density, 500.0),
+            other => panic!("expected device, got {other:?}"),
+        }
+        let fp = &cat.get("t").unwrap().field_provenance["density"];
+        assert_eq!(fp.shadows[0].value, ProvValue::Unset);
+    }
+
+    #[test]
+    fn extend_and_delete_on_tags() {
+        let p = pack(r#"Resource(( id: "fuel", density: 800.0 )),"#);
+        // Parentless + unset tags: extend starts from empty.
+        let s1 = override_set(
+            "patch",
+            "Patch",
+            "",
+            r#"( target: Id("fuel"), field: "tags", op: Extend(["starter", "cheap"]) ),"#,
+        );
+        let s2 = override_set(
+            "scn",
+            "Scenario",
+            "",
+            r#"( target: Id("fuel"), field: "tags", op: Delete("cheap") ),"#,
+        );
+        let cat = Catalog::merge(&[&p], &[&s1, &s2]).unwrap();
+        match &cat.get("fuel").unwrap().record {
+            Record::Resource(r) => assert_eq!(r.tags, vec!["starter"]),
+            other => panic!("expected resource, got {other:?}"),
+        }
+        // Deleting an absent element is loud.
+        let s3 = override_set(
+            "house",
+            "Local",
+            "",
+            r#"( target: Id("fuel"), field: "tags", op: Delete("missing") ),"#,
+        );
+        match Catalog::merge(&[&p], &[&s1, &s3]) {
+            Err(ContentError::AbsentElement { element, .. }) => assert_eq!(element, "missing"),
+            other => panic!("expected AbsentElement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extend_on_unset_with_parent_errors() {
+        let p = pack(&format!("{}{}", engine_base(), engine_variant()));
+        let s = override_set(
+            "scn",
+            "Scenario",
+            "",
+            r#"( target: Id("v"), field: "tags", op: Extend(["x"]) ),"#,
+        );
+        assert!(matches!(
+            Catalog::merge(&[&p], &[&s]),
+            Err(ContentError::UnsetField { .. })
+        ));
+    }
+
+    #[test]
+    fn structural_and_unknown_fields_rejected() {
+        let p = pack(&format!("{}{}", engine_base(), engine_variant()));
+        let structural = override_set(
+            "scn",
+            "Scenario",
+            "",
+            r#"( target: Id("v"), field: "parent", op: Set(Text("engine_base")) ),"#,
+        );
+        assert!(matches!(
+            Catalog::merge(&[&p], &[&structural]),
+            Err(ContentError::StructuralField { .. })
+        ));
+        let unknown = override_set(
+            "scn",
+            "Scenario",
+            "",
+            r#"( target: Id("v"), field: "warp_factor", op: Set(Number(9.0)) ),"#,
+        );
+        match Catalog::merge(&[&p], &[&unknown]) {
+            Err(ContentError::UnknownField { record, field }) => {
+                assert_eq!((record.as_str(), field.as_str()), ("v", "warp_factor"));
+            }
+            other => panic!("expected UnknownField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn type_mismatches_rejected() {
+        let p = pack(r#"Resource(( id: "fuel", density: 800.0, tradable: true )),"#);
+        let mul_bool = override_set(
+            "scn",
+            "Scenario",
+            "",
+            r#"( target: Id("fuel"), field: "tradable", op: Multiply(2.0) ),"#,
+        );
+        match Catalog::merge(&[&p], &[&mul_bool]) {
+            Err(ContentError::TypeMismatch { field, op, .. }) => {
+                assert_eq!((field.as_str(), op), ("tradable", "multiply"));
+            }
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+        let set_wrong = override_set(
+            "scn",
+            "Scenario",
+            "",
+            r#"( target: Id("fuel"), field: "density", op: Set(Bool(true)) ),"#,
+        );
+        assert!(matches!(
+            Catalog::merge(&[&p], &[&set_wrong]),
+            Err(ContentError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn selectors_by_kind_and_by_base() {
+        let p = pack(&format!(
+            "{}{}Device(( id: \"w\", parent: \"engine_base\", density: 1.0, max_mass_flow: 2.0 )),
+             Resource(( id: \"fuel\", density: 800.0 )),",
+            engine_base(),
+            engine_variant()
+        ));
+        // By base: both inheritors get the tag (base excluded, kind-wide not touched).
+        let by_base = override_set(
+            "patch",
+            "Patch",
+            "",
+            r#"( target: Base("engine_base"), field: "tags", op: Set(List(["engine"])) ),"#,
+        );
+        // By kind: every resource (one) gets a density bump.
+        let by_kind = override_set(
+            "scn",
+            "Scenario",
+            "",
+            r#"( target: Kind(Resource), field: "density", op: Multiply(1.25) ),"#,
+        );
+        let cat = Catalog::merge(&[&p], &[&by_base, &by_kind]).unwrap();
+        for id in ["v", "w"] {
+            match &cat.get(id).unwrap().record {
+                Record::Device(d) => assert_eq!(d.tags, vec!["engine"]),
+                other => panic!("expected device, got {other:?}"),
+            }
+        }
+        match &cat.get("fuel").unwrap().record {
+            Record::Resource(r) => assert_eq!(r.density, Some(1000.0)),
+            other => panic!("expected resource, got {other:?}"),
+        }
+        // Zero-match by-kind is legal.
+        let zero = override_set(
+            "house",
+            "Local",
+            "",
+            r#"( target: Kind(Body), field: "tags", op: Set(List(["x"])) ),"#,
+        );
+        assert!(Catalog::merge(&[&p], &[&zero]).is_ok());
+    }
+
+    #[test]
+    fn unknown_targets_rejected() {
+        let p = pack(engine_base());
+        for target in [r#"Id("ghost")"#, r#"Base("ghost")"#] {
+            let s = override_set(
+                "scn",
+                "Scenario",
+                "",
+                &format!(r#"( target: {target}, field: "tags", op: Set(List([])) ),"#),
+            );
+            assert!(matches!(
+                Catalog::merge(&[&p], &[&s]),
+                Err(ContentError::UnknownTarget { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn source_errors_rejected() {
+        let p1 = pack_named("alpha", "", "");
+        // Duplicate source id (pack vs override set).
+        let s_dup = override_set("alpha", "Scenario", "", "");
+        assert!(matches!(
+            Catalog::merge(&[&p1], &[&s_dup]),
+            Err(ContentError::DuplicateSource { .. })
+        ));
+        // Duplicate record definition across packs.
+        let pa = pack_named("alpha", "", r#"Resource(( id: "fuel" )),"#);
+        let pb = pack_named("beta", "", r#"Resource(( id: "fuel" )),"#);
+        assert!(matches!(
+            Catalog::merge(&[&pa, &pb], &[]),
+            Err(ContentError::DuplicateId { .. })
+        ));
+        // Unknown + cyclic dependencies.
+        let p_unknown = pack_named("gamma", "depends: [\"ghost\"],", "");
+        assert!(matches!(
+            Catalog::merge(&[&p_unknown], &[]),
+            Err(ContentError::UnknownDependency { .. })
+        ));
+        let c1 = pack_named("c1", "depends: [\"c2\"],", "");
+        let c2 = pack_named("c2", "depends: [\"c1\"],", "");
+        assert!(matches!(
+            Catalog::merge(&[&c1, &c2], &[]),
+            Err(ContentError::DependencyCycle { .. })
+        ));
+    }
+
+    #[test]
+    fn shipped_example_scenario_applies_over_core() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content");
+        let core = std::fs::read_to_string(root.join("packs/core.ron")).unwrap();
+        let scn = std::fs::read_to_string(root.join("overrides/example-scenario.ron")).unwrap();
+        let cat = Catalog::merge(&[&core], &[&scn]).expect("shipped composition merges");
+        // 3200 × 0.9, re-flowed through the abstract base to the variant.
+        assert_eq!(engine_ev(&cat, "lf_engine_small"), 3200.0 * 0.9);
+        match &cat.get("liquid_fuel").unwrap().record {
+            Record::Resource(r) => assert_eq!(r.tags, vec!["starter"]),
+            other => panic!("expected resource, got {other:?}"),
+        }
+        assert_eq!(cat.sources, vec!["core", "example-scenario"]);
     }
 }

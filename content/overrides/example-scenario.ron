@@ -1,0 +1,17 @@
+// Example scenario-phase override set (WI 548) — the first authored tuning
+// document. Overrides are field operations over pack-defined records; a write
+// on an abstract base re-flows to every variant (bulk tuning by one line).
+// Balance stays a modifier over real physics, never a replacement.
+(
+    format: 1,
+    id: "example-scenario",
+    phase: Scenario,
+    overrides: [
+        // Family-wide engine detune: every engine inheriting from the base
+        // loses 10% exhaust velocity (Multiply is the first-class tuning op).
+        ( target: Id("engine_base"), field: "exhaust_velocity", op: Multiply(0.9) ),
+        // Tag the starter fuel (extend on a parentless record's unset list
+        // starts from empty).
+        ( target: Id("liquid_fuel"), field: "tags", op: Extend(["starter"]) ),
+    ],
+)
