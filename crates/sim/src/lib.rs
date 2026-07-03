@@ -21,6 +21,7 @@ pub mod command;
 pub mod compartments;
 pub mod contact;
 pub mod contact_surface;
+pub mod content;
 pub mod control;
 pub mod diagnostics;
 pub mod flight;

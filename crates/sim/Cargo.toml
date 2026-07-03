@@ -27,4 +27,8 @@ serde = { workspace = true }
 # library code (not just tests), so it is a normal dependency. Rendering-free —
 # does not affect the headless invariant.
 serde_json = { workspace = true }
+# RON parsing for authored content packs (WI 547). Content is data, never code —
+# the loader validates and rejects; nothing in a pack executes. Rendering-free —
+# does not affect the headless invariant.
+ron = { workspace = true }
 parry3d-f64 = "0.28.0"

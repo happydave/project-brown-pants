@@ -1,0 +1,44 @@
+// The trivial core content pack (WI 547) — the first authored asset pack.
+// Real physical quantities only; balance scalars live in the settings /
+// override layers (WIs 548/549), never here.
+#![enable(implicit_some)]
+(
+    format: 1,
+    id: "core",
+    version: "0.1.0",
+    records: [
+        // Abstract base: the common liquid-fuel engine physics. Not content —
+        // an inheritance target only.
+        Device((
+            id: "engine_base",
+            abstract: true,
+            class: Engine,
+            exhaust_velocity: 3200.0, // m/s (Isp ≈ 326 s)
+        )),
+        // Concrete variant: inherits the base's exhaust velocity, sets its own
+        // size (mass flow) and bulk density.
+        Device((
+            id: "lf_engine_small",
+            parent: "engine_base",
+            density: 3000.0,      // kg/m³ (WI 615 cell-scaled mass shape)
+            max_mass_flow: 1.5,   // kg/s ⇒ ~4.8 kN max thrust
+        )),
+        // A structural material — the payload is the sim's real Material shape
+        // (density + strength + the thermal quad).
+        Material((
+            id: "aluminium",
+            density: 2700.0,        // kg/m³
+            strength: 3.1e8,        // Pa
+            specific_heat: 900.0,   // J·kg⁻¹·K⁻¹
+            conductivity: 237.0,    // W·m⁻¹·K⁻¹
+            emissivity: 0.09,
+            max_temp: 900.0,        // K (≈ melting)
+        )),
+        // A resource.
+        Resource((
+            id: "liquid_fuel",
+            density: 800.0,  // kg/m³
+            tradable: true,
+        )),
+    ],
+)
