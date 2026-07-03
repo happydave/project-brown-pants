@@ -8,3 +8,5 @@
 /saves/
 # local screenshots
 /*.png
+# python
+dev/mcp/__pycache__
