@@ -649,7 +649,7 @@ mod tests {
         write_doc(&roots.content.join("packs"), "p", pack_text());
         let bp_dir = roots.content.join("blueprints");
         std::fs::create_dir_all(&bp_dir).unwrap();
-        library::save_craft(&bp_dir, "bp", &blueprint()).unwrap();
+        library::save_blueprint(&bp_dir, "bp", &blueprint()).unwrap();
         let dir = roots.content.join("scenarios");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("s.ron");

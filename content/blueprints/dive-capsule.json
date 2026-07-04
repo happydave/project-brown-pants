@@ -1,7 +1,7 @@
 {
   "format_version": 1,
   "payload": {
-    "kind": "craft",
+    "kind": "blueprint",
     "id": "dive-capsule",
     "name": "Dive Capsule",
     "reference_position": {

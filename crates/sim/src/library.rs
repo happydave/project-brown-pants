@@ -13,7 +13,7 @@
 //! round-trip via the existing format) are unit-testable without any rendering.
 
 use crate::frame::{FrameId, WorldPos};
-use crate::persist::{CraftSubgraph, FormatError, Kind, Payload, SavedDocument};
+use crate::persist::{CraftSubgraph, FormatError, Payload, SavedDocument};
 use crate::voxel::VoxelCraft;
 use glam::DVec3;
 use std::path::{Path, PathBuf};
@@ -101,11 +101,19 @@ pub struct CraftEntry {
     pub path: PathBuf,
 }
 
-/// Builds the document a save writes: a `Craft`-kind [`SavedDocument`] whose
-/// [`CraftSubgraph`] carries `slug` as the stable id and `name` as the display name.
-/// Pure (no I/O), so the encode side is testable without a filesystem.
-fn craft_document(slug: &str, name: &str, craft: &VoxelCraft) -> SavedDocument {
-    SavedDocument::new(Payload::Craft(CraftSubgraph::new(
+/// Builds the document a save writes: a [`SavedDocument`] whose [`CraftSubgraph`]
+/// carries `slug` as the stable id and `name` as the display name, wrapped in the
+/// craft-scope payload variant `wrap` selects (`Payload::Craft` for editor saves,
+/// `Payload::Blueprint` for shipped starting craft — one format, self-describing
+/// kinds, WI 809). Pure (no I/O), so the encode side is testable without a
+/// filesystem.
+fn craft_document(
+    slug: &str,
+    name: &str,
+    craft: &VoxelCraft,
+    wrap: fn(CraftSubgraph) -> Payload,
+) -> SavedDocument {
+    SavedDocument::new(wrap(CraftSubgraph::new(
         slug.to_string(),
         name.to_string(),
         WorldPos::new(FrameId::CENTRAL_BODY, DVec3::ZERO),
@@ -118,21 +126,45 @@ fn craft_path(dir: &Path, slug: &str) -> PathBuf {
     dir.join(format!("{slug}.{CRAFT_EXT}"))
 }
 
-/// Saves `craft` under display `name` into `dir`, creating the directory if needed.
-/// The file is named by the slug of `name`, so re-saving the same name updates that
-/// one slot and never clobbers a craft under a different slug. Returns the written
-/// path. An empty name (no slug-worthy characters) falls back to [`FALLBACK_SLUG`];
-/// callers that want to forbid blank names should validate before calling.
-pub fn save_craft(dir: &Path, name: &str, craft: &VoxelCraft) -> Result<PathBuf, LibraryError> {
+/// The shared writer behind [`save_craft`] and [`save_blueprint`]: slugs the name
+/// (falling back to [`FALLBACK_SLUG`]), creates `dir`, and writes the document in
+/// the payload variant `wrap` selects. Same-slug saves update one slot regardless
+/// of kind — regenerating a shipped file in a new kind overwrites in place.
+fn save_as(
+    dir: &Path,
+    name: &str,
+    craft: &VoxelCraft,
+    wrap: fn(CraftSubgraph) -> Payload,
+) -> Result<PathBuf, LibraryError> {
     let mut slug = slugify(name);
     if slug.is_empty() {
         slug = FALLBACK_SLUG.to_string();
     }
     std::fs::create_dir_all(dir).map_err(|e| LibraryError::Io(e.to_string()))?;
     let path = craft_path(dir, &slug);
-    let json = craft_document(&slug, name, craft).to_json()?;
+    let json = craft_document(&slug, name, craft, wrap).to_json()?;
     std::fs::write(&path, json).map_err(|e| LibraryError::Io(e.to_string()))?;
     Ok(path)
+}
+
+/// Saves `craft` under display `name` into `dir`, creating the directory if needed.
+/// The file is named by the slug of `name`, so re-saving the same name updates that
+/// one slot and never clobbers a craft under a different slug. Returns the written
+/// path. An empty name (no slug-worthy characters) falls back to [`FALLBACK_SLUG`];
+/// callers that want to forbid blank names should validate before calling. Writes a
+/// `craft`-kind document — the editor-save kind.
+pub fn save_craft(dir: &Path, name: &str, craft: &VoxelCraft) -> Result<PathBuf, LibraryError> {
+    save_as(dir, name, craft, Payload::Craft)
+}
+
+/// [`save_craft`]'s sibling for **shipped starting-craft documents** (WI 809): the
+/// same slug/envelope/update-one-slot semantics, but the document self-describes as
+/// a `blueprint` (`Payload::Blueprint`) — the design's first-class kind for an
+/// authored craft template, as opposed to a player's working editor save. The
+/// loaders accept both (any craft-scope kind), so the distinction is provenance,
+/// not compatibility.
+pub fn save_blueprint(dir: &Path, name: &str, craft: &VoxelCraft) -> Result<PathBuf, LibraryError> {
+    save_as(dir, name, craft, Payload::Blueprint)
 }
 
 /// Reads a saved craft document from `path` and returns its craft. Accepts any
@@ -203,10 +235,6 @@ pub fn list_crafts(dir: &Path) -> Vec<CraftEntry> {
 pub fn is_valid_name(name: &str) -> bool {
     !name.trim().is_empty()
 }
-
-/// The kind a saved-craft document declares — exposed so callers can assert scope.
-/// Always [`Kind::Craft`] for documents this module writes.
-pub const SAVED_KIND: Kind = Kind::Craft;
 
 #[cfg(test)]
 mod tests {
@@ -369,6 +397,38 @@ mod tests {
         let path = save_craft(&dir, "!!!", &rich_craft()).unwrap();
         assert_eq!(path.file_stem().unwrap().to_str().unwrap(), FALLBACK_SLUG);
         assert!(load_craft(&path).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_blueprint_round_trips_and_self_describes() {
+        // WI 809: the blueprint writer shares save_craft's semantics but the
+        // written document declares kind `blueprint`.
+        let dir = scratch_dir("blueprint");
+        let craft = rich_craft();
+        let path = save_blueprint(&dir, "First Flight", &craft).unwrap();
+        assert!(path.ends_with("first-flight.json"), "same slug idiom");
+
+        // Round-trips through the ordinary loader (any craft-scope kind).
+        let back = load_craft(&path).unwrap();
+        assert_eq!(back.voxels, craft.voxels);
+        assert_eq!(back.devices, craft.devices);
+        assert_eq!(back.attachments, craft.attachments);
+        assert_eq!(back.cell_size, craft.cell_size);
+
+        // Self-describes: the document's payload — and therefore its serde
+        // kind tag — is Blueprint, not Craft.
+        let json = std::fs::read_to_string(&path).unwrap();
+        let doc = SavedDocument::from_json(&json).unwrap();
+        assert!(
+            matches!(doc.payload, Payload::Blueprint(_)),
+            "shipped artifact declares itself a blueprint"
+        );
+        assert!(
+            json.contains("blueprint"),
+            "kind tag serialized: {}",
+            &json[..json.len().min(120)]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

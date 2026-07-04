@@ -845,7 +845,7 @@ mod tests {
     #[ignore = "writes the shipped content/blueprints/first-flight.json artifact"]
     fn write_first_flight_blueprint() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/blueprints");
-        let path = crate::library::save_craft(&dir, "First Flight", &blueprint()).unwrap();
+        let path = crate::library::save_blueprint(&dir, "First Flight", &blueprint()).unwrap();
         assert!(path.ends_with("first-flight.json"));
     }
 
@@ -916,8 +916,8 @@ mod tests {
     #[ignore = "writes the shipped content/blueprints/dive-capsule.json artifact"]
     fn write_dive_capsule_blueprint() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/blueprints");
-        let path =
-            crate::library::save_craft(&dir, "Dive Capsule", &dive_capsule_blueprint()).unwrap();
+        let path = crate::library::save_blueprint(&dir, "Dive Capsule", &dive_capsule_blueprint())
+            .unwrap();
         assert!(path.ends_with("dive-capsule.json"));
     }
 
@@ -928,7 +928,7 @@ mod tests {
     fn write_sounding_rocket_blueprint() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/blueprints");
         let path =
-            crate::library::save_craft(&dir, "Sounding Rocket", &sounding_rocket_blueprint())
+            crate::library::save_blueprint(&dir, "Sounding Rocket", &sounding_rocket_blueprint())
                 .unwrap();
         assert!(path.ends_with("sounding-rocket.json"));
     }

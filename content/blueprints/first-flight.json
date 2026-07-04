@@ -1,7 +1,7 @@
 {
   "format_version": 1,
   "payload": {
-    "kind": "craft",
+    "kind": "blueprint",
     "id": "first-flight",
     "name": "First Flight",
     "reference_position": {

@@ -350,7 +350,7 @@ mod tests {
     #[ignore = "writes the shipped content/blueprints/harbor-seed.json artifact"]
     fn write_harbor_seed_blueprint() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/blueprints");
-        let path = crate::library::save_craft(&dir, "Harbor Seed", &seed_hull()).unwrap();
+        let path = crate::library::save_blueprint(&dir, "Harbor Seed", &seed_hull()).unwrap();
         assert!(path.ends_with("harbor-seed.json"));
     }
 
