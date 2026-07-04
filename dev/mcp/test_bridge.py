@@ -88,7 +88,26 @@ def main():
             "get_screenshot",
             "replay",
             "send_command",
+            "set_camera",
+            "set_overlay",
+            "get_camera",
+            "send_input",
         }, names
+
+        inp = rpc(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": "send_input",
+                    "arguments": {"command": {"key": {"key": "enter"}}},
+                },
+            },
+        )
+        assert inp["result"]["content"][0]["text"] == '{"ok":true}', inp
+        assert ("/input", '{"key": {"key": "enter"}}') in received["posts"], received["posts"]
 
         rep = rpc(
             proc,

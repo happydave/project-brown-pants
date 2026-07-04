@@ -12,8 +12,13 @@ instead of reproducing it headlessly and guessing the build/inputs (the slow loo
 
 | MCP tool | Bus call | Purpose |
 | --- | --- | --- |
-| `get_telemetry` | `GET /telemetry` | Read the versioned `Telemetry` snapshot (clock, orbit, active-flight autonomy). |
+| `get_telemetry` | `GET /telemetry` | Read the versioned `Telemetry` snapshot (clock, orbit, active-flight autonomy, additive rover/thermal/scenario blocks). |
+| `get_telemetry_history` | `GET /telemetry/history` | The last few seconds of snapshots, oldest-first (WI 644) — a time series for spiky signals. |
+| `get_screenshot` | `GET /screenshot` | Capture the window and return it as an image (WI 647). |
+| `replay` | `POST /replay` | Drive the Tier-B replay cam (WI 648): enter/exit/toggle, scrub, seek. |
 | `send_command` | `POST /command` | Inject one JSON `Command`, e.g. `{"SetPaused": true}`, `{"SetWarp": 4.0}`. |
+| `set_camera` / `set_overlay` / `get_camera` | `POST /camera` / `POST /debug` / `GET /camera` | Debug camera placement + overlays + pose readback (WI 784). |
+| `send_input` | `POST /input` | Inject a keyboard/mouse action (WI 830; **requires a `--features dev` game build** — 404 otherwise): tap/hold keys, move the cursor, click, scroll — indistinguishable from real input, so mode toggles and palette picks become scripted screenshot anchors. |
 
 It is **not** part of the game build and is never load-bearing.
 
@@ -75,15 +80,14 @@ Or edit `~/.claude.json` (or a project `.mcp.json`) by hand — *this* is where 
 }
 ```
 
-After registering (and restarting the session), the assistant gets `get_telemetry` / `send_command`
-tools that act on whatever scene is running.
+After registering (and restarting the session), the assistant gets the bridge's tools (the table
+above) acting on whatever scene is running.
 
-## Known gap (recommended follow-up)
+## Resolved follow-ups
 
-`Telemetry` does not yet carry **rover pose / contact signals** (e.g. `hull_penetration`, per-wheel
-state). Reading those live is exactly what would have lifted the 631/634 blindfold, so the recommended
-next step is a separate WI to enrich the `Telemetry` snapshot (on the versioned surface) with a
-grounded/wheeled section. The bridge needs no change when that lands — it already forwards whatever
-`/telemetry` returns.
+The spike's recommended follow-up — rover pose / contact signals in `Telemetry` — landed as WI 640
+(the `rover` block: pose, `hull_penetration`, per-wheel state); the bridge forwarded it unchanged, as
+predicted. Later additions rode the same pattern: history (644), screenshots (647), replay (648),
+debug camera (784), and input injection (830 — the one tool that needs a `--features dev` game build).
 
 For the full go/no-go and the BRP-vs-command-bus decision, see the work item's `spike.md`.

@@ -117,6 +117,12 @@ sync — adapt onto. It is distinct from the dev-only Bevy Remote Protocol.
   `thermal` blocks when a scene publishes them — e.g. `thermal.max_skin_temp` in the dive).
 - `POST /command` — inject a JSON command into the flight-control executor;
   malformed input returns HTTP 400.
+- `POST /input` — **dev builds only** (`--features dev`; 404 otherwise, WI 830):
+  inject a keyboard/mouse action (`{"key":{"key":"enter"}}` taps Enter;
+  `{"click":{"x":40,"y":260}}` moves the cursor and left-clicks;
+  `{"scroll":{"lines":-2}}` zooms). Injected input is indistinguishable from real
+  input — mode toggles, brushes, and palette clicks are scriptable, so
+  scene-interaction checks pair with `GET /screenshot` as keyboard-free anchors.
 
 ```bash
 curl -s localhost:8787/telemetry

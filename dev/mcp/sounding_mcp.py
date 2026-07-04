@@ -137,6 +137,30 @@ TOOLS = [
         },
     },
     {
+        "name": "send_input",
+        "description": (
+            "Inject one input action into the running game (POST /input, WI 830; requires a "
+            "`--features dev` build — 404 otherwise). Injected input is indistinguishable from real "
+            "keyboard/mouse input, so mode toggles, brushes, and clicks are scriptable: pair with "
+            "get_screenshot for scene-interaction anchors. `command` is a serialized InputCommand, "
+            'e.g. {"key": {"key": "enter"}} (tap; action: "press"/"release"/"tap"), '
+            '{"cursor_move": {"x": 400, "y": 300}}, {"click": {"x": 40, "y": 260}} (left unless '
+            '"button" given), {"mouse_button": {"button": "middle", "action": "press"}}, or '
+            '{"scroll": {"lines": -2}}. Keys: single characters ("a"-"z", "0"-"9") or "enter", '
+            '"tab", "escape", "space", "backspace", "shift", "ctrl", "up"/"down"/"left"/"right", '
+            '"comma", "period", "minus", "f1"-"f12". Coordinates are logical window pixels, '
+            "origin top-left."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "object", "description": "A serialized InputCommand."}
+            },
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "get_camera",
         "description": (
             "Read the debug camera's current pose (GET /camera, WI 784): body-relative position, "
@@ -217,6 +241,11 @@ def _call_tool(name: str, arguments: dict) -> dict:
             if command is None:
                 raise ValueError("set_overlay requires a `command` (DebugCommand)")
             text = _http_post("/debug", json.dumps(command))
+        elif name == "send_input":
+            command = arguments.get("command")
+            if command is None:
+                raise ValueError("send_input requires a `command` (InputCommand)")
+            text = _http_post("/input", json.dumps(command))
         elif name == "get_camera":
             text = _http_get("/camera")
         else:

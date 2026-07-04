@@ -12,6 +12,7 @@
 //! dev-gated Bevy Remote Protocol god-mode surface.
 
 use crate::debug_control::{DebugCameraState, DebugCommand};
+use crate::input_inject::InputCommand;
 use crate::replay::ReplayCommand;
 use bevy::diagnostic::DiagnosticsStore;
 use bevy::prelude::*;
@@ -110,6 +111,15 @@ impl Plugin for BusPlugin {
         let (shot_tx, shot_rx) = mpsc::channel::<()>();
         let (replay_tx, replay_rx) = mpsc::channel::<ReplayCommand>();
         let (debug_tx, debug_rx) = mpsc::channel::<DebugCommand>();
+        // Input injection (WI 830) exists only in dev builds — the WI 496 gating
+        // pattern: no channel, no drain, and `/input` 404s without the feature.
+        #[cfg(feature = "dev")]
+        let (input_tx, input_rx) = {
+            let (t, r) = mpsc::channel::<InputCommand>();
+            (Some(t), r)
+        };
+        #[cfg(not(feature = "dev"))]
+        let input_tx: Option<Sender<InputCommand>> = None;
         let camera = Arc::new(Mutex::new("{\"available\":false}".to_owned()));
         // An absolute path next to the working directory, so the (same-machine) MCP can read it back.
         let shot_path = std::env::current_dir()
@@ -123,8 +133,11 @@ impl Plugin for BusPlugin {
                 let shared = telemetry.clone();
                 let path = shot_path.clone();
                 let cam = camera.clone();
+                let itx = input_tx;
                 thread::spawn(move || {
-                    serve(server, shared, tx, shot_tx, replay_tx, debug_tx, cam, path)
+                    serve(
+                        server, shared, tx, shot_tx, replay_tx, debug_tx, itx, cam, path,
+                    )
                 });
                 info!("bus: listening on http://127.0.0.1:{}", self.port);
             }
@@ -156,6 +169,17 @@ impl Plugin for BusPlugin {
                     publish_camera,
                 ),
             );
+
+        // The injection drain (WI 830) runs before Bevy's input folding so injected
+        // events are indistinguishable from real input this same frame. Dev only.
+        #[cfg(feature = "dev")]
+        {
+            use crate::input_inject::{drain_input, InputInjectRx, PendingReleases};
+            app.insert_resource(InputInjectRx(Mutex::new(input_rx)))
+                .init_resource::<PendingReleases>()
+                .add_systems(PreUpdate, drain_input.before(bevy::input::InputSystems));
+            info!("dev: bus input injection enabled (POST /input)");
+        }
     }
 }
 
@@ -168,6 +192,7 @@ fn serve(
     shot_tx: Sender<()>,
     replay_tx: Sender<ReplayCommand>,
     debug_tx: Sender<DebugCommand>,
+    input_tx: Option<Sender<InputCommand>>,
     camera: Arc<Mutex<String>>,
     shot_path: String,
 ) {
@@ -177,7 +202,16 @@ fn serve(
         let mut body = String::new();
         let _ = request.as_reader().read_to_string(&mut body);
         let (status, payload) = handle_request(
-            &method, &url, &body, &telemetry, &tx, &shot_tx, &replay_tx, &debug_tx, &camera,
+            &method,
+            &url,
+            &body,
+            &telemetry,
+            &tx,
+            &shot_tx,
+            &replay_tx,
+            &debug_tx,
+            input_tx.as_ref(),
+            &camera,
             &shot_path,
         );
         let _ = request.respond(Response::from_string(payload).with_status_code(status));
@@ -195,6 +229,7 @@ fn handle_request(
     shot_tx: &Sender<()>,
     replay_tx: &Sender<ReplayCommand>,
     debug_tx: &Sender<DebugCommand>,
+    input_tx: Option<&Sender<InputCommand>>,
     camera: &Mutex<String>,
     shot_path: &str,
 ) -> (u16, String) {
@@ -251,6 +286,26 @@ fn handle_request(
             // The latest published debug-camera pose (or `{"available":false}`).
             let pose = camera.lock().unwrap();
             (200, pose.clone())
+        }
+        // Input injection (WI 830): dev builds only — without the feature no sender
+        // exists and the route falls through to 404. Key/button names are validated
+        // here so a bad name is a 400 to the caller, not a silent no-op.
+        ("POST", "/input") if input_tx.is_some() => {
+            // The error text embeds caller input (the bad key name), so it is
+            // JSON-escaped — unlike the sibling arms, whose errors are serde's own.
+            match serde_json::from_str::<InputCommand>(body) {
+                Ok(cmd) => match crate::input_inject::validate(&cmd) {
+                    Ok(()) => {
+                        let _ = input_tx.expect("guarded by the match arm").send(cmd);
+                        (200, r#"{"ok":true}"#.to_owned())
+                    }
+                    Err(e) => (400, format!(r#"{{"error":{}}}"#, json_string(&e))),
+                },
+                Err(e) => (
+                    400,
+                    format!(r#"{{"error":{}}}"#, json_string(&e.to_string())),
+                ),
+            }
         }
         _ => (404, r#"{"error":"not found"}"#.to_owned()),
     }
@@ -368,7 +423,8 @@ mod tests {
         Mutex::new(items.iter().map(|s| s.to_string()).collect())
     }
 
-    /// Route a request with throwaway command / screenshot / replay / debug channels.
+    /// Route a request with throwaway command / screenshot / replay / debug channels
+    /// and **no input sender** (the non-dev shape; `/input` must 404).
     fn route(
         method: &str,
         url: &str,
@@ -389,9 +445,40 @@ mod tests {
             &stx,
             &rtx,
             &dtx,
+            None,
             &camera,
             "/tmp/shot.png",
         )
+    }
+
+    /// Route a request with an input sender wired (the dev shape), returning the
+    /// receiver so forwarding can be asserted.
+    fn route_with_input(
+        method: &str,
+        url: &str,
+        body: &str,
+    ) -> (u16, String, mpsc::Receiver<InputCommand>) {
+        let telemetry = ring(&[]);
+        let (tx, _rx) = mpsc::channel();
+        let (stx, _srx) = mpsc::channel();
+        let (rtx, _rrx) = mpsc::channel();
+        let (dtx, _drx) = mpsc::channel();
+        let (itx, irx) = mpsc::channel();
+        let camera = Mutex::new(r#"{"available":false}"#.to_owned());
+        let (status, payload) = handle_request(
+            method,
+            url,
+            body,
+            &telemetry,
+            &tx,
+            &stx,
+            &rtx,
+            &dtx,
+            Some(&itx),
+            &camera,
+            "/tmp/shot.png",
+        );
+        (status, payload, irx)
     }
 
     #[test]
@@ -452,6 +539,7 @@ mod tests {
             &stx,
             &rtx,
             &dtx,
+            None,
             &camera,
             "/tmp/shot.png",
         );
@@ -479,6 +567,7 @@ mod tests {
             &stx,
             &rtx,
             &dtx,
+            None,
             &camera,
             "/tmp/shot.png",
         );
@@ -503,6 +592,7 @@ mod tests {
             &stx,
             &rtx,
             &dtx,
+            None,
             &camera,
             "/tmp/shot.png",
         );
@@ -528,6 +618,7 @@ mod tests {
             &stx,
             &rtx,
             &dtx,
+            None,
             &camera,
             "/tmp/shot.png",
         );
@@ -546,6 +637,7 @@ mod tests {
             &stx,
             &rtx,
             &dtx,
+            None,
             &camera,
             "/tmp/shot.png",
         );
@@ -564,6 +656,7 @@ mod tests {
             &stx,
             &rtx,
             &dtx,
+            None,
             &camera,
             "/tmp/shot.png",
         );
@@ -587,5 +680,41 @@ mod tests {
     fn unknown_route_is_404() {
         let (status, _) = route("GET", "/nope", "", &ring(&[]));
         assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn post_input_without_a_sender_is_404() {
+        // The non-dev shape (WI 830): no injection channel exists, so the route is
+        // absent — indistinguishable from any unknown route.
+        let (status, _) = route("POST", "/input", r#"{"key":{"key":"enter"}}"#, &ring(&[]));
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn post_input_with_a_sender_validates_and_forwards() {
+        use crate::input_inject::KeyAction;
+
+        // Valid command → forwarded.
+        let (status, _, irx) = route_with_input("POST", "/input", r#"{"key":{"key":"enter"}}"#);
+        assert_eq!(status, 200);
+        assert_eq!(
+            irx.try_recv().unwrap(),
+            InputCommand::Key {
+                key: "enter".into(),
+                action: KeyAction::Tap
+            }
+        );
+
+        // Unknown key name → 400 at the route, nothing forwarded.
+        let (status, body, irx) =
+            route_with_input("POST", "/input", r#"{"key":{"key":"hyperspace"}}"#);
+        assert_eq!(status, 400);
+        assert!(body.contains("unknown key"), "{body}");
+        assert!(irx.try_recv().is_err());
+
+        // Malformed JSON → 400.
+        let (status, _, irx) = route_with_input("POST", "/input", "not json");
+        assert_eq!(status, 400);
+        assert!(irx.try_recv().is_err());
     }
 }

@@ -54,6 +54,7 @@ mod gallery_scene;
 mod gamepad;
 mod ground;
 mod harbor_scene;
+mod input_inject;
 mod land_scene;
 mod materials_scene;
 mod moon_scene;
