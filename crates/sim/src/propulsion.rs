@@ -82,7 +82,9 @@ pub struct WetMass {
 /// A craft's propulsion: propellant tanks (reservoirs in a [`ResourceGraph`], each
 /// with a body-frame mount for the mass fold), engines, and per-engine command
 /// state. Tanks reuse the resource graph's bounded `[0, capacity]` semantics;
-/// propellant quantity is measured in **kg** so it folds directly into mass.
+/// propellant quantity is measured in **kg** (mass-per-unit 1), and every mass
+/// fold weighs a reservoir through its explicit `mass_per_unit` model (WI 810),
+/// so non-material stores in the shared graph (electric charge) carry no mass.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Propulsion {
     /// Propellant tanks (`graph.reservoirs[i]` is the i-th tank).
@@ -156,14 +158,18 @@ impl Propulsion {
     /// Fold tank propellant (each tank's mass at its mount) into the dry mass/CoM —
     /// so a draining craft's wet mass falls and its CoM shifts (the
     /// [`crate::flooding::flooded_mass_properties`] pattern; mass + CoM, inertia
-    /// held constant within a burn as a first approximation).
+    /// held constant within a burn as a first approximation). Each reservoir
+    /// weighs `amount × mass_per_unit` (WI 810), so a massless store (electric
+    /// charge) contributes nothing; a reservoir without a `tank_mounts` entry
+    /// masses at the **dry CoM** — the physically neutral default — never the
+    /// lattice origin.
     pub fn wet_mass(&self, dry_mass: f64, dry_com: DVec3) -> WetMass {
         let mut mass = dry_mass;
         let mut moment = dry_mass * dry_com;
         let mut propellant_mass = 0.0;
         for (i, res) in self.graph.reservoirs.iter().enumerate() {
-            let m = res.amount; // propellant quantity is kg
-            let mount = self.tank_mounts.get(i).copied().unwrap_or(DVec3::ZERO);
+            let m = res.amount * res.mass_per_unit;
+            let mount = self.tank_mounts.get(i).copied().unwrap_or(dry_com);
             propellant_mass += m;
             mass += m;
             moment += m * mount;
@@ -176,9 +182,15 @@ impl Propulsion {
         }
     }
 
-    /// Total remaining propellant across all tanks, kg.
+    /// Total remaining propellant **mass** across all tanks, kg — each reservoir
+    /// counted at `amount × mass_per_unit` (WI 810), so a massless store (the
+    /// control battery's electric charge) never inflates the fuel figure.
     pub fn propellant(&self) -> f64 {
-        self.graph.reservoirs.iter().map(|r| r.amount).sum()
+        self.graph
+            .reservoirs
+            .iter()
+            .map(|r| r.amount * r.mass_per_unit)
+            .sum()
     }
 
     /// The craft's remaining **Δv**, m/s — the rocket equation `v_e · ln(m_wet/m_dry)`
@@ -436,6 +448,51 @@ mod tests {
         empty.graph.reservoirs[0].amount = 0.0;
         assert_eq!(empty.delta_v(1_000.0), 0.0);
         assert!((p.propellant() - 1_000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn massless_reservoir_carries_no_mass_fuel_or_delta_v() {
+        // WI 810: a battery-style charge store in the shared graph must not
+        // weigh, count as fuel, or enter the rocket equation.
+        let mut p = single_engine(500.0, 10.0, 3000.0);
+        let baseline = p.wet_mass(1000.0, DVec3::ZERO);
+        let fuel = p.propellant();
+        let dv = p.delta_v(1000.0);
+        p.graph
+            .reservoirs
+            .push(Reservoir::massless(ResourceType(10), 120.0, 120.0));
+        // No mount on purpose: massless ⇒ the mount must not matter either.
+        let with_charge = p.wet_mass(1000.0, DVec3::ZERO);
+        assert_eq!(with_charge.mass, baseline.mass, "charge weighs nothing");
+        assert_eq!(with_charge.center_of_mass, baseline.center_of_mass);
+        assert_eq!(with_charge.propellant_mass, baseline.propellant_mass);
+        assert_eq!(p.propellant(), fuel, "charge is not fuel");
+        assert_eq!(p.delta_v(1000.0), dv, "charge is not Δv");
+    }
+
+    #[test]
+    fn unmounted_mass_bearing_reservoir_masses_at_the_dry_com() {
+        // WI 810: a missing tank_mounts entry defaults to the dry CoM (the
+        // physically neutral point), never the lattice origin.
+        let dry_com = DVec3::new(0.0, 3.0, 0.0);
+        let mut p = single_engine(500.0, 10.0, 3000.0);
+        p.tank_mounts.clear(); // the tank is now unmounted
+        let wet = p.wet_mass(1000.0, dry_com);
+        assert!((wet.mass - 1500.0).abs() < 1e-9, "mass still folds");
+        assert!(
+            (wet.center_of_mass - dry_com).length() < 1e-12,
+            "unmounted mass sits at the dry CoM, not the origin: {:?}",
+            wet.center_of_mass
+        );
+    }
+
+    #[test]
+    fn legacy_reservoir_json_defaults_to_unit_mass() {
+        // Pre-810 serialized reservoirs carry no mass_per_unit field; they must
+        // deserialize to the legacy kg-per-unit model.
+        let json = r#"{"resource":0,"amount":5.0,"capacity":10.0}"#;
+        let r: Reservoir = serde_json::from_str(json).expect("legacy shape loads");
+        assert_eq!(r.mass_per_unit, 1.0);
     }
 
     #[test]

@@ -407,7 +407,7 @@ mod tests {
             .propulsion
             .graph
             .reservoirs
-            .push(Reservoir::new(ELECTRICITY, 0.02, 100.0));
+            .push(Reservoir::massless(ELECTRICITY, 0.02, 100.0));
         let sys = ControlSystem {
             points: vec![ControlPoint::crewed()],
             computers: vec![ControlComputer::command_core(10.0)], // 10/s draw

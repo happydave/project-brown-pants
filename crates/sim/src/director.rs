@@ -294,8 +294,8 @@ pub fn instantiate(spawn: &ScenarioSpawn) -> Option<ScenarioFlight> {
     // SCAFFOLD: one engine record for every Engine device, thrust forced
     // along +Y through the CoM with no gimbal, and one pooled propellant
     // reservoir of `tanks × capacity` — proper per-device assembly mounts
-    // each engine/tank at its own cell with its own record binding, gimbal,
-    // and typed resource plumbing (WI 810).
+    // each engine/tank at its own cell with its own record binding and
+    // gimbal. (Resource mass-typing itself landed with WI 810.)
     let engines: Vec<Engine> = match spawn.engine {
         Some((exhaust_velocity, max_mass_flow)) => engine_cells
             .iter()
@@ -318,16 +318,12 @@ pub fn instantiate(spawn: &ScenarioSpawn) -> Option<ScenarioFlight> {
             reservoirs: vec![Reservoir::new(PROPELLANT, propellant, propellant)],
             ..Default::default()
         },
-        // Two mounts, both at the CoM: the propellant tank, and the battery
-        // reservoir `assemble_control` appends. `wet_mass` counts *every*
-        // reservoir's amount as mass at its mount (pre-existing quirk — an
-        // unmounted reservoir masses at the lattice origin), and an offset
-        // wet CoM turns thrust-through-the-dry-CoM into a constant tipping
-        // torque the SAS cannot hold. Mounting both at the CoM keeps
-        // wet CoM = dry CoM, so the craft flies straight.
-        // SCAFFOLD: mounts belong at the devices' cells; goes away with
-        // mass-typed resources (WI 810) + per-device assembly.
-        tank_mounts: vec![com, com],
+        // The pooled propellant tank masses at the CoM, so wet CoM = dry CoM
+        // and thrust-through-the-CoM flies straight. The battery reservoir
+        // `assemble_control` appends needs no mount: it is massless (WI 810).
+        // SCAFFOLD: the mount belongs at the tank devices' cells; goes away
+        // with per-device assembly.
+        tank_mounts: vec![com],
         engines,
         commands: vec![EngineCommand::default(); n_engines],
     };
@@ -751,9 +747,9 @@ mod tests {
     /// Tier-0 computer, battery, engine, tank — sized so the shipped small
     /// engine (3200 × 0.85 × 0.9 m/s × 1.5 kg/s ≈ 3.7 kN) out-thrusts its
     /// ~310 kg all-up weight (with the 100 kg starter tank): it rests, then
-    /// lifts off at full throttle. Note the battery charge counts toward wet
-    /// mass (the pre-existing `wet_mass` sums *every* reservoir as kg), so
-    /// the starter carries a small 50-unit battery.
+    /// lifts off at full throttle. (The 50-unit battery was sized small when
+    /// charge still counted toward wet mass; since WI 810 charge is massless
+    /// and the size is a content choice, not a physics mitigation.)
     fn blueprint() -> VoxelCraft {
         let mut craft = VoxelCraft::new(0.35);
         craft.voxels.push(Voxel {

@@ -372,9 +372,12 @@ pub fn assemble_control(craft: &VoxelCraft, graph: &mut ResourceGraph) -> Contro
             Some(DeviceFunction::Computer(c)) => sys.computers.push(c),
             Some(DeviceFunction::Battery(b)) => {
                 let id = ReservoirId(graph.reservoirs.len());
+                // Massless (WI 810): charge is not matter — the battery device's
+                // hardware mass is already on the lattice; its stored charge must
+                // not fold into wet mass, fuel totals, or Δv.
                 graph
                     .reservoirs
-                    .push(Reservoir::new(ELECTRICITY, b.charge, b.capacity));
+                    .push(Reservoir::massless(ELECTRICITY, b.charge, b.capacity));
                 if sys.battery.is_none() {
                     sys.battery = Some(id);
                 }
@@ -395,7 +398,7 @@ mod tests {
 
     fn graph_with_battery(amount: f64) -> (ResourceGraph, ReservoirId) {
         let g = ResourceGraph {
-            reservoirs: vec![Reservoir::new(ELECTRICITY, amount, 100.0)],
+            reservoirs: vec![Reservoir::massless(ELECTRICITY, amount, 100.0)],
             ..Default::default()
         };
         (g, ReservoirId(0))

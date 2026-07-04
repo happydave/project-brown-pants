@@ -49,15 +49,39 @@ pub struct Reservoir {
     pub amount: f64,
     /// Maximum quantity.
     pub capacity: f64,
+    /// Mass of one unit of `amount`, kg — the reservoir's explicit mass model
+    /// (WI 810). Mass folds (`Propulsion::wet_mass`) weigh a reservoir at
+    /// `amount × mass_per_unit`, so a mass-denominated store (propellant, kg)
+    /// uses `1` and a non-material store (electric charge) uses `0`. Absent in
+    /// pre-810 serialized graphs, so it serde-defaults to the legacy `1`.
+    #[serde(default = "default_mass_per_unit")]
+    pub mass_per_unit: f64,
+}
+
+fn default_mass_per_unit() -> f64 {
+    1.0
 }
 
 impl Reservoir {
-    /// A reservoir of `resource` with `capacity`, holding `amount`.
+    /// A reservoir of `resource` with `capacity`, holding `amount`, with the
+    /// default mass model (1 kg per unit — the kg-denominated convention).
     pub fn new(resource: ResourceType, amount: f64, capacity: f64) -> Self {
         Self {
             resource,
             amount,
             capacity,
+            mass_per_unit: 1.0,
+        }
+    }
+
+    /// A reservoir whose contents carry no mass (electric charge and other
+    /// non-material stores): `mass_per_unit = 0`.
+    pub fn massless(resource: ResourceType, amount: f64, capacity: f64) -> Self {
+        Self {
+            resource,
+            amount,
+            capacity,
+            mass_per_unit: 0.0,
         }
     }
 

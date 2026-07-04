@@ -213,7 +213,9 @@ pub fn build_powertrain(
             source: PowerSource::Electric {
                 solar_per_s: solar_panels as f64 * SOLAR_PER_PANEL,
             },
-            reservoir: Reservoir::new(ELECTRICITY, cap, cap),
+            // Massless (WI 810): charge is not matter. Inert today — the rover
+            // never mass-folds its powertrain graph — but keeps the model honest.
+            reservoir: Reservoir::massless(ELECTRICITY, cap, cap),
             max_torque,
             drive_wheels,
             consumption: ELECTRIC_CONSUMPTION * draw,
@@ -227,7 +229,7 @@ pub fn build_powertrain(
             source: PowerSource::Electric {
                 solar_per_s: sustain,
             },
-            reservoir: Reservoir::new(ELECTRICITY, DEFAULT_BATTERY_CAP, DEFAULT_BATTERY_CAP),
+            reservoir: Reservoir::massless(ELECTRICITY, DEFAULT_BATTERY_CAP, DEFAULT_BATTERY_CAP),
             max_torque,
             drive_wheels,
             consumption,
