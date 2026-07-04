@@ -207,6 +207,9 @@ fn setup_scene(
     // director configures its physics): the render bundle only.
     let start_render = DVec3::new(0.0, start_altitude, 0.0);
     if let Ok(entity) = craft_q.single() {
+        // SCAFFOLD: a fixed 3×3×5 cuboid regardless of the blueprint — the
+        // craft should render its real voxel skin (as the scenario scene
+        // does), sized from the loaded blueprint.
         commands.entity(entity).insert((
             Mesh3d(meshes.add(Mesh::from(Cuboid::new(3.0, 3.0, 5.0)))),
             MeshMaterial3d(materials.add(StandardMaterial {

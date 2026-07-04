@@ -58,6 +58,10 @@ const MISSION_POLL_SECONDS: f64 = 0.25;
 /// Attitude authority + reaction-wheel defaults (the workshop's assembly
 /// constants — control-system tuning stays code/blueprint-authored this
 /// slice; the catalog owns engine/tank physics).
+///
+/// SCAFFOLD: these should be catalog device records (reaction wheels / RCS as
+/// content) resolved through scenario bindings like engines/tanks are, not
+/// engine constants.
 const ATTITUDE_AUTHORITY: f64 = 5_000.0;
 const WHEEL_TORQUE: f64 = 8_000.0;
 const WHEEL_MOMENTUM: f64 = 1e9;
@@ -65,10 +69,15 @@ const LOW_POWER_RESERVE: f64 = 6.0;
 /// Standard gravity for the G-force readout, m/s² (WI 739).
 const G0: f64 = 9.80665;
 /// Ambient / radiative-sink temperature for an orbit-entry spawn, K (WI 739,
-/// the dive's value — engine tuning, not content).
+/// the dive's value).
+///
+/// SCAFFOLD: thermal ambience is a property of the world/body (content), not
+/// a director constant.
 const ORBIT_AMBIENT_K: f64 = 250.0;
 /// Initial rails-coast time-warp on an orbit-entry spawn (the entry trigger
 /// drops it back to 1× at the interface).
+///
+/// SCAFFOLD: a pacing choice the scenario document should make.
 const RAILS_COAST_WARP: f64 = 30.0;
 
 /// Everything the director needs to spawn a scenario's starting state —
@@ -282,6 +291,11 @@ pub fn instantiate(spawn: &ScenarioSpawn) -> Option<ScenarioFlight> {
         (Some(_), Some(capacity)) if !engine_cells.is_empty() => tanks.max(1) as f64 * capacity,
         _ => 0.0,
     };
+    // SCAFFOLD: one engine record for every Engine device, thrust forced
+    // along +Y through the CoM with no gimbal, and one pooled propellant
+    // reservoir of `tanks × capacity` — proper per-device assembly mounts
+    // each engine/tank at its own cell with its own record binding, gimbal,
+    // and typed resource plumbing (WI 810).
     let engines: Vec<Engine> = match spawn.engine {
         Some((exhaust_velocity, max_mass_flow)) => engine_cells
             .iter()
@@ -311,6 +325,8 @@ pub fn instantiate(spawn: &ScenarioSpawn) -> Option<ScenarioFlight> {
         // wet CoM turns thrust-through-the-dry-CoM into a constant tipping
         // torque the SAS cannot hold. Mounting both at the CoM keeps
         // wet CoM = dry CoM, so the craft flies straight.
+        // SCAFFOLD: mounts belong at the devices' cells; goes away with
+        // mass-typed resources (WI 810) + per-device assembly.
         tank_mounts: vec![com, com],
         engines,
         commands: vec![EngineCommand::default(); n_engines],
@@ -480,6 +496,8 @@ fn apply_spawn_scenario(
                 drag_coefficient: 1.0,
                 slam_coefficient: crate::medium::DEFAULT_SLAM_COEFFICIENT,
             };
+            // SCAFFOLD: forward axis +Z and drag coefficient 1.0 are
+            // conventions the blueprint/catalog should declare.
             let glide =
                 crate::medium::GlideParams::for_craft(descent, &spawn.craft, crate::voxel::Axis::Z);
             let thermal = crate::medium::CraftThermal::new(

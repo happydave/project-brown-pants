@@ -131,6 +131,9 @@ pub enum StartPlacement {
     /// At rest afloat on the root body's ocean surface at the scenario
     /// origin (WI 739, the harbor): the craft assembles at its real material
     /// mass and floats — or sinks — on the shared descent/hydro step.
+    ///
+    /// SCAFFOLD: carries no location — "the origin" stands in for a world
+    /// position (a harbor) that world-building's data should supply.
     Afloat,
 }
 

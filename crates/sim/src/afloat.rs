@@ -13,6 +13,14 @@
 //! set each step — **buoyancy falls as it floods**. The render side (dry-hold
 //! occluders, rising water cuboids) stays presentation; this module owns only
 //! the physics.
+//!
+//! **SCAFFOLD: much of this module is scenario scaffolding, not engine.** The
+//! `synth_*` constructors invent devices a player should place and a catalog
+//! should describe; the assembly hardcodes world/medium conventions the
+//! scenario document should supply. Each site below carries a `SCAFFOLD:`
+//! marker naming its replacement route; the inventory lives at
+//! `docs/projects/sounding/scaffolding.md`. The flood physics (`FloodComps`,
+//! `step_flooding`, `unflooded_cells`) is real engine and stays.
 
 use crate::active::ActiveBody;
 use crate::ballast::{Ballast, BallastCommand, BallastTank};
@@ -42,6 +50,12 @@ pub struct ScenarioVessel;
 /// heavy / solid one sinks. Spawns at sea level over the world origin with a
 /// small starting list so the self-righting reads. `None` for an empty
 /// lattice.
+///
+/// SCAFFOLD: the medium is hardcoded `EARTHLIKE` (should come from the spawn
+/// payload's world), the spawn point is the world origin (the placement/world
+/// data should locate the harbor), the +Z forward axis is a convention the
+/// blueprint should declare, and the 0.2 rad presentation list belongs to the
+/// scene. Assembly-from-lattice itself is engine; these inputs are not.
 pub fn assemble_float(
     craft: &VoxelCraft,
     mu: f64,
@@ -86,6 +100,10 @@ fn hull_aabb(craft: &VoxelCraft) -> (DVec3, DVec3) {
 /// throttle steers (a yaw couple from the ±X offset). Sized to push the
 /// editor-scale starter boat; player-placed thrusters await the WI 715
 /// device palette.
+///
+/// SCAFFOLD: a whole invented device — thrust/draw/fuel (a hardcoded 1500 kg
+/// reservoir) and mounts should come from player-placed thruster devices
+/// (WI 715) backed by catalog records, assembled like engines/tanks are.
 pub fn synth_marine(craft: &VoxelCraft) -> MarinePropulsion {
     let cs = craft.cell_size;
     let (min_m, max_m) = hull_aabb(craft);
@@ -117,6 +135,9 @@ pub fn synth_marine(craft: &VoxelCraft) -> MarinePropulsion {
 /// the stern (−Z, forward is +Z), low so it sits in the water. Area scales
 /// with the hull's beam×draft so bigger boats get more steering authority.
 /// Player-placed rudders await the WI 715 device palette.
+///
+/// SCAFFOLD: an invented device — area/slope/limits and the mount should come
+/// from a player-placed rudder device (WI 715) backed by a catalog record.
 pub fn synth_rudder(craft: &VoxelCraft) -> Rudder {
     let cs = craft.cell_size;
     let (min_m, max_m) = hull_aabb(craft);
@@ -142,6 +163,10 @@ pub fn synth_rudder(craft: &VoxelCraft) -> Rudder {
 /// empty and blowing it surfaces — controllable dive/surface/hold. `None` ⇒
 /// no ballast (an empty/barely-floating hull). Player-placed ballast awaits
 /// the WI 715 device palette.
+///
+/// SCAFFOLD: an invented device — capacity/rates and the mount should come
+/// from player-placed ballast-tank devices (WI 715) backed by catalog
+/// records (the auto-sizing-to-reserve heuristic disappears with them).
 pub fn synth_ballast(craft: &VoxelCraft, surface_radius: f64) -> Option<Ballast> {
     let mp = craft.mass_properties()?;
     let g = 9.81;
