@@ -64,6 +64,17 @@
             emissivity: 0.09,
             max_temp: 900.0,        // K (≈ melting)
         )),
+        // Glass (WI 821) — the transparent structural material: brittle, a poor
+        // conductor, softens near 1000 K. Mirrors the sim's Material::GLASS.
+        Material((
+            id: "glass",
+            density: 2500.0,       // kg/m³
+            strength: 4.0e7,       // Pa (brittle — the weakest structural material)
+            specific_heat: 840.0,  // J·kg⁻¹·K⁻¹
+            conductivity: 1.0,     // W·m⁻¹·K⁻¹
+            emissivity: 0.90,
+            max_temp: 1000.0,      // K (softening)
+        )),
         // A resource.
         Resource((
             id: "liquid_fuel",

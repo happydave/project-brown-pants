@@ -67,6 +67,15 @@ impl Material {
         strength: 5.0e7,
         thermal: Thermal::ABLATOR,
     };
+    /// Glass (WI 821): the first **transparent** material — windows, canopies,
+    /// portholes. Transparency is a render-side property (the sim treats glass as
+    /// ordinary data, per this module's discipline); physically it is dense-ish and
+    /// **brittle** — the weakest structural material, so glass hulls break honestly.
+    pub const GLASS: Material = Material {
+        density: 2_500.0,
+        strength: 4.0e7,
+        thermal: Thermal::GLASS,
+    };
 
     /// The strength assumed for a material loaded from a pre-strength save: high
     /// enough to be effectively unbreakable, so old craft do not spontaneously
@@ -181,6 +190,17 @@ impl Thermal {
         ablation_temp: 1_300.0,
         latent_heat: 5.0e6,
         ablator_fraction: 0.6,
+    };
+    /// Glass-like (WI 821): a poor conductor and strong radiator that softens (fails)
+    /// near 1000 K — fine for a cabin window, hopeless as a re-entry windshield.
+    pub const GLASS: Thermal = Thermal {
+        specific_heat: 840.0,
+        conductivity: 1.0,
+        emissivity: 0.90,
+        max_temp: 1_000.0,
+        ablation_temp: 0.0,
+        latent_heat: 0.0,
+        ablator_fraction: 0.0,
     };
 }
 

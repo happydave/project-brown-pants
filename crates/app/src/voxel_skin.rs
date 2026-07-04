@@ -80,6 +80,7 @@ pub fn material_visual(material: Material) -> MaterialVisual {
         x if x == Material::STEEL => Color::srgb(0.52, 0.55, 0.60),
         x if x == Material::TITANIUM => Color::srgb(0.74, 0.68, 0.58),
         x if x == Material::COMPOSITE => Color::srgb(0.20, 0.20, 0.24),
+        x if x == Material::GLASS => Color::srgb(0.62, 0.80, 0.88),
         _ => Color::srgb(0.55, 0.35, 0.55),
     };
     MaterialVisual { tint }
@@ -153,12 +154,14 @@ pub fn pbr_material(
     materials: &mut Assets<StandardMaterial>,
 ) -> Handle<StandardMaterial> {
     let visual = material_visual(material);
-    pbr_material_with(
-        material,
-        relaxed_base_color(visual.tint),
-        asset_server,
-        materials,
-    )
+    // The relax-toward-white exists to keep the tint from double-saturating a bespoke
+    // albedo texture; glass is texture-less (WI 821), so its tint leads un-relaxed.
+    let base = if material == Material::GLASS {
+        visual.tint
+    } else {
+        relaxed_base_color(visual.tint)
+    };
+    pbr_material_with(material, base, asset_server, materials)
 }
 
 /// Like [`pbr_material`] but with the `base_color` replaced by `tint` (multiplied over the albedo
@@ -173,14 +176,36 @@ pub fn pbr_material_tinted(
     pbr_material_with(material, tint, asset_server, materials)
 }
 
+/// Glass translucency: the alpha the glass `base_color` carries. Low enough to read
+/// through, high enough that the pane is visibly *there*.
+const GLASS_ALPHA: f32 = 0.35;
+
+/// The **texture-less translucent** `StandardMaterial` for glass (WI 821): the caller's
+/// base colour at [`GLASS_ALPHA`], alpha-blended, smooth and non-metallic, **no texture
+/// maps** — real glass is untextured, so this is the correct binding, not a fallback.
+/// Pure (no `AssetServer`), so the one genuinely new render behavior is unit-testable.
+pub fn glass_material(base_color: Color) -> StandardMaterial {
+    StandardMaterial {
+        base_color: base_color.with_alpha(GLASS_ALPHA),
+        alpha_mode: AlphaMode::Blend,
+        perceptual_roughness: 0.08,
+        metallic: 0.0,
+        ..default()
+    }
+}
+
 /// Shared body of [`pbr_material`] / [`pbr_material_tinted`]: the material's bespoke PBR set with a
-/// caller-chosen `base_color` multiplier.
+/// caller-chosen `base_color` multiplier. Glass short-circuits to [`glass_material`] —
+/// translucent and texture-less (a panel tint's hue still applies; the alpha discipline holds).
 fn pbr_material_with(
     material: Material,
     base_color: Color,
     asset_server: &AssetServer,
     materials: &mut Assets<StandardMaterial>,
 ) -> Handle<StandardMaterial> {
+    if material == Material::GLASS {
+        return materials.add(glass_material(base_color));
+    }
     let set = material_set_for(material);
     materials.add(StandardMaterial {
         base_color,
@@ -262,6 +287,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn glass_tint_is_distinct_from_the_structural_tints() {
+        // WI 821: the glass swatch must not collide with any structural material's.
+        for m in STRUCTURAL {
+            assert_ne!(
+                material_visual(Material::GLASS).tint,
+                material_visual(m).tint,
+                "glass shares a tint with a structural material"
+            );
+        }
+    }
+
+    #[test]
+    fn glass_material_is_translucent_smooth_and_untextured() {
+        // WI 821: the one genuinely new render behavior, unit-tested without an
+        // AssetServer (glass_material is pure by design).
+        let mat = glass_material(material_visual(Material::GLASS).tint);
+        assert_eq!(mat.alpha_mode, AlphaMode::Blend, "alpha-blended");
+        assert!(
+            mat.base_color.alpha() < 1.0 && mat.base_color.alpha() > 0.0,
+            "translucent, not invisible: alpha = {}",
+            mat.base_color.alpha()
+        );
+        assert!(mat.perceptual_roughness < 0.2, "smooth");
+        assert_eq!(mat.metallic, 0.0, "dielectric");
+        assert!(
+            mat.base_color_texture.is_none() && mat.normal_map_texture.is_none(),
+            "texture-less by design — never binds a missing asset path"
+        );
     }
 
     #[test]

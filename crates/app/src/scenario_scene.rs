@@ -37,12 +37,11 @@ use sounding_sim::scenario::{load_scenario, ScenarioRoots};
 use sounding_sim::session::{Outcome, Phase};
 use sounding_sim::sim::SimClock;
 use sounding_sim::telemetry::ActiveFlightTelemetry;
-use sounding_sim::voxel::Material;
 
 use crate::bus::ActiveFlight;
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
 use crate::gamepad::{accumulate_chase_look, orbit_offset, ChaseLook, GamepadMap, PadSample};
-use crate::voxel_skin::{build_skin_mesh, pbr_material, VoxelSkin};
+use crate::voxel_skin::{pbr_material, skin_submeshes, VoxelSkin};
 use sounding_sim::frame::{FrameId, WorldPos};
 
 /// The default scenario document when the alias gives no path.
@@ -160,15 +159,19 @@ fn spawn_visuals(
         )),
     ));
 
-    let mesh = meshes.add(build_skin_mesh(&flight.craft.voxels, VoxelSkin::Hull));
-    let material = pbr_material(Material::COMPOSITE, &asset_server, &mut materials);
-    commands.spawn((
-        Mesh3d(mesh),
-        MeshMaterial3d(material),
-        Transform::default(),
-        WorldPlacement(mesh_origin(&flight)),
-        CraftMarker,
-    ));
+    // One submesh per distinct material, each bound to its own PBR appearance
+    // (WI 821) — so a multi-material craft renders honestly in flight (previously
+    // the whole hull bound the composite set) and glass cells draw translucent.
+    for (material, mesh) in skin_submeshes(&flight.craft.voxels, VoxelSkin::Hull) {
+        let mat = pbr_material(material, &asset_server, &mut materials);
+        commands.spawn((
+            Mesh3d(meshes.add(mesh)),
+            MeshMaterial3d(mat),
+            Transform::default(),
+            WorldPlacement(mesh_origin(&flight)),
+            CraftMarker,
+        ));
+    }
 
     commands.spawn((
         DirectionalLight {
@@ -432,7 +435,8 @@ fn track_craft(
     mut craft: Query<(&mut WorldPlacement, &mut Transform), With<CraftMarker>>,
 ) {
     let Some(flight) = flight else { return };
-    if let Ok((mut wp, mut tf)) = craft.single_mut() {
+    // One entity per material submesh (WI 821) — all share the craft's pose.
+    for (mut wp, mut tf) in craft.iter_mut() {
         wp.0 = mesh_origin(&flight);
         tf.rotation = flight.body.orientation.as_quat();
     }
@@ -463,7 +467,8 @@ fn draw_attitude_gizmo(
     craft: Query<&Transform, With<CraftMarker>>,
 ) {
     let Some(flight) = flight else { return };
-    if let Ok(tf) = craft.single() {
+    // Submesh entities share one pose (WI 821) — any one anchors the gizmo.
+    if let Some(tf) = craft.iter().next() {
         let pos = tf.translation;
         let nose = (flight.body.orientation.as_quat() * Vec3::Y).normalize_or_zero();
         gizmos.line(pos, pos + nose * 6.0, Color::srgb(0.3, 1.0, 0.3));

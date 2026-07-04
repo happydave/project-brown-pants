@@ -21,11 +21,12 @@ use sounding_sim::voxel::{
 use std::fs;
 
 /// The selectable structural materials.
-const PALETTE: [(&str, Material); 4] = [
+const PALETTE: [(&str, Material); 5] = [
     ("aluminium", Material::ALUMINIUM),
     ("steel", Material::STEEL),
     ("titanium", Material::TITANIUM),
     ("composite", Material::COMPOSITE),
+    ("glass", Material::GLASS),
 ];
 
 const BLUEPRINT_PATH: &str = "blueprint.json";
@@ -366,6 +367,7 @@ pub(crate) const PALETTE_GROUPS: &[(&str, &[PaletteEntry])] = &[
             PaletteEntry::Material(1),
             PaletteEntry::Material(2),
             PaletteEntry::Material(3),
+            PaletteEntry::Material(4),
         ],
     ),
     (
