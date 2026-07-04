@@ -86,7 +86,7 @@ use crate::parts::{
 };
 use crate::replay::Replayable;
 use crate::surface_stream::{self, ChunkCenter, ChunkStreamer, StreamedChunk};
-use crate::voxel_skin::{pbr_material, skin_submeshes, VoxelSkin};
+use crate::voxel_skin::{panel_render_pieces, pbr_material, skin_submeshes, VoxelSkin};
 
 const BODY: CentralBody = CentralBody::EARTHLIKE;
 const SUBSTEP_DT: f64 = 0.004;
@@ -1246,6 +1246,19 @@ fn sync_build_meshes(
             BuildEntity,
         ));
     }
+    // Face panels render from their records through the shared seam — plates + trim
+    // (WI 825): a plate boat opened in the workshop shows its hull.
+    for (mesh, mat) in
+        panel_render_pieces(&editor.craft, &asset_server, &mut materials, &mut meshes)
+    {
+        commands.spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(mat),
+            Transform::default(),
+            BuildMesh,
+            BuildEntity,
+        ));
+    }
     // Devices render as their mechanical-kit mesh (motor/battery/fuel-tank/…, WI 653) at the cell
     // centre; a device kind with no mapped part falls back to an orange cube.
     let dev_mat = materials.add(StandardMaterial {
@@ -1406,6 +1419,20 @@ fn enter_test(
             commands.spawn((
                 Mesh3d(meshes.add(mesh)),
                 MeshMaterial3d(chassis_mat),
+                Transform::default(),
+                RoverChassisMesh,
+                Replayable,
+                TestEntity,
+            ));
+        }
+        // Chassis face panels — plates + trim from the shared seam (WI 825), tracked
+        // with the chassis like any other chassis sub-mesh.
+        for (mesh, mat) in
+            panel_render_pieces(&editor.craft, &asset_server, &mut materials, &mut meshes)
+        {
+            commands.spawn((
+                Mesh3d(mesh),
+                MeshMaterial3d(mat),
                 Transform::default(),
                 RoverChassisMesh,
                 Replayable,
@@ -2145,6 +2172,22 @@ fn reconcile_meshes(
                     TestEntity,
                 ));
             }
+            // Face panels — plates + trim from the shared seam (WI 825).
+            for (mesh, mat) in panel_render_pieces(
+                &world.craft.voxels,
+                &asset_server,
+                &mut materials,
+                &mut meshes,
+            ) {
+                commands.spawn((
+                    Mesh3d(mesh),
+                    MeshMaterial3d(mat),
+                    Transform::default(),
+                    WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, render)),
+                    CraftMarker,
+                    TestEntity,
+                ));
+            }
         }
         CraftState::Fractured => {
             for (i, (voxels, body)) in world.fragments.iter().enumerate() {
@@ -2157,6 +2200,20 @@ fn reconcile_meshes(
                     let mat = pbr_material(material, &asset_server, &mut materials);
                     commands.spawn((
                         Mesh3d(meshes.add(mesh)),
+                        MeshMaterial3d(mat),
+                        Transform::default(),
+                        WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, render)),
+                        FragmentMarker(i),
+                        TestEntity,
+                    ));
+                }
+                // Fragment panels: none today (plates are outside the breakage graph
+                // until WI 828), but the site is seam-correct when they arrive.
+                for (mesh, mat) in
+                    panel_render_pieces(voxels, &asset_server, &mut materials, &mut meshes)
+                {
+                    commands.spawn((
+                        Mesh3d(mesh),
                         MeshMaterial3d(mat),
                         Transform::default(),
                         WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, render)),
@@ -2566,6 +2623,16 @@ fn reconcile_rover_debris(
             let mat = pbr_material(material, &asset_server, &mut materials);
             commands.spawn((
                 Mesh3d(meshes.add(mesh)),
+                MeshMaterial3d(mat),
+                Transform::default(),
+                RoverFragmentMesh(i),
+                TestEntity,
+            ));
+        }
+        // Fragment panels: none until WI 828; seam-correct when they arrive (WI 825).
+        for (mesh, mat) in panel_render_pieces(voxels, &asset_server, &mut materials, &mut meshes) {
+            commands.spawn((
+                Mesh3d(mesh),
                 MeshMaterial3d(mat),
                 Transform::default(),
                 RoverFragmentMesh(i),

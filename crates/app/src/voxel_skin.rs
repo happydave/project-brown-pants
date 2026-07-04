@@ -7,6 +7,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::image::{ImageAddressMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
+use sounding_sim::panel_mesh::{panel_submeshes, panel_trim_mesh};
 use sounding_sim::voxel::{Material, Voxel, VoxelCraft};
 use sounding_sim::voxel_mesh::{blocky_mesh, greedy_mesh, SkinMesh};
 
@@ -32,7 +33,13 @@ impl VoxelSkin {
 /// Build a Bevy `Mesh` for `craft` rendered with `skin`, with a generated tangent basis
 /// (required for normal mapping — the `-- materials` validation flagged this).
 pub fn build_skin_mesh(craft: &VoxelCraft, skin: VoxelSkin) -> Mesh {
-    let data = skin.mesh_data(craft);
+    mesh_from_skin_data(skin.mesh_data(craft))
+}
+
+/// Convert engine-agnostic [`SkinMesh`] data into a Bevy `Mesh` with a generated
+/// tangent basis — the one conversion the hull skin, panel plates, and trim all share
+/// (WI 825). The generators emit unit-square face UVs, so tangent generation is valid.
+fn mesh_from_skin_data(data: SkinMesh) -> Mesh {
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::default(),
@@ -235,6 +242,52 @@ fn pbr_material_with(
     })
 }
 
+/// A steel-blue cast for **panel** plates (WI 727 → 825): multiplied over the material's
+/// albedo so panels read as panels at a glance, distinct from solid cubes which keep
+/// their neutral material colour. Moved here from the harbor so every solid-render
+/// scene shares one panel appearance.
+pub const PANEL_TINT: Color = Color::srgb(0.42, 0.62, 1.0);
+
+/// The frame/trim appearance (WI 825): a flat dark graphite — texture-less, so it
+/// reads as a colour break against any plate or hull material. Pure (no
+/// `AssetServer`), like [`glass_material`], so the binding is unit-testable. The
+/// colour is a WI 825 visual knob.
+pub fn trim_material() -> StandardMaterial {
+    StandardMaterial {
+        base_color: Color::srgb(0.13, 0.13, 0.15),
+        perceptual_roughness: 0.6,
+        metallic: 0.35,
+        ..default()
+    }
+}
+
+/// Ready-to-spawn render pieces for a craft's **face panels** (WI 825, panels design
+/// stage 2): one merged plate mesh per distinct panel material in its panel-tinted
+/// binding (glass routes to the translucent binding), plus the frame/trim mesh in
+/// [`trim_material`]. Each scene spawns the pairs with its own markers/transforms —
+/// the one seam replacing per-scene plate inference. Empty when the craft has no
+/// panels, so panel-less scenes allocate nothing.
+pub fn panel_render_pieces(
+    craft: &VoxelCraft,
+    asset_server: &AssetServer,
+    materials: &mut Assets<StandardMaterial>,
+    meshes: &mut Assets<Mesh>,
+) -> Vec<(Handle<Mesh>, Handle<StandardMaterial>)> {
+    let mut out = Vec::new();
+    for (material, data) in panel_submeshes(craft) {
+        let mat = pbr_material_tinted(material, PANEL_TINT, asset_server, materials);
+        out.push((meshes.add(mesh_from_skin_data(data)), mat));
+    }
+    let trim = panel_trim_mesh(craft);
+    if trim.face_count() > 0 {
+        out.push((
+            meshes.add(mesh_from_skin_data(trim)),
+            materials.add(trim_material()),
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +409,39 @@ mod tests {
     fn empty_craft_has_no_submeshes() {
         let craft = VoxelCraft::new(1.0);
         assert!(skin_submeshes(&craft, VoxelSkin::Hull).is_empty());
+    }
+
+    #[test]
+    fn trim_material_is_a_dark_neutral_distinct_from_every_tint() {
+        // WI 825: the frame/trim colour break must not collide with any material's
+        // swatch (the same distinctness discipline as the WI 614 tint tests), and it
+        // must be texture-less (never binds an asset path).
+        let trim = trim_material();
+        let c = trim.base_color.to_srgba();
+        assert!(c.red < 0.3 && c.green < 0.3 && c.blue < 0.3, "dark: {c:?}");
+        for m in STRUCTURAL
+            .iter()
+            .copied()
+            .chain(std::iter::once(Material::GLASS))
+        {
+            assert_ne!(trim.base_color, material_visual(m).tint);
+        }
+        assert_ne!(trim.base_color, PANEL_TINT, "distinct from the panel cast");
+        assert!(trim.base_color_texture.is_none(), "texture-less");
+    }
+
+    #[test]
+    fn skin_data_conversion_generates_tangents_for_plates_and_trim() {
+        // WI 825 (plan-review note): the shared conversion path must accept the
+        // panel generators' output — valid UVs ⇒ tangent generation succeeds.
+        let mut craft = VoxelCraft::new(0.5);
+        craft.set_face_panel(IVec3::ZERO, IVec3::X, Some(Material::STEEL));
+        craft.set_face_panel(IVec3::new(0, 1, 0), IVec3::X, Some(Material::GLASS));
+        for (_, data) in panel_submeshes(&craft) {
+            let mesh = mesh_from_skin_data(data);
+            assert!(mesh.attribute(Mesh::ATTRIBUTE_TANGENT).is_some());
+        }
+        let trim = mesh_from_skin_data(panel_trim_mesh(&craft));
+        assert!(trim.attribute(Mesh::ATTRIBUTE_TANGENT).is_some());
     }
 }

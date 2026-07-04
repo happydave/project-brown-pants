@@ -37,6 +37,7 @@ pub mod marine;
 pub mod medium;
 pub mod mission;
 pub mod orbit;
+pub mod panel_mesh;
 pub mod persist;
 pub mod powertrain;
 pub mod propulsion;

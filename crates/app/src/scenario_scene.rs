@@ -41,7 +41,7 @@ use sounding_sim::telemetry::ActiveFlightTelemetry;
 use crate::bus::ActiveFlight;
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
 use crate::gamepad::{accumulate_chase_look, orbit_offset, ChaseLook, GamepadMap, PadSample};
-use crate::voxel_skin::{pbr_material, skin_submeshes, VoxelSkin};
+use crate::voxel_skin::{panel_render_pieces, pbr_material, skin_submeshes, VoxelSkin};
 use sounding_sim::frame::{FrameId, WorldPos};
 
 /// The default scenario document when the alias gives no path.
@@ -166,6 +166,22 @@ fn spawn_visuals(
         let mat = pbr_material(material, &asset_server, &mut materials);
         commands.spawn((
             Mesh3d(meshes.add(mesh)),
+            MeshMaterial3d(mat),
+            Transform::default(),
+            WorldPlacement(mesh_origin(&flight)),
+            CraftMarker,
+        ));
+    }
+    // Face panels — plates + trim from the shared seam (WI 825): a saved plate
+    // boat flown in a scenario renders its hull.
+    for (mesh, mat) in panel_render_pieces(
+        &flight.craft.voxels,
+        &asset_server,
+        &mut materials,
+        &mut meshes,
+    ) {
+        commands.spawn((
+            Mesh3d(mesh),
             MeshMaterial3d(mat),
             Transform::default(),
             WorldPlacement(mesh_origin(&flight)),

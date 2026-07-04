@@ -51,7 +51,9 @@ use sounding_sim::medium::{
 use sounding_sim::powertrain::MotorTier;
 use sounding_sim::scenario::{load_scenario, ScenarioRoots, StartPlacement};
 use sounding_sim::sim::CentralBody;
-use sounding_sim::voxel::{Material, VoxelCraft, PANEL_FILL};
+#[cfg(test)]
+use sounding_sim::voxel::Material;
+use sounding_sim::voxel::VoxelCraft;
 
 use crate::build::{self, BuildEntity, BuildHud, BuildMesh};
 use crate::editor::{
@@ -61,7 +63,7 @@ use crate::editor::{
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
 use crate::scene_cam::{self, OrbitFollowCam};
 use crate::scene_water::{self, WaterPatch, WaveSpec};
-use crate::voxel_skin::{pbr_material, pbr_material_tinted, skin_submeshes, VoxelSkin};
+use crate::voxel_skin::{panel_render_pieces, pbr_material, skin_submeshes, VoxelSkin};
 
 const BODY: CentralBody = CentralBody::EARTHLIKE;
 
@@ -640,17 +642,11 @@ fn dress_vessel(
                 Transform::from_translation(com_off),
             ));
         }
-        let plates = plate_meshes(craft.cell_size, &mut meshes);
-        let mats = material_handles(&craft, &asset_server, &mut materials);
-        for (material, axis, pos) in panel_plate_specs(&craft) {
-            let mat = mats
-                .iter()
-                .find(|(m, _)| *m == material)
-                .map(|(_, h)| h.clone());
+        for (mesh, mat) in panel_render_pieces(&craft, &asset_server, &mut materials, &mut meshes) {
             parent.spawn((
-                Mesh3d(plates[axis].clone()),
-                MeshMaterial3d(mat.unwrap_or_default()),
-                Transform::from_translation(pos + com_off),
+                Mesh3d(mesh),
+                MeshMaterial3d(mat),
+                Transform::from_translation(com_off),
             ));
         }
         // Interior water (WI 729): one renderer for every region — sealed compartment, open cavity,
@@ -767,82 +763,17 @@ fn sync_build_meshes(
             BuildEntity,
         ));
     }
-    let plates = plate_meshes(editor.craft.cell_size, &mut meshes);
-    let mats = material_handles(&editor.craft, &asset_server, &mut materials);
-    for (material, axis, pos) in panel_plate_specs(&editor.craft) {
-        let mat = mats
-            .iter()
-            .find(|(m, _)| *m == material)
-            .map(|(_, h)| h.clone());
+    for (mesh, mat) in
+        panel_render_pieces(&editor.craft, &asset_server, &mut materials, &mut meshes)
+    {
         commands.spawn((
-            Mesh3d(plates[axis].clone()),
-            MeshMaterial3d(mat.unwrap_or_default()),
-            Transform::from_translation(pos),
+            Mesh3d(mesh),
+            MeshMaterial3d(mat),
+            Transform::default(),
             BuildMesh,
             BuildEntity,
         ));
     }
-}
-
-/// A thin-plate render spec per **face panel** (WI 824, replacing the WI 723 exterior-adjacency
-/// inference): `(material, thin-axis, centre)` in lattice coords — one plate per panel record, on
-/// its own grid boundary. The plate you see is the plate that weighs, floats, and seals; the WI 825
-/// frame/trim visual language builds on this.
-fn panel_plate_specs(craft: &VoxelCraft) -> Vec<(Material, usize, Vec3)> {
-    craft
-        .face_panels
-        .iter()
-        .map(|p| {
-            let axis = match p.axis {
-                sounding_sim::voxel::Axis::X => 0,
-                sounding_sim::voxel::Axis::Y => 1,
-                sounding_sim::voxel::Axis::Z => 2,
-            };
-            (p.material, axis, craft.face_center(p).as_vec3())
-        })
-        .collect()
-}
-
-/// The three thin-plate meshes (X/Y/Z thin) for a cell size, reused across all panel plates (WI 722).
-fn plate_meshes(cell_size: f64, meshes: &mut Assets<Mesh>) -> [Handle<Mesh>; 3] {
-    let s = cell_size as f32;
-    let t = (cell_size * PANEL_FILL) as f32;
-    [
-        meshes.add(Mesh::from(Cuboid::new(t, s, s))),
-        meshes.add(Mesh::from(Cuboid::new(s, t, s))),
-        meshes.add(Mesh::from(Cuboid::new(s, s, t))),
-    ]
-}
-
-/// A steel-blue cast for **panel** plates (WI 727): multiplied over the material's albedo so panels read
-/// as panels at a glance (the at-a-glance cue the old blue-cube WI 719 gave), distinct from solid cubes
-/// which keep their neutral material colour. The plate geometry (WI 723) is unchanged.
-const PANEL_TINT: Color = Color::srgb(0.42, 0.62, 1.0);
-
-/// One reusable **panel-tinted** PBR material handle per distinct material among the craft's
-/// **face panels** (WI 722/727 → 824), so the many plates don't each allocate a material — and
-/// panels read distinct from solid cubes. (Glass plates route to the translucent glass binding
-/// through `pbr_material_tinted`, WI 821.)
-fn material_handles(
-    craft: &VoxelCraft,
-    asset_server: &AssetServer,
-    materials: &mut Assets<StandardMaterial>,
-) -> Vec<(Material, Handle<StandardMaterial>)> {
-    let mut present: Vec<Material> = Vec::new();
-    for p in &craft.face_panels {
-        if !present.contains(&p.material) {
-            present.push(p.material);
-        }
-    }
-    present
-        .into_iter()
-        .map(|m| {
-            (
-                m,
-                pbr_material_tinted(m, PANEL_TINT, asset_server, materials),
-            )
-        })
-        .collect()
 }
 
 /// Will this craft float, and at what draft? (WI 720, the Build-mode predictor.) Net buoyancy is the
@@ -883,7 +814,9 @@ fn would_float(craft: &VoxelCraft) -> (bool, f64) {
 fn update_build_hud(editor: Res<EditorState>, mut hud: Query<&mut Text, With<BuildHud>>) {
     if let Ok(mut text) = hud.single_mut() {
         let cells = editor.craft.voxels.len();
-        let panels = editor.craft.panels.len();
+        // The live face-panel store (WI 824/825) — the legacy cell-flag set is
+        // decode-only and always empty in play.
+        let panels = editor.craft.face_panels.len();
         let mode = if editor.panel_mode {
             "PANEL (thin)"
         } else {
@@ -1173,23 +1106,25 @@ mod tests {
         craft
     }
 
-    /// WI 824: one rendered plate per face-panel record — the plate you see is the
-    /// plate that weighs/floats/seals; no inference, no plates without records.
+    /// WI 824 → 825: one rendered plate per face-panel record — the plate you see is
+    /// the plate that weighs/floats/seals; no inference, no plates without records.
+    /// The geometry now comes from the shared `panel_mesh` seam (a merged box mesh
+    /// per material, 6 quads per plate); the shipped seed renders exactly its
+    /// record count.
     #[test]
-    fn panel_plate_specs_render_one_plate_per_record() {
-        let mut c = VoxelCraft::new(0.5);
-        c.set_face_panel(IVec3::ZERO, IVec3::Y, Some(Material::ALUMINIUM));
-        c.set_face_panel(IVec3::ZERO, IVec3::X, Some(Material::GLASS));
-        let specs = panel_plate_specs(&c);
-        assert_eq!(specs.len(), 2);
+    fn seed_renders_one_plate_per_record_through_the_shared_seam() {
+        use sounding_sim::panel_mesh::panel_submeshes;
 
-        // No panels ⇒ no plates.
-        assert!(panel_plate_specs(&VoxelCraft::new(0.5)).is_empty());
-
-        // The shipped seed: exactly its face-panel count.
         let seed = seed_hull();
         assert!(!seed.face_panels.is_empty(), "the seed is a plate hull");
-        assert_eq!(panel_plate_specs(&seed).len(), seed.face_panels.len());
+        let boxes: usize = panel_submeshes(&seed)
+            .iter()
+            .map(|(_, m)| m.face_count() / 6)
+            .sum();
+        assert_eq!(boxes, seed.face_panels.len());
+
+        // No panels ⇒ no plates.
+        assert!(panel_submeshes(&VoxelCraft::new(0.5)).is_empty());
     }
 
     /// WI 713: an **open-top** hull (seed with its top removed) is predicted to FLOAT — on its held-out
