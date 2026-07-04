@@ -5,6 +5,7 @@
 //! companion, second-screen, and replay read the same shape. Rendering-free.
 
 use crate::active::ActiveBody;
+use crate::content::Setting;
 use crate::control::ControlTier;
 use crate::flight::FlightCraft;
 use crate::orbit::Orbit;
@@ -13,6 +14,7 @@ use crate::sim::SimClock;
 use crate::voxel::VoxelCraft;
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// A point-in-time snapshot of the simulation, as served to external clients.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -59,6 +61,24 @@ pub struct Telemetry {
     /// it deserialize to `None`.
     #[serde(default)]
     pub ballast: Option<BallastTelemetry>,
+    /// The running scenario's identity + composed balance settings (WI 550), when a
+    /// scenario scene is live. Scalar names are a semi-public contract; each carries
+    /// its factor and optional authored rationale — the "real × named modifier" trust
+    /// line. Additive/serde-defaulted: snapshots without it deserialize to `None`.
+    #[serde(default)]
+    pub scenario: Option<ScenarioTelemetry>,
+}
+
+/// The running scenario's readout on the bus (WI 550): which scenario is loaded and
+/// the frozen balance scalars it composed with.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ScenarioTelemetry {
+    /// The scenario document's stable id.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// The composed settings: scalar name → frozen factor + optional rationale.
+    pub settings: BTreeMap<String, Setting>,
 }
 
 /// The live craft's ballast readout on the bus (WI 709): how full the ballast tanks are
@@ -358,6 +378,7 @@ impl Telemetry {
             hydro: None,
             marine: None,
             ballast: None,
+            scenario: None,
         }
     }
 
@@ -406,6 +427,13 @@ impl Telemetry {
     /// submarine can layer the fill-fraction readout onto `capture`.
     pub fn with_ballast(mut self, ballast: BallastTelemetry) -> Self {
         self.ballast = Some(ballast);
+        self
+    }
+
+    /// Attach the running scenario's identity + composed settings (WI 550).
+    /// Builder-style, mirroring the other additive blocks.
+    pub fn with_scenario(mut self, scenario: ScenarioTelemetry) -> Self {
+        self.scenario = Some(scenario);
         self
     }
 }

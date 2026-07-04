@@ -23,6 +23,16 @@
             density: 3000.0,      // kg/m³ (WI 615 cell-scaled mass shape)
             max_mass_flow: 1.5,   // kg/s ⇒ ~4.8 kN max thrust
         )),
+        // A small propellant tank (WI 550): the capacity the scenario
+        // director's assembly draws per Tank device on the starting craft.
+        // Sized to the starter scale: the small engine lifts ~370 kg all-up
+        // (after the example scalars), so the starter tank stays light.
+        Device((
+            id: "fuel_tank_small",
+            class: Tank,
+            density: 400.0,  // kg/m³ (empty shell — propellant is separate)
+            capacity: 100.0, // kg propellant per tank
+        )),
         // A structural material — the payload is the sim's real Material shape
         // (density + strength + the thermal quad).
         Material((

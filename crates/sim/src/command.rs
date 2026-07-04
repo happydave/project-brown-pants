@@ -99,6 +99,14 @@ pub enum Command {
     /// scene can be stepped a known amount for inspection. Clamped to `[0, MAX_STEP_BUDGET]`; ignored
     /// while running. Applied by [`apply_command`] (in the `clock` reach, like `SetPaused`).
     Step { seconds: f64 },
+    /// Spawn the **staged** scenario starting state into the one-craft flight
+    /// chain (WI 550). Structural (a spawn), so it is applied by the scenario
+    /// director's own system — the `SetGear` pattern — not [`apply_command`].
+    /// The already-loaded, already-validated payload is staged as the
+    /// director's pending-spawn state by the scenario loader boundary; this
+    /// command is the trigger, so the spawn is command-driven without the
+    /// envelope losing `Copy` to a heavy payload. No pending payload ⇒ no-op.
+    SpawnScenario,
 }
 
 /// Applies a single command to the simulation. Pure and deterministic — the only
@@ -131,8 +139,9 @@ pub fn apply_command(cmd: &Command, clock: &mut SimClock, orbit: Option<&mut Orb
                 None => false,
             }
         }
-        // Structural gear switch and propulsion commands are applied by their own
-        // systems, not here (outside the `(clock, orbit)` reach).
+        // Structural commands (gear switch, scenario spawn) and propulsion/
+        // control commands are applied by their own systems, not here
+        // (outside the `(clock, orbit)` reach).
         Command::SetGear(_)
         | Command::SetThrottle(_)
         | Command::SetGimbal(_)
@@ -141,7 +150,8 @@ pub fn apply_command(cmd: &Command, clock: &mut SimClock, orbit: Option<&mut Orb
         | Command::SetSasRecapture(_)
         | Command::SetAutopilot(_)
         | Command::SetSasGains(..)
-        | Command::SetControlTier(_) => false,
+        | Command::SetControlTier(_)
+        | Command::SpawnScenario => false,
     }
 }
 
@@ -181,6 +191,7 @@ fn execute_commands(
             Command::SetSasGains(kp, kd) => info!("sas gains: kp={kp} kd={kd}"),
             Command::SetControlTier(t) => info!("control-tier selection: {t:?}"),
             Command::Step { seconds } => info!("step: +{seconds}s (budget {})", clock.step_budget),
+            Command::SpawnScenario => info!("scenario spawn requested"),
         }
     }
 }

@@ -66,6 +66,7 @@ mod planet;
 mod play_scene;
 mod replay;
 mod rover_scene;
+mod scenario_scene;
 mod scene_cam;
 mod scene_water;
 mod skins_scene;
@@ -95,6 +96,7 @@ use moon_scene::MoonScenePlugin;
 use planet::PlanetPlugin;
 use play_scene::PlayScenePlugin;
 use rover_scene::RoverScenePlugin;
+use scenario_scene::ScenarioScenePlugin;
 use skins_scene::SkinsScenePlugin;
 use surface_scene::SurfaceScenePlugin;
 use terrain_mesh_scene::TerrainMeshScenePlugin;
@@ -126,6 +128,7 @@ enum Scene {
     Harbor,
     Surface,
     Moon,
+    Scenario,
 }
 
 fn selected_scene() -> Scene {
@@ -152,6 +155,7 @@ fn selected_scene() -> Scene {
         Some("harbor") => Scene::Harbor,
         Some("surface") => Scene::Surface,
         Some("moon") => Scene::Moon,
+        Some("scenario") => Scene::Scenario,
         _ => Scene::Editor,
     }
 }
@@ -261,6 +265,9 @@ fn main() {
         }
         Scene::Moon => {
             app.add_plugins(MoonScenePlugin);
+        }
+        Scene::Scenario => {
+            app.add_plugins(ScenarioScenePlugin);
         }
     }
 

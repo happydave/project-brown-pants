@@ -72,7 +72,7 @@
 //! (WI 550's scope).
 
 use crate::voxel::{Material, Thermal};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
@@ -143,9 +143,14 @@ pub enum ContentError {
         field: String,
         element: String,
     },
-    /// Two settings scalars share a name (one frozen value per name; scenario
-    /// layering is a WI 550 decision, deliberately not made here).
+    /// Two settings scalars share a name (one frozen value per name; the
+    /// scenario is a *source of* settings documents and same-phase name
+    /// collisions stay a loud authoring error — design doctrine, WI 800).
     DuplicateScalar { name: String },
+    /// A settings scalar's factor is not finite and strictly positive — ×0
+    /// and negatives cannot express a physical modification in a
+    /// multiply-only grammar (WI 550).
+    InvalidScalarFactor { name: String, factor: f64 },
     /// A balance scalar's bound field has no content-defined value when the
     /// settings bake applies — the scalar would *originate* a physical
     /// quantity rather than modify one (the physical-truth seam, WI 549).
@@ -215,6 +220,11 @@ impl fmt::Display for ContentError {
             ContentError::DuplicateScalar { name } => {
                 write!(f, "duplicate balance-scalar name `{name}`")
             }
+            ContentError::InvalidScalarFactor { name, factor } => write!(
+                f,
+                "balance scalar `{name}` has factor {factor}: a factor must be finite and \
+                 strictly positive (a multiply-only grammar cannot express ×0 or negatives)"
+            ),
             ContentError::SeamViolation { scalar, record, field } => write!(
                 f,
                 "balance scalar `{scalar}` would originate (not modify) record `{record}` field `{field}`: \
@@ -323,8 +333,9 @@ impl RawRecord {
 }
 
 /// The functional class a device record describes — the discriminator that
-/// decides which physical fields apply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+/// decides which physical fields apply. Ordered/hashable so it can key a
+/// scenario's device-binding map (WI 550).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum DeviceClass {
     Engine,
     Tank,
@@ -520,16 +531,6 @@ pub enum OverridePhase {
     Local,
 }
 
-impl OverridePhase {
-    fn rank(self) -> u8 {
-        match self {
-            OverridePhase::Patch => 0,
-            OverridePhase::Scenario => 1,
-            OverridePhase::Local => 2,
-        }
-    }
-}
-
 /// An override-set document as authored.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -623,12 +624,34 @@ struct RawSettings {
 struct RawScalar {
     /// The scalar's name — frozen once per composition, surfaced in
     /// provenance and [`Catalog::settings`] for telemetry ("real × modifier").
+    ///
+    /// Naming convention (WI 550): names are a **semi-public contract** — they
+    /// appear in telemetry and will be recorded in saves (WI 553). Use
+    /// lowercase `snake_case`; renaming a scalar is an outward-facing change.
     name: String,
-    /// The proportional factor (1.0 is a legal identity knob).
+    /// The proportional factor. Must be finite and strictly positive (×0 and
+    /// negatives are nonsense in a multiply-only grammar); 1.0 is a legal
+    /// identity knob.
     factor: f64,
     /// What it multiplies: the 548 target vocabulary plus a field name.
     target: Target,
     field: String,
+    /// Optional human-readable justification, surfaced with the factor in
+    /// [`Catalog::settings`] → telemetry (WI 550) — the educational trust
+    /// line beside "real × modifier" ("×50 — fuel logistics isn't this
+    /// lesson's focus").
+    rationale: Option<String>,
+}
+
+/// A frozen balance scalar as exposed on [`Catalog::settings`]: the factor
+/// plus its optional authored rationale (WI 550). Serde-able so telemetry can
+/// carry the composed settings (names are a semi-public contract).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Setting {
+    /// The frozen proportional factor.
+    pub factor: f64,
+    /// Optional authored justification for telemetry/UI.
+    pub rationale: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -795,10 +818,11 @@ pub struct Catalog {
     /// All source ids (settings, then packs, then override sets — the
     /// design's ladder numbering) in resolution order.
     pub sources: Vec<String>,
-    /// The frozen balance scalars (name → factor, WI 549): resolved before
-    /// any data phase, immutable, readable by later layers/telemetry. The
-    /// records below already have them baked in — the sim never sees these.
-    pub settings: BTreeMap<String, f64>,
+    /// The frozen balance scalars (name → factor + rationale, WI 549/550):
+    /// resolved before any data phase, immutable, readable by later
+    /// layers/telemetry. The records below already have them baked in — the
+    /// sim never sees these.
+    pub settings: BTreeMap<String, Setting>,
     records: BTreeMap<String, Entry>,
 }
 
@@ -1232,11 +1256,26 @@ fn merge_composition(
     // data phase (documents in id order; duplicate names are an error — one
     // frozen value per name).
     settings_docs.sort_by(|a, b| a.id.cmp(&b.id));
-    let mut settings: BTreeMap<String, f64> = BTreeMap::new();
+    let mut settings: BTreeMap<String, Setting> = BTreeMap::new();
     for doc in &settings_docs {
         for scalar in &doc.scalars {
+            // WI 550: a factor must be finite and strictly positive — ×0 and
+            // negatives are nonsense in a multiply-only grammar (extreme
+            // values belong in packs, as deliberate physical truths).
+            if !(scalar.factor.is_finite() && scalar.factor > 0.0) {
+                return Err(ContentError::InvalidScalarFactor {
+                    name: scalar.name.clone(),
+                    factor: scalar.factor,
+                });
+            }
             if settings
-                .insert(scalar.name.clone(), scalar.factor)
+                .insert(
+                    scalar.name.clone(),
+                    Setting {
+                        factor: scalar.factor,
+                        rationale: scalar.rationale.clone(),
+                    },
+                )
                 .is_some()
             {
                 return Err(ContentError::DuplicateScalar {
@@ -2266,6 +2305,49 @@ mod tests {
     }
 
     #[test]
+    fn scalar_factor_must_be_finite_and_positive() {
+        // WI 550: ×0, negatives, and non-finite factors are rejected at
+        // freeze with the scalar named — a multiply-only grammar cannot
+        // express them as a physical modification.
+        let p = pack(&format!("{}{}", engine_base(), engine_variant()));
+        for factor in ["0.0", "-0.5", "inf", "NaN"] {
+            let s = settings_doc(
+                "bal",
+                &format!(
+                    r#"( name: "eff", factor: {factor}, target: Id("engine_base"), field: "exhaust_velocity" ),"#
+                ),
+            );
+            match Catalog::compose(&[&p], &[&s], &[]) {
+                Err(ContentError::InvalidScalarFactor { name, .. }) => assert_eq!(name, "eff"),
+                other => panic!("factor {factor}: expected InvalidScalarFactor, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_rationale_surfaces_on_the_frozen_setting() {
+        // WI 550: the authored rationale rides the frozen setting (the
+        // telemetry trust line beside "real × modifier"); absent = None.
+        let p = pack(&format!("{}{}", engine_base(), engine_variant()));
+        let s = settings_doc(
+            "bal",
+            r#"( name: "eff", factor: 0.5, target: Id("engine_base"), field: "exhaust_velocity",
+                 rationale: Some("engines simplified; orbits are the lesson") ),
+               ( name: "plain", factor: 2.0, target: Id("engine_base"), field: "exhaust_velocity" ),"#,
+        );
+        let cat = Catalog::compose(&[&p], &[&s], &[]).unwrap();
+        let eff = cat.settings.get("eff").unwrap();
+        assert_eq!(eff.factor, 0.5);
+        assert_eq!(
+            eff.rationale.as_deref(),
+            Some("engines simplified; orbits are the lesson")
+        );
+        assert_eq!(cat.settings.get("plain").unwrap().rationale, None);
+        // Both scalars multiply the same field — distinct names stack.
+        assert_eq!(engine_ev(&cat, "v"), 3200.0 * 0.5 * 2.0);
+    }
+
+    #[test]
     fn scalar_bakes_at_merge_with_frozen_set_and_provenance() {
         let p = pack(&format!("{}{}", engine_base(), engine_variant()));
         let s = settings_doc(
@@ -2277,7 +2359,10 @@ mod tests {
         // the sim-facing record carries no scalar anywhere.
         assert_eq!(engine_ev(&cat, "v"), 3200.0 * 0.7);
         // Frozen set exposed by name.
-        assert_eq!(cat.settings.get("fuel_efficiency"), Some(&0.7));
+        assert_eq!(
+            cat.settings.get("fuel_efficiency").map(|s| s.factor),
+            Some(0.7)
+        );
         // Provenance: winning source names document + scalar; shadow holds
         // the authored physical value (real × modifier for telemetry).
         let fp = &cat.get("v").unwrap().field_provenance["exhaust_velocity"];
@@ -2453,7 +2538,10 @@ mod tests {
         let cat = Catalog::compose(&[&core], &[&bal], &[&scn]).expect("full composition merges");
         // 3200 × 0.85 (settings bake) × 0.9 (scenario multiply), via the base.
         assert_eq!(engine_ev(&cat, "lf_engine_small"), 3200.0 * 0.85 * 0.9);
-        assert_eq!(cat.settings.get("engine_efficiency"), Some(&0.85));
+        assert_eq!(
+            cat.settings.get("engine_efficiency").map(|s| s.factor),
+            Some(0.85)
+        );
         assert_eq!(
             cat.sources,
             vec!["example-settings", "core", "example-scenario"]

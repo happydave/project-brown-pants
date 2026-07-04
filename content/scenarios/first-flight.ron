@@ -1,0 +1,30 @@
+// The trivial flight-only scenario (WI 550) — content Slice 1's first
+// fixture. It composes exactly the three Slice 0 example documents (the core
+// pack, the example settings, the example scenario override set) plus the
+// shipped starter blueprint, on the built-in earthlike world.
+//
+// The seam, end to end: the starter craft's engine flies with
+//   3200 m/s (core pack, physical)
+//   × 0.85   (engine_efficiency setting)
+//   × 0.9    (example-scenario override on the engine base)
+//   = 2448 m/s exhaust velocity
+// — real value × named modifiers, visible in telemetry provenance.
+#![enable(implicit_some)]
+(
+    format: 1,
+    id: "first-flight",
+    name: "First Flight",
+    world: Earthlike,
+    packs: ["core"],
+    settings: ["example-settings"],
+    overrides: ["example-scenario"],
+    start: (
+        blueprint: "first-flight",
+        placement: Pad,
+        bindings: {
+            Engine: "lf_engine_small",
+            Tank: "fuel_tank_small",
+        },
+    ),
+    // Missions arrive at WI 551; lore at WI 554.
+)

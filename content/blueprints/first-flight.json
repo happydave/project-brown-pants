@@ -1,0 +1,118 @@
+{
+  "format_version": 1,
+  "payload": {
+    "kind": "craft",
+    "id": "first-flight",
+    "name": "First Flight",
+    "reference_position": {
+      "frame": 0,
+      "pos": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "craft": {
+      "cell_size": 0.35,
+      "voxels": [
+        {
+          "cell": [
+            0,
+            0,
+            0
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        }
+      ],
+      "devices": [
+        {
+          "cell": [
+            0,
+            2,
+            0
+          ],
+          "mass": 40.0,
+          "kind": "command",
+          "function": {
+            "control_point": {
+              "crewed": true
+            }
+          },
+          "motor": null
+        },
+        {
+          "cell": [
+            0,
+            2,
+            0
+          ],
+          "mass": 5.0,
+          "kind": "computer",
+          "function": {
+            "computer": {
+              "grants": "stabilized",
+              "power_draw": 0.5
+            }
+          },
+          "motor": null
+        },
+        {
+          "cell": [
+            0,
+            1,
+            0
+          ],
+          "mass": 10.0,
+          "kind": "battery",
+          "function": {
+            "battery": {
+              "charge": 50.0,
+              "capacity": 50.0
+            }
+          },
+          "motor": null
+        },
+        {
+          "cell": [
+            0,
+            0,
+            0
+          ],
+          "mass": 30.0,
+          "kind": "engine",
+          "function": null,
+          "motor": null
+        },
+        {
+          "cell": [
+            0,
+            1,
+            0
+          ],
+          "mass": 5.0,
+          "kind": "tank",
+          "function": null,
+          "motor": null
+        }
+      ],
+      "attachments": [],
+      "doors": [],
+      "parts": [],
+      "panels": []
+    },
+    "resources": [],
+    "crew": []
+  }
+}

@@ -3,6 +3,10 @@
 // quantity (the physical-truth seam): the resolved catalog holds final
 // physical values, the sim never sees scalars, and provenance keeps the
 // authored value + the named modifier for honest educational telemetry.
+//
+// Scalar names are a semi-public contract (telemetry + saves): lowercase
+// snake_case; renaming one is an outward-facing change (WI 550).
+#![enable(implicit_some)]
 (
     format: 1,
     id: "example-settings",
@@ -14,6 +18,7 @@
             factor: 0.85,
             target: Id("engine_base"),
             field: "exhaust_velocity",
+            rationale: "example detune: engines run at 85% of catalog spec",
         ),
     ],
 )
