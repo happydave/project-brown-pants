@@ -214,24 +214,40 @@ pub fn buoyancy_wrench(
     let mut torque = DVec3::ZERO;
     let mut submerged_volume = 0.0;
     let mut draft = 0.0_f64;
-    // Displacement = solid voxels (the hull) + enclosed compartment cells (the air it encloses). A
-    // panel voxel displaces only `voxel_fill` of a cell (WI 716, a thin plate); enclosed air is a full
-    // cell.
+    // Displacement = solid voxels (the hull) + enclosed compartment cells (the air it
+    // encloses) as full cells, plus **face panels** displacing their plate volume at
+    // their face centre (WI 824 — cells are cubes; plates live on faces).
     let cells = craft
         .voxels
         .iter()
-        .map(|v| (v.cell, craft.voxel_fill(v.cell)))
-        .chain(enclosed.iter().map(|c| (*c, 1.0)));
-    for (cell, fill) in cells {
+        .map(|v| v.cell)
+        .chain(enclosed.iter().copied());
+    for cell in cells {
         let local = (cell.as_dvec3() + DVec3::splat(0.5)) * craft.cell_size - com;
         let world = body_position + body_orientation * local;
         let fraction = cell_submerged_fraction(world, craft.cell_size, surface_radius, time);
         if fraction <= 0.0 {
             continue;
         }
-        let displaced = cell_volume * fill * fraction; // the water this cell displaces
+        let displaced = cell_volume * fraction; // the water this cell displaces
         let f = density * gravity * displaced * up;
         let arm = world - body_position; // offset from the centre of mass (the body integrates the CoM)
+        force += f;
+        torque += arm.cross(f);
+        submerged_volume += displaced;
+        draft = draft.max(surface_radius - world.length());
+    }
+    let panel_volume = craft.panel_volume();
+    for p in &craft.face_panels {
+        let local = craft.face_center(p) - com;
+        let world = body_position + body_orientation * local;
+        let fraction = cell_submerged_fraction(world, craft.cell_size, surface_radius, time);
+        if fraction <= 0.0 {
+            continue;
+        }
+        let displaced = panel_volume * fraction;
+        let f = density * gravity * displaced * up;
+        let arm = world - body_position;
         force += f;
         torque += arm.cross(f);
         submerged_volume += displaced;
@@ -276,15 +292,26 @@ pub struct OpenCavity {
 /// block. A first cut for **top-opening** hulls; side-hole openings below the waterline are a later item.
 pub fn open_cavity(craft: &VoxelCraft) -> OpenCavity {
     let solid: HashSet<IVec3> = craft.voxels.iter().map(|v| v.cell).collect();
-    if solid.is_empty() {
+    if solid.is_empty() && craft.face_panels.is_empty() {
         return OpenCavity::default();
     }
+    // Structure bounds cover solids and paneled boundaries (WI 824 — a hull can
+    // be all plates). The **gunwale** is the top structural *cell* row: a
+    // Y-normal plate is the ceiling of its owner cell (air resting on top of the
+    // deck is outside, not a cavity), so panels contribute `p.cell.y`, never the
+    // +unit side.
     let (mut lo, mut hi) = (IVec3::MAX, IVec3::MIN);
+    let mut max_solid_y = i32::MIN;
     for &c in &solid {
         lo = lo.min(c);
         hi = hi.max(c);
+        max_solid_y = max_solid_y.max(c.y);
     }
-    let max_solid_y = hi.y;
+    for p in &craft.face_panels {
+        lo = lo.min(p.cell);
+        hi = hi.max(p.cell + p.axis.unit());
+        max_solid_y = max_solid_y.max(p.cell.y);
+    }
     let (elo, ehi) = (lo - IVec3::ONE, hi + IVec3::ONE);
     let in_bbox = |c: IVec3| {
         c.x >= elo.x && c.x <= ehi.x && c.y >= elo.y && c.y <= ehi.y && c.z >= elo.z && c.z <= ehi.z
@@ -320,17 +347,24 @@ pub fn open_cavity(craft: &VoxelCraft) -> OpenCavity {
     while let Some(c) = stack.pop() {
         for off in neighbours {
             let n = c + off;
-            if is_air(n) && exterior.insert(n) {
+            if is_air(n) && !craft.boundary_sealed(&solid, c, off) && exterior.insert(n) {
                 stack.push(n);
             }
         }
     }
-    // The bucket interior: exterior-reachable air with a floor below it, under the gunwale.
-    let has_solid_below = |c: IVec3| (lo.y..c.y).any(|y| solid.contains(&IVec3::new(c.x, y, c.z)));
+    // The bucket interior: exterior-reachable air with a floor below it, under the
+    // gunwale. A floor is any **sealed downward crossing** in the column — a solid
+    // cell or a face panel (the WI 824 coverage predicate), so a plated bilge
+    // holds water out exactly as a solid one does.
+    let has_floor_below = |c: IVec3| {
+        (lo.y..=c.y)
+            .rev()
+            .any(|y| craft.boundary_sealed(&solid, IVec3::new(c.x, y, c.z), IVec3::NEG_Y))
+    };
     let mut cells: Vec<IVec3> = exterior
         .iter()
         .copied()
-        .filter(|&c| c.y <= max_solid_y && has_solid_below(c))
+        .filter(|&c| c.y <= max_solid_y && has_floor_below(c))
         .collect();
     if cells.is_empty() {
         return OpenCavity::default();
@@ -2605,7 +2639,8 @@ mod tests {
         for v in &solid.voxels {
             panel.set_panel(v.cell, true); // every wall cell is a thin panel
         }
-        let enc = enclosed_cells(&solid); // identical geometry ⇒ same enclosed set
+        panel.convert_legacy_panels(); // WI 824: plates on faces, cells emptied
+        let enc = enclosed_cells(&solid); // the solid hull's enclosed set
         let g = 9.81;
         let rho = 1_025.0;
         let deep = DVec3::new(0.0, SURFACE_R - 100.0, 0.0); // fully submerged ⇒ max buoyancy

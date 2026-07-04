@@ -381,12 +381,48 @@ pub struct Door {
     pub open: bool,
 }
 
-/// An axis along which the cross-sectional-area curve is sliced.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// An axis along which the cross-sectional-area curve is sliced (and the normal
+/// axis of a [`FacePanel`]'s boundary, WI 824).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Axis {
     X,
     Y,
     Z,
+}
+
+impl Axis {
+    /// The positive unit cell-step along this axis.
+    pub fn unit(self) -> IVec3 {
+        match self {
+            Axis::X => IVec3::X,
+            Axis::Y => IVec3::Y,
+            Axis::Z => IVec3::Z,
+        }
+    }
+}
+
+/// A **face panel** (WI 824, the panels design): a thin structural plate on the
+/// boundary between lattice cell `cell` and `cell + axis.unit()` — the canonical
+/// key is always the negative-side cell, so one boundary is stored exactly once.
+/// Panels mass and displace their plate ([`PANEL_FILL`] thickness), seal their
+/// boundary (the coverage predicate), and carry their own material — a glass face
+/// panel is a window.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FacePanel {
+    /// The cell on the boundary's negative side (the canonical owner).
+    pub cell: IVec3,
+    /// The boundary's normal axis: the panel sits between `cell` and
+    /// `cell + axis.unit()`.
+    pub axis: Axis,
+    /// The plate's material.
+    pub material: Material,
+}
+
+impl FacePanel {
+    /// Deterministic sort key (WI 820 discipline: ordered encode).
+    fn key(&self) -> (i32, i32, i32, u8) {
+        (self.cell.x, self.cell.y, self.cell.z, self.axis as u8)
+    }
 }
 
 /// Derived mass properties of a craft, in its own local frame (metres, kg).
@@ -682,21 +718,41 @@ pub struct VoxelCraft {
     /// Defaulted on load so pre-parts saves stay backward-loadable.
     #[serde(default)]
     pub parts: Vec<Part>,
-    /// Cells built as **thin panels** (Starbase plates, WI 716): a panel is a structural voxel in
-    /// every role *except* mass and buoyancy displacement, where it counts only [`PANEL_FILL`] of a
-    /// cell — so a panel hull is light enough to float honestly. Still a compartment barrier and a
-    /// full aero cross-section. Defaulted on load so pre-panel saves stay backward-loadable (empty ⇒
-    /// every voxel is a solid cube, exactly as before).
+    /// **Legacy** cell-panel flags (WI 716, superseded by [`FacePanel`]s in WI 824):
+    /// decode-only — loaders convert flagged cells to face panels
+    /// ([`convert_legacy_panels`]) and in-play craft never carry flags. Kept so
+    /// pre-824 saves load; never re-written.
     #[serde(default)]
     pub panels: HashSet<IVec3>,
+    /// **Face panels** (WI 824): thin plates on cell boundaries — the first-class
+    /// panel model (cells are solid cubes; plates live on faces). Kept sorted by
+    /// [`FacePanel::key`] for deterministic encode; defaulted on load so pre-824
+    /// saves stay backward-loadable.
+    #[serde(default)]
+    pub face_panels: Vec<FacePanel>,
 }
 
-/// The fraction of a cell a **panel** (thin plate) occupies, for mass and buoyancy displacement
-/// (WI 716). A panel weighs and displaces `PANEL_FILL ×` a solid cube of the same material — the lever
-/// that lets a real hull float without a magic-light material. Bounded `(0, 1]`; solid cubes are `1.0`.
-/// `0.1` (a ~5 cm plate on a 0.5 m cell): a normal-scale panel hull floats at ~40 % draft under real
-/// mass (WI 717 tune); thinner than the WI 716 prototype's 0.2, closer to real plate-on-frame.
-pub const PANEL_FILL: f64 = 0.1;
+/// A **plate's thickness** as a fraction of the cell size (WI 716 → WI 824): a
+/// [`FacePanel`] masses and displaces `face_area × PANEL_FILL × cell_size` of its
+/// material — the lever that lets a real hull float without a magic-light material.
+/// `0.05` (a ~5 mm plate on a 0.1 m build cell). Halved from the legacy 0.1 at the
+/// WI 824 conversion: a legacy hull wall converts to an inner *and* outer skin
+/// (the R1 topology rule), so half-thickness plates keep a converted wall's total
+/// plate mass at the legacy value while the sealed inter-skin void displaces
+/// honestly (the double-hull accounting audited in the WI 824 plan).
+pub const PANEL_FILL: f64 = 0.05;
+
+/// The summary [`VoxelCraft::convert_legacy_panels`] returns for the conversion
+/// log (WI 824): what the R1 migration did to one craft.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LegacyPanelConversion {
+    /// Flagged cells emptied into face panels.
+    pub cells_converted: usize,
+    /// Fully-embedded flagged cells kept as solid cells (inert plating).
+    pub cells_kept_solid: usize,
+    /// Face panels created.
+    pub plates_created: usize,
+}
 
 impl Default for VoxelCraft {
     fn default() -> Self {
@@ -708,6 +764,7 @@ impl Default for VoxelCraft {
             doors: Vec::new(),
             parts: Vec::new(),
             panels: HashSet::new(),
+            face_panels: Vec::new(),
         }
     }
 }
@@ -731,29 +788,166 @@ impl VoxelCraft {
         self.voxels.len() as f64 * self.cell_volume()
     }
 
-    /// Whether `cell` is built as a thin panel (WI 716).
+    /// Whether `cell` carries a **legacy** cell-panel flag (WI 716; decode-only
+    /// since WI 824 — see [`Self::convert_legacy_panels`]).
     pub fn is_panel(&self, cell: IVec3) -> bool {
         self.panels.contains(&cell)
     }
 
-    /// The material-occupancy fraction of `cell` for mass and buoyancy displacement (WI 716):
-    /// [`PANEL_FILL`] for a panel cell, `1.0` for a solid cube. (A panel still seals and presents a
-    /// full aero cross-section — only its mass and displacement are thin.)
-    pub fn voxel_fill(&self, cell: IVec3) -> f64 {
-        if self.is_panel(cell) {
-            PANEL_FILL
-        } else {
-            1.0
-        }
-    }
-
-    /// Mark (or clear) `cell` as a thin panel (WI 716). Clearing a non-panel cell is a no-op.
+    /// Set (or clear) a **legacy** cell-panel flag. Retained for building
+    /// pre-conversion fixtures and the conversion tests; in-play craft use
+    /// [`FacePanel`]s (WI 824).
     pub fn set_panel(&mut self, cell: IVec3, panel: bool) {
         if panel {
             self.panels.insert(cell);
         } else {
             self.panels.remove(&cell);
         }
+    }
+
+    /// Canonicalize the boundary between `cell` and `cell + dir` (`dir` a ±unit
+    /// step) to its face key: the negative-side cell and the normal axis.
+    pub fn canonical_face(cell: IVec3, dir: IVec3) -> (IVec3, Axis) {
+        let axis = if dir.x != 0 {
+            Axis::X
+        } else if dir.y != 0 {
+            Axis::Y
+        } else {
+            Axis::Z
+        };
+        let owner = if dir.x + dir.y + dir.z > 0 {
+            cell
+        } else {
+            cell + dir
+        };
+        (owner, axis)
+    }
+
+    /// The face panel on the boundary owned by `(cell, axis)`, if any (WI 824).
+    pub fn face_panel_at(&self, cell: IVec3, axis: Axis) -> Option<&FacePanel> {
+        let key = (cell.x, cell.y, cell.z, axis as u8);
+        self.face_panels
+            .binary_search_by(|p| p.key().cmp(&key))
+            .ok()
+            .map(|i| &self.face_panels[i])
+    }
+
+    /// The face panel on the boundary between `cell` and `cell + dir` (either
+    /// side's view; `dir` a ±unit step), if any (WI 824).
+    pub fn face_panel_between(&self, cell: IVec3, dir: IVec3) -> Option<&FacePanel> {
+        let (owner, axis) = Self::canonical_face(cell, dir);
+        self.face_panel_at(owner, axis)
+    }
+
+    /// Place (`Some(material)`) or remove (`None`) the face panel on the boundary
+    /// between `cell` and `cell + dir` (WI 824). Keeps the store sorted (the
+    /// deterministic-encode invariant); placing over an existing panel replaces
+    /// its material.
+    pub fn set_face_panel(&mut self, cell: IVec3, dir: IVec3, material: Option<Material>) {
+        let (owner, axis) = Self::canonical_face(cell, dir);
+        let key = (owner.x, owner.y, owner.z, axis as u8);
+        match self.face_panels.binary_search_by(|p| p.key().cmp(&key)) {
+            Ok(i) => match material {
+                Some(m) => self.face_panels[i].material = m,
+                None => {
+                    self.face_panels.remove(i);
+                }
+            },
+            Err(i) => {
+                if let Some(m) = material {
+                    self.face_panels.insert(
+                        i,
+                        FacePanel {
+                            cell: owner,
+                            axis,
+                            material: m,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Restore the face-panel sort invariant (defensive, for decoded documents
+    /// whose producer did not order the store).
+    pub fn normalize_face_panels(&mut self) {
+        self.face_panels.sort_by_key(|p| p.key());
+        self.face_panels.dedup_by_key(|p| p.key());
+    }
+
+    /// **The per-face coverage predicate** (WI 824; the shaped-cell seam, panels
+    /// design R3): the boundary between `cell` and `cell + dir` is sealed iff
+    /// fully covered by solid occupancy on either side and/or a face panel.
+    /// `solid` is the caller's occupancy set (the compartment flood-fill passes
+    /// voxels + closed doors; other consumers pass voxels). Boolean-valued today;
+    /// shaped cells later supply partial coverage *through this one function* —
+    /// callers must not inline their own seal logic.
+    pub fn boundary_sealed(&self, solid: &HashSet<IVec3>, cell: IVec3, dir: IVec3) -> bool {
+        solid.contains(&cell)
+            || solid.contains(&(cell + dir))
+            || self.face_panel_between(cell, dir).is_some()
+    }
+
+    /// Convert **legacy** cell-panel flags (WI 716) to face panels — the panels
+    /// design's R1 migration rule, applied at document load. Evaluated against
+    /// the craft's *original* occupancy (order-independent, deterministic): each
+    /// flagged cell gains a face panel of its material on every face adjacent to
+    /// an empty cell, then empties; a flagged cell with **no** empty neighbour is
+    /// inert embedded plating and stays a solid cell. Sealing topology is
+    /// preserved by construction (every crossing the solid cell blocked is now
+    /// blocked by a plate or remains solid). Returns a per-craft summary for the
+    /// conversion log; a craft with no flags is untouched (idempotent).
+    pub fn convert_legacy_panels(&mut self) -> Option<LegacyPanelConversion> {
+        if self.panels.is_empty() {
+            self.normalize_face_panels();
+            return None;
+        }
+        let occupied: HashSet<IVec3> = self.voxels.iter().map(|v| v.cell).collect();
+        let dirs = [
+            IVec3::X,
+            IVec3::NEG_X,
+            IVec3::Y,
+            IVec3::NEG_Y,
+            IVec3::Z,
+            IVec3::NEG_Z,
+        ];
+        let flagged: Vec<IVec3> = {
+            let mut f: Vec<IVec3> = self.panels.iter().copied().collect();
+            f.sort_by_key(|c| (c.x, c.y, c.z));
+            f
+        };
+        let mut cells_converted = 0usize;
+        let mut cells_kept_solid = 0usize;
+        let mut plates_created = 0usize;
+        let mut emptied: HashSet<IVec3> = HashSet::new();
+        for cell in flagged {
+            let Some(voxel) = self.voxels.iter().find(|v| v.cell == cell).copied() else {
+                continue; // a stray flag on an unoccupied cell is dropped
+            };
+            let empty_neighbours: Vec<IVec3> = dirs
+                .iter()
+                .copied()
+                .filter(|d| !occupied.contains(&(cell + *d)))
+                .collect();
+            if empty_neighbours.is_empty() {
+                cells_kept_solid += 1; // fully embedded: inert plating stays solid
+                continue;
+            }
+            for d in empty_neighbours {
+                self.set_face_panel(cell, d, Some(voxel.material));
+                plates_created += 1;
+            }
+            emptied.insert(cell);
+            cells_converted += 1;
+        }
+        self.voxels.retain(|v| !emptied.contains(&v.cell));
+        self.panels.clear();
+        self.normalize_face_panels();
+        Some(LegacyPanelConversion {
+            cells_converted,
+            cells_kept_solid,
+            plates_created,
+        })
     }
 
     /// Whether this craft (or breakage fragment) carries a control point — a
@@ -769,17 +963,34 @@ impl VoxelCraft {
         (c.as_dvec3() + DVec3::splat(0.5)) * self.cell_size
     }
 
+    /// World-frame centre of a face panel's plate, metres (WI 824): the centre of
+    /// the boundary between `p.cell` and its positive-`axis` neighbour.
+    pub fn face_center(&self, p: &FacePanel) -> DVec3 {
+        self.cell_center(p.cell) + p.axis.unit().as_dvec3() * (0.5 * self.cell_size)
+    }
+
+    /// A face panel's plate volume, m³ (WI 824): face area × plate thickness.
+    pub fn panel_volume(&self) -> f64 {
+        self.cell_size * self.cell_size * (PANEL_FILL * self.cell_size)
+    }
+
     /// Derived mass properties, or `None` for an empty craft (no mass).
+    /// Cells are solid cubes; **face panels** fold as their plate mass at their
+    /// face centre (point-mass inertia, the device/part pattern) — WI 824.
     pub fn mass_properties(&self) -> Option<MassProperties> {
         // Accumulate mass and first moment for the centre of mass.
         let mut mass = 0.0;
         let mut moment = DVec3::ZERO;
         let cell_volume = self.cell_volume();
         for v in &self.voxels {
-            // A panel carries only PANEL_FILL of a cube's mass (WI 716).
-            let m = v.material.density * cell_volume * self.voxel_fill(v.cell);
+            let m = v.material.density * cell_volume;
             mass += m;
             moment += m * self.cell_center(v.cell);
+        }
+        for p in &self.face_panels {
+            let m = p.material.density * self.panel_volume();
+            mass += m;
+            moment += m * self.face_center(p);
         }
         for d in &self.devices {
             mass += d.mass;
@@ -804,11 +1015,23 @@ impl VoxelCraft {
         // Solid-cube self inertia (per diagonal): m·s²/6.
         let cube_self = self.cell_size * self.cell_size / 6.0;
         for v in &self.voxels {
-            let m = v.material.density * cell_volume * self.voxel_fill(v.cell);
+            let m = v.material.density * cell_volume;
             let r = self.cell_center(v.cell) - com;
             ixx += m * (cube_self + r.y * r.y + r.z * r.z);
             iyy += m * (cube_self + r.x * r.x + r.z * r.z);
             izz += m * (cube_self + r.x * r.x + r.y * r.y);
+            ixy -= m * r.x * r.y;
+            ixz -= m * r.x * r.z;
+            iyz -= m * r.y * r.z;
+        }
+        // Face panels as point masses at their face centres (WI 824; the
+        // device/part pattern — slab self-inertia is a refinement left open).
+        for p in &self.face_panels {
+            let m = p.material.density * self.panel_volume();
+            let r = self.face_center(p) - com;
+            ixx += m * (r.y * r.y + r.z * r.z);
+            iyy += m * (r.x * r.x + r.z * r.z);
+            izz += m * (r.x * r.x + r.y * r.y);
             ixy -= m * r.x * r.y;
             ixz -= m * r.x * r.z;
             iyz -= m * r.y * r.z;
@@ -851,16 +1074,33 @@ impl VoxelCraft {
     }
 
     /// The cross-sectional-area curve along `axis`: `(station, area_m2)` pairs,
-    /// sorted by station. Area = occupied cells in the slice × cell². Derived from
-    /// voxel occupancy only (devices excluded). Integrates (× cell_size) to the
-    /// occupied voxel volume.
+    /// sorted by station. Area = occupied cells in the slice × cell² (devices
+    /// excluded). **WI 824 interim bridge** (removed by the WI 827 sealed
+    /// envelope): a cell also counts as occupied when **two or more** of its six
+    /// faces carry panels — which reconstructs exactly the legacy panel cells
+    /// (converted walls are double-skinned) plus panel-bounded cavities, while a
+    /// hull's single-plate-facing outside neighbours do not count. A lone
+    /// authored plate under-presents until the envelope lands; documented, not
+    /// bridged further.
     pub fn area_curve(&self, axis: Axis) -> Vec<(i32, f64)> {
+        let mut panel_faces: BTreeMap<(i32, i32, i32), u32> = BTreeMap::new();
+        for p in &self.face_panels {
+            for c in [p.cell, p.cell + p.axis.unit()] {
+                *panel_faces.entry((c.x, c.y, c.z)).or_default() += 1;
+            }
+        }
+        let mut cells: HashSet<IVec3> = self.voxels.iter().map(|v| v.cell).collect();
+        for ((x, y, z), n) in panel_faces {
+            if n >= 2 {
+                cells.insert(IVec3::new(x, y, z));
+            }
+        }
         let mut counts: BTreeMap<i32, usize> = BTreeMap::new();
-        for v in &self.voxels {
+        for cell in cells {
             let station = match axis {
-                Axis::X => v.cell.x,
-                Axis::Y => v.cell.y,
-                Axis::Z => v.cell.z,
+                Axis::X => cell.x,
+                Axis::Y => cell.y,
+                Axis::Z => cell.z,
             };
             *counts.entry(station).or_default() += 1;
         }
@@ -1273,49 +1513,105 @@ mod tests {
         assert!(m.thermal.max_temp > 1.0e8, "inert default never fails");
     }
 
-    // --- WI 716: thin structural panels ---
+    // --- WI 824: face panels (cells are cubes; plates live on faces) ---
 
     #[test]
-    fn panels_default_empty_and_set_panel_round_trips() {
-        let mut craft = block(2, 1, 1, 0.5, Material::ALUMINIUM);
-        // No panels by default ⇒ every cell is a full solid cube.
-        assert!(craft.panels.is_empty());
-        assert_eq!(craft.voxel_fill(IVec3::new(0, 0, 0)), 1.0);
-        assert!(!craft.is_panel(IVec3::new(0, 0, 0)));
-        // Marking a cell a panel sets its fill; clearing restores it.
-        craft.set_panel(IVec3::new(0, 0, 0), true);
-        assert!(craft.is_panel(IVec3::new(0, 0, 0)));
-        assert_eq!(craft.voxel_fill(IVec3::new(0, 0, 0)), PANEL_FILL);
-        craft.set_panel(IVec3::new(0, 0, 0), false);
-        assert!(!craft.is_panel(IVec3::new(0, 0, 0)));
-    }
-
-    #[test]
-    fn a_panel_voxel_masses_a_fraction_of_a_solid_cube() {
-        let solid = block(1, 1, 1, 0.5, Material::ALUMINIUM);
-        let mut panel = solid.clone();
-        panel.set_panel(IVec3::new(0, 0, 0), true);
-        let ms = solid.mass_properties().unwrap().mass;
-        let mp = panel.mass_properties().unwrap().mass;
-        assert!(
-            (mp - ms * PANEL_FILL).abs() < 1e-9,
-            "a panel weighs PANEL_FILL × a cube: {mp} vs {ms}×{PANEL_FILL}"
+    fn face_panel_store_canonicalizes_both_sides_and_round_trips() {
+        let mut craft = VoxelCraft::new(0.5);
+        assert!(craft.face_panels.is_empty());
+        // The same boundary addressed from either side is one canonical entry.
+        let a = IVec3::new(1, 0, 0);
+        craft.set_face_panel(a, IVec3::X, Some(Material::ALUMINIUM));
+        assert_eq!(craft.face_panels.len(), 1);
+        assert!(craft.face_panel_between(a, IVec3::X).is_some());
+        assert!(craft
+            .face_panel_between(a + IVec3::X, IVec3::NEG_X)
+            .is_some());
+        // Placing from the other side replaces the material, never doubles.
+        craft.set_face_panel(a + IVec3::X, IVec3::NEG_X, Some(Material::GLASS));
+        assert_eq!(craft.face_panels.len(), 1);
+        assert_eq!(
+            craft.face_panel_between(a, IVec3::X).unwrap().material,
+            Material::GLASS
         );
-        // Inertia scales with the (reduced) mass too.
-        let is = solid.mass_properties().unwrap().inertia.col(0).x;
-        let ip = panel.mass_properties().unwrap().inertia.col(0).x;
-        assert!((ip - is * PANEL_FILL).abs() < 1e-9 * is.max(1.0));
+        // Removal from either side clears the one entry.
+        craft.set_face_panel(a, IVec3::X, None);
+        assert!(craft.face_panels.is_empty());
     }
 
     #[test]
-    fn a_panel_keeps_the_full_aero_cross_section() {
-        // A panel is thin only in mass/displacement — for aero it is a present cell (full area).
+    fn a_face_panel_masses_its_plate_and_an_all_panel_craft_has_mass() {
+        let cs = 0.5;
+        let mut craft = VoxelCraft::new(cs);
+        craft.set_face_panel(IVec3::ZERO, IVec3::Y, Some(Material::ALUMINIUM));
+        let mp = craft.mass_properties().expect("plates alone carry mass");
+        let plate = Material::ALUMINIUM.density * cs * cs * (PANEL_FILL * cs);
+        assert!(
+            (mp.mass - plate).abs() < 1e-9,
+            "plate mass: {} vs {plate}",
+            mp.mass
+        );
+        // The plate sits at its face centre (one cell up from the cell centre's y).
+        assert!((mp.center_of_mass.y - cs).abs() < 1e-9);
+    }
+
+    #[test]
+    fn conversion_preserves_the_area_bridge_cross_section() {
+        // WI 824 interim aero bridge (removed by WI 827): converting a flagged
+        // hull leaves the area curve exactly at the legacy value — a cell with
+        // ≥2 paneled faces counts as occupied (the converted cells are
+        // double-plus-skinned), and single-plate outside neighbours don't.
         let solid = block(2, 2, 2, 0.5, Material::ALUMINIUM);
         let mut panel = solid.clone();
         for v in &solid.voxels {
             panel.set_panel(v.cell, true);
         }
+        panel.convert_legacy_panels();
+        assert!(panel.voxels.is_empty());
         assert_eq!(panel.area_curve(Axis::X), solid.area_curve(Axis::X));
         assert_eq!(panel.area_curve(Axis::Y), solid.area_curve(Axis::Y));
+        assert_eq!(panel.area_curve(Axis::Z), solid.area_curve(Axis::Z));
+    }
+
+    #[test]
+    fn legacy_conversion_follows_the_r1_rule() {
+        // A 3×3×3 flagged shell around a cavity: wall cells convert to inner and
+        // outer skins (the audited double-skin accounting); the craft empties.
+        let mut shell = VoxelCraft::new(0.5);
+        for x in 0..3 {
+            for y in 0..3 {
+                for z in 0..3 {
+                    if x == 1 && y == 1 && z == 1 {
+                        continue; // the cavity
+                    }
+                    let c = IVec3::new(x, y, z);
+                    shell.voxels.push(Voxel {
+                        cell: c,
+                        material: Material::ALUMINIUM,
+                    });
+                    shell.set_panel(c, true);
+                }
+            }
+        }
+        let report = shell.convert_legacy_panels().expect("flags converted");
+        assert_eq!(report.cells_converted, 26);
+        assert_eq!(report.cells_kept_solid, 0);
+        assert!(shell.voxels.is_empty(), "every flagged cell emptied");
+        // Face cells (not corners/edges) have exactly two empty-adjacent faces:
+        // exterior + cavity — the double skin. 6 of them; corners have 3
+        // exterior faces; edges 2 exterior. Total plates: 6×(1+1) + 12×2 + 8×3 = 60.
+        assert_eq!(report.plates_created, 60);
+        assert_eq!(shell.face_panels.len(), 60);
+
+        // A fully-embedded flagged cell stays solid (inert plating).
+        let mut embedded = block(3, 3, 3, 0.5, Material::ALUMINIUM);
+        embedded.set_panel(IVec3::new(1, 1, 1), true);
+        let r = embedded.convert_legacy_panels().unwrap();
+        assert_eq!(r.cells_kept_solid, 1);
+        assert_eq!(r.cells_converted, 0);
+        assert_eq!(embedded.voxels.len(), 27, "embedded cell kept");
+
+        // Idempotent: a craft with no flags is untouched.
+        assert!(embedded.convert_legacy_panels().is_none());
     }
 }

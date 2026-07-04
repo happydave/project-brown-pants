@@ -760,12 +760,17 @@ pub(crate) fn editor_input(
 }
 
 /// The voxel/face under the mouse cursor (WI 612): where a left-click adds, where a right-click
-/// removes (None when hovering empty ground), and the cell to highlight.
+/// removes (None when hovering empty ground), and the cell to highlight. Since WI 824 the ray
+/// also hits **face panels**: `panel` carries the hit boundary (near-side cell + direction) so
+/// right-click removes a plate and panel-mode placement targets real faces.
 #[derive(Clone, Copy)]
 pub(crate) struct Hovered {
     pub add_cell: IVec3,
     pub remove_cell: Option<IVec3>,
     pub highlight: IVec3,
+    /// The face panel under the cursor, as `(near-side cell, direction across the boundary)` —
+    /// `Some` only when a plate is the nearest hit.
+    pub panel: Option<(IVec3, IVec3)>,
 }
 
 /// The current mouse hover, recomputed each frame (WI 612). `None` when the cursor is off-window or
@@ -803,8 +808,15 @@ fn ray_aabb(o: Vec3, d: Vec3, min: Vec3, max: Vec3) -> Option<(f32, IVec3)> {
 }
 
 /// Nearest voxel hit by the ray `(o, d)`: the hit cell and the entry-face normal. Brute-force over
-/// the (sparse, modest) voxel set. Crate-visible + pure so it is unit-testable.
+/// the (sparse, modest) voxel set. Pure so it is unit-testable (the runtime path uses
+/// [`raycast_voxels_t`] to arbitrate against panel hits).
+#[cfg(test)]
 pub(crate) fn raycast_voxels(o: Vec3, d: Vec3, craft: &VoxelCraft) -> Option<(IVec3, IVec3)> {
+    raycast_voxels_t(o, d, craft).map(|(cell, n, _)| (cell, n))
+}
+
+/// [`raycast_voxels`] with the hit distance, so callers can arbitrate against panel hits (WI 824).
+fn raycast_voxels_t(o: Vec3, d: Vec3, craft: &VoxelCraft) -> Option<(IVec3, IVec3, f32)> {
     let s = craft.cell_size as f32;
     let mut best_t = f32::INFINITY;
     let mut best = None;
@@ -814,7 +826,38 @@ pub(crate) fn raycast_voxels(o: Vec3, d: Vec3, craft: &VoxelCraft) -> Option<(IV
         if let Some((t, n)) = ray_aabb(o, d, min, max) {
             if t < best_t {
                 best_t = t;
-                best = Some((v.cell, n));
+                best = Some((v.cell, n, t));
+            }
+        }
+    }
+    best
+}
+
+/// Nearest **face panel** hit by the ray (WI 824): the plate's thin box on its grid boundary.
+/// Returns `(near-side cell, direction across the boundary, t)` — the pair
+/// `VoxelCraft::set_face_panel`/`face_panel_between` take. Pure and unit-testable.
+pub(crate) fn raycast_panels(o: Vec3, d: Vec3, craft: &VoxelCraft) -> Option<(IVec3, IVec3, f32)> {
+    let s = craft.cell_size as f32;
+    let half_th = 0.5 * (sounding_sim::voxel::PANEL_FILL as f32) * s;
+    let mut best_t = f32::INFINITY;
+    let mut best = None;
+    for p in &craft.face_panels {
+        let n = p.axis.unit();
+        let centre = (p.cell.as_vec3() + Vec3::splat(0.5) + n.as_vec3() * 0.5) * s;
+        let mut he = Vec3::splat(0.5 * s);
+        he = he * (Vec3::ONE - n.as_vec3()) + n.as_vec3() * half_th;
+        if let Some((t, hit_n)) = ray_aabb(o, d, centre - he, centre + he) {
+            if t < best_t {
+                best_t = t;
+                // Near side = the boundary side the ray came from: the panel's own
+                // cell when approached from −axis, its neighbour otherwise.
+                let toward_positive = hit_n.dot(n) < 0;
+                let (near, dir) = if toward_positive {
+                    (p.cell, n)
+                } else {
+                    (p.cell + n, -n)
+                };
+                best = Some((near, dir, t));
             }
         }
     }
@@ -871,11 +914,28 @@ pub(crate) fn update_hover(
     let d = *ray.direction;
     let s = editor.craft.cell_size as f32;
 
-    if let Some((cell, n)) = raycast_voxels(o, d, &editor.craft) {
+    // Nearest of voxel vs face panel wins (WI 824) — plates are clickable.
+    let voxel_hit = raycast_voxels_t(o, d, &editor.craft);
+    let panel_hit = raycast_panels(o, d, &editor.craft);
+    let panel_nearer = match (&voxel_hit, &panel_hit) {
+        (Some((_, _, vt)), Some((_, _, pt))) => pt < vt,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    if panel_nearer {
+        let (near, dir, _) = panel_hit.unwrap();
+        hover.0 = Some(Hovered {
+            add_cell: near, // a voxel placed against a plate fills the near cell
+            remove_cell: None,
+            highlight: near,
+            panel: Some((near, dir)),
+        });
+    } else if let Some((cell, n, _)) = voxel_hit {
         hover.0 = Some(Hovered {
             add_cell: cell + n,
             remove_cell: Some(cell),
             highlight: cell,
+            panel: None,
         });
     } else if d.y.abs() > 1e-6 {
         let t = -o.y / d.y;
@@ -886,6 +946,7 @@ pub(crate) fn update_hover(
                 add_cell: cell,
                 remove_cell: None,
                 highlight: cell,
+                panel: None,
             });
         }
     }
@@ -914,12 +975,22 @@ pub(crate) fn mouse_build(
     if buttons.just_pressed(MouseButton::Left) {
         let material = PALETTE[state.material].1;
         let brush = state.brush;
+        // Panel-build (WI 824): in panel mode a click on a **voxel face** places a
+        // face panel on that boundary, in the palette material (glass ⇒ a window).
+        // Free-standing plate walls need a solid face to click until WI 826 adds
+        // coplanar extension off an existing plate.
+        if state.panel_mode && brush == Brush::Voxel {
+            if let Some(cell) = h.remove_cell {
+                let dir = h.add_cell - cell; // the clicked face's boundary
+                state.craft.set_face_panel(cell, dir, Some(material));
+            }
+            return;
+        }
         // Voxel/wheel go on the clicked face (the empty adjacent cell); a device goes into the
         // hovered solid cell.
         let device_cell = h.remove_cell.unwrap_or(h.add_cell);
         let wheel_mount = (h.add_cell.as_dvec3() + DVec3::splat(0.5)) * state.craft.cell_size;
         let motor = state.motor;
-        let panel = state.panel_mode;
         place_brush(
             &mut state.craft,
             brush,
@@ -929,18 +1000,18 @@ pub(crate) fn mouse_build(
             wheel_mount,
             motor,
         );
-        // Panel-build (WI 716): a placed structural voxel becomes a thin panel (light hull).
-        if panel && brush == Brush::Voxel {
-            state.craft.set_panel(h.add_cell, true);
-        }
     }
     if buttons.just_pressed(MouseButton::Right) {
         let s = state.craft.cell_size;
+        // A plate under the cursor removes first (WI 824).
+        if let Some((cell, dir)) = h.panel {
+            state.craft.set_face_panel(cell, dir, None);
+            return;
+        }
         // Remove the voxel/device in the hovered solid cell.
         if let Some(cell) = h.remove_cell {
             state.craft.voxels.retain(|v| v.cell != cell);
             state.craft.devices.retain(|dd| dd.cell != cell);
-            state.craft.set_panel(cell, false); // clear any panel entry for the removed cell (WI 716)
         }
         // Remove a wheel/part near the hovered cells. Wheels mount on a **face** (the empty adjacent
         // cell), so they aren't in any voxel cell — check both the hovered cell and the face cell so
@@ -1038,6 +1109,20 @@ pub(crate) fn draw_editor(mut gizmos: Gizmos, state: Res<EditorState>) {
             &Cuboid::new(s, s, s),
             cell_center(v.cell, state.craft.cell_size),
             material_color(v.material),
+        );
+    }
+    // Face panels as thin boxes on their grid boundaries (WI 824).
+    let th = (sounding_sim::voxel::PANEL_FILL as f32) * s;
+    for p in &state.craft.face_panels {
+        let dims = match p.axis {
+            sounding_sim::voxel::Axis::X => Vec3::new(th, s, s),
+            sounding_sim::voxel::Axis::Y => Vec3::new(s, th, s),
+            sounding_sim::voxel::Axis::Z => Vec3::new(s, s, th),
+        };
+        gizmos.primitive_3d(
+            &Cuboid::from_size(dims),
+            state.craft.face_center(p).as_vec3(),
+            material_color(p.material),
         );
     }
     // Devices (smaller, orange).

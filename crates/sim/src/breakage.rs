@@ -173,8 +173,9 @@ pub fn failing_cut(craft: &VoxelCraft, a_cm: DVec3, omega: DVec3) -> Option<Seve
                 let n = v.cell + off;
                 if occupied.contains(&n) {
                     bonds.insert(bond(v.cell, n));
-                    // A panel's bond has less material cross-section, so it is weaker (WI 716, R2).
-                    strength += v.material.strength * face_area * craft.voxel_fill(v.cell);
+                    // Cells are solid cubes since WI 824 (plates live on faces;
+                    // face-panel bonds join this graph in WI 828).
+                    strength += v.material.strength * face_area;
                 }
             }
             if bonds.is_empty() {
@@ -198,7 +199,7 @@ pub fn failing_cut(craft: &VoxelCraft, a_cm: DVec3, omega: DVec3) -> Option<Seve
                 if on_high != high_is_outboard {
                     continue;
                 }
-                let m = v.material.density * cell_volume * craft.voxel_fill(v.cell);
+                let m = v.material.density * cell_volume;
                 let r = cell_center(cell_size, v.cell) - com;
                 load += m * point_acceleration(a_cm, omega, r);
             }
@@ -866,14 +867,15 @@ mod tests {
         }
     }
 
-    /// WI 716 (R2): a panel is **not stronger** than a solid cube. Its bond strength scales with the
-    /// plate's thinner cross-section (fill), so under any load that fractures the solid beam the panel
-    /// beam fractures too — and at a load too small for the solid, neither fails. (Under *self-inertial*
-    /// load a uniform panel beam is equal per-g, since both its mass and its bond strength scale by
-    /// fill; the absolute bond strength is lower. The guard catches the real bug: had strength **not**
-    /// been scaled, the lighter panels would fail at a *higher* acceleration — i.e. be *stronger*.)
+    /// WI 824 interim (the panels design's stage-5 gap, accepted in the plan):
+    /// face panels are **not yet** in the connectivity graph, so an all-panel
+    /// beam is unbreakable until WI 828 adds face bonds — this test pins the
+    /// interim so 828 has a red/green seam to flip, and asserts the solid beam's
+    /// behavior is untouched by the panel-model change. (The WI 716 R2 property —
+    /// a panel is never stronger than the solid it replaces — returns as a
+    /// face-bond test in WI 828.)
     #[test]
-    fn a_panel_beam_is_not_stronger_than_a_solid_beam() {
+    fn face_panels_are_outside_the_breakage_graph_until_wi_828() {
         let mut solid = VoxelCraft::new(0.5);
         for x in 0..6 {
             solid.voxels.push(Voxel {
@@ -881,21 +883,24 @@ mod tests {
                 material: Material::ALUMINIUM,
             });
         }
+        // The converted form of a legacy panel beam: plates only, no voxels.
         let mut panel = solid.clone();
         for v in solid.voxels.clone() {
             panel.set_panel(v.cell, true);
         }
+        panel.convert_legacy_panels();
+        assert!(panel.voxels.is_empty(), "converted beam is all plates");
+
         let heavy = DVec3::new(0.0, 200_000.0, 0.0); // a bending load past the beam's strength
         let light = DVec3::new(0.0, 1_000.0, 0.0); // a load neither beam fails under
         assert!(
             failing_cut(&solid, heavy, DVec3::ZERO).is_some(),
-            "solid fractures under heavy load"
-        );
-        assert!(
-            failing_cut(&panel, heavy, DVec3::ZERO).is_some(),
-            "panel is not stronger — it fractures under any load the solid does"
+            "solid fractures under heavy load (unchanged by WI 824)"
         );
         assert!(failing_cut(&solid, light, DVec3::ZERO).is_none());
-        assert!(failing_cut(&panel, light, DVec3::ZERO).is_none());
+        assert!(
+            failing_cut(&panel, heavy, DVec3::ZERO).is_none(),
+            "plates carry no bonds yet — the WI 828 seam"
+        );
     }
 }

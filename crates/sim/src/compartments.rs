@@ -59,7 +59,10 @@ const NEIGHBOURS: [IVec3; 6] = [
 ];
 
 /// Compute the sealed compartments of `craft` given its current door states.
-/// Pure and deterministic.
+/// Pure and deterministic. Passability between air cells is decided by **the**
+/// per-face coverage predicate ([`VoxelCraft::boundary_sealed`], WI 824) — solid
+/// occupancy (voxels + closed doors) and face panels both seal; no other seal
+/// logic exists here.
 pub fn compartments(craft: &VoxelCraft) -> CompartmentSet {
     // Solid (air barrier) cells: structural voxels plus closed doors.
     let mut solid: HashSet<IVec3> = craft.voxels.iter().map(|v| v.cell).collect();
@@ -68,16 +71,21 @@ pub fn compartments(craft: &VoxelCraft) -> CompartmentSet {
             solid.insert(d.cell);
         }
     }
-    if solid.is_empty() {
+    if solid.is_empty() && craft.face_panels.is_empty() {
         return CompartmentSet::default();
     }
 
-    // Bounding box of the structure, expanded by one cell so the border is all
+    // Bounding box of the structure — solids and paneled boundaries (a craft can
+    // be all plates, WI 824) — expanded by one cell so the border is all
     // exterior air.
     let (mut lo, mut hi) = (IVec3::MAX, IVec3::MIN);
     for &c in &solid {
         lo = lo.min(c);
         hi = hi.max(c);
+    }
+    for p in &craft.face_panels {
+        lo = lo.min(p.cell);
+        hi = hi.max(p.cell + p.axis.unit());
     }
     lo -= IVec3::ONE;
     hi += IVec3::ONE;
@@ -106,7 +114,7 @@ pub fn compartments(craft: &VoxelCraft) -> CompartmentSet {
     while let Some(c) = stack.pop() {
         for off in NEIGHBOURS {
             let n = c + off;
-            if is_air(n) && exterior.insert(n) {
+            if is_air(n) && !craft.boundary_sealed(&solid, c, off) && exterior.insert(n) {
                 stack.push(n);
             }
         }
@@ -142,7 +150,10 @@ pub fn compartments(craft: &VoxelCraft) -> CompartmentSet {
             cells.push(c);
             for off in NEIGHBOURS {
                 let n = c + off;
-                if interior_set.contains(&n) && seen.insert(n) {
+                if interior_set.contains(&n)
+                    && !craft.boundary_sealed(&solid, c, off)
+                    && seen.insert(n)
+                {
                     stack.push(n);
                 }
             }
@@ -226,6 +237,81 @@ mod tests {
             !(p.x > 0 && p.x < n - 1 && p.y > 0 && p.y < n - 1 && p.z > 0 && p.z < n - 1)
         });
         c
+    }
+
+    // --- WI 824: face-panel sealing through the one coverage predicate ---
+
+    /// An `n³` box of **face panels** around an empty interior: plates on every
+    /// boundary between the inside cells `(0..n)³` and the outside.
+    fn panel_box(n: i32) -> VoxelCraft {
+        let mut c = VoxelCraft::new(1.0);
+        for a in 0..n {
+            for b in 0..n {
+                for (cell, dir) in [
+                    (IVec3::new(0, a, b), IVec3::NEG_X),
+                    (IVec3::new(n - 1, a, b), IVec3::X),
+                    (IVec3::new(a, 0, b), IVec3::NEG_Y),
+                    (IVec3::new(a, n - 1, b), IVec3::Y),
+                    (IVec3::new(a, b, 0), IVec3::NEG_Z),
+                    (IVec3::new(a, b, n - 1), IVec3::Z),
+                ] {
+                    c.set_face_panel(cell, dir, Some(Material::ALUMINIUM));
+                }
+            }
+        }
+        c
+    }
+
+    #[test]
+    fn a_panel_box_encloses_and_one_removed_plate_vents_it() {
+        // A pure-plate 3³ box (no voxels at all) seals 27 cells.
+        let mut c = panel_box(3);
+        let set = compartments(&c);
+        assert_eq!(set.count(), 1, "an all-plate craft has a compartment");
+        assert_eq!(set.compartments[0].cells.len(), 27);
+        // Removing one plate vents the whole box to the exterior.
+        c.set_face_panel(IVec3::new(0, 0, 0), IVec3::NEG_X, None);
+        assert_eq!(compartments(&c).count(), 0, "one missing plate vents it");
+    }
+
+    #[test]
+    fn an_interior_panel_bulkhead_splits_a_cavity() {
+        // A 5³ solid shell whose cavity is split by a plate wall at the x=1|2
+        // boundary — a *paneled* bulkhead, no voxels added.
+        let mut c = hollow_shell(5);
+        assert_eq!(compartments(&c).count(), 1);
+        for y in 1..4 {
+            for z in 1..4 {
+                c.set_face_panel(IVec3::new(1, y, z), IVec3::X, Some(Material::ALUMINIUM));
+            }
+        }
+        let set = compartments(&c);
+        assert_eq!(set.count(), 2, "the panel bulkhead splits the cavity");
+        let mut sizes: Vec<usize> = set.compartments.iter().map(|c| c.cells.len()).collect();
+        sizes.sort();
+        assert_eq!(sizes, vec![9, 18], "3×3 slab one side, 2×3×3 the other");
+    }
+
+    #[test]
+    fn converting_a_legacy_panel_shell_preserves_separation() {
+        // R1 topology preservation end-to-end: a flagged shell encloses before
+        // conversion and still encloses after (the cavity never reaches the
+        // exterior), with the converted wall cells joining sealed space.
+        let mut legacy = hollow_shell(5);
+        for v in legacy.voxels.clone() {
+            legacy.set_panel(v.cell, true);
+        }
+        assert_eq!(compartments(&legacy).count(), 1, "pre-conversion: sealed");
+        legacy.convert_legacy_panels();
+        assert!(legacy.voxels.is_empty());
+        let set = compartments(&legacy);
+        assert!(set.count() >= 1, "post-conversion: still sealed");
+        // The 3³ cavity is still enclosed, plus the double-hull wall voids.
+        assert!(
+            set.total_volume() >= 27.0,
+            "cavity (27) plus wall voids enclosed: {}",
+            set.total_volume()
+        );
     }
 
     // --- I1 / I2 topology ---

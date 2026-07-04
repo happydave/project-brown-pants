@@ -33,7 +33,7 @@ use std::fmt;
 /// build meeting the new kind rejects it as an unknown kind (`Malformed`). A version
 /// bump is reserved for changes to an *existing* payload's shape (which would require
 /// a migration arm). `BodyAsset` (WI 760) and `System` (WI 761) were added additively.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// What a serialized artifact is used as. One format, several uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,13 +172,50 @@ impl SavedDocument {
         let probe: VersionProbe =
             serde_json::from_str(s).map_err(|e| FormatError::Malformed(e.to_string()))?;
         match probe.format_version {
-            FORMAT_VERSION => {
-                serde_json::from_str(s).map_err(|e| FormatError::Malformed(e.to_string()))
+            // v1 and v2 share the payload shape; a v1 craft may carry legacy
+            // cell-panel flags, which the WI 824 conversion turns into face
+            // panels. New documents are always written at v2.
+            1 | FORMAT_VERSION => {
+                let mut doc: SavedDocument =
+                    serde_json::from_str(s).map_err(|e| FormatError::Malformed(e.to_string()))?;
+                doc.convert_craft_panels();
+                // A migrated document *is* a current-format document: stamp it, so
+                // re-serializing it can never produce a v1 file carrying v2 content
+                // (which an old build would load and silently strip).
+                doc.format_version = FORMAT_VERSION;
+                Ok(doc)
             }
-            // Future: an older supported version parses into its vN shape here and
-            // is migrated up to the current `SavedDocument` before returning. No
-            // older versions exist at format version 1, so nothing is migrated yet.
             other => Err(FormatError::UnsupportedVersion(other)),
+        }
+    }
+
+    /// The WI 824 migration: convert legacy cell-panel flags to face panels on a
+    /// craft-scope payload (the panels design's R1 rule), logging a per-craft
+    /// summary with the compartment-count delta. A document without flags is only
+    /// normalized (face-panel order), never altered.
+    fn convert_craft_panels(&mut self) {
+        let craft = match &mut self.payload {
+            Payload::Craft(c) | Payload::Subassembly(c) | Payload::Blueprint(c) => {
+                (c.id.clone(), &mut c.craft)
+            }
+            Payload::WorldSave(_) | Payload::BodyAsset(_) | Payload::System(_) => return,
+        };
+        let (id, craft) = craft;
+        if craft.panels.is_empty() {
+            craft.normalize_face_panels();
+            return;
+        }
+        let before = crate::compartments::compartments(craft).count();
+        let report = craft.convert_legacy_panels();
+        let after = crate::compartments::compartments(craft).count();
+        if let Some(r) = report {
+            bevy_log::info!(
+                "craft `{id}`: converted {} legacy panel cell(s) to {} face panel(s) \
+                 ({} embedded cell(s) kept solid); compartments {before} -> {after}",
+                r.cells_converted,
+                r.plates_created,
+                r.cells_kept_solid,
+            );
         }
     }
 }
@@ -234,6 +271,48 @@ mod tests {
             material: Material::ALUMINIUM,
         });
         craft
+    }
+
+    #[test]
+    fn v1_legacy_panel_flags_convert_to_face_panels_at_load() {
+        // WI 824: a v1 document whose craft carries cell-panel flags loads,
+        // converts per the R1 rule, and comes out flag-free with face panels;
+        // a v2 (or flagless v1) document is untouched beyond normalization.
+        let mut craft = sample_craft(); // one voxel at the origin
+        craft.set_panel(IVec3::ZERO, true);
+        let mut doc = SavedDocument::new(Payload::Craft(CraftSubgraph::new(
+            "legacy",
+            "Legacy",
+            sample_pos(),
+            craft,
+        )));
+        doc.format_version = 1; // pretend it was written pre-824
+        let json = serde_json::to_string(&doc).unwrap();
+        let loaded = SavedDocument::from_json(&json).unwrap();
+        let Payload::Craft(c) = &loaded.payload else {
+            panic!("craft payload expected");
+        };
+        assert_eq!(
+            loaded.format_version, FORMAT_VERSION,
+            "a migrated document is stamped at the current format"
+        );
+        assert!(c.craft.panels.is_empty(), "flags consumed");
+        assert!(c.craft.voxels.is_empty(), "the lone flagged cell emptied");
+        assert_eq!(
+            c.craft.face_panels.len(),
+            6,
+            "a free-standing flagged cell plates all six faces"
+        );
+
+        // A flagless craft round-trips bit-stable through the same seam.
+        let plain = SavedDocument::new(Payload::Craft(CraftSubgraph::new(
+            "plain",
+            "Plain",
+            sample_pos(),
+            sample_craft(),
+        )));
+        let back = SavedDocument::from_json(&plain.to_json().unwrap()).unwrap();
+        assert_eq!(plain, back);
     }
 
     #[test]
@@ -318,12 +397,12 @@ mod tests {
 
     #[test]
     fn newer_version_rejected_by_version_not_payload_parse() {
-        // Alien payload shape (a bare number) a v1 build cannot parse — the
+        // Alien payload shape (a bare number) this build cannot parse — the
         // version-stable probe still reads the version and rejects by version.
-        let newer = r#"{ "format_version": 2, "payload": 12345 }"#;
+        let newer = r#"{ "format_version": 3, "payload": 12345 }"#;
         assert_eq!(
             SavedDocument::from_json(newer),
-            Err(FormatError::UnsupportedVersion(2))
+            Err(FormatError::UnsupportedVersion(3))
         );
     }
 
@@ -390,7 +469,8 @@ mod tests {
     }
 
     #[test]
-    fn format_version_is_one() {
-        assert_eq!(FORMAT_VERSION, 1);
+    fn format_version_is_two() {
+        // v2 = WI 824 (face panels; legacy cell-panel flags convert at load).
+        assert_eq!(FORMAT_VERSION, 2);
     }
 }

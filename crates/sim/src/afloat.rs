@@ -86,12 +86,23 @@ pub fn assemble_float(
 /// The hull lattice's metre-space AABB `(min, max)`.
 fn hull_aabb(craft: &VoxelCraft) -> (DVec3, DVec3) {
     let cs = craft.cell_size;
-    let (mut lo, mut hi) = (IVec3::MAX, IVec3::MIN);
+    let mut lo = DVec3::MAX;
+    let mut hi = DVec3::MIN;
     for v in &craft.voxels {
-        lo = lo.min(v.cell);
-        hi = hi.max(v.cell);
+        lo = lo.min(v.cell.as_dvec3() * cs);
+        hi = hi.max((v.cell.as_dvec3() + DVec3::ONE) * cs);
     }
-    (lo.as_dvec3() * cs, (hi.as_dvec3() + DVec3::ONE) * cs)
+    // Face panels bound by their plate geometry (WI 824): a full face span in
+    // the tangential axes, the plate thickness along the normal.
+    for p in &craft.face_panels {
+        let fc = craft.face_center(p);
+        let mut he = DVec3::splat(0.5 * cs);
+        let n = p.axis.unit().as_dvec3();
+        he = he * (DVec3::ONE - n) + n * (0.5 * crate::voxel::PANEL_FILL * cs);
+        lo = lo.min(fc - he);
+        hi = hi.max(fc + he);
+    }
+    (lo, hi)
 }
 
 /// A synthesized marine drive for a built hull (WI 708): a port + starboard
@@ -341,6 +352,32 @@ mod tests {
                 }
             }
         }
+        // Face-panel form (WI 824): the shell converts to inner+outer skins
+        // around a double-hull void — the model the shipped blueprint carries.
+        c.convert_legacy_panels();
+        c
+    }
+
+    /// The seed geometry in **solid cubes** (no panels) — the sinking
+    /// comparison hull (the legacy tests built this by clearing flags; since
+    /// WI 824 the seed has no flags to clear).
+    fn solid_shell() -> VoxelCraft {
+        let mut c = VoxelCraft::new(0.5);
+        let (w, h, l) = (7, 5, 11);
+        for x in 0..w {
+            for y in 0..h {
+                for z in 0..l {
+                    let on_surface =
+                        x == 0 || x == w - 1 || y == 0 || y == h - 1 || z == 0 || z == l - 1;
+                    if on_surface {
+                        c.voxels.push(Voxel {
+                            cell: glam::IVec3::new(x, y, z),
+                            material: Material::ALUMINIUM,
+                        });
+                    }
+                }
+            }
+        }
         c
     }
 
@@ -380,12 +417,8 @@ mod tests {
     fn the_panel_seed_floats_but_a_solid_hull_sinks() {
         let seed = seed_hull();
         assert!(net_buoyancy(&seed) > 0.0, "the panel pontoon floats");
-        let mut solid = seed_hull();
-        for v in &solid.voxels.clone() {
-            solid.set_panel(v.cell, false);
-        }
         assert!(
-            net_buoyancy(&solid) < 0.0,
+            net_buoyancy(&solid_shell()) < 0.0,
             "the same hull in solid cubes sinks"
         );
     }
@@ -457,11 +490,7 @@ mod tests {
             "a full tank ({cap_mass} kg) overcomes the reserve ({reserve} kg)"
         );
         // A solid (sinking) hull gets none.
-        let mut solid = seed_hull();
-        for v in &solid.voxels.clone() {
-            solid.set_panel(v.cell, false);
-        }
-        assert!(synth_ballast(&solid, BODY.radius).is_none());
+        assert!(synth_ballast(&solid_shell(), BODY.radius).is_none());
     }
 
     /// WI 725: the synthesized rudder sits in the water aft of the hull and

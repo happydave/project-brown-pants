@@ -26,7 +26,6 @@
 //! the toggle — they never coexist. Float camera: middle-drag orbit + wheel zoom; HUD shows draft /
 //! heel / net buoyancy.
 
-use std::collections::HashSet;
 use std::f32::consts::FRAC_PI_4;
 
 use bevy::camera::Exposure;
@@ -62,9 +61,7 @@ use crate::editor::{
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
 use crate::scene_cam::{self, OrbitFollowCam};
 use crate::scene_water::{self, WaterPatch, WaveSpec};
-use crate::voxel_skin::{
-    materials_present, pbr_material, pbr_material_tinted, skin_submeshes, VoxelSkin,
-};
+use crate::voxel_skin::{pbr_material, pbr_material_tinted, skin_submeshes, VoxelSkin};
 
 const BODY: CentralBody = CentralBody::EARTHLIKE;
 
@@ -239,11 +236,13 @@ fn build_flood_state(
     // centred on the mount, a fraction of the hull's footprint, sitting on the floor and clamped **inside**
     // the hull so it never pokes through the skin. Water still rises in it as the tank floods.
     if let Some(b) = ballast {
-        let (hull_min, hull_max) = cell_aabb(
-            &craft.voxels.iter().map(|v| v.cell).collect::<Vec<_>>(),
-            cs,
-            com_off,
-        );
+        // Hull bounds from solids and paneled cells (WI 824 — a hull can be all
+        // plates); the plate's owner cell is the inside row for a shell hull.
+        let mut hull_cells: Vec<IVec3> = craft.voxels.iter().map(|v| v.cell).collect();
+        for p in &craft.face_panels {
+            hull_cells.push(p.cell);
+        }
+        let (hull_min, hull_max) = cell_aabb(&hull_cells, cs, com_off);
         let span = hull_max - hull_min;
         for (tank, t) in b.tanks.iter().enumerate() {
             let centre = t.mount.as_vec3() + com_off;
@@ -632,9 +631,8 @@ fn dress_vessel(
     ));
     hull.with_children(|parent| {
         // Render the built hull centred on the CoM — solid cubes in their per-material skin,
-        // thin panels as actual thin plates on the hull faces they form (WI 722).
-        let (solid, _) = split_panels(&craft);
-        for (material, mesh) in skin_submeshes(&solid, VoxelSkin::Hull) {
+        // face panels as actual thin plates on their grid boundaries (WI 722 → 824).
+        for (material, mesh) in skin_submeshes(&craft, VoxelSkin::Hull) {
             let mat = pbr_material(material, &asset_server, &mut materials);
             parent.spawn((
                 Mesh3d(meshes.add(mesh)),
@@ -757,10 +755,9 @@ fn sync_build_meshes(
     for e in &existing {
         commands.entity(e).despawn();
     }
-    // Solid cubes render via the per-material hull skin; thin panels render as actual thin plates on
-    // the hull faces they form (WI 722).
-    let (solid, _) = split_panels(&editor.craft);
-    for (material, mesh) in skin_submeshes(&solid, VoxelSkin::Hull) {
+    // Solid cubes render via the per-material hull skin; face panels render as actual thin plates
+    // on their grid boundaries (WI 722 → 824).
+    for (material, mesh) in skin_submeshes(&editor.craft, VoxelSkin::Hull) {
         let mat = pbr_material(material, &asset_server, &mut materials);
         commands.spawn((
             Mesh3d(meshes.add(mesh)),
@@ -787,103 +784,23 @@ fn sync_build_meshes(
     }
 }
 
-/// Partition a craft's voxels into a **solid-cube** craft and a **thin-panel** craft (WI 719), so each
-/// can render with its own material. Hull-skin only (devices/parts unneeded here).
-fn split_panels(craft: &VoxelCraft) -> (VoxelCraft, VoxelCraft) {
-    let mut solid = VoxelCraft::new(craft.cell_size);
-    let mut panel = VoxelCraft::new(craft.cell_size);
-    for v in &craft.voxels {
-        if craft.is_panel(v.cell) {
-            panel.voxels.push(*v);
-        } else {
-            solid.voxels.push(*v);
-        }
-    }
-    (solid, panel)
-}
-
-/// The empty cells that are **outside** the hull (WI 723): a flood-fill from the expanded bounding-box
-/// border through empty cells, mirroring `compartments` — so the enclosed cavity is *not* included.
-/// Used to plate only the true outer surface.
-fn exterior_empty_cells(craft: &VoxelCraft) -> HashSet<IVec3> {
-    let occupied: HashSet<IVec3> = craft.voxels.iter().map(|v| v.cell).collect();
-    if occupied.is_empty() {
-        return HashSet::new();
-    }
-    let (mut lo, mut hi) = (IVec3::MAX, IVec3::MIN);
-    for &c in &occupied {
-        lo = lo.min(c);
-        hi = hi.max(c);
-    }
-    lo -= IVec3::ONE;
-    hi += IVec3::ONE;
-    let in_bbox = |c: IVec3| {
-        c.x >= lo.x && c.x <= hi.x && c.y >= lo.y && c.y <= hi.y && c.z >= lo.z && c.z <= hi.z
-    };
-    let is_air = |c: IVec3| in_bbox(c) && !occupied.contains(&c);
-    let neighbours = [
-        IVec3::X,
-        IVec3::NEG_X,
-        IVec3::Y,
-        IVec3::NEG_Y,
-        IVec3::Z,
-        IVec3::NEG_Z,
-    ];
-    let mut exterior = HashSet::new();
-    let mut stack = Vec::new();
-    for x in lo.x..=hi.x {
-        for y in lo.y..=hi.y {
-            for z in lo.z..=hi.z {
-                let c = IVec3::new(x, y, z);
-                let border =
-                    x == lo.x || x == hi.x || y == lo.y || y == hi.y || z == lo.z || z == hi.z;
-                if border && is_air(c) && exterior.insert(c) {
-                    stack.push(c);
-                }
-            }
-        }
-    }
-    while let Some(c) = stack.pop() {
-        for off in neighbours {
-            let n = c + off;
-            if is_air(n) && exterior.insert(n) {
-                stack.push(n);
-            }
-        }
-    }
-    exterior
-}
-
-/// A thin-plate render spec for the hull's **outer surface** (WI 723): `(material, thin-axis, centre)`
-/// in lattice coords — a plate on each panel-cell face whose neighbour is **exterior** (outside the
-/// hull, not the enclosed cavity), seated flush on that grid boundary. Outer faces of a wall are
-/// coplanar/contiguous ⇒ one coherent thin shell (no exploded box); the cavity is not double-plated.
+/// A thin-plate render spec per **face panel** (WI 824, replacing the WI 723 exterior-adjacency
+/// inference): `(material, thin-axis, centre)` in lattice coords — one plate per panel record, on
+/// its own grid boundary. The plate you see is the plate that weighs, floats, and seals; the WI 825
+/// frame/trim visual language builds on this.
 fn panel_plate_specs(craft: &VoxelCraft) -> Vec<(Material, usize, Vec3)> {
-    let exterior = exterior_empty_cells(craft);
-    let cs = craft.cell_size;
-    let inset = 0.5 * cs * (1.0 - PANEL_FILL); // seat flush against the exterior grid boundary
-    let dirs: [(IVec3, usize); 6] = [
-        (IVec3::X, 0),
-        (IVec3::NEG_X, 0),
-        (IVec3::Y, 1),
-        (IVec3::NEG_Y, 1),
-        (IVec3::Z, 2),
-        (IVec3::NEG_Z, 2),
-    ];
-    let mut out = Vec::new();
-    for v in &craft.voxels {
-        if !craft.is_panel(v.cell) {
-            continue;
-        }
-        let centre = (v.cell.as_dvec3() + DVec3::splat(0.5)) * cs;
-        for (off, axis) in dirs {
-            if exterior.contains(&(v.cell + off)) {
-                let pos = centre + off.as_dvec3() * inset;
-                out.push((v.material, axis, pos.as_vec3()));
-            }
-        }
-    }
-    out
+    craft
+        .face_panels
+        .iter()
+        .map(|p| {
+            let axis = match p.axis {
+                sounding_sim::voxel::Axis::X => 0,
+                sounding_sim::voxel::Axis::Y => 1,
+                sounding_sim::voxel::Axis::Z => 2,
+            };
+            (p.material, axis, craft.face_center(p).as_vec3())
+        })
+        .collect()
 }
 
 /// The three thin-plate meshes (X/Y/Z thin) for a cell size, reused across all panel plates (WI 722).
@@ -902,15 +819,22 @@ fn plate_meshes(cell_size: f64, meshes: &mut Assets<Mesh>) -> [Handle<Mesh>; 3] 
 /// which keep their neutral material colour. The plate geometry (WI 723) is unchanged.
 const PANEL_TINT: Color = Color::srgb(0.42, 0.62, 1.0);
 
-/// One reusable **panel-tinted** PBR material handle per distinct structural material in the craft
-/// (WI 722/727), so the many panel plates don't each allocate a material — and panels read distinct from
-/// solid cubes.
+/// One reusable **panel-tinted** PBR material handle per distinct material among the craft's
+/// **face panels** (WI 722/727 → 824), so the many plates don't each allocate a material — and
+/// panels read distinct from solid cubes. (Glass plates route to the translucent glass binding
+/// through `pbr_material_tinted`, WI 821.)
 fn material_handles(
     craft: &VoxelCraft,
     asset_server: &AssetServer,
     materials: &mut Assets<StandardMaterial>,
 ) -> Vec<(Material, Handle<StandardMaterial>)> {
-    materials_present(craft)
+    let mut present: Vec<Material> = Vec::new();
+    for p in &craft.face_panels {
+        if !present.contains(&p.material) {
+            present.push(p.material);
+        }
+    }
+    present
         .into_iter()
         .map(|m| {
             (
@@ -1012,7 +936,12 @@ fn track_hull(
     let r = body.position.length();
     let g_local = if r > 0.0 { BODY.mu / (r * r) } else { 0.0 };
     let up = if r > 0.0 { body.position / r } else { DVec3::Y };
-    let sample = FluidMedium::EARTHLIKE.sample_altitude(r - BODY.radius);
+    // The gauge uses the **ocean** density: `buoyancy_wrench` already gates each
+    // cell/plate by its own submerged fraction, so sampling the medium at the
+    // CoM's altitude (the old code) mis-read air density — and "SINKING" — for
+    // any hull floating high enough to lift its CoM above the waterline
+    // (latent; exposed when the WI 824 plate hull floated higher).
+    let water = FluidMedium::EARTHLIKE.sample_altitude(-0.1);
     let load = buoyancy_wrench(
         &dc.craft,
         dc.com,
@@ -1020,7 +949,7 @@ fn track_hull(
         body.orientation,
         BODY.radius,
         0.0,
-        sample.density,
+        water.density,
         g_local,
         &dc.enclosed,
     );
@@ -1033,7 +962,7 @@ fn track_hull(
         body.orientation,
         BODY.radius,
         0.0,
-        sample.density,
+        water.density,
         g_local,
         &dc.open,
     );
@@ -1209,81 +1138,65 @@ mod tests {
         sounding_sim::library::load_craft(&path).expect("shipped harbor-seed blueprint")
     }
 
-    /// WI 719: `split_panels` partitions voxels into solid + panel sets for distinct rendering.
-    #[test]
-    fn split_panels_partitions_solid_and_panel_cells() {
-        // The all-panel seed: solid set empty, panel set = the whole hull.
-        let seed = seed_hull();
-        let (solid, panel) = split_panels(&seed);
-        assert!(solid.voxels.is_empty());
-        assert_eq!(panel.voxels.len(), seed.voxels.len());
-
-        // A no-panel craft: everything is in the solid set (renders unchanged).
-        let mut plain = seed.clone();
-        plain.panels.clear();
-        let (s2, p2) = split_panels(&plain);
-        assert_eq!(s2.voxels.len(), plain.voxels.len());
-        assert!(p2.voxels.is_empty());
-    }
-
-    /// WI 723: the exterior flood-fill excludes the enclosed cavity (so only the outer surface plates).
-    #[test]
-    fn exterior_flood_excludes_the_cavity() {
-        let seed = seed_hull(); // a 7×5×11 sealed shell
-        let ext = exterior_empty_cells(&seed);
-        assert!(
-            ext.contains(&IVec3::new(-1, 2, 5)),
-            "outside the hull is exterior"
-        );
-        assert!(
-            !ext.contains(&IVec3::new(3, 2, 5)),
-            "the enclosed cavity is NOT exterior"
-        );
-        assert!(
-            !ext.contains(&IVec3::new(0, 2, 5)),
-            "a solid wall cell is not air"
-        );
-    }
-
-    /// WI 723: plates seat on the hull's **outer** faces only — coherent thin shell, no cavity
-    /// double-plating; no panels ⇒ no plates.
-    #[test]
-    fn panel_plate_specs_plates_outer_faces() {
-        // A lone panel cell: all 6 neighbours are exterior ⇒ 6 plates (a fully-skinned cube).
+    /// The seed geometry in **solid cubes** — the sinking comparison hull.
+    fn solid_shell() -> VoxelCraft {
         let mut c = VoxelCraft::new(0.5);
-        c.voxels.push(Voxel {
-            cell: IVec3::ZERO,
-            material: Material::ALUMINIUM,
-        });
-        c.set_panel(IVec3::ZERO, true);
-        assert_eq!(panel_plate_specs(&c).len(), 6);
+        let (w, h, l) = (7, 5, 11);
+        for x in 0..w {
+            for y in 0..h {
+                for z in 0..l {
+                    if x == 0 || x == w - 1 || y == 0 || y == h - 1 || z == 0 || z == l - 1 {
+                        c.voxels.push(Voxel {
+                            cell: IVec3::new(x, y, z),
+                            material: Material::ALUMINIUM,
+                        });
+                    }
+                }
+            }
+        }
+        c
+    }
+
+    /// Remove the top deck of an all-plate hull (WI 824 fixture): drop every
+    /// Y-normal panel on the hull's top boundary, opening the cavity.
+    fn open_top(mut craft: VoxelCraft) -> VoxelCraft {
+        let top = craft
+            .face_panels
+            .iter()
+            .filter(|p| p.axis == sounding_sim::voxel::Axis::Y)
+            .map(|p| p.cell.y)
+            .max()
+            .expect("the hull has a deck");
+        craft
+            .face_panels
+            .retain(|p| !(p.axis == sounding_sim::voxel::Axis::Y && p.cell.y == top));
+        craft
+    }
+
+    /// WI 824: one rendered plate per face-panel record — the plate you see is the
+    /// plate that weighs/floats/seals; no inference, no plates without records.
+    #[test]
+    fn panel_plate_specs_render_one_plate_per_record() {
+        let mut c = VoxelCraft::new(0.5);
+        c.set_face_panel(IVec3::ZERO, IVec3::Y, Some(Material::ALUMINIUM));
+        c.set_face_panel(IVec3::ZERO, IVec3::X, Some(Material::GLASS));
+        let specs = panel_plate_specs(&c);
+        assert_eq!(specs.len(), 2);
 
         // No panels ⇒ no plates.
-        let mut solid = c.clone();
-        solid.panels.clear();
-        assert!(panel_plate_specs(&solid).is_empty());
+        assert!(panel_plate_specs(&VoxelCraft::new(0.5)).is_empty());
 
-        // The seed shell: at least one outer plate per wall cell, but far fewer than all 6 faces
-        // (internal + cavity faces are excluded — the fix for the exploded box).
+        // The shipped seed: exactly its face-panel count.
         let seed = seed_hull();
-        let n = panel_plate_specs(&seed).len();
-        assert!(n >= seed.voxels.len());
-        assert!(n < 6 * seed.voxels.len());
+        assert!(!seed.face_panels.is_empty(), "the seed is a plate hull");
+        assert_eq!(panel_plate_specs(&seed).len(), seed.face_panels.len());
     }
 
     /// WI 713: an **open-top** hull (seed with its top removed) is predicted to FLOAT — on its held-out
     /// volume — where without the open-cavity term the thin shell alone would read as SINK.
     #[test]
     fn would_float_predicts_an_open_top_hull_floats() {
-        let mut open = seed_hull();
-        let max_y = open.voxels.iter().map(|v| v.cell.y).max().unwrap();
-        open.voxels.retain(|v| v.cell.y != max_y); // remove the deck → an open boat
-        open.panels = open
-            .panels
-            .iter()
-            .copied()
-            .filter(|c| c.y != max_y)
-            .collect();
+        let open = open_top(seed_hull()); // remove the deck → an open boat
         assert!(
             !open_cavity(&open).cells.is_empty(),
             "removing the deck opens the cavity"
@@ -1303,10 +1216,8 @@ mod tests {
         assert!(floats, "the panel seed is predicted to float");
         assert!(draft > 0.0 && draft < 1.0, "with a real draft: {draft}");
 
-        let mut solid = seed.clone();
-        solid.panels.clear();
         assert!(
-            !would_float(&solid).0,
+            !would_float(&solid_shell()).0,
             "the same hull in solid cubes is predicted to sink"
         );
 
@@ -1348,15 +1259,7 @@ mod tests {
         );
 
         // An open-top hull: an Open region appears.
-        let mut open = seed_hull();
-        let max_y = open.voxels.iter().map(|v| v.cell.y).max().unwrap();
-        open.voxels.retain(|v| v.cell.y != max_y);
-        open.panels = open
-            .panels
-            .iter()
-            .copied()
-            .filter(|c| c.y != max_y)
-            .collect();
+        let open = open_top(seed_hull());
         let open_com = open.mass_properties().unwrap().center_of_mass;
         let open_state = build_flood_state(&open, open_com, &FloodComps::for_craft(&open), None);
         assert_eq!(
@@ -1404,11 +1307,9 @@ mod tests {
             .find(|r| matches!(r.source, WaterSource::Ballast { .. }))
             .expect("a ballast region exists");
 
-        let (hull_min, hull_max) = cell_aabb(
-            &seed.voxels.iter().map(|v| v.cell).collect::<Vec<_>>(),
-            seed.cell_size,
-            -com.as_vec3(),
-        );
+        // Hull bounds from the plate hull's paneled cells (WI 824 — no voxels).
+        let hull_cells: Vec<IVec3> = seed.face_panels.iter().map(|p| p.cell).collect();
+        let (hull_min, hull_max) = cell_aabb(&hull_cells, seed.cell_size, -com.as_vec3());
         let eps = 1e-4;
         assert!(
             region.min.cmpge(hull_min - Vec3::splat(eps)).all()
