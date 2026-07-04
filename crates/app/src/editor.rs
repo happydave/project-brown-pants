@@ -186,6 +186,14 @@ pub struct EditorState {
     pub(crate) panel_mode: bool,
 }
 
+impl EditorState {
+    /// The palette material the structural brush currently places (WI 826): the one
+    /// appearance source for placement and the panel-ghost preview.
+    pub(crate) fn active_material(&self) -> Material {
+        PALETTE[self.material % PALETTE.len()].1
+    }
+}
+
 impl Default for EditorState {
     fn default() -> Self {
         // A small seed craft so the derivations have something to show at startup. 0.1 m cells —
@@ -771,6 +779,12 @@ pub(crate) struct Hovered {
     /// The face panel under the cursor, as `(near-side cell, direction across the boundary)` —
     /// `Some` only when a plate is the nearest hit.
     pub panel: Option<(IVec3, IVec3)>,
+    /// Where a panel-mode click would place a plate (WI 826): the clicked voxel
+    /// face's boundary, or — when hovering an existing plate — the **coplanar
+    /// extension** boundary toward the hit point. `None` when no placement is
+    /// possible (ground / empty hover). Drives both `mouse_build` and the
+    /// plate-ghost preview.
+    pub panel_target: Option<(IVec3, IVec3)>,
 }
 
 /// The current mouse hover, recomputed each frame (WI 612). `None` when the cursor is off-window or
@@ -864,6 +878,45 @@ pub(crate) fn raycast_panels(o: Vec3, d: Vec3, craft: &VoxelCraft) -> Option<(IV
     best
 }
 
+/// The **coplanar extension** boundary for a plate hit (WI 826): the neighbouring
+/// boundary — same normal axis — toward the ray's hit point, so a click on a plate
+/// grows the wall toward where you clicked. The hit's offset from the plate centre
+/// is taken in the plate's two tangent axes (the normal component ignored); the
+/// larger |offset| picks the growth axis, its sign the direction. An exact tie
+/// resolves to the first tangent axis in x→y→z order (deterministic; at one-pixel
+/// scale the choice is invisible). Pure and unit-testable.
+pub(crate) fn coplanar_extension(
+    cell_size: f64,
+    near: IVec3,
+    dir: IVec3,
+    hit: Vec3,
+) -> (IVec3, IVec3) {
+    let s = cell_size as f32;
+    // Plate centre: the boundary face between `near` and `near + dir`.
+    let centre = (near.as_vec3() + Vec3::splat(0.5) + dir.as_vec3() * 0.5) * s;
+    let off = (hit - centre) * (Vec3::ONE - dir.as_vec3().abs());
+    let axes = [Vec3::X, Vec3::Y, Vec3::Z];
+    let mut best = 0usize;
+    let mut best_mag = -1.0f32;
+    for (i, a) in axes.iter().enumerate() {
+        if dir.as_vec3().abs().dot(*a) > 0.5 {
+            continue; // the normal axis is not a growth direction
+        }
+        let mag = off.dot(*a).abs();
+        if mag > best_mag {
+            best_mag = mag;
+            best = i;
+        }
+    }
+    let sign = if off[best] >= 0.0 { 1 } else { -1 };
+    let step = IVec3::new(
+        if best == 0 { sign } else { 0 },
+        if best == 1 { sign } else { 0 },
+        if best == 2 { sign } else { 0 },
+    );
+    (near + step, dir)
+}
+
 /// Mouse orbit/zoom: middle-drag orbits, scroll zooms (WI 612). Left/right buttons stay free for
 /// building. Mutates [`OrbitCam`]; `orbit_camera` then positions the camera. Crate-visible so the
 /// workshop's Build mode runs it under a state run-condition.
@@ -923,12 +976,16 @@ pub(crate) fn update_hover(
         _ => false,
     };
     if panel_nearer {
-        let (near, dir, _) = panel_hit.unwrap();
+        let (near, dir, t) = panel_hit.unwrap();
+        // Coplanar extension (WI 826): a panel-mode click on a plate grows the
+        // wall toward the hit point.
+        let extend = coplanar_extension(editor.craft.cell_size, near, dir, o + d * t);
         hover.0 = Some(Hovered {
             add_cell: near, // a voxel placed against a plate fills the near cell
             remove_cell: None,
             highlight: near,
             panel: Some((near, dir)),
+            panel_target: Some(extend),
         });
     } else if let Some((cell, n, _)) = voxel_hit {
         hover.0 = Some(Hovered {
@@ -936,6 +993,8 @@ pub(crate) fn update_hover(
             remove_cell: Some(cell),
             highlight: cell,
             panel: None,
+            // A panel-mode click on a voxel face plates that boundary (WI 824).
+            panel_target: Some((cell, n)),
         });
     } else if d.y.abs() > 1e-6 {
         let t = -o.y / d.y;
@@ -947,6 +1006,7 @@ pub(crate) fn update_hover(
                 remove_cell: None,
                 highlight: cell,
                 panel: None,
+                panel_target: None, // the ground plane is not a cell boundary
             });
         }
     }
@@ -973,15 +1033,19 @@ pub(crate) fn mouse_build(
         return;
     };
     if buttons.just_pressed(MouseButton::Left) {
-        let material = PALETTE[state.material].1;
+        let material = state.active_material();
         let brush = state.brush;
-        // Panel-build (WI 824): in panel mode a click on a **voxel face** places a
-        // face panel on that boundary, in the palette material (glass ⇒ a window).
-        // Free-standing plate walls need a solid face to click until WI 826 adds
-        // coplanar extension off an existing plate.
+        // Panel-build (WI 824 → 826): in panel mode a click places a face panel at
+        // the hover's `panel_target` — the clicked voxel face's boundary, or the
+        // **coplanar extension** when clicking an existing plate (the wall grows
+        // toward the click), in the palette material (glass ⇒ a window). Placing
+        // onto an already-paneled boundary repaints its material.
         if state.panel_mode && brush == Brush::Voxel {
-            if let Some(cell) = h.remove_cell {
-                let dir = h.add_cell - cell; // the clicked face's boundary
+            if let Some((cell, dir)) = h.panel_target {
+                info!(
+                    "panel place: hover panel {:?} -> target ({cell:?}, {dir:?})",
+                    h.panel
+                );
                 state.craft.set_face_panel(cell, dir, Some(material));
             }
             return;
@@ -1239,6 +1303,65 @@ mod tests {
             raycast_voxels(Vec3::new(0.5, 5.0, 0.5), Vec3::Y, &craft),
             None
         );
+    }
+
+    /// WI 826: the coplanar extension grows toward the hit point — hits near each of
+    /// a plate's four edges yield the four neighbouring boundaries, on both approach
+    /// sides, and the exact-centre tie is deterministic.
+    #[test]
+    fn coplanar_extension_grows_toward_the_click() {
+        // An X-normal plate on the boundary between (0,0,0) and (1,0,0), cell 1 m:
+        // the plane x = 1, spanning y,z ∈ [0,1]; centre (1.0, 0.5, 0.5).
+        let (near, dir) = (IVec3::ZERO, IVec3::X);
+        let cases = [
+            (Vec3::new(1.0, 0.9, 0.5), IVec3::new(0, 1, 0)), // near +Y edge
+            (Vec3::new(1.0, 0.1, 0.5), IVec3::new(0, -1, 0)), // near −Y edge
+            (Vec3::new(1.0, 0.5, 0.95), IVec3::new(0, 0, 1)), // near +Z edge
+            (Vec3::new(1.0, 0.5, 0.05), IVec3::new(0, 0, -1)), // near −Z edge
+        ];
+        for (hit, step) in cases {
+            assert_eq!(
+                coplanar_extension(1.0, near, dir, hit),
+                (near + step, dir),
+                "hit {hit:?} grows by {step:?}"
+            );
+        }
+        // The other approach side reports the same boundary in its own frame:
+        // near = (1,0,0), dir = −X — extension keeps that (near, dir) form.
+        let (near2, dir2) = (IVec3::X, IVec3::NEG_X);
+        assert_eq!(
+            coplanar_extension(1.0, near2, dir2, Vec3::new(1.0, 0.9, 0.5)),
+            (near2 + IVec3::Y, dir2)
+        );
+        // Exact centre: deterministic (first tangent axis in x→y→z order — Y for an
+        // X-normal plate), positive sign.
+        assert_eq!(
+            coplanar_extension(1.0, near, dir, Vec3::new(1.0, 0.5, 0.5)),
+            (near + IVec3::Y, dir)
+        );
+    }
+
+    /// WI 826, end to end through the ray path: a ray hitting a lone plate near its
+    /// +Z edge extends the wall to the +Z neighbour boundary — the free-standing
+    /// wall no longer needs a solid face per plate.
+    #[test]
+    fn ray_on_a_plate_extends_the_wall_coplanarly() {
+        let mut craft = VoxelCraft::new(1.0);
+        craft.set_face_panel(IVec3::ZERO, IVec3::X, Some(Material::STEEL));
+
+        // From +X looking −X at a point on the plate near its +Z edge.
+        let o = Vec3::new(5.0, 0.5, 0.9);
+        let d = Vec3::NEG_X;
+        let (near, dir, t) = raycast_panels(o, d, &craft).expect("plate hit");
+        let target = coplanar_extension(craft.cell_size, near, dir, o + d * t);
+        assert_eq!(target, (near + IVec3::Z, dir));
+
+        // Placing there yields a second coplanar plate on its own boundary.
+        craft.set_face_panel(target.0, target.1, Some(Material::STEEL));
+        assert_eq!(craft.face_panels.len(), 2);
+        assert!(craft
+            .face_panel_between(IVec3::new(0, 0, 1), IVec3::X)
+            .is_some());
     }
 
     #[test]

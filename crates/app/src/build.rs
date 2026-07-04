@@ -197,11 +197,27 @@ pub(crate) fn draw_build_overlays(
             cc(h.highlight),
             Color::srgb(0.2, 1.0, 0.45),
         );
-        gizmos.primitive_3d(
-            &Cuboid::new(s * 0.94, s * 0.94, s * 0.94),
-            cc(h.add_cell),
-            Color::srgba(0.2, 1.0, 0.45, 0.4),
-        );
+        if editor.panel_mode && editor.brush == crate::editor::Brush::Voxel {
+            // Panel mode (WI 826): ghost the **pending plate** at the exact boundary
+            // a click would fill (voxel face or coplanar extension), in the palette
+            // material's swatch colour — no ghost when no placement is possible.
+            if let Some((cell, dir)) = h.panel_target {
+                let th = (sounding_sim::voxel::PANEL_FILL as f32) * s * 1.3;
+                let dims = Vec3::splat(s * 1.04) * (Vec3::ONE - dir.as_vec3().abs())
+                    + dir.as_vec3().abs() * th;
+                let centre = ((cell.as_dvec3() + DVec3::splat(0.5) + dir.as_dvec3() * 0.5)
+                    * editor.craft.cell_size)
+                    .as_vec3();
+                let tint = crate::voxel_skin::material_visual(editor.active_material()).tint;
+                gizmos.primitive_3d(&Cuboid::from_size(dims), centre, tint);
+            }
+        } else {
+            gizmos.primitive_3d(
+                &Cuboid::new(s * 0.94, s * 0.94, s * 0.94),
+                cc(h.add_cell),
+                Color::srgba(0.2, 1.0, 0.45, 0.4),
+            );
+        }
     }
 
     if let Some(mp) = editor.craft.mass_properties() {

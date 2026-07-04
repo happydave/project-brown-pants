@@ -57,8 +57,8 @@ use sounding_sim::voxel::VoxelCraft;
 
 use crate::build::{self, BuildEntity, BuildHud, BuildMesh};
 use crate::editor::{
-    draw_editor, editor_input, mouse_build, mouse_orbit_input, orbit_camera, update_hover, Brush,
-    EditorState, HoverState, OrbitCam, PointerOnPalette,
+    editor_input, mouse_build, mouse_orbit_input, orbit_camera, update_hover, Brush, EditorState,
+    HoverState, OrbitCam, PointerOnPalette,
 };
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
 use crate::scene_cam::{self, OrbitFollowCam};
@@ -347,7 +347,12 @@ impl Plugin for HarborScenePlugin {
                     mouse_build,
                     orbit_camera,
                     sync_build_meshes,
-                    draw_editor,
+                    // The shared Build overlays (WI 826 consistency audit): hover
+                    // highlight + panel-ghost preview + CoM/axes — the same drawer
+                    // the workshop runs. Replaces `draw_editor`, whose wireframes
+                    // duplicated the solid meshes (voxels since WI 612, plates
+                    // since WI 825) and offered no hover affordance.
+                    build::draw_build_overlays,
                     build::update_palette_highlight,
                     update_build_hud,
                 )

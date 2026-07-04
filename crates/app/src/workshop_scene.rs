@@ -1157,7 +1157,7 @@ fn enter_build(mut commands: Commands) {
     ));
     commands.spawn((
         Text::new(
-            "left-click place · right-click remove · middle-drag orbit · scroll zoom · pad: right-stick orbit / bumpers zoom · Tab material · K save vehicle · O load vehicle · P pause · Enter → TEST (4 wheels ⇒ drive it)",
+            "left-click place · right-click remove · middle-drag orbit · scroll zoom · pad: right-stick orbit / bumpers zoom · Tab material · T panel mode (thin plates on faces) · K save vehicle · O load vehicle · P pause · Enter → TEST (4 wheels ⇒ drive it)",
         ),
         TextFont {
             font_size: 14.0,
@@ -1202,9 +1202,17 @@ fn update_build_hud(
         } else {
             ""
         };
+        // Place-mode line (WI 826): the same panel-mode read-out the harbor Build
+        // shows, so the shared editor's `T` toggle is visible here too.
+        let mode = if editor.panel_mode {
+            "PANEL (thin)"
+        } else {
+            "solid"
+        };
         text.0 = format!(
-            "workshop · BUILD\nbrush:   {brush}\nvoxels:  {}\ndevices: {}\nwheels:  {}\nmass:    {mass:.0} kg\nmotor:   {} ({:.0} N·m, top {:.0}) [M]{pad}",
+            "workshop · BUILD\nbrush:   {brush}\nplace:   {mode} [T]\nvoxels:  {}\npanels:  {}\ndevices: {}\nwheels:  {}\nmass:    {mass:.0} kg\nmotor:   {} ({:.0} N·m, top {:.0}) [M]{pad}",
             editor.craft.voxels.len(),
+            editor.craft.face_panels.len(),
             editor.craft.devices.len(),
             editor.craft.parts.len(),
             editor.motor.label(),
