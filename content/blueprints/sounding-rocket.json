@@ -1,0 +1,198 @@
+{
+  "format_version": 1,
+  "payload": {
+    "kind": "craft",
+    "id": "sounding-rocket",
+    "name": "Sounding Rocket",
+    "reference_position": {
+      "frame": 0,
+      "pos": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "craft": {
+      "cell_size": 1.0,
+      "voxels": [
+        {
+          "cell": [
+            0,
+            0,
+            0
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            0,
+            1,
+            0
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            0,
+            2,
+            0
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            0,
+            3,
+            0
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            0,
+            4,
+            0
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        }
+      ],
+      "devices": [
+        {
+          "cell": [
+            0,
+            0,
+            0
+          ],
+          "mass": 120.0,
+          "kind": "command",
+          "function": {
+            "control_point": {
+              "crewed": true
+            }
+          },
+          "motor": null
+        },
+        {
+          "cell": [
+            0,
+            2,
+            0
+          ],
+          "mass": 40.0,
+          "kind": "computer",
+          "function": {
+            "computer": {
+              "grants": "tunable",
+              "power_draw": 0.4
+            }
+          },
+          "motor": null
+        },
+        {
+          "cell": [
+            0,
+            3,
+            0
+          ],
+          "mass": 60.0,
+          "kind": "battery",
+          "function": {
+            "battery": {
+              "charge": 120.0,
+              "capacity": 120.0
+            }
+          },
+          "motor": null
+        },
+        {
+          "cell": [
+            0,
+            0,
+            0
+          ],
+          "mass": 150.0,
+          "kind": "engine",
+          "function": null,
+          "motor": null
+        },
+        {
+          "cell": [
+            0,
+            1,
+            0
+          ],
+          "mass": 50.0,
+          "kind": "tank",
+          "function": null,
+          "motor": null
+        }
+      ],
+      "attachments": [],
+      "doors": [],
+      "parts": [],
+      "panels": []
+    },
+    "resources": [],
+    "crew": []
+  }
+}

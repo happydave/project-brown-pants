@@ -1,0 +1,20 @@
+// Launch (WI 739) — the migrated `-- launch` scene as pure data: the rocket
+// rests on the pad, then the liftoff mission throttles it up (the old scene's
+// auto-throttle, now a mission effect through the command envelope).
+#![enable(implicit_some)]
+(
+    format: 1,
+    id: "launch",
+    name: "Launch — surface lift-off",
+    world: Earthlike,
+    packs: ["core"],
+    start: (
+        blueprint: "sounding-rocket",
+        placement: Pad,
+        bindings: {
+            Engine: "lf_engine_medium",
+            Tank: "fuel_tank_medium",
+        },
+    ),
+    missions: ["liftoff"],
+)

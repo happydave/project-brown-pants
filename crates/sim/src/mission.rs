@@ -78,6 +78,12 @@ pub enum Condition {
     SpeedAbove(f64),
     /// The craft has left the pad (released).
     Airborne,
+    /// Elapsed flight sim time exceeds this many seconds (WI 739) — the
+    /// timed-event leaf that lets auto-flight scripts be mission data (a
+    /// liftoff mission whose effect is a throttle command). `T ≤ 0` is
+    /// satisfied at the first poll — harmless under monotone latching, so it
+    /// is not a validation error.
+    ElapsedAbove(f64),
 }
 
 impl Condition {
@@ -112,6 +118,7 @@ impl Condition {
             Condition::AltitudeAbove(m) => s.altitude > *m,
             Condition::SpeedAbove(v) => s.speed > *v,
             Condition::Airborne => s.airborne,
+            Condition::ElapsedAbove(t) => s.elapsed > *t,
             _ => false,
         }
     }
@@ -361,6 +368,29 @@ mod tests {
             st.poll(&seq, &snap(150.0, 0.0, false)),
             "ordered completion"
         );
+    }
+
+    /// WI 739: the timed-event leaf queries elapsed flight time; T ≤ 0 is
+    /// satisfied at the first poll (documented, not an error).
+    #[test]
+    fn elapsed_leaf_queries_flight_time() {
+        let timed = Condition::ElapsedAbove(2.0);
+        let mut st = NodeState::for_condition(&timed);
+        let at = |elapsed: f64| {
+            let block = ScenarioTelemetry {
+                id: "s".into(),
+                name: "S".into(),
+                elapsed,
+                ..Default::default()
+            };
+            Telemetry::capture(&SimClock::default(), None, 1.0, None).with_scenario(block)
+        };
+        assert!(!st.poll(&timed, &at(1.0)));
+        assert!(st.poll(&timed, &at(2.5)));
+
+        let immediate = Condition::ElapsedAbove(0.0);
+        let mut st = NodeState::for_condition(&immediate);
+        assert!(st.poll(&immediate, &at(0.1)), "T ≤ 0 holds at first poll");
     }
 
     #[test]

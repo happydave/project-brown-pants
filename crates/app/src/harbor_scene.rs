@@ -1,4 +1,5 @@
-//! Harbor — a boat workshop on the water (`-- harbor`, WI 706 + 707).
+//! Harbor — a boat workshop on the water (`-- harbor`, WI 706 + 707), its
+//! starting hull **from scenario data** since WI 739.
 //!
 //! A self-contained **Build ↔ Float** loop (toggle with `Enter`), mirroring the grounded workshop's
 //! Build ↔ Test:
@@ -6,17 +7,24 @@
 //! - **Build** (WI 707): the voxel editor (the `editor` module's systems under a state run-condition)
 //!   edits a hull lattice near the origin — mouse orbit/zoom, left-click place / right-click remove,
 //!   keyboard brush. The craft renders **solid** (`voxel_skin::skin_submeshes`).
-//! - **Float** (WI 706/717): the built lattice is assembled into an `ActiveBody` + `DivingCraft` at its
-//!   **real material mass** (WI 717 — no auto-ballast) and floats (or **sinks**) on calm water by a
-//!   dock, self-righting via the WI 705 buoyancy wrench + WI 711 enclosed-volume buoyancy + WI 716 thin
-//!   panels + free-surface damping (the same `DescentPlugin` → `glide_step` the dive uses). A light
-//!   **panel** hull floats; a heavy/solid one sinks to the sea floor — the harbor is the proving ground.
+//! - **Float** (WI 706/717, spawned through the scenario director since WI 739): entering Float
+//!   stages the live build as an **Afloat** scenario spawn — the sim-side assembly
+//!   (`sounding_sim::afloat`) builds the `ActiveBody` + `DivingCraft` at its **real material mass**
+//!   (WI 717 — no auto-ballast) with the synthesized drive/rudder/ballast and the interior-flood
+//!   physics, and it floats (or **sinks**) on calm water by a dock, self-righting via the WI 705
+//!   buoyancy wrench + WI 711 enclosed-volume buoyancy + WI 716 thin panels + free-surface damping
+//!   (the same `DescentPlugin` → `glide_step` the dive uses). A light **panel** hull floats; a
+//!   heavy/solid one sinks to the sea floor — the harbor is the proving ground.
+//!
+//! **The content comes from `content/scenarios/harbor.ron`** (or an explicit `-- harbor <path>`):
+//! the seed hull is its referenced blueprint, loaded into the editor at startup. This scene keeps
+//! Build (the shared editor) and the waterfront presentation; the Float physics assembly and the
+//! flood stepping live in the sim.
 //!
 //! Build and Float are different coordinate worlds (Build near the origin with the editor camera;
 //! Float in planetary coordinates with floating origin), so each spawns/despawns its own entities on
-//! the toggle — they never coexist. Sealed-hull buoyancy (WI 711): a sealed hull floats; open-top
-//! hulls await WI 713. Float camera: middle-drag orbit + wheel zoom; HUD shows draft / heel / net
-//! buoyancy.
+//! the toggle — they never coexist. Float camera: middle-drag orbit + wheel zoom; HUD shows draft /
+//! heel / net buoyancy.
 
 use std::collections::HashSet;
 use std::f32::consts::FRAC_PI_4;
@@ -30,21 +38,21 @@ use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 
 use sounding_sim::active::{ActiveBody, Gravity};
-use sounding_sim::ballast::{Ballast, BallastCommand, BallastTank};
-use sounding_sim::compartments::compartments;
-use sounding_sim::flooding::FloodCompartment;
+use sounding_sim::afloat::{FloodComps, ScenarioVessel};
+use sounding_sim::ballast::{Ballast, BallastCommand};
+use sounding_sim::command::Command;
+use sounding_sim::director::{DirectorPlugin, PendingSpawn, ScenarioSpawn};
 use sounding_sim::fluid::FluidMedium;
 use sounding_sim::frame::{FrameId, WorldPos};
-use sounding_sim::marine::{MarinePropulsion, MarineThruster, Rudder, ThrusterCommand};
+use sounding_sim::marine::{MarinePropulsion, Rudder};
 use sounding_sim::medium::{
-    buoyancy_wrench, enclosed_cells, heel_angle, max_cross_section, open_cavity, open_cavity_load,
-    open_cavity_rim_factor, DescentParams, DescentPlugin, DivingCraft, GlideParams,
-    DEFAULT_SLAM_COEFFICIENT,
+    buoyancy_wrench, enclosed_cells, heel_angle, open_cavity, open_cavity_load,
+    open_cavity_rim_factor, DescentPlugin, DivingCraft,
 };
 use sounding_sim::powertrain::MotorTier;
-use sounding_sim::resource::{Reservoir, ReservoirId, ResourceGraph, ResourceType};
+use sounding_sim::scenario::{load_scenario, ScenarioRoots, StartPlacement};
 use sounding_sim::sim::CentralBody;
-use sounding_sim::voxel::{Axis, Material, Voxel, VoxelCraft, PANEL_FILL};
+use sounding_sim::voxel::{Material, VoxelCraft, PANEL_FILL};
 
 use crate::build::{self, BuildEntity, BuildHud, BuildMesh};
 use crate::editor::{
@@ -83,31 +91,16 @@ fn render_world(sim_pos: DVec3) -> DVec3 {
     sim_pos - DVec3::new(0.0, BODY.radius, 0.0)
 }
 
-/// The seed hull: a sealed **panel** pontoon (WI 716/717) — surface cells are thin aluminium **panels**
-/// (light, so it floats honestly under real mass), enclosing air. Editor-scale 0.5 m cells ⇒ a
-/// 3.5 × 2.5 × 5.5 m starter boat the player can reshape. The same hull in **solid** cubes would sink —
-/// that is the game.
-fn seed_hull() -> VoxelCraft {
-    let mut c = VoxelCraft::new(0.5);
-    let (w, h, l) = (7, 5, 11);
-    for x in 0..w {
-        for y in 0..h {
-            for z in 0..l {
-                let on_surface =
-                    x == 0 || x == w - 1 || y == 0 || y == h - 1 || z == 0 || z == l - 1;
-                if on_surface {
-                    let cell = IVec3::new(x, y, z);
-                    c.voxels.push(Voxel {
-                        cell,
-                        material: Material::ALUMINIUM,
-                    });
-                    c.set_panel(cell, true); // a thin hull plate, not a solid cube (WI 716)
-                }
-            }
-        }
-    }
-    c
-}
+/// The default scenario document when `-- harbor` is given no path (WI 739).
+/// The seed hull — a sealed panel pontoon that floats honestly under real
+/// mass — is this document's referenced blueprint, not code.
+const DEFAULT_SCENARIO: &str = "content/scenarios/harbor.ron";
+
+/// The loaded scenario's resolved spawn payload (WI 739), kept as the Float
+/// template: entering Float re-stages it with the **live build** as the
+/// craft, so the director assembles exactly what the editor holds.
+#[derive(Resource)]
+struct HarborTemplate(ScenarioSpawn);
 
 /// The harbor's Float follow-camera config (WI 714): the editor/gallery orbit convention, with the
 /// harbor's inverted horizontal drag and tighter zoom range.
@@ -141,29 +134,16 @@ struct HarborReadout {
     flood: f64,
 }
 
-/// The harbor's interior-water state (WI 718 + 728 + 709, unified by WI 729): the WI 520 flood physics
-/// per sealed compartment, plus a single **render manifest** (`regions`) of every interior volume that can
-/// hold water — sealed compartment, open cavity, or ballast tank — each with the source its fill level
-/// comes from. One renderer draws them all (occluder + rising surface), so a new water source is data (a
-/// new region), not a new render block. Driven by the existing WI 519/520/713 systems — no `sounding_sim`
-/// change.
+/// The harbor's interior-water **render manifest** (WI 718 + 728 + 709, unified by WI 729; the
+/// flood *physics* moved to `sounding_sim::afloat` in WI 739): every interior volume that can hold
+/// water — sealed compartment, open cavity, or ballast tank — each with the source its fill level
+/// comes from. One renderer draws them all (occluder + rising surface), so a new water source is
+/// data (a new region), not a new render block.
 #[derive(Resource, Default)]
 struct FloodState {
-    /// The sealed-compartment flood models (WI 520) — the physics that drives buoyancy loss. The render
-    /// manifest references these by index via [`WaterSource::Sealed`].
-    comps: Vec<FloodComp>,
     /// Every interior volume that can hold water, with its fill source (WI 729). The unified renderer
     /// spawns one occluder + one rising-water cuboid per region and raises it from `source`.
     regions: Vec<InteriorWaterRegion>,
-    /// Whether the hull has been breached (the player opened it to the sea).
-    breached: bool,
-}
-
-struct FloodComp {
-    /// The compartment's empty cells, sorted by height (ascending) — water fills bottom-up.
-    cells: Vec<IVec3>,
-    /// The WI 520 transient flood model (volume, centroid, breach/flood state).
-    flood: FloodCompartment,
 }
 
 /// One interior volume that can hold water (WI 729): an AABB to fill — hull-local, CoM-offset render
@@ -192,24 +172,11 @@ enum WaterSource {
 #[derive(Component)]
 struct InteriorWater(usize);
 
-/// Flood relaxation rate (1/s) — a several-second flood once breached (WI 520 `step` constant).
-const FLOOD_RATE: f64 = 0.15;
-
 /// How much of an **open** boat's interior the dry-hold occluder fills, bottom-up (WI 734). The cap sits
 /// just above the typical floating waterline so it still hides the sea-level water plane, while the top is
 /// left open so you can see down into the real hollow interior (a recess, not a flush grey lid). Sealed
 /// compartments and ballast tanks fill fully — their interiors are genuinely closed.
 const OPEN_HOLD_FILL: f32 = 0.72;
-
-/// The cells of a compartment that still hold **air** at a given flooded fraction (WI 718): water fills
-/// **bottom-up**, so the lowest `fraction · n` cells have flooded (lost their air) and the upper ones
-/// remain. `cells` must be sorted by height ascending. The hull's enclosed-buoyancy set is rebuilt from
-/// these, so buoyancy falls as it floods. Pure (the testable core of the buoyancy feedback).
-fn unflooded_cells(cells: &[IVec3], flooded_fraction: f64) -> Vec<IVec3> {
-    let n = cells.len();
-    let flooded = (flooded_fraction.clamp(0.0, 1.0) * n as f64).round() as usize;
-    cells.iter().skip(flooded.min(n)).copied().collect()
-}
 
 /// The vertical scale + centre of a rising-water cuboid (WI 729): a unit cube scaled to `frac` of a
 /// region's vertical `extent`, its base pinned at `min_y` so the surface rises from the floor. Returns
@@ -233,26 +200,22 @@ fn cell_aabb(cells: &[IVec3], cs: f64, com_off: Vec3) -> (Vec3, Vec3) {
     )
 }
 
-/// Build the harbor interior-water state (WI 718/728/709, unified by WI 729), dry: the sealed-compartment
-/// flood models plus the render manifest of every interior volume that can hold water — sealed
-/// compartments, the open cavity, and the ballast tanks (so ballast shows as water in its tank).
-fn build_flood_state(craft: &VoxelCraft, com: DVec3, ballast: Option<&Ballast>) -> FloodState {
+/// Build the harbor interior-water **render manifest** (WI 718/728/709, unified by WI 729; physics
+/// sim-side since WI 739): one region per interior volume that can hold water — sealed compartments
+/// (from the sim-side flood physics aboard the vessel), the open cavity, and the ballast tanks (so
+/// ballast shows as water in its tank).
+fn build_flood_state(
+    craft: &VoxelCraft,
+    com: DVec3,
+    flood: &FloodComps,
+    ballast: Option<&Ballast>,
+) -> FloodState {
     let cs = craft.cell_size;
     let com_off = -com.as_vec3();
-    let atm = 101_325.0;
-    let crush = 5.0e6; // ~500 m of water (well beyond the harbor)
-    let mut comps = Vec::new();
     let mut regions = Vec::new();
-    // Sealed compartments (WI 718): each a flood model + a region fed by its flooded fraction.
-    for c in &compartments(craft).compartments {
-        let mut cells = c.cells.clone();
-        cells.sort_by_key(|p| p.y);
-        let (min, max) = cell_aabb(&cells, cs, com_off);
-        let comp = comps.len();
-        comps.push(FloodComp {
-            cells,
-            flood: FloodCompartment::from_compartment(c, cs, atm, crush),
-        });
+    // Sealed compartments (WI 718): a region fed by each sim-side flood model's flooded fraction.
+    for (comp, fc) in flood.comps.iter().enumerate() {
+        let (min, max) = cell_aabb(&fc.cells, cs, com_off);
         regions.push(InteriorWaterRegion {
             min,
             max,
@@ -295,11 +258,7 @@ fn build_flood_state(craft: &VoxelCraft, com: DVec3, ballast: Option<&Ballast>) 
             });
         }
     }
-    FloodState {
-        comps,
-        regions,
-        breached: false,
-    }
+    FloodState { regions }
 }
 
 // --- markers (teardown: tag only the root of each spawned tree) ---
@@ -329,7 +288,9 @@ impl Plugin for HarborScenePlugin {
         app.add_plugins(FloatingOriginPlugin)
             .init_state::<HarborMode>()
             .insert_resource(EditorState {
-                craft: seed_hull(),
+                // The lattice is loaded from the scenario's blueprint at
+                // startup (WI 739) — content, not code.
+                craft: VoxelCraft::new(0.5),
                 cursor: IVec3::new(0, 3, 0),
                 material: 0,
                 brush: Brush::default(),
@@ -344,10 +305,14 @@ impl Plugin for HarborScenePlugin {
             .insert_resource(harbor_cam())
             .init_resource::<FloodState>()
             .insert_resource(Gravity { mu: BODY.mu })
+            // The scenario director (WI 739): the Afloat spawn arm assembles
+            // the staged hull sim-side (+ the flood-physics stepper).
+            .add_plugins(DirectorPlugin)
             .add_plugins(DescentPlugin {
                 substep_dt: SUBSTEP_DT,
                 max_substeps: MAX_SUBSTEPS,
             })
+            .add_systems(Startup, load_harbor_scenario)
             .add_systems(OnEnter(HarborMode::Float), enter_float)
             .add_systems(OnExit(HarborMode::Float), exit_float)
             .add_systems(OnEnter(HarborMode::Build), enter_build)
@@ -356,10 +321,11 @@ impl Plugin for HarborScenePlugin {
             .add_systems(
                 Update,
                 (
+                    dress_vessel,
                     harbor_drive_input,
                     harbor_ballast_input,
                     harbor_breach_input,
-                    harbor_flood_step,
+                    raise_interior_water,
                     track_hull,
                     scene_cam::orbit_follow_input,
                     scene_cam::orbit_follow_camera,
@@ -404,289 +370,76 @@ fn toggle_mode(
     }
 }
 
-/// Builds the descent/glide parameters and the floating body for a hull lattice using its **real
-/// material mass** (WI 717 — no auto-ballast): a light panel hull floats, a heavy / solid one sinks.
-/// `None` for an empty lattice.
-fn assemble_float(craft: &VoxelCraft) -> Option<(ActiveBody, DivingCraft)> {
-    let mp = craft.mass_properties()?;
-    if mp.mass <= 0.0 {
-        return None;
-    }
-    let mass = mp.mass; // real mass — floating is earned, not granted
-    let inertia = mp.inertia;
-    let descent = DescentParams {
-        medium: FluidMedium::EARTHLIKE,
-        mu: BODY.mu,
-        surface_radius: BODY.radius,
-        drag_area: max_cross_section(craft),
-        drag_coefficient: 1.0,
-        slam_coefficient: DEFAULT_SLAM_COEFFICIENT,
+/// Loads the harbor scenario document at startup (WI 739): the editor's
+/// starting lattice is the referenced blueprint, and the resolved payload is
+/// kept as the Float template. A bad document fails fast with the loader's
+/// message.
+fn load_harbor_scenario(
+    mut commands: Commands,
+    mut editor: ResMut<EditorState>,
+    mut pending: ResMut<PendingSpawn>,
+    mut messages: MessageWriter<Command>,
+) {
+    let path = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| DEFAULT_SCENARIO.to_string());
+    let roots = ScenarioRoots::default();
+    let scenario = match load_scenario(std::path::Path::new(&path), &roots) {
+        Ok(s) => s,
+        Err(e) => panic!("scenario `{path}` failed to load: {e}"),
     };
-    let glide = GlideParams::for_craft(descent, craft, Axis::Z);
-    let start_sim = DVec3::new(0.0, BODY.radius, 0.0);
-    let mut body = ActiveBody::new(start_sim, DVec3::ZERO, mass, inertia);
-    body.orientation = DQuat::from_rotation_z(0.2); // a starting list, so the self-righting reads
-    Some((
-        body,
-        DivingCraft::new(craft.clone(), mp.center_of_mass, glide),
-    ))
-}
-
-/// A synthesized marine drive for a built hull (WI 708): a port + starboard screw pair low at the
-/// stern (the −Z face; forward is +Z, the glide forward axis), mounted near the keel so they sit in
-/// the water. Differential throttle steers (a yaw couple from the ±X offset). Sized to push the
-/// editor-scale starter boat; player-placed thrusters await the WI 715 device palette.
-fn synth_marine(craft: &VoxelCraft) -> MarinePropulsion {
-    let cs = craft.cell_size;
-    let (mut lo, mut hi) = (IVec3::MAX, IVec3::MIN);
-    for v in &craft.voxels {
-        lo = lo.min(v.cell);
-        hi = hi.max(v.cell);
+    if scenario.placement != StartPlacement::Afloat {
+        panic!(
+            "scenario `{path}` is not an afloat scenario — the harbor presents Afloat placements"
+        );
     }
-    let min_m = lo.as_dvec3() * cs;
-    let max_m = (hi.as_dvec3() + DVec3::ONE) * cs;
-    let centre_x = 0.5 * (min_m.x + max_m.x);
-    let beam = (max_m.x - min_m.x).max(cs);
-    let stern_z = min_m.z + 0.5 * cs; // just inside the stern (the −Z end)
-    let keel_y = min_m.y + 0.5 * cs; // near the bottom row, so the screws are submerged
-    let off = 0.30 * beam;
-    let screw = |x: f64| MarineThruster {
-        tank: ReservoirId(0),
-        max_thrust: 5_000.0,
-        reference_density: 1_025.0, // water surface — full thrust submerged, ~none in air
-        max_draw: 4.0,
-        mount: DVec3::new(x, keel_y, stern_z),
-        axis: DVec3::Z, // push forward (+Z)
-    };
-    MarinePropulsion {
-        graph: ResourceGraph {
-            reservoirs: vec![Reservoir::new(ResourceType(0), 1_500.0, 1_500.0)],
-            ..Default::default()
-        },
-        thrusters: vec![screw(centre_x + off), screw(centre_x - off)],
-        commands: vec![ThrusterCommand::default(); 2],
-        last_thrust: 0.0,
-    }
-}
-
-/// A synthesized rudder for a built hull (WI 725): a control surface aft at the stern (−Z, forward is
-/// +Z), low so it sits in the water. Area scales with the hull's beam×draft so bigger boats get more
-/// steering authority. Player-placed rudders await the WI 715 device palette.
-fn synth_rudder(craft: &VoxelCraft) -> Rudder {
-    let cs = craft.cell_size;
-    let (mut lo, mut hi) = (IVec3::MAX, IVec3::MIN);
-    for v in &craft.voxels {
-        lo = lo.min(v.cell);
-        hi = hi.max(v.cell);
-    }
-    let min_m = lo.as_dvec3() * cs;
-    let max_m = (hi.as_dvec3() + DVec3::ONE) * cs;
-    let beam = (max_m.x - min_m.x).max(cs);
-    let depth = (max_m.y - min_m.y).max(cs);
-    Rudder {
-        mount: DVec3::new(
-            0.5 * (min_m.x + max_m.x),
-            min_m.y + 0.5 * cs,  // low, in the water
-            min_m.z - 0.25 * cs, // just aft of the stern
-        ),
-        forward: DVec3::Z,
-        area: 0.25 * beam * depth, // a fraction of the stern cross-section
-        slope: 6.0,                // ~2π lift-curve slope per radian
-        max_angle: 0.6,            // ~34° hard over
-        angle: 0.0,
-    }
-}
-
-/// A synthesized ballast tank for a built hull (WI 709): one tank low at the keel, sized so a full
-/// flood **clearly overcomes the hull's reserve buoyancy** (≈1.5× the reserve), so flooding it sinks a
-/// boat that floats empty and blowing it surfaces — controllable dive/surface/hold. `dry_mass` is
-/// cached for the per-tick fold. `None` ⇒ no ballast (an empty/barely-floating hull). Player-placed
-/// ballast awaits the WI 715 device palette.
-fn synth_ballast(craft: &VoxelCraft) -> Option<Ballast> {
-    let mp = craft.mass_properties()?;
-    let g = 9.81;
-    // The hull's reserve buoyancy (fully-submerged displaced weight − real weight), as a mass.
-    let deep = DVec3::new(0.0, BODY.radius - 100.0, 0.0);
-    let max_buoy = buoyancy_wrench(
-        craft,
-        mp.center_of_mass,
-        deep,
-        DQuat::IDENTITY,
-        BODY.radius,
-        0.0,
-        1_025.0,
-        g,
-        &enclosed_cells(craft),
-    )
-    .force
-    .length();
-    let reserve_mass = ((max_buoy - mp.mass * g) / g).max(0.0);
-    if reserve_mass <= 0.0 {
-        return None; // already sinks; ballast is meaningless
-    }
-    let cap_volume = 1.5 * reserve_mass / 1_025.0; // m³ of water to clearly overcome the reserve
-    let cs = craft.cell_size;
-    let (mut lo, mut hi) = (IVec3::MAX, IVec3::MIN);
-    for v in &craft.voxels {
-        lo = lo.min(v.cell);
-        hi = hi.max(v.cell);
-    }
-    let min_m = lo.as_dvec3() * cs;
-    let max_m = (hi.as_dvec3() + DVec3::ONE) * cs;
-    let mount = DVec3::new(
-        0.5 * (min_m.x + max_m.x),
-        min_m.y + 0.5 * cs, // low in the hull, so a flooded tank sinks the bow evenly and trims down
-        0.5 * (min_m.z + max_m.z),
+    info!(
+        "scenario `{}` ({}) loaded: seed hull of {} voxels",
+        scenario.id,
+        scenario.name,
+        scenario.blueprint.voxels.len(),
     );
-    let rate = cap_volume / 6.0; // ~6 s to fully flood or blow
-    Some(Ballast {
-        tanks: vec![BallastTank {
-            capacity: cap_volume,
-            mount,
-            fill: 0.0,
-            fill_rate: rate,
-            blow_rate: rate,
-        }],
-        command: BallastCommand::Hold,
-        dry_mass: mp.mass,
-    })
+    editor.craft = scenario.blueprint.clone();
+    let template = ScenarioSpawn::from_scenario(&scenario);
+    // The initial Float entry ran before this loader (Bevy applies the
+    // default-state OnEnter ahead of Startup), so stage the opening spawn
+    // here; later Build → Float toggles stage through `enter_float`.
+    pending.0 = Some(template.clone());
+    messages.write(Command::SpawnScenario);
+    commands.insert_resource(HarborTemplate(template));
 }
 
-/// Enters Float: assemble the built hull and spawn the floating waterfront (WI 706 + 707).
+/// Enters Float: stage the live build for the director's Afloat spawn (WI 739)
+/// and spawn the floating waterfront (WI 706 + 707).
+#[allow(clippy::too_many_arguments)]
 fn enter_float(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut scattering: ResMut<Assets<ScatteringMedium>>,
-    asset_server: Res<AssetServer>,
     editor: Res<EditorState>,
+    template: Option<Res<HarborTemplate>>,
+    mut pending: ResMut<PendingSpawn>,
+    mut messages: MessageWriter<Command>,
 ) {
     let start_render = render_world(DVec3::new(0.0, BODY.radius, 0.0));
 
-    // The floating hull, assembled from the built lattice. If the build is empty, skip it (the
+    // The floating hull: stage the **live build** as an Afloat scenario spawn
+    // (WI 739) — the sim-side director assembles it (real material mass,
+    // synthesized drive/rudder/ballast, flood physics) and the shared descent
+    // step floats it; `dress_vessel` attaches the render tree when it
+    // appears. If the build is empty the director logs and skips it (the
     // waterfront still renders; the player can return to Build).
-    if let Some((body, dc)) = assemble_float(&editor.craft) {
-        let com_off = -dc.com.as_vec3();
-        let craft = dc.craft.clone();
-        // A synthesized stern drive (WI 708): no device palette yet (WI 715), so any built hull
-        // gets a port+starboard screw pair so it can sail and steer (differential thrust).
-        let marine = synth_marine(&craft);
-        // A synthesized ballast tank (WI 709): flood to dive, blow to surface (no palette yet, WI 715).
-        let ballast = synth_ballast(&craft);
-        // A synthesized rudder (WI 725): the primary underway steering surface.
-        let rudder = synth_rudder(&craft);
-        // Interior water (WI 718/728/709, unified by WI 729): one render manifest of every interior volume
-        // that can hold water — sealed compartments (occlude the ocean, flood when breached), the open
-        // cavity (swamps over the rim), and the ballast tanks (fill on command). Driven by WI 519/520/713.
-        let flood_state = build_flood_state(&craft, dc.com, ballast.as_ref());
-        let dry_fill_mat = materials.add(StandardMaterial {
-            // A painted-hold interior tone (WI 733): opaque so it occludes the ocean / sea-level water
-            // patch, but **self-lit** (emissive) so it reads as the inside of the boat through an open
-            // hatch — the hold is an enclosed recess that direct sun + sky IBL never reach, so a merely
-            // lit grey rendered black. Emissive ~0.2 matches the dive scene's soft-glow convention under
-            // this camera's exposure (not blooming).
-            base_color: Color::srgb(0.24, 0.25, 0.27),
-            emissive: LinearRgba::rgb(0.20, 0.21, 0.23),
-            perceptual_roughness: 1.0,
-            ..default()
+    // On the very first entry the loader has not run yet (the initial
+    // OnEnter precedes Startup) — it stages the opening spawn itself.
+    if let Some(template) = template {
+        pending.0 = Some(ScenarioSpawn {
+            craft: editor.craft.clone(),
+            ..template.0.clone()
         });
-        let water_fill_mat = materials.add(StandardMaterial {
-            base_color: Color::srgba(0.08, 0.30, 0.42, 0.75),
-            alpha_mode: AlphaMode::Blend,
-            perceptual_roughness: 0.1,
-            ..default()
-        });
-        let unit_cube = meshes.add(Mesh::from(Cuboid::new(1.0, 1.0, 1.0)));
-        let mut hull = commands.spawn((
-            body,
-            dc,
-            marine,
-            rudder,
-            Transform::default(),
-            Visibility::default(),
-            WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, start_render)),
-            HullMarker,
-            scene_cam::CameraTarget, // the follow camera tracks the hull (WI 714)
-            FloatEntity,
-        ));
-        if let Some(b) = ballast {
-            hull.insert(b);
-        }
-        hull.with_children(|parent| {
-            // Render the built hull centred on the CoM — solid cubes in their per-material skin,
-            // thin panels as actual thin plates on the hull faces they form (WI 722).
-            let (solid, _) = split_panels(&craft);
-            for (material, mesh) in skin_submeshes(&solid, VoxelSkin::Hull) {
-                let mat = pbr_material(material, &asset_server, &mut materials);
-                parent.spawn((
-                    Mesh3d(meshes.add(mesh)),
-                    MeshMaterial3d(mat),
-                    Transform::from_translation(com_off),
-                ));
-            }
-            let plates = plate_meshes(craft.cell_size, &mut meshes);
-            let mats = material_handles(&craft, &asset_server, &mut materials);
-            for (material, axis, pos) in panel_plate_specs(&craft) {
-                let mat = mats
-                    .iter()
-                    .find(|(m, _)| *m == material)
-                    .map(|(_, h)| h.clone());
-                parent.spawn((
-                    Mesh3d(plates[axis].clone()),
-                    MeshMaterial3d(mat.unwrap_or_default()),
-                    Transform::from_translation(pos + com_off),
-                ));
-            }
-            // Interior water (WI 729): one renderer for every region — sealed compartment, open cavity,
-            // or ballast tank. Each gets an opaque dry hold (occludes the ocean / reads as a tank) + a
-            // flat rising-water cuboid (a unit cube `harbor_flood_step` scales to its source's fill level).
-            for (i, region) in flood_state.regions.iter().enumerate() {
-                let size = region.max - region.min;
-                let centre = 0.5 * (region.min + region.max);
-                let eps = 0.02;
-                // WI 734: an OPEN hold is capped just above the floating waterline (`OPEN_HOLD_FILL`) — it
-                // still hides the sea-level water plane, but the top is left open so you see **down into**
-                // the real hollow interior (a recess, not a flush lid). Sealed compartments + ballast tanks
-                // fill fully (their interiors are genuinely closed).
-                let fill = if matches!(region.source, WaterSource::Open) {
-                    OPEN_HOLD_FILL
-                } else {
-                    1.0
-                };
-                let occ_h = (size.y * fill - eps).max(0.01);
-                parent.spawn((
-                    Mesh3d(meshes.add(Mesh::from(Cuboid::new(
-                        (size.x - eps).max(0.01),
-                        occ_h,
-                        (size.z - eps).max(0.01),
-                    )))),
-                    MeshMaterial3d(dry_fill_mat.clone()),
-                    Transform::from_translation(Vec3::new(
-                        centre.x,
-                        region.min.y + 0.5 * size.y * fill,
-                        centre.z,
-                    )),
-                ));
-                parent.spawn((
-                    Mesh3d(unit_cube.clone()),
-                    MeshMaterial3d(water_fill_mat.clone()),
-                    Transform {
-                        translation: Vec3::new(centre.x, region.min.y, centre.z),
-                        scale: Vec3::new(
-                            (size.x - eps).max(0.01),
-                            0.0001,
-                            (size.z - eps).max(0.01),
-                        ),
-                        ..default()
-                    },
-                    InteriorWater(i),
-                ));
-            }
-        });
-        commands.insert_resource(flood_state);
-    } else {
-        commands.insert_resource(FloodState::default());
+        messages.write(Command::SpawnScenario);
     }
+    commands.insert_resource(FloodState::default());
 
     // Distant ocean (sunk 2 m so it does not z-fight the animated patch).
     commands.spawn((
@@ -825,6 +578,126 @@ fn enter_float(
         AnchorCamera,
         FloatEntity,
     ));
+}
+
+/// Dresses a director-spawned vessel (WI 739): when the Afloat spawn appears,
+/// attach the presentation — teardown/camera markers, render placement, the
+/// hull skin + panel plates as children, and the interior-water render
+/// manifest (occluders + rising-water cuboids) built over the sim-side flood
+/// physics.
+#[allow(clippy::type_complexity)]
+fn dress_vessel(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    asset_server: Res<AssetServer>,
+    vessels: Query<(Entity, &DivingCraft, &FloodComps, Option<&Ballast>), Added<ScenarioVessel>>,
+) {
+    let Ok((entity, dc, flood, ballast)) = vessels.single() else {
+        return;
+    };
+    let start_render = render_world(DVec3::new(0.0, BODY.radius, 0.0));
+    let com_off = -dc.com.as_vec3();
+    let craft = dc.craft.clone();
+    // Interior water (WI 718/728/709, unified by WI 729): one render manifest of every interior
+    // volume that can hold water — sealed compartments (occlude the ocean, flood when breached),
+    // the open cavity (swamps over the rim), and the ballast tanks (fill on command).
+    let flood_state = build_flood_state(&craft, dc.com, flood, ballast);
+    let dry_fill_mat = materials.add(StandardMaterial {
+        // A painted-hold interior tone (WI 733): opaque so it occludes the ocean / sea-level water
+        // patch, but **self-lit** (emissive) so it reads as the inside of the boat through an open
+        // hatch — the hold is an enclosed recess that direct sun + sky IBL never reach, so a merely
+        // lit grey rendered black. Emissive ~0.2 matches the dive scene's soft-glow convention under
+        // this camera's exposure (not blooming).
+        base_color: Color::srgb(0.24, 0.25, 0.27),
+        emissive: LinearRgba::rgb(0.20, 0.21, 0.23),
+        perceptual_roughness: 1.0,
+        ..default()
+    });
+    let water_fill_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.08, 0.30, 0.42, 0.75),
+        alpha_mode: AlphaMode::Blend,
+        perceptual_roughness: 0.1,
+        ..default()
+    });
+    let unit_cube = meshes.add(Mesh::from(Cuboid::new(1.0, 1.0, 1.0)));
+    let mut hull = commands.entity(entity);
+    hull.insert((
+        Transform::default(),
+        Visibility::default(),
+        WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, start_render)),
+        HullMarker,
+        scene_cam::CameraTarget, // the follow camera tracks the hull (WI 714)
+        FloatEntity,
+    ));
+    hull.with_children(|parent| {
+        // Render the built hull centred on the CoM — solid cubes in their per-material skin,
+        // thin panels as actual thin plates on the hull faces they form (WI 722).
+        let (solid, _) = split_panels(&craft);
+        for (material, mesh) in skin_submeshes(&solid, VoxelSkin::Hull) {
+            let mat = pbr_material(material, &asset_server, &mut materials);
+            parent.spawn((
+                Mesh3d(meshes.add(mesh)),
+                MeshMaterial3d(mat),
+                Transform::from_translation(com_off),
+            ));
+        }
+        let plates = plate_meshes(craft.cell_size, &mut meshes);
+        let mats = material_handles(&craft, &asset_server, &mut materials);
+        for (material, axis, pos) in panel_plate_specs(&craft) {
+            let mat = mats
+                .iter()
+                .find(|(m, _)| *m == material)
+                .map(|(_, h)| h.clone());
+            parent.spawn((
+                Mesh3d(plates[axis].clone()),
+                MeshMaterial3d(mat.unwrap_or_default()),
+                Transform::from_translation(pos + com_off),
+            ));
+        }
+        // Interior water (WI 729): one renderer for every region — sealed compartment, open cavity,
+        // or ballast tank. Each gets an opaque dry hold (occludes the ocean / reads as a tank) + a
+        // flat rising-water cuboid (a unit cube `raise_interior_water` scales to its source's level).
+        for (i, region) in flood_state.regions.iter().enumerate() {
+            let size = region.max - region.min;
+            let centre = 0.5 * (region.min + region.max);
+            let eps = 0.02;
+            // WI 734: an OPEN hold is capped just above the floating waterline (`OPEN_HOLD_FILL`) — it
+            // still hides the sea-level water plane, but the top is left open so you see **down into**
+            // the real hollow interior (a recess, not a flush lid). Sealed compartments + ballast tanks
+            // fill fully (their interiors are genuinely closed).
+            let fill = if matches!(region.source, WaterSource::Open) {
+                OPEN_HOLD_FILL
+            } else {
+                1.0
+            };
+            let occ_h = (size.y * fill - eps).max(0.01);
+            parent.spawn((
+                Mesh3d(meshes.add(Mesh::from(Cuboid::new(
+                    (size.x - eps).max(0.01),
+                    occ_h,
+                    (size.z - eps).max(0.01),
+                )))),
+                MeshMaterial3d(dry_fill_mat.clone()),
+                Transform::from_translation(Vec3::new(
+                    centre.x,
+                    region.min.y + 0.5 * size.y * fill,
+                    centre.z,
+                )),
+            ));
+            parent.spawn((
+                Mesh3d(unit_cube.clone()),
+                MeshMaterial3d(water_fill_mat.clone()),
+                Transform {
+                    translation: Vec3::new(centre.x, region.min.y, centre.z),
+                    scale: Vec3::new((size.x - eps).max(0.01), 0.0001, (size.z - eps).max(0.01)),
+                    ..default()
+                },
+                InteriorWater(i),
+            ));
+        }
+    });
+    commands.insert_resource(flood_state);
 }
 
 fn exit_float(mut commands: Commands, entities: Query<Entity, With<FloatEntity>>) {
@@ -1225,56 +1098,36 @@ fn harbor_ballast_input(
     readout.ballast = b.fill_fraction();
 }
 
-/// Breach the hull (WI 718): `X` opens the sealed compartments to the sea so they begin to flood.
-/// One-way — re-enter Float (toggle to Build and back) to reset to a dry hull.
-fn harbor_breach_input(keys: Res<ButtonInput<KeyCode>>, mut flood: ResMut<FloodState>) {
+/// Breach the hull (WI 718): `X` opens the sealed compartments to the sea so they begin to flood
+/// (the flood physics is the sim-side `FloodComps` aboard the vessel, WI 739). One-way — re-enter
+/// Float (toggle to Build and back) to reset to a dry hull.
+fn harbor_breach_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut hull: Query<&mut FloodComps, With<HullMarker>>,
+) {
+    let Ok(mut flood) = hull.single_mut() else {
+        return;
+    };
     if keys.just_pressed(KeyCode::KeyX) && !flood.breached {
-        flood.breached = true;
-        for c in &mut flood.comps {
-            c.flood.breached = true;
-        }
+        flood.breach();
     }
 }
 
-/// Advance interior water (WI 718/728/709, unified by WI 729): step each breached compartment against the
-/// water at its keel, rebuild the hull's enclosed-buoyancy set from the still-dry (upper) cells so
-/// **buoyancy falls as it floods** (it sits lower / sinks), then raise **every** interior-water cuboid to
-/// its source's level — sealed flooding (WI 520), open swamping (WI 713), or ballast fill (WI 709) — in
-/// one loop. Physics driven entirely by the WI 519/520/713 models; no `sounding_sim` change. Publishes the
-/// flooded (flood + swamp) fraction; ballast is reported separately by `track_ballast`.
+/// Raise the interior-water render (WI 718/728/709, unified by WI 729; the flood *physics* stepped
+/// sim-side since WI 739): read each region's fill level from its source — sealed flooding (the
+/// vessel's `FloodComps`), open swamping (WI 713), or ballast fill (WI 709) — publish the flooded
+/// fraction, and scale every interior-water cuboid to its level (transform-only, no mesh rebuild).
 #[allow(clippy::type_complexity)]
-fn harbor_flood_step(
-    time: Res<Time>,
-    mut flood: ResMut<FloodState>,
+fn raise_interior_water(
+    flood: Res<FloodState>,
     mut readout: ResMut<HarborReadout>,
-    mut hull: Query<(&ActiveBody, &mut DivingCraft, Option<&Ballast>), With<HullMarker>>,
+    hull: Query<(&ActiveBody, &DivingCraft, &FloodComps, Option<&Ballast>), With<HullMarker>>,
     mut water: Query<(&InteriorWater, &mut Transform)>,
 ) {
-    let Ok((body, mut dc, ballast)) = hull.single_mut() else {
+    let Ok((body, dc, comps, ballast)) = hull.single() else {
         return;
     };
-    let dt = time.delta_secs_f64();
-    let mut total_vol = 0.0;
-    let mut total_water = 0.0;
-    let mut enclosed: Vec<IVec3> = Vec::new();
-    for comp in &mut flood.comps {
-        // Sample the water at the compartment; the breach is taken to sit at/below the keel, so a
-        // breached hull always takes on water, and the inflow grows as it sinks deeper (real).
-        let centroid_world = body.position + body.orientation * (comp.flood.centroid - dc.com);
-        let alt = (centroid_world.length() - BODY.radius).min(-0.1);
-        let sample = FluidMedium::EARTHLIKE.sample_altitude(alt);
-        comp.flood.step(&sample, FLOOD_RATE, dt);
-        total_vol += comp.flood.volume;
-        total_water += comp.flood.floodwater;
-        enclosed.extend(unflooded_cells(&comp.cells, comp.flood.flooded_fraction()));
-    }
-    // Rebuild the buoyancy set from the still-dry cells (the shared `advance_descent` reads this).
-    dc.enclosed = enclosed;
-    readout.flood = if total_vol > 0.0 {
-        (total_water / total_vol).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
+    readout.flood = comps.flooded_fraction();
     // The open cavity's swamp share, computed once (1 floating ⇒ dry, 0 swamped ⇒ full). `1 − rim_factor`.
     let open_frac = if flood
         .regions
@@ -1296,13 +1149,12 @@ fn harbor_flood_step(
     } else {
         0.0
     };
-    // Raise every interior-water cuboid to its source's fill level (transform-only, no mesh rebuild).
     for (iw, mut tf) in &mut water {
         let Some(region) = flood.regions.get(iw.0) else {
             continue;
         };
         let frac = match region.source {
-            WaterSource::Sealed { comp } => flood
+            WaterSource::Sealed { comp } => comps
                 .comps
                 .get(comp)
                 .map_or(0.0, |c| c.flood.flooded_fraction() as f32),
@@ -1346,44 +1198,15 @@ fn update_hud(readout: Res<HarborReadout>, mut hud: Query<&mut Text, With<Hud>>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sounding_sim::medium::enclosed_cells;
+    use sounding_sim::ballast::BallastTank;
+    use sounding_sim::voxel::Voxel;
 
-    /// Net buoyancy of a craft fully submerged (max buoyancy − real weight): >0 floats, <0 sinks.
-    fn net_buoyancy(craft: &VoxelCraft) -> f64 {
-        let mp = craft.mass_properties().unwrap();
-        let enc = enclosed_cells(craft);
-        let g = 9.81;
-        let deep = DVec3::new(0.0, BODY.radius - 100.0, 0.0);
-        let buoy = buoyancy_wrench(
-            craft,
-            mp.center_of_mass,
-            deep,
-            DQuat::IDENTITY,
-            BODY.radius,
-            0.0,
-            1_025.0,
-            g,
-            &enc,
-        )
-        .force
-        .length();
-        buoy - mp.mass * g
-    }
-
-    /// WI 717: the **panel** seed hull floats under **real mass**, while the same hull in **solid
-    /// cubes** sinks — the proving-ground contrast (no auto-ballast).
-    #[test]
-    fn the_panel_seed_floats_but_a_solid_hull_sinks() {
-        let seed = seed_hull();
-        assert!(!seed.panels.is_empty(), "the seed is built of panels");
-        assert!(net_buoyancy(&seed) > 0.0, "the panel seed hull floats");
-
-        let mut solid = seed.clone();
-        solid.panels.clear(); // same geometry, solid cubes
-        assert!(
-            net_buoyancy(&solid) < 0.0,
-            "the same hull in solid cubes sinks"
-        );
+    /// The shipped harbor seed hull (the scenario's blueprint) — the tests'
+    /// fixture is the same document the scene loads (WI 739).
+    fn seed_hull() -> VoxelCraft {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../content/blueprints/harbor-seed.json");
+        sounding_sim::library::load_craft(&path).expect("shipped harbor-seed blueprint")
     }
 
     /// WI 719: `split_panels` partitions voxels into solid + panel sets for distinct rendering.
@@ -1491,121 +1314,6 @@ mod tests {
         assert!(!would_float(&VoxelCraft::new(0.5)).0);
     }
 
-    /// WI 717: the float body carries the craft's **real** mass (no auto-ballast).
-    #[test]
-    fn assemble_float_uses_real_mass() {
-        let seed = seed_hull();
-        let (body, _) = assemble_float(&seed).unwrap();
-        let real = seed.mass_properties().unwrap().mass;
-        assert!(
-            (body.mass - real).abs() < 1e-9,
-            "float body uses real mass: {} vs {real}",
-            body.mass
-        );
-    }
-
-    #[test]
-    fn an_empty_lattice_does_not_assemble() {
-        assert!(assemble_float(&VoxelCraft::new(0.5)).is_none());
-    }
-
-    /// WI 708: the synthesized stern drive sits in the water on the floated seed hull and pushes it
-    /// **forward** (+Z), drawing fuel — and steers (a yaw couple) under differential throttle.
-    #[test]
-    fn synth_marine_drives_the_seed_hull_forward_and_steers() {
-        let seed = seed_hull();
-        let (body, dc) = assemble_float(&seed).unwrap();
-        let mut mp = synth_marine(&seed);
-        let fuel0 = mp.fuel();
-
-        // Full ahead: forward thrust, fuel drawn.
-        mp.drive(1.0, 0.0);
-        let (f, tq) = mp.thrust_step(
-            &FluidMedium::EARTHLIKE,
-            BODY.radius,
-            body.position,
-            body.orientation,
-            dc.com,
-            0.1,
-        );
-        assert!(
-            f.length() > 0.0,
-            "the keel screws are submerged and push: {f:?}"
-        );
-        // Forward is +Z in the body frame; the world thrust is mostly along the hull's forward axis.
-        let forward_world = body.orientation * DVec3::Z;
-        assert!(f.dot(forward_world) > 0.0, "drives forward");
-        assert!(mp.fuel() < fuel0, "fuel drawn under power");
-        assert!(tq.length() >= 0.0);
-
-        // Differential throttle yaws (nonzero steering moment about up).
-        mp.drive(0.4, 0.6);
-        let (_f2, tq2) = mp.thrust_step(
-            &FluidMedium::EARTHLIKE,
-            BODY.radius,
-            body.position,
-            body.orientation,
-            dc.com,
-            0.1,
-        );
-        let up = body.position.normalize_or(DVec3::Y);
-        assert!(
-            tq2.dot(up).abs() > 1e-3,
-            "differential thrust steers: {tq2:?}"
-        );
-    }
-
-    /// WI 718: flooding removes the hull's enclosed buoyancy **bottom-up**, so net buoyancy falls
-    /// monotonically as it floods — a hull that floats dry sinks fully flooded.
-    #[test]
-    fn flooding_removes_buoyancy_bottom_up_and_sinks() {
-        let seed = seed_hull();
-        let mp = seed.mass_properties().unwrap();
-        let mut cells: Vec<IVec3> = compartments(&seed)
-            .compartments
-            .iter()
-            .flat_map(|c| c.cells.iter().copied())
-            .collect();
-        cells.sort_by_key(|c| c.y);
-        assert!(!cells.is_empty(), "the sealed hull has an enclosed cavity");
-
-        let g = 9.81;
-        let deep = DVec3::new(0.0, BODY.radius - 100.0, 0.0);
-        let net = |frac: f64| {
-            let enc = unflooded_cells(&cells, frac);
-            let buoy = buoyancy_wrench(
-                &seed,
-                mp.center_of_mass,
-                deep,
-                DQuat::IDENTITY,
-                BODY.radius,
-                0.0,
-                1_025.0,
-                g,
-                &enc,
-            )
-            .force
-            .length();
-            buoy - mp.mass * g
-        };
-        assert!(net(0.0) > 0.0, "dry, the panel hull floats");
-        assert!(net(1.0) < 0.0, "fully flooded, it sinks");
-        // Monotone buoyancy loss as it floods.
-        assert!(
-            net(0.0) > net(0.5) && net(0.5) > net(1.0),
-            "buoyancy falls as it floods"
-        );
-        // Bottom-up: at half flood the dry cells are the upper half.
-        let dry = unflooded_cells(&cells, 0.5);
-        assert!(dry.len() < cells.len() && !dry.is_empty());
-        let min_dry_y = dry.iter().map(|c| c.y).min().unwrap();
-        let max_flooded_y = cells[(0.5 * cells.len() as f64).round() as usize - 1].y;
-        assert!(
-            min_dry_y >= max_flooded_y,
-            "the dry cells are the upper ones"
-        );
-    }
-
     /// WI 729: `build_flood_state` produces one render region per water source — a sealed compartment
     /// (Sealed), the open cavity (Open), and each ballast tank (Ballast) — so the renderer is data-driven.
     #[test]
@@ -1617,7 +1325,8 @@ mod tests {
         // A sealed hull, no ballast: a Sealed region, no Open, no Ballast.
         let seed = seed_hull();
         let com = seed.mass_properties().unwrap().center_of_mass;
-        let sealed = build_flood_state(&seed, com, None);
+        let comps = FloodComps::for_craft(&seed);
+        let sealed = build_flood_state(&seed, com, &comps, None);
         assert!(
             count(&sealed, |s| matches!(s, WaterSource::Sealed { .. })) >= 1,
             "the sealed hull yields at least one Sealed region"
@@ -1633,7 +1342,7 @@ mod tests {
             "no ballast ⇒ no Ballast region"
         );
         assert_eq!(
-            sealed.comps.len(),
+            comps.comps.len(),
             count(&sealed, |s| matches!(s, WaterSource::Sealed { .. })),
             "each Sealed region maps to a compartment"
         );
@@ -1649,7 +1358,7 @@ mod tests {
             .filter(|c| c.y != max_y)
             .collect();
         let open_com = open.mass_properties().unwrap().center_of_mass;
-        let open_state = build_flood_state(&open, open_com, None);
+        let open_state = build_flood_state(&open, open_com, &FloodComps::for_craft(&open), None);
         assert_eq!(
             count(&open_state, |s| matches!(s, WaterSource::Open)),
             1,
@@ -1668,7 +1377,7 @@ mod tests {
             command: BallastCommand::Hold,
             dry_mass: 1.0,
         };
-        let ballasted = build_flood_state(&seed, com, Some(&ballast));
+        let ballasted = build_flood_state(&seed, com, &comps, Some(&ballast));
         assert_eq!(
             count(&ballasted, |s| matches!(
                 s,
@@ -1686,8 +1395,9 @@ mod tests {
     fn ballast_region_fits_within_the_hull() {
         let seed = seed_hull();
         let com = seed.mass_properties().unwrap().center_of_mass;
-        let ballast = synth_ballast(&seed).expect("the sealed seed hull synthesizes ballast");
-        let fs = build_flood_state(&seed, com, Some(&ballast));
+        let ballast = sounding_sim::afloat::synth_ballast(&seed, BODY.radius)
+            .expect("the sealed seed hull synthesizes ballast");
+        let fs = build_flood_state(&seed, com, &FloodComps::for_craft(&seed), Some(&ballast));
         let region = fs
             .regions
             .iter()
@@ -1739,80 +1449,5 @@ mod tests {
         );
     }
 
-    /// WI 725: the synthesized rudder sits in the water aft of the hull and steers it **only when
-    /// moving** — a yaw moment under way, nothing at a standstill.
-    #[test]
-    fn synth_rudder_steers_the_moving_seed_hull_only_under_way() {
-        let seed = seed_hull();
-        let (body, dc) = assemble_float(&seed).unwrap();
-        let mut r = synth_rudder(&seed);
-        r.set_turn(1.0); // hard over
-        let m = FluidMedium::EARTHLIKE;
-
-        // At rest: no flow ⇒ no steering.
-        let (_, t_rest) = r.wrench(
-            &m,
-            BODY.radius,
-            body.position,
-            body.orientation,
-            DVec3::ZERO,
-            dc.com,
-        );
-        assert_eq!(t_rest, DVec3::ZERO, "no steering at a standstill");
-
-        // Under way (forward, the hull's +Z): a real yaw moment about the local up.
-        let forward = body.orientation * DVec3::Z;
-        let (_, t_move) = r.wrench(
-            &m,
-            BODY.radius,
-            body.position,
-            body.orientation,
-            forward * 5.0,
-            dc.com,
-        );
-        let up = body.position.normalize_or(DVec3::Y);
-        assert!(
-            t_move.dot(up).abs() > 1e-3,
-            "the rudder yaws the moving hull: {t_move:?}"
-        );
-    }
-
-    /// WI 709: flooding the synthesized ballast flips the seed hull's net buoyancy negative (it
-    /// dives), and blowing it recovers positive net buoyancy (it surfaces) — controllable and
-    /// reversible.
-    #[test]
-    fn ballast_flips_net_buoyancy_dive_and_surface() {
-        let seed = seed_hull();
-        let mut b = synth_ballast(&seed).expect("the panel hull has reserve buoyancy");
-        let g = 9.81;
-        let enc = enclosed_cells(&seed);
-        let mp = seed.mass_properties().unwrap();
-        let deep = DVec3::new(0.0, BODY.radius - 100.0, 0.0);
-        let buoy = buoyancy_wrench(
-            &seed,
-            mp.center_of_mass,
-            deep,
-            DQuat::IDENTITY,
-            BODY.radius,
-            0.0,
-            1_025.0,
-            g,
-            &enc,
-        )
-        .force
-        .length();
-        let net = |ballast: &Ballast| buoy - ballast.wet_mass(mp.center_of_mass, 1_025.0).mass * g;
-
-        // Blown (empty): the panel hull floats.
-        assert!(net(&b) > 0.0, "blown ballast ⇒ floats");
-        // Flood it fully: it sinks.
-        b.command = BallastCommand::Fill;
-        b.step(100.0);
-        assert!(net(&b) < 0.0, "flooded ballast ⇒ sinks (dives)");
-        // Blow it again: it floats once more (reversible).
-        b.command = BallastCommand::Blow;
-        b.step(100.0);
-        assert!(net(&b) > 0.0, "blown again ⇒ floats (reversible)");
-    }
     // The wave-height unit test moved to `scene_water` (WI 714).
 }

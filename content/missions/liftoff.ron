@@ -1,0 +1,16 @@
+// Liftoff (WI 739) — the launch/autopilot scenes' auto-throttle as mission
+// data: two seconds on the pad (the old HOLD_TIME), then full throttle
+// through the command envelope. The effect snaps to 1.0 where the old scenes
+// ramped over 1.5 s — an accepted migration deviation (plan, Stage 1).
+#![enable(implicit_some)]
+(
+    format: 1,
+    id: "liftoff",
+    name: "Liftoff",
+    offer: Immediate,
+    objective: ElapsedAbove(2.0),
+    effects: [
+        Command(SetThrottle(1.0)),
+        Lore("Umbilicals clear. She flies herself now."),
+    ],
+)

@@ -107,13 +107,31 @@ pub struct StartSpec {
     pub bindings: BTreeMap<DeviceClass, String>,
 }
 
-/// Start placements. Additive by design: orbit / surface / water variants
-/// arrive with the scenes that need them (convergence A2), never by reshaping
-/// `Pad`. Serialize because the placement rides the staged spawn payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Start placements. Additive by design: new variants arrive with the scenes
+/// that need them (convergence A2), never by reshaping `Pad`. Serialize
+/// because the placement rides the staged spawn payload.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum StartPlacement {
     /// At rest on the root body's launch pad (surface radius + craft CoM).
     Pad,
+    /// On a Kepler orbit about the root body, coasting on rails toward
+    /// atmospheric entry (WI 739, the dive): the craft starts at `altitude`
+    /// with tangential `speed` (an entry trajectory when the resulting
+    /// periapsis falls into the atmosphere) and wakes into active descent
+    /// physics when it falls below the `interface` altitude (the automatic
+    /// warp-drop + gear hand-off).
+    Orbit {
+        /// Start altitude above the surface, m.
+        altitude: f64,
+        /// Tangential start speed, m/s.
+        speed: f64,
+        /// Entry-interface altitude, m (rails → active wake).
+        interface: f64,
+    },
+    /// At rest afloat on the root body's ocean surface at the scenario
+    /// origin (WI 739, the harbor): the craft assembles at its real material
+    /// mass and floats — or sinks — on the shared descent/hydro step.
+    Afloat,
 }
 
 // ---------------------------------------------------------------------------

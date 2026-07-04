@@ -1,0 +1,19 @@
+// Play (WI 739) — the migrated `-- play` scene as pure data: fly the
+// sounding rocket by hand. Physical pack values only (no settings/overrides)
+// so the craft flies with the scene's original numbers.
+#![enable(implicit_some)]
+(
+    format: 1,
+    id: "play",
+    name: "Play — fly by hand",
+    world: Earthlike,
+    packs: ["core"],
+    start: (
+        blueprint: "sounding-rocket",
+        placement: Pad,
+        bindings: {
+            Engine: "lf_engine_medium",
+            Tank: "fuel_tank_medium",
+        },
+    ),
+)

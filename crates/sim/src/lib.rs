@@ -8,6 +8,7 @@
 
 pub mod active;
 pub mod aero;
+pub mod afloat;
 pub mod attitude;
 pub mod autopilot;
 pub mod ballast;

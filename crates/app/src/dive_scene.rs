@@ -1,13 +1,20 @@
-//! Toy 9 — the dive (WI 509), the full **live chain** in SI (WI 527).
+//! The dive (WI 509), the full **live chain** in SI (WI 527) — played **from
+//! scenario data** since WI 739.
 //!
 //! One craft runs the whole gearbox on screen: it starts on an **SI Kepler orbit**
 //! high above the surface, coasts down on rails under time warp, **auto-drops** to
 //! the active gear at the atmospheric entry interface (`DiveTriggerPlugin` +
 //! `HandoffPlugin`), and is then driven by the active-gear aero forces
 //! (`DescentPlugin` → `glide_step`) — gravity + drag + buoyancy + lift — gliding
-//! and weathervaning through vacuum → atmosphere → ocean to splashdown. All one
-//! consistent SI unit system, shared with the headless app and the planet scene
-//! via `CentralBody::EARTHLIKE` (no per-scene unit convention).
+//! and weathervaning through vacuum → atmosphere → ocean to splashdown.
+//!
+//! **The content comes from `content/scenarios/dive.ron`** (or an explicit
+//! `-- dive <path>`): the capsule blueprint, the entry orbit (altitude/speed),
+//! and the entry-interface altitude are document data resolved by the content
+//! loader; the sim-side director's orbit-entry arm configures the on-rails
+//! craft from the staged payload (WI 739). This scene is presentation: it
+//! loads + stages, then renders — the water, the entry glow, the steam and
+//! splash VFX, the follow camera, and the HUD.
 //!
 //! Rendering uses the floating-origin flat-ground convention (sea level at world
 //! Y = 0, planet centre at `(0, -R, 0)`); the craft's sim position (its orbit while
@@ -16,78 +23,47 @@
 use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::light::{light_consts::lux, AtmosphereEnvironmentMapLight};
-use bevy::math::{DVec2, DVec3};
+use bevy::math::DVec3;
 use bevy::pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium};
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use sounding_sim::active::{ActiveBody, Gravity};
-use sounding_sim::fluid::{FluidMedium, MediumKind};
+use sounding_sim::command::Command;
+use sounding_sim::director::{DirectorPlugin, PendingSpawn, ScenarioSpawn};
+use sounding_sim::fluid::MediumKind;
 use sounding_sim::frame::{FrameId, WorldPos};
-use sounding_sim::handoff::{orbit_state_3d, GearState, HandoffPlugin};
+use sounding_sim::handoff::{orbit_state_3d, HandoffPlugin};
 use sounding_sim::medium::{
-    buoyancy_wrench, dynamic_pressure, heel_angle, max_cross_section, CraftThermal, DescentParams,
-    DescentPlugin, DiveTriggerPlugin, DivingCraft, EntryInterface, GlideParams,
-    DEFAULT_SLAM_COEFFICIENT, DIVE_HEAT_SCALE,
+    buoyancy_wrench, dynamic_pressure, heel_angle, CraftThermal, DescentPlugin, DiveTriggerPlugin,
+    DivingCraft, EntryInterface,
 };
-use sounding_sim::orbit::Orbit;
+use sounding_sim::scenario::{load_scenario, ScenarioRoots, StartPlacement};
 use sounding_sim::sim::{CentralBody, Craft, SimClock};
 use sounding_sim::telemetry::ThermalTelemetry;
-use sounding_sim::voxel::{Axis, Material, Voxel, VoxelCraft};
 
 use crate::bus::DiveThermal;
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
 use crate::scene_cam::{self, OrbitFollowCam};
 use crate::scene_water::{self, WaterPatch, WaveSpec};
 
-/// Ambient / radiative-sink temperature for the dive, K.
-const DIVE_AMBIENT: f64 = 250.0;
+/// The default scenario document when `-- dive` is given no path.
+const DEFAULT_SCENARIO: &str = "content/scenarios/dive.ron";
+
 /// Skin temperature (K) at which the craft begins to visibly glow.
 const GLOW_ONSET: f64 = 500.0;
 
 /// The canonical Earth-like body, in SI (WI 527).
 const BODY: CentralBody = CentralBody::EARTHLIKE;
-/// Starting altitude of the orbit's high point, metres.
-const START_ALT: f64 = 120_000.0;
-/// Tangential entry speed, m/s (WI 693): a genuine **orbital** re-entry (~7 km/s,
-/// just under circular at this altitude) rather than the old ~600 m/s suborbital
-/// lob — so heating is physically dramatic. Periapsis falls into the atmosphere, so
-/// the craft re-enters and reaches the ocean (validated headless).
-const ENTRY_SPEED: f64 = 7_000.0;
-/// Atmospheric-entry interface altitude, metres (where warp drops and the craft
-/// wakes into active physics).
+/// Placeholder entry-interface altitude for plugin construction, metres — the
+/// director's orbit-entry spawn overwrites it from the scenario document.
 const ENTRY_ALT: f64 = 100_000.0;
 /// Active-descent sub-step, seconds (the stiff entry/splashdown wants a small step).
 const SUBSTEP_DT: f64 = 0.002;
 /// Cap on active descent sub-steps per frame.
 const MAX_SUBSTEPS: u32 = 4_000;
-/// Initial time warp for the on-rails coast down to the interface.
-const INITIAL_WARP: f64 = 30.0;
 /// Depth (negative altitude) at which the sim is paused so the craft rests rather
 /// than tunnelling the (non-collision) seabed.
 const REST_DEPTH: f64 = -3_500.0;
-
-/// A slender re-entry body along +Z (forward): a 3×3×4 composite hull with an
-/// **ablative heat-shield nose tip** (WI 688) at the windward front — a positive
-/// static margin so it weathervanes into the airflow, a tapered area curve for
-/// transonic wave drag (WI 526), and a shield that ablates to survive re-entry.
-fn dive_craft() -> VoxelCraft {
-    let mut c = VoxelCraft::new(1.0);
-    for z in 0..4 {
-        for x in 0..3 {
-            for y in 0..3 {
-                c.voxels.push(Voxel {
-                    cell: IVec3::new(x, y, z),
-                    material: Material::COMPOSITE,
-                });
-            }
-        }
-    }
-    c.voxels.push(Voxel {
-        cell: IVec3::new(1, 1, 4),
-        material: Material::ABLATOR,
-    });
-    c
-}
 
 /// The craft's flat-ground render position (sea level at Y = 0): the radial sim
 /// frame shifted so the planet centre sits one radius below the origin.
@@ -143,7 +119,7 @@ struct Hud;
 #[derive(Component)]
 struct CraftMarker;
 
-/// The Toy 9 dive scene.
+/// The dive scene: scenario data in (WI 739), the live chain on screen.
 pub struct DiveScenePlugin;
 
 impl Plugin for DiveScenePlugin {
@@ -153,6 +129,9 @@ impl Plugin for DiveScenePlugin {
             // The handoff sleep path reads Gravity; the descent driver replaces the
             // pure-gravity ActivePlugin (glide_step already includes gravity).
             .insert_resource(Gravity { mu: BODY.mu })
+            // The scenario director (WI 739): the orbit-entry spawn arm
+            // configures the on-rails craft from the staged payload.
+            .add_plugins(DirectorPlugin)
             .add_plugins(HandoffPlugin)
             .add_plugins(DiveTriggerPlugin {
                 interface: EntryInterface {
@@ -193,46 +172,42 @@ fn setup_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut scattering: ResMut<Assets<ScatteringMedium>>,
-    mut clock: ResMut<SimClock>,
-    mut craft_q: Query<(Entity, &mut Craft, &mut GearState)>,
+    mut pending: ResMut<PendingSpawn>,
+    mut messages: MessageWriter<Command>,
+    craft_q: Query<Entity, With<Craft>>,
 ) {
-    // A genuine **orbital** re-entry from START_ALT (WI 693): a bound Kepler orbit at
-    // near-circular speed whose periapsis falls into the atmosphere, so the craft
-    // enters at ~7 km/s — carrying orbital kinetic energy, so re-entry heating is
-    // physically dramatic (heating ∝ v³). Start at the +Y high point with a +X
-    // tangential velocity so "up" ≈ +Y, matching the flat-ground render convention.
-    let r0 = BODY.radius + START_ALT;
-    let orbit = Orbit::from_state(
-        BODY.mu,
-        DVec2::new(0.0, r0),
-        DVec2::new(ENTRY_SPEED, 0.0),
-        0.0,
-    )
-    .expect("bound re-entry orbit");
-
-    let voxels = dive_craft();
-    let mp = voxels.mass_properties().expect("non-empty craft");
-    let descent = DescentParams {
-        medium: FluidMedium::EARTHLIKE,
-        mu: BODY.mu,
-        surface_radius: BODY.radius,
-        drag_area: max_cross_section(&voxels),
-        drag_coefficient: 1.0,
-        slam_coefficient: DEFAULT_SLAM_COEFFICIENT,
+    // The content: load + validate the scenario document (arg 2 or the shipped
+    // default), stage the resolved payload, and post the spawn command — the
+    // director's orbit-entry arm (WI 739) puts the craft on the entry orbit,
+    // attaches its diving description + thermal state, sets the entry
+    // interface, and issues the rails-coast warp. This scene renders.
+    let path = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| DEFAULT_SCENARIO.to_string());
+    let roots = ScenarioRoots::default();
+    let scenario = match load_scenario(std::path::Path::new(&path), &roots) {
+        Ok(s) => s,
+        Err(e) => panic!("scenario `{path}` failed to load: {e}"),
     };
-    let glide = GlideParams::for_craft(descent, &voxels, Axis::Z);
-    let start_render = render_world(orbit_state_3d(&orbit, 0.0).0);
+    let start_altitude = match scenario.placement {
+        StartPlacement::Orbit { altitude, .. } => altitude,
+        _ => panic!(
+            "scenario `{path}` is not an orbit-entry scenario — the dive scene presents \
+             Orbit placements (use `-- scenario {path}` for pad starts)"
+        ),
+    };
+    info!(
+        "scenario `{}` ({}) loaded: orbit-entry from {start_altitude} m",
+        scenario.id, scenario.name,
+    );
+    pending.0 = Some(ScenarioSpawn::from_scenario(&scenario));
+    messages.write(Command::SpawnScenario);
 
-    // Reconfigure the single craft the OrbitPlugin spawned (main.rs): put it on the
-    // re-entry orbit with a real gear-state, and attach its diving description plus
-    // the render bundle. One craft runs the whole chain.
-    if let Ok((entity, mut craft, mut gear)) = craft_q.single_mut() {
-        craft.orbit = orbit;
-        *gear = GearState::new(mp.mass, mp.inertia);
-        let thermal = CraftThermal::new(&voxels, DIVE_AMBIENT, DIVE_AMBIENT, DIVE_HEAT_SCALE);
+    // Dress the on-rails craft entity (the OrbitPlugin spawned it; the
+    // director configures its physics): the render bundle only.
+    let start_render = DVec3::new(0.0, start_altitude, 0.0);
+    if let Ok(entity) = craft_q.single() {
         commands.entity(entity).insert((
-            DivingCraft::new(voxels, mp.center_of_mass, glide),
-            thermal,
             Mesh3d(meshes.add(Mesh::from(Cuboid::new(3.0, 3.0, 5.0)))),
             MeshMaterial3d(materials.add(StandardMaterial {
                 base_color: Color::srgb(0.85, 0.84, 0.88),
@@ -246,8 +221,6 @@ fn setup_scene(
             scene_cam::CameraTarget, // the follow camera tracks the craft (WI 714)
         ));
     }
-    // Coast down under warp; the entry trigger drops it to 1 at the interface.
-    clock.warp = INITIAL_WARP;
 
     // Seabed: an opaque sphere just below sea level, centred one radius down.
     commands.spawn((

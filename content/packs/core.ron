@@ -33,6 +33,26 @@
             density: 400.0,  // kg/m³ (empty shell — propellant is separate)
             capacity: 100.0, // kg propellant per tank
         )),
+        // The sounding-rocket engine (WI 739): the migrated flight-family
+        // scenes' engine as a catalog record — 3000 m/s × 70 kg/s ⇒ ~210 kN,
+        // TWR ≈ 1.6 on the sounding-rocket blueprint. Authored standalone
+        // (not off engine_base): these are the scenes' physical values,
+        // carried over unchanged.
+        Device((
+            id: "lf_engine_medium",
+            class: Engine,
+            density: 3000.0,          // kg/m³
+            exhaust_velocity: 3000.0, // m/s (Isp ≈ 306 s)
+            max_mass_flow: 70.0,      // kg/s ⇒ ~210 kN max thrust
+        )),
+        // The sounding-rocket tank (WI 739): the scenes' 5000 kg propellant
+        // load as a per-tank capacity.
+        Device((
+            id: "fuel_tank_medium",
+            class: Tank,
+            density: 400.0,   // kg/m³
+            capacity: 5000.0, // kg propellant per tank
+        )),
         // A structural material — the payload is the sim's real Material shape
         // (density + strength + the thermal quad).
         Material((

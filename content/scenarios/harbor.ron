@@ -1,0 +1,19 @@
+// Harbor (WI 739) — the migrated `-- harbor` Float start as pure data: the
+// seed panel pontoon afloat on calm water by the dock. The hull assembles at
+// its real material mass (a light panel hull floats; the same hull in solid
+// cubes would sink — that is the game) with the synthesized stern drive,
+// rudder, and ballast tank. The harbor scene's Build mode edits this
+// blueprint's lattice; Float re-spawns the live build through the same
+// director path.
+#![enable(implicit_some)]
+(
+    format: 1,
+    id: "harbor",
+    name: "Harbor",
+    world: Earthlike,
+    packs: [],
+    start: (
+        blueprint: "harbor-seed",
+        placement: Afloat,
+    ),
+)

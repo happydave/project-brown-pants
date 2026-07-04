@@ -34,6 +34,7 @@ use crate::mission::{Effect, Mission, MissionState, NodeState, Offer};
 use crate::propulsion::{Engine, EngineCommand, Propulsion};
 use crate::resource::{Reservoir, ReservoirId, ResourceGraph, ResourceType};
 use crate::scenario::{Scenario, StartPlacement};
+use crate::session::GameSession;
 use crate::sim::SimClock;
 use crate::voxel::{DeviceKind, VoxelCraft};
 use bevy_app::prelude::*;
@@ -61,6 +62,14 @@ const ATTITUDE_AUTHORITY: f64 = 5_000.0;
 const WHEEL_TORQUE: f64 = 8_000.0;
 const WHEEL_MOMENTUM: f64 = 1e9;
 const LOW_POWER_RESERVE: f64 = 6.0;
+/// Standard gravity for the G-force readout, m/s² (WI 739).
+const G0: f64 = 9.80665;
+/// Ambient / radiative-sink temperature for an orbit-entry spawn, K (WI 739,
+/// the dive's value — engine tuning, not content).
+const ORBIT_AMBIENT_K: f64 = 250.0;
+/// Initial rails-coast time-warp on an orbit-entry spawn (the entry trigger
+/// drops it back to 1× at the interface).
+const RAILS_COAST_WARP: f64 = 30.0;
 
 /// Everything the director needs to spawn a scenario's starting state —
 /// **fully resolved**: catalog values are final physical numbers, the world is
@@ -179,6 +188,13 @@ pub struct ScenarioFlight {
     pub elapsed: f64,
     /// Flight time of the last mission poll.
     pub last_poll: f64,
+    /// The played session — Launch → Flight → Recovery with landed/crashed
+    /// outcome, driven by simulation state (WI 739, absorbing the play/
+    /// autopilot scenes' session tracking). Terminal Recovery freezes the
+    /// stepper, matching the migrated scenes' behaviour.
+    pub session: GameSession,
+    /// Felt (proper) acceleration over the last sub-step, in g (WI 739).
+    pub g_force: f64,
 }
 
 /// One mission's runtime state: its definition, lifecycle state, and the
@@ -215,6 +231,9 @@ impl ScenarioFlight {
             altitude: self.pad.altitude(&self.body),
             speed: self.body.velocity.length(),
             airborne: self.pad.released,
+            elapsed: self.elapsed,
+            session: Some(self.session),
+            g_force: self.g_force,
             missions: self
                 .missions
                 .iter()
@@ -230,12 +249,17 @@ impl ScenarioFlight {
     }
 }
 
-/// Assembles the spawn payload into the one-craft chain. `None` for an empty
-/// lattice (no mass) — the same honest failure as the workshop. Engines take
-/// their physics from the payload's catalog-resolved values; a craft with
-/// engine devices but no engine parameters assembles **engine-less** rather
-/// than inventing numbers (the validated path can't produce that state).
+/// Assembles a **Pad-placement** spawn payload into the one-craft chain.
+/// `None` for an empty lattice (no mass) — the same honest failure as the
+/// workshop — or for a non-Pad placement (those spawn through their own arms;
+/// see [`apply_spawn_scenario`]). Engines take their physics from the
+/// payload's catalog-resolved values; a craft with engine devices but no
+/// engine parameters assembles **engine-less** rather than inventing numbers
+/// (the validated path can't produce that state).
 pub fn instantiate(spawn: &ScenarioSpawn) -> Option<ScenarioFlight> {
+    if !matches!(spawn.placement, StartPlacement::Pad) {
+        return None;
+    }
     let voxels = spawn.craft.clone();
     let mp = voxels.mass_properties()?;
     let s = voxels.cell_size;
@@ -304,9 +328,8 @@ pub fn instantiate(spawn: &ScenarioSpawn) -> Option<ScenarioFlight> {
         },
     };
 
-    // Placement: only Pad exists this slice — at rest on the root body's
-    // surface, supported by the launch pad until thrust beats weight.
-    let StartPlacement::Pad = spawn.placement;
+    // Pad placement: at rest on the root body's surface, supported by the
+    // launch pad until thrust beats weight.
     let rest_radius = spawn.surface_radius + com.y;
     let body = ActiveBody::new(
         DVec3::new(0.0, rest_radius, 0.0),
@@ -358,22 +381,43 @@ pub fn instantiate(spawn: &ScenarioSpawn) -> Option<ScenarioFlight> {
         lore: None,
         elapsed: 0.0,
         last_poll: 0.0,
+        session: {
+            let mut s = GameSession::new();
+            s.begin_launch();
+            s
+        },
+        g_force: 1.0,
     })
 }
 
 /// The structural arm for [`Command::SpawnScenario`] (the `SetGear` pattern):
-/// consumes the staged payload and inserts the spawned [`ScenarioFlight`].
-/// No stage ⇒ no-op (logged); an empty-lattice payload ⇒ no spawn (logged).
+/// consumes the staged payload and spawns the placement's regime. No stage ⇒
+/// no-op (logged); an empty-lattice payload ⇒ no spawn (logged).
+///
+/// **Pad** inserts the [`ScenarioFlight`] one-craft chain. **Orbit** (WI 739,
+/// the dive) configures the app's single on-rails craft entity instead: the
+/// entry orbit, a real gear state, the diving description + thermal state,
+/// and the entry-interface resource — the existing sim plugins
+/// ([`crate::handoff::HandoffPlugin`], the [`EntryInterface`] trigger,
+/// [`crate::medium::DescentPlugin`]) then run the rails → wake → descent
+/// chain; the director configures, it does not step.
 ///
 /// The director's initial state is issued as **ordinary commands**: SAS
-/// hold-attitude on spawn (a fixed engine below the CoM is pendulum-unstable;
-/// the starter carries a Tier-0 command core exactly so its first flight
-/// flies straight — a craft without one simply ignores the command, the
-/// tier gate's honest behaviour).
+/// hold-attitude on a Pad spawn (a fixed engine below the CoM is
+/// pendulum-unstable; the starter carries a Tier-0 command core exactly so
+/// its first flight flies straight — a craft without one simply ignores the
+/// command, the tier gate's honest behaviour), and the rails-coast time-warp
+/// on an Orbit spawn (the entry trigger's warp filter drops it back to 1×).
+#[allow(clippy::type_complexity)]
 fn apply_spawn_scenario(
     mut messages: ParamSet<(MessageReader<Command>, MessageWriter<Command>)>,
     mut pending: ResMut<PendingSpawn>,
     mut commands: Commands,
+    mut rails: Query<(
+        Entity,
+        &mut crate::sim::Craft,
+        &mut crate::handoff::GearState,
+    )>,
 ) {
     let triggered = messages
         .p0()
@@ -382,8 +426,12 @@ fn apply_spawn_scenario(
     if !triggered {
         return;
     }
-    match pending.0.take() {
-        Some(spawn) => match instantiate(&spawn) {
+    let Some(spawn) = pending.0.take() else {
+        bevy_log::warn!("SpawnScenario with no staged payload — no-op");
+        return;
+    };
+    match spawn.placement {
+        StartPlacement::Pad => match instantiate(&spawn) {
             Some(flight) => {
                 bevy_log::info!(
                     "scenario `{}` spawned: {} on the pad",
@@ -397,7 +445,114 @@ fn apply_spawn_scenario(
             }
             None => bevy_log::warn!("scenario spawn: blueprint has no mass — nothing spawned"),
         },
-        None => bevy_log::warn!("SpawnScenario with no staged payload — no-op"),
+        StartPlacement::Orbit {
+            altitude,
+            speed,
+            interface,
+        } => {
+            let Some(mp) = spawn.craft.mass_properties() else {
+                bevy_log::warn!("scenario spawn: blueprint has no mass — nothing spawned");
+                return;
+            };
+            let Ok((entity, mut craft, mut gear)) = rails.single_mut() else {
+                bevy_log::warn!("orbit-entry spawn: no on-rails craft entity — nothing spawned");
+                return;
+            };
+            // The entry orbit: start at the +Y high point with +X tangential
+            // velocity (the dive scene's flat-ground render convention).
+            let r0 = spawn.surface_radius + altitude;
+            let Some(orbit) = crate::orbit::Orbit::from_state(
+                spawn.mu,
+                glam::DVec2::new(0.0, r0),
+                glam::DVec2::new(speed, 0.0),
+                0.0,
+            ) else {
+                bevy_log::warn!("orbit-entry spawn: unbound start state — nothing spawned");
+                return;
+            };
+            craft.orbit = orbit;
+            *gear = crate::handoff::GearState::new(mp.mass, mp.inertia);
+            let descent = crate::medium::DescentParams {
+                medium: spawn.medium,
+                mu: spawn.mu,
+                surface_radius: spawn.surface_radius,
+                drag_area: max_cross_section(&spawn.craft),
+                drag_coefficient: 1.0,
+                slam_coefficient: crate::medium::DEFAULT_SLAM_COEFFICIENT,
+            };
+            let glide =
+                crate::medium::GlideParams::for_craft(descent, &spawn.craft, crate::voxel::Axis::Z);
+            let thermal = crate::medium::CraftThermal::new(
+                &spawn.craft,
+                ORBIT_AMBIENT_K,
+                ORBIT_AMBIENT_K,
+                crate::medium::DIVE_HEAT_SCALE,
+            );
+            commands.entity(entity).insert((
+                crate::medium::DivingCraft::new(spawn.craft.clone(), mp.center_of_mass, glide),
+                thermal,
+            ));
+            commands.insert_resource(crate::medium::EntryInterface {
+                surface_radius: spawn.surface_radius,
+                altitude: interface,
+            });
+            bevy_log::info!(
+                "scenario `{}` spawned: {} on rails at {altitude} m, entry interface {interface} m",
+                spawn.id,
+                spawn.name
+            );
+            messages.p1().write(Command::SetWarp(RAILS_COAST_WARP));
+        }
+        StartPlacement::Afloat => {
+            // The harbor regime (WI 739): assemble at real material mass and
+            // spawn the floating chain the shared DescentPlugin steps —
+            // synthesized drive/rudder/ballast until the device palette
+            // (WI 715), interior-flood physics alongside.
+            let Some((body, dc)) =
+                crate::afloat::assemble_float(&spawn.craft, spawn.mu, spawn.surface_radius)
+            else {
+                bevy_log::warn!("scenario spawn: blueprint has no mass — nothing spawned");
+                return;
+            };
+            let marine = crate::afloat::synth_marine(&spawn.craft);
+            let ballast = crate::afloat::synth_ballast(&spawn.craft, spawn.surface_radius);
+            let rudder = crate::afloat::synth_rudder(&spawn.craft);
+            let flood = crate::afloat::FloodComps::for_craft(&spawn.craft);
+            let mut vessel = commands.spawn((
+                body,
+                dc,
+                marine,
+                rudder,
+                flood,
+                crate::afloat::ScenarioVessel,
+            ));
+            if let Some(b) = ballast {
+                vessel.insert(b);
+            }
+            bevy_log::info!(
+                "scenario `{}` spawned: {} afloat at the origin",
+                spawn.id,
+                spawn.name
+            );
+        }
+    }
+}
+
+/// Advances every vessel's interior flooding (WI 739, the physics half of
+/// the old harbor flood step): breached compartments take on water and the
+/// hull's enclosed-buoyancy set shrinks, so the shared descent step feels
+/// the lost buoyancy. Render (occluders, rising water) stays scene-side.
+fn step_vessel_flooding(
+    time: Res<Time>,
+    mut vessels: Query<(
+        &crate::active::ActiveBody,
+        &mut crate::medium::DivingCraft,
+        &mut crate::afloat::FloodComps,
+    )>,
+) {
+    let dt = time.delta_secs_f64();
+    for (body, mut dc, mut comps) in &mut vessels {
+        crate::afloat::step_flooding(&mut comps, body, &mut dc, dt);
     }
 }
 
@@ -424,6 +579,11 @@ fn step_scenario_flight(
     flight: Option<ResMut<ScenarioFlight>>,
 ) {
     let Some(mut flight) = flight else { return };
+    // A terminal session (Recovery) freezes the flight — the migrated play/
+    // autopilot behaviour (WI 739).
+    if flight.session.is_terminal() {
+        return;
+    }
     let dt = if !clock.paused {
         time.delta_secs_f64()
     } else if clock.step_budget > 0.0 {
@@ -435,7 +595,15 @@ fn step_scenario_flight(
     };
     flight.accumulator += dt * clock.warp;
     let mut n = 0;
-    while flight.accumulator >= SUBSTEP_DT && n < MAX_SUBSTEPS {
+    while flight.accumulator >= SUBSTEP_DT && n < MAX_SUBSTEPS && !flight.session.is_terminal() {
+        let v0 = flight.body.velocity;
+        let r0 = flight.body.position.length();
+        let up0 = if r0 > 0.0 {
+            flight.body.position / r0
+        } else {
+            DVec3::Y
+        };
+        let mu = flight.params.mu;
         let ScenarioFlight {
             body,
             craft,
@@ -447,6 +615,20 @@ fn step_scenario_flight(
         // `advance_clock` owns it (advancing it from two places would
         // double-count sim time in the composed app).
         flight_step(body, craft, params, pad, SUBSTEP_DT);
+
+        // Felt acceleration (what an accelerometer reads) and the session
+        // phase, from simulation state (WI 739 — the play/autopilot wiring).
+        let gravity_accel = -mu / (r0 * r0) * up0;
+        let felt = (flight.body.velocity - v0) / SUBSTEP_DT - gravity_accel;
+        flight.g_force = felt.length() / G0;
+        let altitude = flight.pad.altitude(&flight.body);
+        let vertical_speed = flight.body.velocity.dot(up0);
+        let speed = flight.body.velocity.length();
+        let released = flight.pad.released;
+        flight
+            .session
+            .update(released, altitude, vertical_speed, speed);
+
         flight.accumulator -= SUBSTEP_DT;
         flight.elapsed += SUBSTEP_DT;
         n += 1;
@@ -531,6 +713,7 @@ impl Plugin for DirectorPlugin {
                     apply_spawn_scenario,
                     apply_flight_commands,
                     step_scenario_flight,
+                    step_vessel_flooding,
                     evaluate_missions,
                 )
                     .chain(),
@@ -650,6 +833,90 @@ mod tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/blueprints");
         let path = crate::library::save_craft(&dir, "First Flight", &blueprint()).unwrap();
         assert!(path.ends_with("first-flight.json"));
+    }
+
+    /// The flight-family blueprint (WI 739): the play/launch/autopilot
+    /// scenes' 1 m-cell composite stack — crewed control point, Tier-2
+    /// tuning computer, battery — plus Engine/Tank devices so the director's
+    /// catalog-bound assembly supplies the propulsion (the scenes hardcoded
+    /// it). With the core pack's medium engine/tank records the all-up mass
+    /// gives the scenes' TWR ≈ 1.6.
+    fn sounding_rocket_blueprint() -> VoxelCraft {
+        let mut craft = VoxelCraft::new(1.0);
+        for y in 0..5 {
+            craft.voxels.push(Voxel {
+                cell: IVec3::new(0, y, 0),
+                material: Material::COMPOSITE,
+            });
+        }
+        craft
+            .devices
+            .push(Device::control_point(IVec3::new(0, 0, 0), 120.0, true));
+        craft.devices.push(Device::computer(
+            IVec3::new(0, 2, 0),
+            40.0,
+            ControlComputer::tuning_computer(0.4),
+        ));
+        craft.devices.push(Device::battery(
+            IVec3::new(0, 3, 0),
+            60.0,
+            BatterySpec::full(120.0),
+        ));
+        craft
+            .devices
+            .push(Device::structural(IVec3::ZERO, 150.0, DeviceKind::Engine));
+        craft.devices.push(Device::structural(
+            IVec3::new(0, 1, 0),
+            50.0,
+            DeviceKind::Tank,
+        ));
+        craft
+    }
+
+    /// The dive-capsule blueprint (WI 739): the dive scene's slender re-entry
+    /// body along +Z — a 3×3×4 composite hull with an ablative heat-shield
+    /// nose tip at the windward front (positive static margin → it
+    /// weathervanes into the airflow). No devices — a passive capsule.
+    fn dive_capsule_blueprint() -> VoxelCraft {
+        let mut c = VoxelCraft::new(1.0);
+        for z in 0..4 {
+            for x in 0..3 {
+                for y in 0..3 {
+                    c.voxels.push(Voxel {
+                        cell: IVec3::new(x, y, z),
+                        material: Material::COMPOSITE,
+                    });
+                }
+            }
+        }
+        c.voxels.push(Voxel {
+            cell: IVec3::new(1, 1, 4),
+            material: Material::ABLATOR,
+        });
+        c
+    }
+
+    /// Regenerates the shipped dive-capsule blueprint (WI 739):
+    /// `cargo test -p sounding_sim --lib write_dive_capsule_blueprint -- --ignored`
+    #[test]
+    #[ignore = "writes the shipped content/blueprints/dive-capsule.json artifact"]
+    fn write_dive_capsule_blueprint() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/blueprints");
+        let path =
+            crate::library::save_craft(&dir, "Dive Capsule", &dive_capsule_blueprint()).unwrap();
+        assert!(path.ends_with("dive-capsule.json"));
+    }
+
+    /// Regenerates the shipped flight-family blueprint (WI 739):
+    /// `cargo test -p sounding_sim --lib write_sounding_rocket_blueprint -- --ignored`
+    #[test]
+    #[ignore = "writes the shipped content/blueprints/sounding-rocket.json artifact"]
+    fn write_sounding_rocket_blueprint() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/blueprints");
+        let path =
+            crate::library::save_craft(&dir, "Sounding Rocket", &sounding_rocket_blueprint())
+                .unwrap();
+        assert!(path.ends_with("sounding-rocket.json"));
     }
 
     /// The shipped fixture, end to end: content/scenarios/first-flight.ron
@@ -838,6 +1105,248 @@ mod tests {
         let flight = app.world().resource::<ScenarioFlight>();
         assert_eq!(flight.missions[0].state, MissionState::Completed);
         assert_eq!(flight.missions[1].state, MissionState::Completed);
+    }
+
+    /// WI 739 Stage 1: the shipped launch scenario end to end — the craft
+    /// rests on the pad with no player input, the liftoff mission's
+    /// `ElapsedAbove` objective completes at ~2 s of flight time, its effect
+    /// throttles the engine through the envelope, and the rocket lifts off:
+    /// the session tracks Launch → Flight and the telemetry block carries
+    /// elapsed time, session, and G-force.
+    #[test]
+    fn shipped_launch_scenario_lifts_off_by_mission_effect() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let roots = crate::scenario::ScenarioRoots {
+            content: root.join("content"),
+            saves: root.join("saves"),
+        };
+        let s = crate::scenario::load_scenario(&root.join("content/scenarios/launch.ron"), &roots)
+            .unwrap();
+        let spawn = ScenarioSpawn::from_scenario(&s);
+        assert_eq!(spawn.engine, Some((3000.0, 70.0)), "physical, unscaled");
+        assert_eq!(spawn.tank_capacity, Some(5000.0));
+
+        let mut app = mission_app(spawn.missions.clone());
+        // Re-stage with the real payload (mission_app staged the test one).
+        app.world_mut().resource_mut::<PendingSpawn>().0 = Some(spawn);
+        app.world_mut().write_message(Command::SpawnScenario);
+        app.update();
+        {
+            let flight = app.world().resource::<ScenarioFlight>();
+            assert!(!flight.pad.released);
+            assert_eq!(flight.session.phase, crate::session::Phase::Launch);
+        }
+        // No input at all: one second in, still held (the mission waits).
+        step_sim(&mut app, 1.0);
+        assert!(!app.world().resource::<ScenarioFlight>().pad.released);
+        // Past the 2 s hold the effect throttles up; TWR ≈ 1.6 releases the
+        // pad and the rocket climbs.
+        step_sim(&mut app, 4.0);
+        let flight = app.world().resource::<ScenarioFlight>();
+        assert_eq!(flight.missions[0].state, MissionState::Completed);
+        assert!(flight.pad.released, "mission effect throttled it up");
+        assert!(flight.body.velocity.y > 0.0, "ascending");
+        assert_eq!(flight.session.phase, crate::session::Phase::Flight);
+        let block = flight.telemetry();
+        assert!(block.elapsed > 4.0);
+        assert_eq!(
+            block.session.map(|s| s.phase),
+            Some(crate::session::Phase::Flight)
+        );
+        assert!(block.g_force > 0.0);
+    }
+
+    /// WI 739 Stage 2: the shipped dive scenario loads (empty pack list, no
+    /// bindings — a passive capsule) and its orbit-entry payload spawn
+    /// configures the on-rails craft entity; the existing sim plugins then
+    /// run the chain: rails coast under the spawn-issued warp, auto-wake at
+    /// the entry interface (warp filter back to 1×), finite active descent.
+    #[test]
+    fn shipped_dive_scenario_spawns_rails_and_wakes_at_the_interface() {
+        use crate::handoff::{GearState, HandoffPlugin};
+        use crate::medium::{DescentPlugin, DiveTriggerPlugin, EntryInterface};
+        use crate::sim::{CentralBody, Craft, OrbitPlugin};
+        use bevy_time::Time;
+        use std::time::Duration;
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let roots = crate::scenario::ScenarioRoots {
+            content: root.join("content"),
+            saves: root.join("saves"),
+        };
+        let s = crate::scenario::load_scenario(&root.join("content/scenarios/dive.ron"), &roots)
+            .unwrap();
+        assert!(s.bindings.is_empty(), "a passive capsule needs no bindings");
+        let spawn = ScenarioSpawn::from_scenario(&s);
+        assert_eq!(
+            spawn.placement,
+            StartPlacement::Orbit {
+                altitude: 120_000.0,
+                speed: 7_000.0,
+                interface: 100_000.0,
+            }
+        );
+
+        let body = CentralBody::EARTHLIKE;
+        // Any parking orbit — the spawn arm replaces it with the entry orbit.
+        let parking = crate::orbit::Orbit::from_state(
+            body.mu,
+            glam::DVec2::new(body.radius + 500_000.0, 0.0),
+            glam::DVec2::new(0.0, (body.mu / (body.radius + 500_000.0)).sqrt()),
+            0.0,
+        )
+        .unwrap();
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default()); // drive time manually (deterministic)
+        app.insert_resource(crate::active::Gravity { mu: body.mu });
+        app.add_plugins(OrbitPlugin {
+            central_body: body,
+            initial_orbit: parking,
+        });
+        app.add_plugins(crate::command::FlightControlPlugin);
+        app.add_plugins(HandoffPlugin);
+        app.add_plugins(DiveTriggerPlugin {
+            // Placeholder config — the spawn arm overwrites it from the payload.
+            interface: EntryInterface {
+                surface_radius: body.radius,
+                altitude: 1.0,
+            },
+        });
+        app.add_plugins(DescentPlugin {
+            substep_dt: 0.004,
+            max_substeps: 250,
+        });
+        app.add_plugins(DirectorPlugin);
+
+        app.world_mut().resource_mut::<PendingSpawn>().0 = Some(spawn);
+        app.world_mut().write_message(Command::SpawnScenario);
+        app.update();
+        // The spawn arm configured the interface from the document and issued
+        // the rails-coast warp through the envelope.
+        assert_eq!(app.world().resource::<EntryInterface>().altitude, 100_000.0);
+        {
+            let mut q = app.world_mut().query::<&Craft>();
+            let orbit = q.single(app.world()).unwrap().orbit;
+            assert!(
+                orbit.periapsis_radius() < body.radius,
+                "an entry trajectory: periapsis inside the atmosphere"
+            );
+        }
+        app.update();
+        assert_eq!(app.world().resource::<SimClock>().warp, RAILS_COAST_WARP);
+
+        // Coast to the interface and wake; then descend actively and finitely.
+        let mut transitioned = false;
+        for _ in 0..2_000 {
+            app.world_mut()
+                .resource_mut::<Time<()>>()
+                .advance_by(Duration::from_secs_f64(0.5));
+            app.update();
+            let mut q = app
+                .world_mut()
+                .query::<Option<&crate::active::ActiveBody>>();
+            if let Some(active) = q.single(app.world()).unwrap() {
+                transitioned = true;
+                assert!(
+                    active.position.is_finite() && active.velocity.is_finite(),
+                    "active descent state must stay finite"
+                );
+                let altitude = active.position.length() - body.radius;
+                assert!(altitude < 100_500.0, "woke at/below the interface");
+                if altitude < 80_000.0 {
+                    break; // well into active descent — the chain runs
+                }
+            }
+        }
+        assert!(
+            transitioned,
+            "rails must hand off to active at the interface"
+        );
+        // The entry trigger's warp filter dropped the coast warp.
+        assert_eq!(app.world().resource::<SimClock>().warp, 1.0);
+        // The gear state carries the blueprint's real mass.
+        let mp = dive_capsule_blueprint().mass_properties().unwrap();
+        let mut q = app.world_mut().query::<&GearState>();
+        assert_eq!(q.single(app.world()).unwrap().mass, mp.mass);
+    }
+
+    /// WI 739 Stage 3: the shipped harbor scenario loads and its afloat
+    /// payload spawns the floating chain — the seed panel pontoon settles on
+    /// the water (finite, near the waterline, righting from its starting
+    /// list) on the shared descent step, with the synthesized drive/rudder/
+    /// ballast and the flood physics aboard.
+    #[test]
+    fn shipped_harbor_scenario_spawns_afloat_and_settles() {
+        use crate::afloat::{FloodComps, ScenarioVessel};
+        use crate::medium::{DescentPlugin, DivingCraft};
+        use bevy_time::Time;
+        use std::time::Duration;
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let roots = crate::scenario::ScenarioRoots {
+            content: root.join("content"),
+            saves: root.join("saves"),
+        };
+        let s = crate::scenario::load_scenario(&root.join("content/scenarios/harbor.ron"), &roots)
+            .unwrap();
+        let spawn = ScenarioSpawn::from_scenario(&s);
+        assert_eq!(spawn.placement, StartPlacement::Afloat);
+
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default()); // drive time manually
+        app.init_resource::<SimClock>();
+        app.add_plugins(crate::command::FlightControlPlugin);
+        app.add_plugins(DescentPlugin {
+            substep_dt: 0.002,
+            max_substeps: 64,
+        });
+        app.add_plugins(DirectorPlugin);
+
+        app.world_mut().resource_mut::<PendingSpawn>().0 = Some(spawn);
+        app.world_mut().write_message(Command::SpawnScenario);
+        app.update();
+        {
+            let mut q = app
+                .world_mut()
+                .query_filtered::<(&ActiveBody, &FloodComps), With<ScenarioVessel>>();
+            let (body, flood) = q.single(app.world()).unwrap();
+            assert!(body.orientation.to_axis_angle().1 > 0.1, "starting list");
+            assert!(
+                !flood.comps.is_empty(),
+                "sealed pontoon: flood physics aboard"
+            );
+        }
+
+        // Let it settle for ~12 s of sim time.
+        for _ in 0..240 {
+            app.world_mut()
+                .resource_mut::<Time<()>>()
+                .advance_by(Duration::from_secs_f64(0.05));
+            app.update();
+        }
+        let surface = crate::sim::CentralBody::EARTHLIKE.radius;
+        let mut q = app
+            .world_mut()
+            .query_filtered::<(&ActiveBody, &DivingCraft), With<ScenarioVessel>>();
+        let (body, _dc) = q.single(app.world()).unwrap();
+        assert!(
+            body.position.is_finite() && body.velocity.is_finite(),
+            "afloat state stays finite"
+        );
+        let altitude = body.position.length() - surface;
+        assert!(
+            altitude.abs() < 3.0,
+            "the panel pontoon rides near the waterline: {altitude} m"
+        );
+        assert!(
+            body.velocity.length() < 1.0,
+            "settled: {} m/s",
+            body.velocity.length()
+        );
+        // Righted from the 0.2 rad starting list.
+        let up_alignment =
+            (body.orientation * glam::DVec3::Y).dot(body.position.normalize_or(glam::DVec3::Y));
+        assert!(up_alignment > 0.98, "self-righted: {up_alignment}");
     }
 
     #[test]

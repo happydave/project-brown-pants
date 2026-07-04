@@ -6,14 +6,14 @@
 //! - `cargo run -p sounding` — Toy 5 voxel ship editor (default)
 //! - `cargo run -p sounding -- planet` — Toy 4 floating-origin planet + atmosphere
 //! - `cargo run -p sounding -- rover` — Toy 6 rover on terrain
-//! - `cargo run -p sounding -- dive` — Toy 9 the dive (orbit → atmosphere → ocean)
+//! - `cargo run -p sounding -- dive` — the dive (orbit → atmosphere → ocean), **from scenario data** (WI 739): `content/scenarios/dive.ron`
 //! - `cargo run -p sounding -- break` — structural breakage (a spinning craft snaps apart)
 //! - `cargo run -p sounding -- compartments` — airtight compartments (hatch + breach)
 //! - `cargo run -p sounding -- flooding` — decompression/flooding (breach a submerged craft)
 //! - `cargo run -p sounding -- windtunnel` — aero: lift curve + transonic area-ruling plots
-//! - `cargo run -p sounding -- launch` — surface lift-off: a rocket rests on the pad, then ascends under thrust
-//! - `cargo run -p sounding -- autopilot` — a continuous one-craft session flown automatically: Launch → Flight → Recovery (a sounding)
-//! - `cargo run -p sounding -- play` — fly a craft by hand: throttle/attitude/SAS/warp, with a full flight HUD (Δv, apsides, energy)
+//! - `cargo run -p sounding -- launch` — surface lift-off **from scenario data** (WI 739): `content/scenarios/launch.ron` on the scenario scene (the liftoff mission throttles it up)
+//! - `cargo run -p sounding -- autopilot` — a hands-off sounding **from scenario data** (WI 739): `content/scenarios/autopilot.ron`
+//! - `cargo run -p sounding -- play` — fly a craft by hand **from scenario data** (WI 739): `content/scenarios/play.ron`, with the full flight HUD (Δv, apsides, energy)
 //! - `cargo run -p sounding -- skins` — voxel-skin comparison: the same craft flown side by side, blocky vs greedy-meshed hull
 //! - `cargo run -p sounding -- land` — drop a craft and watch the collision response bring it to rest
 //! - `cargo run -p sounding -- collide` — fire a craft at another (and a debris pile) — craft↔craft collision
@@ -22,7 +22,7 @@
 //! - `cargo run -p sounding -- materials` — preview a generated PBR material set on lit geometry
 //! - `cargo run -p sounding -- terrainmesh` — preview a generated MoGe terrain relief (glTF)
 //! - `cargo run -p sounding -- gallery` — part catalog viewer: every mechanical-kit part laid out by category, click to inspect
-//! - `cargo run -p sounding -- harbor` — float a built hull on calm water by a dock: WI 705/711 righting + enclosed-volume buoyancy made visible
+//! - `cargo run -p sounding -- harbor` — float a built hull on calm water by a dock (WI 705/711 righting + enclosed buoyancy); seed hull + Float spawn **from scenario data** (WI 739): `content/scenarios/harbor.ron`
 //! - `cargo run -p sounding -- surface [seed] [archetype]` — fly a generated body from orbit to its streamed procedural surface (quadtree LOD, WI 764)
 //! - `cargo run -p sounding -- moon` — land and drive a rover on a generated cratered moon: analytic-surface contact (WI 765) under the WI 764 render
 //!
@@ -37,7 +37,6 @@ use sounding_sim::diagnostics::SimDiagnosticsPlugin;
 use sounding_sim::orbit::Orbit;
 use sounding_sim::sim::{CentralBody, OrbitPlugin};
 
-mod autopilot_scene;
 mod bodies_scene;
 mod break_scene;
 mod build;
@@ -56,14 +55,12 @@ mod gamepad;
 mod ground;
 mod harbor_scene;
 mod land_scene;
-mod launch_scene;
 mod materials_scene;
 mod moon_scene;
 mod overlay;
 mod parts;
 mod pause;
 mod planet;
-mod play_scene;
 mod replay;
 mod rover_scene;
 mod scenario_scene;
@@ -78,7 +75,6 @@ mod voxel_skin;
 mod wind_tunnel_scene;
 mod workshop_scene;
 
-use autopilot_scene::AutopilotScenePlugin;
 use bodies_scene::BodiesScenePlugin;
 use break_scene::BreakScenePlugin;
 use collide_scene::CollideScenePlugin;
@@ -90,11 +86,9 @@ use flooding_scene::FloodingScenePlugin;
 use gallery_scene::GalleryScenePlugin;
 use harbor_scene::HarborScenePlugin;
 use land_scene::LandScenePlugin;
-use launch_scene::LaunchScenePlugin;
 use materials_scene::MaterialsScenePlugin;
 use moon_scene::MoonScenePlugin;
 use planet::PlanetPlugin;
-use play_scene::PlayScenePlugin;
 use rover_scene::RoverScenePlugin;
 use scenario_scene::ScenarioScenePlugin;
 use skins_scene::SkinsScenePlugin;
@@ -103,7 +97,9 @@ use terrain_mesh_scene::TerrainMeshScenePlugin;
 use wind_tunnel_scene::WindTunnelScenePlugin;
 use workshop_scene::WorkshopScenePlugin;
 
-/// Which toy scene the windowed app shows.
+/// Which toy scene the windowed app shows. The flight-family flags
+/// (`play`/`launch`/`autopilot`) are **scenario aliases** (WI 739): one
+/// scenario scene, different shipped documents.
 enum Scene {
     Editor,
     Bodies,
@@ -114,9 +110,6 @@ enum Scene {
     Compartments,
     Flooding,
     WindTunnel,
-    Launch,
-    Autopilot,
-    Play,
     Materials,
     Skins,
     Land,
@@ -128,7 +121,9 @@ enum Scene {
     Harbor,
     Surface,
     Moon,
-    Scenario,
+    /// The scenario scene with the given default document (an explicit
+    /// `-- <alias> <path>` still overrides it).
+    Scenario(&'static str),
 }
 
 fn selected_scene() -> Scene {
@@ -141,9 +136,9 @@ fn selected_scene() -> Scene {
         Some("compartments") => Scene::Compartments,
         Some("flooding") => Scene::Flooding,
         Some("windtunnel") => Scene::WindTunnel,
-        Some("launch") => Scene::Launch,
-        Some("autopilot") => Scene::Autopilot,
-        Some("play") => Scene::Play,
+        Some("launch") => Scene::Scenario("content/scenarios/launch.ron"),
+        Some("autopilot") => Scene::Scenario("content/scenarios/autopilot.ron"),
+        Some("play") => Scene::Scenario("content/scenarios/play.ron"),
         Some("materials") => Scene::Materials,
         Some("skins") => Scene::Skins,
         Some("land") => Scene::Land,
@@ -155,7 +150,7 @@ fn selected_scene() -> Scene {
         Some("harbor") => Scene::Harbor,
         Some("surface") => Scene::Surface,
         Some("moon") => Scene::Moon,
-        Some("scenario") => Scene::Scenario,
+        Some("scenario") => Scene::Scenario("content/scenarios/first-flight.ron"),
         _ => Scene::Editor,
     }
 }
@@ -224,15 +219,6 @@ fn main() {
         Scene::WindTunnel => {
             app.add_plugins(WindTunnelScenePlugin);
         }
-        Scene::Launch => {
-            app.add_plugins(LaunchScenePlugin);
-        }
-        Scene::Autopilot => {
-            app.add_plugins(AutopilotScenePlugin);
-        }
-        Scene::Play => {
-            app.add_plugins(PlayScenePlugin);
-        }
         Scene::Materials => {
             app.add_plugins(MaterialsScenePlugin);
         }
@@ -266,8 +252,8 @@ fn main() {
         Scene::Moon => {
             app.add_plugins(MoonScenePlugin);
         }
-        Scene::Scenario => {
-            app.add_plugins(ScenarioScenePlugin);
+        Scene::Scenario(default_doc) => {
+            app.add_plugins(ScenarioScenePlugin { default_doc });
         }
     }
 

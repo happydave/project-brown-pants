@@ -1,0 +1,768 @@
+{
+  "format_version": 1,
+  "payload": {
+    "kind": "craft",
+    "id": "dive-capsule",
+    "name": "Dive Capsule",
+    "reference_position": {
+      "frame": 0,
+      "pos": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "craft": {
+      "cell_size": 1.0,
+      "voxels": [
+        {
+          "cell": [
+            0,
+            0,
+            0
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            0,
+            1,
+            0
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            0,
+            2,
+            0
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            1,
+            0,
+            0
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            1,
+            1,
+            0
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            1,
+            2,
+            0
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            2,
+            0,
+            0
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            2,
+            1,
+            0
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            2,
+            2,
+            0
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            0,
+            0,
+            1
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            0,
+            1,
+            1
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            0,
+            2,
+            1
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            1,
+            0,
+            1
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            1,
+            1,
+            1
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            1,
+            2,
+            1
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            2,
+            0,
+            1
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            2,
+            1,
+            1
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            2,
+            2,
+            1
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            0,
+            0,
+            2
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            0,
+            1,
+            2
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            0,
+            2,
+            2
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            1,
+            0,
+            2
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            1,
+            1,
+            2
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            1,
+            2,
+            2
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            2,
+            0,
+            2
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            2,
+            1,
+            2
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            2,
+            2,
+            2
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            0,
+            0,
+            3
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            0,
+            1,
+            3
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            0,
+            2,
+            3
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            1,
+            0,
+            3
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            1,
+            1,
+            3
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            1,
+            2,
+            3
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            2,
+            0,
+            3
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            2,
+            1,
+            3
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            2,
+            2,
+            3
+          ],
+          "material": {
+            "density": 1600.0,
+            "strength": 600000000.0,
+            "thermal": {
+              "specific_heat": 1000.0,
+              "conductivity": 5.0,
+              "emissivity": 0.8,
+              "max_temp": 3000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            1,
+            1,
+            4
+          ],
+          "material": {
+            "density": 1400.0,
+            "strength": 50000000.0,
+            "thermal": {
+              "specific_heat": 1500.0,
+              "conductivity": 0.5,
+              "emissivity": 0.85,
+              "max_temp": 3500.0,
+              "ablation_temp": 1300.0,
+              "latent_heat": 5000000.0,
+              "ablator_fraction": 0.6
+            }
+          }
+        }
+      ],
+      "devices": [],
+      "attachments": [],
+      "doors": [],
+      "parts": [],
+      "panels": []
+    },
+    "resources": [],
+    "crew": []
+  }
+}

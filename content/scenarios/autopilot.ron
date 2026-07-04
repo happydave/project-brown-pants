@@ -1,0 +1,21 @@
+// Autopilot (WI 739) — the migrated `-- autopilot` scene as pure data: a
+// hands-off sounding. The liftoff mission throttles the rocket up; SAS (set
+// at spawn) holds it vertical; it ascends, burns out, falls back, and the
+// session tracks Launch → Flight → Recovery.
+#![enable(implicit_some)]
+(
+    format: 1,
+    id: "autopilot",
+    name: "Autopilot — a sounding",
+    world: Earthlike,
+    packs: ["core"],
+    start: (
+        blueprint: "sounding-rocket",
+        placement: Pad,
+        bindings: {
+            Engine: "lf_engine_medium",
+            Tank: "fuel_tank_medium",
+        },
+    ),
+    missions: ["liftoff"],
+)

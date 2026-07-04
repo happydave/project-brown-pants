@@ -91,6 +91,17 @@ pub struct ScenarioTelemetry {
     /// Whether the craft has left the pad (WI 551).
     #[serde(default)]
     pub airborne: bool,
+    /// Elapsed flight sim time, s (WI 739) — the mission timed-event leaf
+    /// (`ElapsedAbove`) reads this.
+    #[serde(default)]
+    pub elapsed: f64,
+    /// The played session (Launch → Flight → Recovery + outcome), when the
+    /// flight tracks one (WI 739).
+    #[serde(default)]
+    pub session: Option<crate::session::GameSession>,
+    /// Felt (proper) acceleration, in g (WI 739).
+    #[serde(default)]
+    pub g_force: f64,
     /// Mission states, in the scenario's declared order (WI 551).
     #[serde(default)]
     pub missions: Vec<MissionTelemetry>,

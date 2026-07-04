@@ -1,0 +1,23 @@
+// Dive (WI 739) — the migrated `-- dive` scene as pure data: the full live
+// chain. The capsule starts on a genuine orbital re-entry trajectory
+// (~7 km/s at 120 km — heating ∝ v³, so entry is physically dramatic),
+// coasts down on rails under warp, wakes into active descent physics at the
+// 100 km entry interface, and glides through vacuum → atmosphere → ocean to
+// splashdown. The capsule carries no devices, so no bindings are needed; no
+// packs/settings/overrides — the world and the craft are the content.
+#![enable(implicit_some)]
+(
+    format: 1,
+    id: "dive",
+    name: "The Dive",
+    world: Earthlike,
+    packs: [],
+    start: (
+        blueprint: "dive-capsule",
+        placement: Orbit(
+            altitude: 120000.0,
+            speed: 7000.0,
+            interface: 100000.0,
+        ),
+    ),
+)
