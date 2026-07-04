@@ -279,8 +279,31 @@ fn update_hud(
             None => format!("\n  {name} ×{}", s.factor),
         })
         .collect();
+    // Mission lines (WI 551): name, state, and latched progress; plus the
+    // most recent lore beat once one surfaces.
+    let missions: String = flight
+        .missions
+        .iter()
+        .map(|m| {
+            format!(
+                "\n  {} — {} ({:.0}%)",
+                m.def.name,
+                m.state,
+                m.nodes.progress(&m.def.objective) * 100.0
+            )
+        })
+        .collect();
+    let missions = if missions.is_empty() {
+        String::new()
+    } else {
+        format!("\nmissions:{missions}")
+    };
+    let lore = match &flight.lore {
+        Some(beat) => format!("\n» {beat}"),
+        None => String::new(),
+    };
     text.0 = format!(
-        "scenario: {name} — {state}{paused}\naltitude: {altitude:8.1} m\nspeed:    {speed:8.1} m/s\nthrottle: {throttle:4.2}   propellant: {prop:6.1} kg\nsettings:{settings}",
+        "scenario: {name} — {state}{paused}\naltitude: {altitude:8.1} m\nspeed:    {speed:8.1} m/s\nthrottle: {throttle:4.2}   propellant: {prop:6.1} kg\nsettings:{settings}{missions}{lore}",
         name = flight.name,
         paused = crate::pause::paused_banner(&clock),
     );

@@ -34,6 +34,7 @@ pub mod launch;
 pub mod library;
 pub mod marine;
 pub mod medium;
+pub mod mission;
 pub mod orbit;
 pub mod persist;
 pub mod powertrain;

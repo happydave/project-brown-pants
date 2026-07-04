@@ -19,9 +19,7 @@ use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use sounding_sim::command::Command;
 use sounding_sim::diagnostics::ENERGY_DRIFT;
 use sounding_sim::sim::{CentralBody, Craft, SimClock};
-use sounding_sim::telemetry::{
-    ActiveFlightTelemetry, RoverTelemetry, ScenarioTelemetry, Telemetry, ThermalTelemetry,
-};
+use sounding_sim::telemetry::{ActiveFlightTelemetry, RoverTelemetry, Telemetry, ThermalTelemetry};
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -308,14 +306,10 @@ fn publish_telemetry(
     if let Some(t) = thermal.0 {
         snapshot = snapshot.with_thermal(t);
     }
-    // Attach the running scenario's identity + composed settings when the director has
-    // spawned one (WI 550) — read straight off the sim resource, no bridge needed.
+    // Attach the running scenario's block when the director has spawned one (WI 550/551)
+    // — the same constructor the mission evaluator queries, so wire and evaluator agree.
     if let Some(f) = scenario.as_ref() {
-        snapshot = snapshot.with_scenario(ScenarioTelemetry {
-            id: f.id.clone(),
-            name: f.name.clone(),
-            settings: f.settings.clone(),
-        });
+        snapshot = snapshot.with_scenario(f.telemetry());
     }
     // Decimate the per-frame publish into the bounded history ring (WI 644) so it spans several
     // seconds without an oversized payload; the newest entry is always `GET /telemetry`.

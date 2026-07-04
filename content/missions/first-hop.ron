@@ -1,0 +1,14 @@
+// The first mission (WI 551) — the 536-subsuming shape: a goal is one
+// mission with one objective leaf. The objective is a query over the bus
+// telemetry snapshot; the effect surfaces a lore beat on the scenario block.
+#![enable(implicit_some)]
+(
+    format: 1,
+    id: "first-hop",
+    name: "First Hop — reach 100 m",
+    offer: Immediate,
+    objective: AltitudeAbove(100.0),
+    effects: [
+        Lore("A hundred metres of daylight under the tail. The pad crew owes you a drink."),
+    ],
+)

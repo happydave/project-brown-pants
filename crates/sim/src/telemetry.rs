@@ -70,8 +70,11 @@ pub struct Telemetry {
 }
 
 /// The running scenario's readout on the bus (WI 550): which scenario is loaded and
-/// the frozen balance scalars it composed with.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+/// the frozen balance scalars it composed with. **WI 551:** also the flight readout
+/// the mission objective leaves query (altitude/speed/airborne — objectives are bus
+/// queries, so the queried data must be on the bus), the mission states, and the most
+/// recent lore beat. All additive/serde-defaulted.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct ScenarioTelemetry {
     /// The scenario document's stable id.
     pub id: String,
@@ -79,6 +82,34 @@ pub struct ScenarioTelemetry {
     pub name: String,
     /// The composed settings: scalar name → frozen factor + optional rationale.
     pub settings: BTreeMap<String, Setting>,
+    /// Altitude above the pad surface, m (WI 551).
+    #[serde(default)]
+    pub altitude: f64,
+    /// Speed, m/s (WI 551).
+    #[serde(default)]
+    pub speed: f64,
+    /// Whether the craft has left the pad (WI 551).
+    #[serde(default)]
+    pub airborne: bool,
+    /// Mission states, in the scenario's declared order (WI 551).
+    #[serde(default)]
+    pub missions: Vec<MissionTelemetry>,
+    /// The most recent lore beat surfaced by a mission effect (WI 551).
+    #[serde(default)]
+    pub lore: Option<String>,
+}
+
+/// One mission's telemetry row (WI 551).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct MissionTelemetry {
+    /// The mission document's stable id.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Lifecycle state (pending / active / completed).
+    pub state: crate::mission::MissionState,
+    /// Latched-leaf fraction of the objective tree, `[0, 1]`.
+    pub progress: f64,
 }
 
 /// The live craft's ballast readout on the bus (WI 709): how full the ballast tanks are

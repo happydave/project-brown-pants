@@ -14,14 +14,16 @@
 //! the WI 549 detectors (`validate_body_refs`, seam violation, factor rules)
 //! via [`Catalog::compose`]. The document is data; nothing here executes it.
 //!
-//! The mission list is carried by the schema but **rejected when non-empty**
-//! until WI 551 defines the mission document and evaluator — loud and
-//! additive to relax, never silently unvalidated. The lore payload is opaque.
+//! Missions (WI 551) are referenced by id like every other document
+//! (`content/missions/<id>.ron`), parsed/validated at load, and carried on
+//! the loaded scenario for the director's evaluator. The lore payload is
+//! opaque.
 
 use crate::body_asset::BodyAsset;
 use crate::body_library;
 use crate::content::{Catalog, ContentError, DeviceClass, DeviceSpec, OverridePhase, Record};
 use crate::library::{self, LibraryError};
+use crate::mission::{parse_mission, Mission, MissionError, Offer};
 use crate::system::{CompileError, Placement, System};
 use crate::system_library;
 use crate::universe::Universe;
@@ -66,8 +68,10 @@ pub struct ScenarioDoc {
     pub overrides: Vec<String>,
     /// The starting state.
     pub start: StartSpec,
-    /// Mission references — carried by the schema, rejected when non-empty
-    /// until WI 551 (loud, additive to relax).
+    /// Mission documents, by id (`content/missions/<id>.ron`, WI 551) —
+    /// resolved and validated at load like every other reference; offered in
+    /// declared order (an `AfterMission` offer must name an earlier-or-any id
+    /// in this list).
     #[serde(default)]
     pub missions: Vec<String>,
     /// Opaque narrative payload (the lore store arrives at WI 554).
@@ -153,8 +157,12 @@ pub enum ScenarioError {
     /// The blueprint carries a device class this slice consumes, but the
     /// scenario binds no catalog record for it (no silent hardcodes).
     BindingMissing { class: DeviceClass },
-    /// The mission list is non-empty; mission documents arrive at WI 551.
-    MissionsUnsupported { count: usize },
+    /// The scenario lists the same mission twice.
+    DuplicateMission { id: String },
+    /// A mission document failed to parse/validate (WI 551).
+    Mission { id: String, error: MissionError },
+    /// A mission's `AfterMission` offer names a mission not in this scenario.
+    UnknownMissionRef { mission: String, after: String },
 }
 
 impl fmt::Display for ScenarioError {
@@ -206,10 +214,14 @@ impl fmt::Display for ScenarioError {
                 "blueprint carries {class:?} devices but the scenario binds no catalog record \
                  for {class:?} — assembly takes physical values from content, never hardcodes"
             ),
-            ScenarioError::MissionsUnsupported { count } => write!(
+            ScenarioError::DuplicateMission { id } => {
+                write!(f, "mission `{id}` is listed more than once")
+            }
+            ScenarioError::Mission { id, error } => write!(f, "mission `{id}`: {error}"),
+            ScenarioError::UnknownMissionRef { mission, after } => write!(
                 f,
-                "scenario lists {count} mission(s); mission documents arrive at WI 551 — \
-                 until then the list must be empty"
+                "mission `{mission}` offers after `{after}`, which is not a mission of this \
+                 scenario"
             ),
         }
     }
@@ -273,6 +285,8 @@ pub struct Scenario {
     pub bindings: BTreeMap<DeviceClass, String>,
     /// Opaque lore payload (carried, not interpreted).
     pub lore: Option<String>,
+    /// Resolved mission definitions, in the scenario's declared order (WI 551).
+    pub missions: Vec<Mission>,
 }
 
 /// A minimal probe for an override set's declared phase (the full document is
@@ -314,10 +328,41 @@ pub fn load_scenario(path: &Path, roots: &ScenarioRoots) -> Result<Scenario, Sce
 /// Loads and validates an already-parsed scenario document (the path-id check
 /// is the caller's when a path exists).
 pub fn load_doc(doc: ScenarioDoc, roots: &ScenarioRoots) -> Result<Scenario, ScenarioError> {
-    if !doc.missions.is_empty() {
-        return Err(ScenarioError::MissionsUnsupported {
-            count: doc.missions.len(),
-        });
+    // Missions (WI 551): resolve each referenced document, loudly.
+    let mut missions: Vec<Mission> = Vec::with_capacity(doc.missions.len());
+    for id in &doc.missions {
+        if missions.iter().any(|m| &m.id == id) {
+            return Err(ScenarioError::DuplicateMission { id: id.clone() });
+        }
+        let path = roots.content.join("missions").join(format!("{id}.ron"));
+        if !path.exists() {
+            return Err(ScenarioError::MissingDocument {
+                kind: "mission",
+                id: id.clone(),
+            });
+        }
+        let m = parse_mission(&read(&path)?).map_err(|error| ScenarioError::Mission {
+            id: id.clone(),
+            error,
+        })?;
+        if m.id != *id {
+            return Err(ScenarioError::IdMismatch {
+                expected: id.clone(),
+                found: m.id,
+            });
+        }
+        missions.push(m);
+    }
+    // AfterMission offers must reference missions of this scenario.
+    for m in &missions {
+        if let Offer::AfterMission(after) = &m.offer {
+            if !missions.iter().any(|o| &o.id == after) {
+                return Err(ScenarioError::UnknownMissionRef {
+                    mission: m.id.clone(),
+                    after: after.clone(),
+                });
+            }
+        }
     }
 
     // Gather referenced content documents (missing file = loud, by kind + id).
@@ -463,6 +508,7 @@ pub fn load_doc(doc: ScenarioDoc, roots: &ScenarioRoots) -> Result<Scenario, Sce
         placement: doc.start.placement,
         bindings: doc.start.bindings,
         lore: doc.lore,
+        missions,
     })
 }
 
@@ -768,12 +814,75 @@ mod tests {
     }
 
     #[test]
-    fn non_empty_missions_are_rejected_until_551() {
+    fn missions_resolve_and_validate_at_load() {
         let roots = scratch_roots("missions");
+        // Unresolved reference: no such mission document.
         let path = standard_fixture(&roots, &base_scenario(r#"missions: ["reach-orbit"],"#));
         assert!(matches!(
             load_scenario(&path, &roots),
-            Err(ScenarioError::MissionsUnsupported { count: 1 })
+            Err(ScenarioError::MissingDocument {
+                kind: "mission",
+                ..
+            })
+        ));
+        // A real mission resolves and rides the loaded scenario.
+        write_doc(
+            &roots.content.join("missions"),
+            "reach-orbit",
+            r#"(format: 1, id: "reach-orbit", name: "Reach 100 m",
+                objective: AltitudeAbove(100.0), effects: [Lore("done")])"#,
+        );
+        let s = load_scenario(&path, &roots).unwrap();
+        assert_eq!(s.missions.len(), 1);
+        assert_eq!(s.missions[0].name, "Reach 100 m");
+        // Duplicate listing is loud.
+        std::fs::write(
+            &path,
+            base_scenario(r#"missions: ["reach-orbit", "reach-orbit"],"#),
+        )
+        .unwrap();
+        assert!(matches!(
+            load_scenario(&path, &roots),
+            Err(ScenarioError::DuplicateMission { .. })
+        ));
+        // A vacuous objective is a named mission error.
+        write_doc(
+            &roots.content.join("missions"),
+            "vacuous",
+            r#"(format: 1, id: "vacuous", name: "V", objective: Any([]))"#,
+        );
+        std::fs::write(&path, base_scenario(r#"missions: ["vacuous"],"#)).unwrap();
+        assert!(matches!(
+            load_scenario(&path, &roots),
+            Err(ScenarioError::Mission {
+                error: crate::mission::MissionError::VacuousObjective,
+                ..
+            })
+        ));
+        // An AfterMission offer must name a mission of this scenario.
+        write_doc(
+            &roots.content.join("missions"),
+            "later",
+            r#"(format: 1, id: "later", name: "L", offer: AfterMission("ghost"),
+                objective: Airborne)"#,
+        );
+        std::fs::write(&path, base_scenario(r#"missions: ["later"],"#)).unwrap();
+        match load_scenario(&path, &roots) {
+            Err(ScenarioError::UnknownMissionRef { mission, after }) => {
+                assert_eq!((mission.as_str(), after.as_str()), ("later", "ghost"));
+            }
+            other => panic!("expected UnknownMissionRef, got {other:?}"),
+        }
+        // Internal id must match the referenced file stem.
+        write_doc(
+            &roots.content.join("missions"),
+            "stem",
+            r#"(format: 1, id: "not-stem", name: "S", objective: Airborne)"#,
+        );
+        std::fs::write(&path, base_scenario(r#"missions: ["stem"],"#)).unwrap();
+        assert!(matches!(
+            load_scenario(&path, &roots),
+            Err(ScenarioError::IdMismatch { .. })
         ));
     }
 

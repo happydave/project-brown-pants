@@ -26,5 +26,6 @@
             Tank: "fuel_tank_small",
         },
     ),
-    // Missions arrive at WI 551; lore at WI 554.
+    // The first mission (WI 551): reach 100 m. The lore *store* arrives at WI 554.
+    missions: ["first-hop"],
 )

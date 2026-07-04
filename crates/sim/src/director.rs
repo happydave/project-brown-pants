@@ -30,6 +30,7 @@ use crate::flight::{flight_step, FlightCraft, FlightParams, GroundContact};
 use crate::fluid::FluidMedium;
 use crate::launch::LaunchPad;
 use crate::medium::max_cross_section;
+use crate::mission::{Effect, Mission, MissionState, NodeState, Offer};
 use crate::propulsion::{Engine, EngineCommand, Propulsion};
 use crate::resource::{Reservoir, ReservoirId, ResourceGraph, ResourceType};
 use crate::scenario::{Scenario, StartPlacement};
@@ -50,6 +51,9 @@ const SUBSTEP_DT: f64 = 0.004;
 const MAX_SUBSTEPS: u32 = 250;
 /// Bounded chunk of the WI 643 step budget consumed per frame while paused.
 const STEP_CHUNK_SECONDS: f64 = 1.0 / 60.0;
+/// Mission-evaluation poll cadence, sim-seconds of flight time (WI 551) —
+/// bounded, warp-safe (latching makes coarse polls defined semantics).
+const MISSION_POLL_SECONDS: f64 = 0.25;
 /// Attitude authority + reaction-wheel defaults (the workshop's assembly
 /// constants — control-system tuning stays code/blueprint-authored this
 /// slice; the catalog owns engine/tank physics).
@@ -87,6 +91,9 @@ pub struct ScenarioSpawn {
     /// The composed balance settings (names are a semi-public contract;
     /// surfaced on telemetry as "real × named modifier").
     pub settings: BTreeMap<String, Setting>,
+    /// The scenario's mission definitions, in declared order (WI 551).
+    #[serde(default)]
+    pub missions: Vec<Mission>,
 }
 
 impl ScenarioSpawn {
@@ -131,6 +138,7 @@ impl ScenarioSpawn {
             medium: s.root_asset.fluid_medium(),
             placement: s.placement,
             settings: s.catalog.settings.clone(),
+            missions: s.missions.clone(),
         }
     }
 }
@@ -161,6 +169,65 @@ pub struct ScenarioFlight {
     pub settings: BTreeMap<String, Setting>,
     /// Frame-time accumulator for fixed sub-stepping.
     pub accumulator: f64,
+    /// Mission runtime state, in declared order (WI 551).
+    pub missions: Vec<MissionRun>,
+    /// The most recent lore beat surfaced by a mission effect (WI 551).
+    pub lore: Option<String>,
+    /// Integrated flight sim time, s — the evaluator's poll clock (the orbit
+    /// plugin owns `SimClock.time`; this is the scenario flight's own time,
+    /// warp-scaled by construction).
+    pub elapsed: f64,
+    /// Flight time of the last mission poll.
+    pub last_poll: f64,
+}
+
+/// One mission's runtime state: its definition, lifecycle state, and the
+/// latch tree mirroring its objective (WI 551).
+pub struct MissionRun {
+    /// The authored definition.
+    pub def: Mission,
+    /// Lifecycle state (Pending / Active / Completed).
+    pub state: MissionState,
+    /// Objective latch state (monotone progress).
+    pub nodes: NodeState,
+}
+
+impl MissionRun {
+    fn new(def: Mission) -> MissionRun {
+        let state = match def.offer {
+            Offer::Immediate => MissionState::Active,
+            Offer::AfterMission(_) => MissionState::Pending,
+        };
+        let nodes = NodeState::for_condition(&def.objective);
+        MissionRun { def, state, nodes }
+    }
+}
+
+impl ScenarioFlight {
+    /// The scenario telemetry block — **one construction** shared by the bus
+    /// publisher and the mission evaluator, so objective leaves query exactly
+    /// the shape the wire serves (WI 551).
+    pub fn telemetry(&self) -> crate::telemetry::ScenarioTelemetry {
+        crate::telemetry::ScenarioTelemetry {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            settings: self.settings.clone(),
+            altitude: self.pad.altitude(&self.body),
+            speed: self.body.velocity.length(),
+            airborne: self.pad.released,
+            missions: self
+                .missions
+                .iter()
+                .map(|m| crate::telemetry::MissionTelemetry {
+                    id: m.def.id.clone(),
+                    name: m.def.name.clone(),
+                    state: m.state,
+                    progress: m.nodes.progress(&m.def.objective),
+                })
+                .collect(),
+            lore: self.lore.clone(),
+        }
+    }
 }
 
 /// Assembles the spawn payload into the one-craft chain. `None` for an empty
@@ -282,6 +349,15 @@ pub fn instantiate(spawn: &ScenarioSpawn) -> Option<ScenarioFlight> {
         pad,
         settings: spawn.settings.clone(),
         accumulator: 0.0,
+        missions: spawn
+            .missions
+            .iter()
+            .cloned()
+            .map(MissionRun::new)
+            .collect(),
+        lore: None,
+        elapsed: 0.0,
+        last_poll: 0.0,
     })
 }
 
@@ -372,7 +448,70 @@ fn step_scenario_flight(
         // double-count sim time in the composed app).
         flight_step(body, craft, params, pad, SUBSTEP_DT);
         flight.accumulator -= SUBSTEP_DT;
+        flight.elapsed += SUBSTEP_DT;
         n += 1;
+    }
+}
+
+/// The mission evaluator (WI 551): at a bounded flight-time cadence, builds
+/// the bus-shaped snapshot (the same construction the publisher uses) and
+/// polls every Active mission's objective tree. Node satisfaction latches
+/// (monotone — warp-coarse polling is defined semantics, not a race). On
+/// completion the mission's effects issue **once**: `Command` effects as
+/// ordinary envelope messages (validated by the executor/tier gates exactly
+/// like player commands — fire-and-forget, a rejection does not un-complete),
+/// `Lore` effects onto the scenario state (telemetry + HUD). Completion
+/// activates any Pending mission whose `AfterMission` offer names it (the
+/// linear campaign primitive). No new warp-drop triggers; paused flights
+/// accrue no flight time, so no polls.
+fn evaluate_missions(
+    clock: Res<SimClock>,
+    flight: Option<ResMut<ScenarioFlight>>,
+    mut commands: MessageWriter<Command>,
+) {
+    let Some(mut flight) = flight else { return };
+    if flight.missions.is_empty() || flight.elapsed - flight.last_poll < MISSION_POLL_SECONDS {
+        return;
+    }
+    flight.last_poll = flight.elapsed;
+
+    // The snapshot the leaves query — the wire shape, not sim internals.
+    let snap = crate::telemetry::Telemetry::capture(&clock, None, flight.params.mu, None)
+        .with_scenario(flight.telemetry());
+
+    let mut completed: Vec<String> = Vec::new();
+    let mut beats: Vec<String> = Vec::new();
+    for run in flight.missions.iter_mut() {
+        if run.state != MissionState::Active {
+            continue;
+        }
+        if run.nodes.poll(&run.def.objective, &snap) {
+            run.state = MissionState::Completed;
+            bevy_log::info!("mission `{}` complete: {}", run.def.id, run.def.name);
+            for effect in &run.def.effects {
+                match effect {
+                    Effect::Lore(text) => beats.push(text.clone()),
+                    Effect::Command(cmd) => {
+                        commands.write(*cmd);
+                    }
+                }
+            }
+            completed.push(run.def.id.clone());
+        }
+    }
+    if let Some(beat) = beats.pop() {
+        flight.lore = Some(beat);
+    }
+    // Offer successors of anything that just completed.
+    for done in &completed {
+        for run in flight.missions.iter_mut() {
+            if run.state == MissionState::Pending
+                && matches!(&run.def.offer, Offer::AfterMission(after) if after == done)
+            {
+                run.state = MissionState::Active;
+                bevy_log::info!("mission `{}` offered: {}", run.def.id, run.def.name);
+            }
+        }
     }
 }
 
@@ -392,6 +531,7 @@ impl Plugin for DirectorPlugin {
                     apply_spawn_scenario,
                     apply_flight_commands,
                     step_scenario_flight,
+                    evaluate_missions,
                 )
                     .chain(),
             );
@@ -455,6 +595,26 @@ mod tests {
             medium: FluidMedium::EARTHLIKE,
             placement: StartPlacement::Pad,
             settings: BTreeMap::new(),
+            missions: Vec::new(),
+        }
+    }
+
+    /// A payload carrying the given missions.
+    fn spawn_with_missions(missions: Vec<Mission>) -> ScenarioSpawn {
+        ScenarioSpawn {
+            missions,
+            ..spawn_payload()
+        }
+    }
+
+    fn hop(id: &str, offer: Offer, altitude: f64) -> Mission {
+        Mission {
+            format: 1,
+            id: id.into(),
+            name: format!("hop {id}"),
+            offer,
+            objective: crate::mission::Condition::AltitudeAbove(altitude),
+            effects: vec![Effect::Lore(format!("{id} done"))],
         }
     }
 
@@ -524,6 +684,10 @@ mod tests {
             "one shipped tank × bound capacity"
         );
         assert!(!flight.pad.released, "starts at rest on the pad");
+        // The shipped mission rides the payload and starts Active (WI 551).
+        assert_eq!(spawn.missions.len(), 1);
+        assert_eq!(spawn.missions[0].id, "first-hop");
+        assert_eq!(flight.missions[0].state, MissionState::Active);
     }
 
     /// Advances the paused app by `seconds` of sim time through the WI 643
@@ -597,5 +761,101 @@ mod tests {
         );
         // Propellant drew from the catalog-bound tank over the burn.
         assert!(flight.craft.propulsion.graph.reservoirs[0].amount < 100.0);
+    }
+
+    /// Builds the standard headless app: executor + director + a spawned
+    /// payload, paused, ready to be driven by `Command::Step`.
+    fn mission_app(missions: Vec<Mission>) -> App {
+        let mut app = App::new();
+        app.add_plugins(bevy_time::TimePlugin);
+        app.init_resource::<SimClock>();
+        app.add_plugins(crate::command::FlightControlPlugin);
+        app.add_plugins(DirectorPlugin);
+        app.world_mut().resource_mut::<PendingSpawn>().0 = Some(spawn_with_missions(missions));
+        app.world_mut().write_message(Command::SpawnScenario);
+        app.update();
+        app.world_mut().write_message(Command::SetPaused(true));
+        app.update();
+        app
+    }
+
+    #[test]
+    fn first_hop_completes_end_to_end_with_lore() {
+        let mut app = mission_app(vec![hop("hop", Offer::Immediate, 100.0)]);
+        // At rest: Active, zero progress, no lore.
+        step_sim(&mut app, 1.0);
+        {
+            let flight = app.world().resource::<ScenarioFlight>();
+            assert_eq!(flight.missions[0].state, MissionState::Active);
+            let block = flight.telemetry();
+            assert_eq!(block.missions[0].progress, 0.0);
+            assert_eq!(block.lore, None);
+            assert!(!block.airborne);
+        }
+        // Full throttle: the climb passes 100 m; the mission completes and
+        // the lore beat surfaces on the (bus-shaped) scenario block.
+        app.world_mut().write_message(Command::SetThrottle(1.0));
+        app.update();
+        step_sim(&mut app, 4.0);
+        step_sim(&mut app, 4.0);
+        let flight = app.world().resource::<ScenarioFlight>();
+        assert_eq!(flight.missions[0].state, MissionState::Completed);
+        let block = flight.telemetry();
+        assert_eq!(block.missions[0].progress, 1.0);
+        assert_eq!(block.lore.as_deref(), Some("hop done"));
+        assert!(block.altitude > 100.0);
+    }
+
+    #[test]
+    fn completion_latches_and_after_mission_chains() {
+        // Mission 2 offers after mission 1; both are one-leaf altitude hops.
+        let mut app = mission_app(vec![
+            hop("one", Offer::Immediate, 50.0),
+            hop("two", Offer::AfterMission("one".into()), 120.0),
+        ]);
+        {
+            let flight = app.world().resource::<ScenarioFlight>();
+            assert_eq!(flight.missions[0].state, MissionState::Active);
+            assert_eq!(flight.missions[1].state, MissionState::Pending, "gated");
+        }
+        app.world_mut().write_message(Command::SetThrottle(1.0));
+        app.update();
+        step_sim(&mut app, 4.0);
+        step_sim(&mut app, 4.0);
+        {
+            let flight = app.world().resource::<ScenarioFlight>();
+            assert_eq!(flight.missions[0].state, MissionState::Completed);
+            assert_eq!(
+                flight.missions[1].state,
+                MissionState::Completed,
+                "offered on one's completion, then completed by the same climb"
+            );
+        }
+        // Latching: cut throttle, fall back — completed missions stay completed.
+        app.world_mut().write_message(Command::SetThrottle(0.0));
+        app.update();
+        step_sim(&mut app, 4.0);
+        let flight = app.world().resource::<ScenarioFlight>();
+        assert_eq!(flight.missions[0].state, MissionState::Completed);
+        assert_eq!(flight.missions[1].state, MissionState::Completed);
+    }
+
+    #[test]
+    fn command_effects_act_through_the_executor() {
+        // A mission whose effect is an envelope command: on completion the
+        // executor applies it exactly as a player command (warp changes).
+        let mut m = hop("warpme", Offer::Immediate, 50.0);
+        m.effects = vec![Effect::Command(Command::SetWarp(4.0))];
+        let mut app = mission_app(vec![m]);
+        assert_eq!(app.world().resource::<SimClock>().warp, 1.0);
+        app.world_mut().write_message(Command::SetThrottle(1.0));
+        app.update();
+        step_sim(&mut app, 4.0);
+        step_sim(&mut app, 4.0);
+        assert_eq!(
+            app.world().resource::<ScenarioFlight>().missions[0].state,
+            MissionState::Completed
+        );
+        assert_eq!(app.world().resource::<SimClock>().warp, 4.0);
     }
 }
