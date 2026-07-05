@@ -58,28 +58,28 @@ const NEIGHBOURS: [IVec3; 6] = [
     IVec3::new(0, 0, -1),
 ];
 
-/// Compute the sealed compartments of `craft` given its current door states.
-/// Pure and deterministic. Passability between air cells is decided by **the**
-/// per-face coverage predicate ([`VoxelCraft::boundary_sealed`], WI 824) — solid
-/// occupancy (voxels + closed doors) and face panels both seal; no other seal
-/// logic exists here.
-pub fn compartments(craft: &VoxelCraft) -> CompartmentSet {
-    // Solid (air barrier) cells: structural voxels plus closed doors.
-    let mut solid: HashSet<IVec3> = craft.voxels.iter().map(|v| v.cell).collect();
-    for d in &craft.doors {
-        if !d.open {
-            solid.insert(d.cell);
-        }
-    }
-    if solid.is_empty() && craft.face_panels.is_empty() {
-        return CompartmentSet::default();
-    }
+/// The exterior flood-fill shared by compartment derivation and the WI 827 aero
+/// **sealed envelope**: the expanded structure bounding box (`lo..=hi`, border all
+/// air by construction) and the air cells the exterior can reach through it,
+/// crossing a boundary only where **the** per-face coverage predicate
+/// ([`VoxelCraft::boundary_sealed`], WI 824) says it is not sealed. `solid` is the
+/// caller's barrier set — the one input the two consumers differ on (compartments:
+/// voxels + *closed* doors; the aero envelope: voxels + *all* doors).
+struct ExteriorFill {
+    /// Expanded bounding-box minimum (inclusive).
+    lo: IVec3,
+    /// Expanded bounding-box maximum (inclusive).
+    hi: IVec3,
+    /// The exterior-reachable air cells within the box.
+    exterior: HashSet<IVec3>,
+}
 
+fn exterior_fill(craft: &VoxelCraft, solid: &HashSet<IVec3>) -> ExteriorFill {
     // Bounding box of the structure — solids and paneled boundaries (a craft can
     // be all plates, WI 824) — expanded by one cell so the border is all
     // exterior air.
     let (mut lo, mut hi) = (IVec3::MAX, IVec3::MIN);
-    for &c in &solid {
+    for &c in solid {
         lo = lo.min(c);
         hi = hi.max(c);
     }
@@ -114,11 +114,68 @@ pub fn compartments(craft: &VoxelCraft) -> CompartmentSet {
     while let Some(c) = stack.pop() {
         for off in NEIGHBOURS {
             let n = c + off;
-            if is_air(n) && !craft.boundary_sealed(&solid, c, off) && exterior.insert(n) {
+            if is_air(n) && !craft.boundary_sealed(solid, c, off) && exterior.insert(n) {
                 stack.push(n);
             }
         }
     }
+    ExteriorFill { lo, hi, exterior }
+}
+
+/// The **sealed envelope** (WI 827, panels design stage 4): every cell the exterior
+/// flood-fill cannot reach — occupied structure plus the enclosed air sealed behind
+/// it. This is the aero cross-section input: a closed plated hull presents its full
+/// body to the flow (the air inside goes around). Derived on demand from the same
+/// fill machinery compartments use — never stored.
+///
+/// **Doors are structure for aero**: every door cell is a barrier (and an envelope
+/// member) *regardless of open state*, so the area curve is a build-time property —
+/// an open hatch does not delete the fuselage's cross-section. (Compartments keep
+/// their open/closed door semantics; only the aero input treats doors as fixed.)
+pub fn sealed_envelope(craft: &VoxelCraft) -> HashSet<IVec3> {
+    let mut solid: HashSet<IVec3> = craft.voxels.iter().map(|v| v.cell).collect();
+    for d in &craft.doors {
+        solid.insert(d.cell);
+    }
+    if solid.is_empty() && craft.face_panels.is_empty() {
+        return HashSet::new();
+    }
+    let fill = exterior_fill(craft, &solid);
+    let mut envelope = HashSet::new();
+    for x in fill.lo.x..=fill.hi.x {
+        for y in fill.lo.y..=fill.hi.y {
+            for z in fill.lo.z..=fill.hi.z {
+                let c = IVec3::new(x, y, z);
+                if !fill.exterior.contains(&c) {
+                    envelope.insert(c);
+                }
+            }
+        }
+    }
+    envelope
+}
+
+/// Compute the sealed compartments of `craft` given its current door states.
+/// Pure and deterministic. Passability between air cells is decided by **the**
+/// per-face coverage predicate ([`VoxelCraft::boundary_sealed`], WI 824) — solid
+/// occupancy (voxels + closed doors) and face panels both seal; no other seal
+/// logic exists here.
+pub fn compartments(craft: &VoxelCraft) -> CompartmentSet {
+    // Solid (air barrier) cells: structural voxels plus closed doors.
+    let mut solid: HashSet<IVec3> = craft.voxels.iter().map(|v| v.cell).collect();
+    for d in &craft.doors {
+        if !d.open {
+            solid.insert(d.cell);
+        }
+    }
+    if solid.is_empty() && craft.face_panels.is_empty() {
+        return CompartmentSet::default();
+    }
+
+    let fill = exterior_fill(craft, &solid);
+    let (lo, hi) = (fill.lo, fill.hi);
+    let exterior = &fill.exterior;
+    let is_air = |c: IVec3| !solid.contains(&c);
 
     // Interior air = air cells the exterior never reached. Collect in a sorted
     // order for deterministic component numbering.

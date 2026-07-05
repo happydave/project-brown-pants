@@ -1074,41 +1074,44 @@ impl VoxelCraft {
     }
 
     /// The cross-sectional-area curve along `axis`: `(station, area_m2)` pairs,
-    /// sorted by station. Area = occupied cells in the slice × cell² (devices
-    /// excluded). **WI 824 interim bridge** (removed by the WI 827 sealed
-    /// envelope): a cell also counts as occupied when **two or more** of its six
-    /// faces carry panels — which reconstructs exactly the legacy panel cells
-    /// (converted walls are double-skinned) plus panel-bounded cavities, while a
-    /// hull's single-plate-facing outside neighbours do not count. A lone
-    /// authored plate under-presents until the envelope lands; documented, not
-    /// bridged further.
+    /// sorted by station. **The sealed envelope** (WI 827, panels design stage 4):
+    /// area = envelope cells in the slice × cell² (devices excluded), where the
+    /// envelope is everything the exterior flood-fill cannot reach — occupied
+    /// structure plus the enclosed air sealed behind it
+    /// ([`crate::compartments::sealed_envelope`]). A closed plated hull presents
+    /// its full body to the flow (the air inside goes around); a breached hull
+    /// presents only its structure (the cavity vents). A **free-standing plate**
+    /// (neither side in the envelope) presents itself: its full face area sliced
+    /// along its normal (attributed to its owning cell's station), its
+    /// [`PANEL_FILL`] edge sliced tangentially; a plate on the envelope's skin
+    /// adds nothing (the cell behind it already presents). Replaces the WI 824
+    /// interim ≥2-paneled-faces bridge.
     pub fn area_curve(&self, axis: Axis) -> Vec<(i32, f64)> {
-        let mut panel_faces: BTreeMap<(i32, i32, i32), u32> = BTreeMap::new();
-        for p in &self.face_panels {
-            for c in [p.cell, p.cell + p.axis.unit()] {
-                *panel_faces.entry((c.x, c.y, c.z)).or_default() += 1;
-            }
-        }
-        let mut cells: HashSet<IVec3> = self.voxels.iter().map(|v| v.cell).collect();
-        for ((x, y, z), n) in panel_faces {
-            if n >= 2 {
-                cells.insert(IVec3::new(x, y, z));
-            }
-        }
-        let mut counts: BTreeMap<i32, usize> = BTreeMap::new();
-        for cell in cells {
-            let station = match axis {
-                Axis::X => cell.x,
-                Axis::Y => cell.y,
-                Axis::Z => cell.z,
-            };
-            *counts.entry(station).or_default() += 1;
-        }
+        let envelope = crate::compartments::sealed_envelope(self);
         let cell_area = self.cell_size * self.cell_size;
-        counts
-            .into_iter()
-            .map(|(s, c)| (s, c as f64 * cell_area))
-            .collect()
+        let station = |c: IVec3| match axis {
+            Axis::X => c.x,
+            Axis::Y => c.y,
+            Axis::Z => c.z,
+        };
+        let mut areas: BTreeMap<i32, f64> = BTreeMap::new();
+        for &cell in &envelope {
+            *areas.entry(station(cell)).or_default() += cell_area;
+        }
+        for p in &self.face_panels {
+            let free_standing =
+                !envelope.contains(&p.cell) && !envelope.contains(&(p.cell + p.axis.unit()));
+            if !free_standing {
+                continue;
+            }
+            let projected = if axis == p.axis {
+                cell_area // face-on: the full plate face
+            } else {
+                PANEL_FILL * cell_area // edge-on: the plate's thin edge
+            };
+            *areas.entry(station(p.cell)).or_default() += projected;
+        }
+        areas.into_iter().collect()
     }
 
     /// Inserts another craft's voxels and devices, offset by `offset` cells (used
@@ -1556,11 +1559,12 @@ mod tests {
     }
 
     #[test]
-    fn conversion_preserves_the_area_bridge_cross_section() {
-        // WI 824 interim aero bridge (removed by WI 827): converting a flagged
-        // hull leaves the area curve exactly at the legacy value — a cell with
-        // ≥2 paneled faces counts as occupied (the converted cells are
-        // double-plus-skinned), and single-plate outside neighbours don't.
+    fn conversion_preserves_the_cross_section_via_the_envelope() {
+        // WI 827 sealed envelope: a converted flagged hull is plates around
+        // sealed air, and the envelope (everything the exterior cannot reach)
+        // is exactly the legacy solid region — so the curve stays at the legacy
+        // value, now for the physically-right reason (the flow goes around a
+        // closed hull, not through it).
         let solid = block(2, 2, 2, 0.5, Material::ALUMINIUM);
         let mut panel = solid.clone();
         for v in &solid.voxels {
@@ -1571,6 +1575,109 @@ mod tests {
         assert_eq!(panel.area_curve(Axis::X), solid.area_curve(Axis::X));
         assert_eq!(panel.area_curve(Axis::Y), solid.area_curve(Axis::Y));
         assert_eq!(panel.area_curve(Axis::Z), solid.area_curve(Axis::Z));
+    }
+
+    /// A solid-walled `n×n×n` box with a hollow interior (walls one cell thick).
+    fn hollow_box(n: i32, cell_size: f64) -> VoxelCraft {
+        let mut craft = VoxelCraft::new(cell_size);
+        for x in 0..n {
+            for y in 0..n {
+                for z in 0..n {
+                    let wall = x == 0 || x == n - 1 || y == 0 || y == n - 1 || z == 0 || z == n - 1;
+                    if wall {
+                        craft.voxels.push(Voxel {
+                            cell: IVec3::new(x, y, z),
+                            material: Material::ALUMINIUM,
+                        });
+                    }
+                }
+            }
+        }
+        craft
+    }
+
+    #[test]
+    fn a_hollow_hull_presents_its_full_body_cross_section() {
+        // The R2 comparison fixture (WI 827): before the envelope, a hollow
+        // hull's mid-body slice counted only its walls (4×4 − 2×2 = 12 cells);
+        // with the envelope the enclosed cavity presents too, so hollow == solid
+        // (16 cells per mid slice). The air inside goes around with the hull.
+        let hollow = hollow_box(4, 0.5);
+        let solid = block(4, 4, 4, 0.5, Material::ALUMINIUM);
+        for axis in [Axis::X, Axis::Y, Axis::Z] {
+            assert_eq!(hollow.area_curve(axis), solid.area_curve(axis));
+        }
+        let cell_area = 0.5 * 0.5;
+        let mid = hollow
+            .area_curve(Axis::X)
+            .iter()
+            .find(|&&(s, _)| s == 1)
+            .map(|&(_, a)| a)
+            .unwrap();
+        assert!(
+            (mid - 16.0 * cell_area).abs() < 1e-9,
+            "mid slice presents the full 4×4 body, was walls-only 12 pre-827 (got {mid})"
+        );
+    }
+
+    #[test]
+    fn a_breached_hull_presents_only_its_structure() {
+        // Reachability does the work: knock one wall cell out and the cavity
+        // vents — only the remaining structure presents cross-section.
+        let mut breached = hollow_box(4, 0.5);
+        breached.voxels.retain(|v| v.cell != IVec3::new(0, 1, 1));
+        let curve = breached.area_curve(Axis::X);
+        let integral: f64 = curve.iter().map(|(_, a)| a * breached.cell_size).sum();
+        assert!(
+            (integral - breached.occupied_volume()).abs() < 1e-9,
+            "a vented cavity contributes nothing: curve integrates to structure volume alone"
+        );
+    }
+
+    #[test]
+    fn a_lone_plate_presents_its_plate() {
+        // A free-standing plate presents its full face sliced along its normal
+        // (at its owning cell's station) and its thin edge sliced tangentially.
+        let cs = 0.5;
+        let mut craft = VoxelCraft::new(cs);
+        craft.set_face_panel(IVec3::ZERO, IVec3::Y, Some(Material::ALUMINIUM));
+        let cell_area = cs * cs;
+        assert_eq!(craft.area_curve(Axis::Y), vec![(0, cell_area)]);
+        assert_eq!(craft.area_curve(Axis::X), vec![(0, PANEL_FILL * cell_area)]);
+        assert_eq!(craft.area_curve(Axis::Z), vec![(0, PANEL_FILL * cell_area)]);
+    }
+
+    #[test]
+    fn a_plate_on_the_envelope_skin_adds_nothing() {
+        // A plate flush against a solid cell is the hull's skin: the cell behind
+        // it already presents that area — no double counting.
+        let solid = block(1, 1, 1, 0.5, Material::ALUMINIUM);
+        let mut skinned = solid.clone();
+        skinned.set_face_panel(IVec3::ZERO, IVec3::Y, Some(Material::ALUMINIUM));
+        for axis in [Axis::X, Axis::Y, Axis::Z] {
+            assert_eq!(skinned.area_curve(axis), solid.area_curve(axis));
+        }
+    }
+
+    #[test]
+    fn an_open_door_does_not_vent_the_cross_section() {
+        // Doors are structure for aero (WI 827 decision): an open hatch does not
+        // delete the fuselage's drag area, so the curve is a build-time property
+        // independent of door state — and equal to the fully sealed hull's.
+        let sealed = hollow_box(4, 0.5);
+        let mut doored = sealed.clone();
+        let gap = IVec3::new(0, 1, 1);
+        doored.voxels.retain(|v| v.cell != gap);
+        doored.doors.push(Door {
+            cell: gap,
+            open: false,
+        });
+        let mut open = doored.clone();
+        open.doors[0].open = true;
+        for axis in [Axis::X, Axis::Y, Axis::Z] {
+            assert_eq!(doored.area_curve(axis), open.area_curve(axis));
+            assert_eq!(doored.area_curve(axis), sealed.area_curve(axis));
+        }
     }
 
     #[test]
