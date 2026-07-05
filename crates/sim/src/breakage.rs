@@ -1384,4 +1384,45 @@ mod tests {
             "strictly fractional: {fraction}"
         );
     }
+
+    #[test]
+    fn a_shell_bonds_as_its_solid_form_and_its_fill_rides_a_fragment() {
+        // WI 836 solid-for-topology: bonds read the coverage masks, which never
+        // consult fill — the stacked-wedge pair bonds identically as solids or
+        // shells (strengths included). What *does* change is the mass the bond
+        // must carry (a shell masses only its skin), which flows through
+        // `voxel_mass` — and a severed shell fragment keeps its fill with the
+        // skin masses conserving.
+        use crate::shape::{FillMode, ShapedCell};
+        let mut solid = bar(2, Material::GLASS);
+        wedge_at(&mut solid, IVec3::ZERO, 0);
+        wedge_at(&mut solid, IVec3::new(1, 0, 0), 0);
+        let mut shell = solid.clone();
+        for s in shell.shapes.clone() {
+            shell.set_shape(ShapedCell {
+                fill: FillMode::Shell,
+                ..s
+            });
+        }
+        let sb = structural_bonds(&solid);
+        let hb = structural_bonds(&shell);
+        assert_eq!(sb.len(), hb.len(), "same bond graph");
+        for (a, b) in sb.iter().zip(&hb) {
+            assert_eq!(a.strength, b.strength, "bond strength ignores fill");
+        }
+        let before = shell.mass_properties().unwrap().mass;
+        let severed: Severed = [bond(IVec3::ZERO, IVec3::new(1, 0, 0))]
+            .into_iter()
+            .collect();
+        let frags = connected_components(&shell, &severed);
+        assert_eq!(frags.len(), 2);
+        for f in &frags {
+            assert_eq!(f.shapes.len(), 1, "the record rides");
+            assert_eq!(f.shapes[0].fill, FillMode::Shell, "fill rides");
+        }
+        assert!(
+            (total_mass(&frags) - before).abs() < 1e-9,
+            "skin masses conserve"
+        );
+    }
 }

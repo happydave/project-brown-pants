@@ -216,9 +216,11 @@ pub fn buoyancy_wrench(
     let mut draft = 0.0_f64;
     // Displacement = solid voxels (the hull; a shaped cell displaces its form's
     // volume fraction at its rotated centroid — WI 831, graded the same way full
-    // cells are) + enclosed compartment cells (the air it encloses) as full
-    // cells, plus **face panels** displacing their plate volume at their face
-    // centre (WI 824 — cells are cubes; plates live on faces).
+    // cells are; a **shell** displaces only its skin volume at the skin centroid,
+    // WI 836 — both arrive via `voxel_volume`/`voxel_centroid`) + enclosed
+    // compartment cells (the air it encloses) as full cells, plus **face
+    // panels** displacing their plate volume at their face centre (WI 824 —
+    // cells are cubes; plates live on faces).
     for v in &craft.voxels {
         let local = craft.voxel_centroid(v) - com;
         let world = body_position + body_orientation * local;
@@ -237,9 +239,13 @@ pub fn buoyancy_wrench(
     for &cell in enclosed {
         // An enclosed shaped member contributes its **air remainder** (WI 832) —
         // its solid part already displaced in the voxel loop above, so a fully
-        // enclosed shaped cell totals exactly one cell. Empty members are all
-        // air (fraction 1, the pre-832 behaviour). Graded at the cell centre,
-        // the same approximation full cells make.
+        // enclosed shaped *solid* cell totals exactly one cell. A **shell**
+        // (WI 836) totals less: the remainder here is still its form's (fill is
+        // not consulted — solid-for-topology), but the voxel loop displaced only
+        // its skin; the interior is deliberately not a compartment and displaces
+        // nothing. Empty members are all air (fraction 1, the pre-832
+        // behaviour). Graded at the cell centre, the same approximation full
+        // cells make.
         let air = craft
             .shape_at(cell)
             .map(|s| 1.0 - crate::shape::constants(s.form).volume)

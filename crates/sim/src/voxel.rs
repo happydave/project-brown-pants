@@ -919,11 +919,24 @@ impl VoxelCraft {
         self.shapes.dedup_by_key(|s| s.key());
     }
 
-    /// A voxel's solid volume, m³ (WI 831): the cell volume × its form's volume
-    /// fraction (1 for an unshaped cell).
+    /// A voxel's material volume, m³ (WI 831): the cell volume × its form's
+    /// volume fraction (1 for an unshaped cell). A **shell** (WI 836) is its
+    /// boundary skin at plate thickness — `shell_area × PANEL_FILL` of the cell
+    /// (the multiply by [`PANEL_FILL`] happens here, keeping the form constants
+    /// pure geometry). Mass *and* displacement both fold through this volume,
+    /// so a shell masses and displaces only its skin (the design's
+    /// plate-for-mass collapse); every admitted form's skin volume is well
+    /// below its solid volume at `PANEL_FILL` 0.05, so no clamp is needed.
     pub fn voxel_volume(&self, v: &Voxel) -> f64 {
         match self.shape_at(v.cell) {
-            Some(s) => self.cell_volume() * crate::shape::constants(s.form).volume,
+            Some(s) => {
+                let c = crate::shape::constants(s.form);
+                let fraction = match s.fill {
+                    crate::shape::FillMode::Solid => c.volume,
+                    crate::shape::FillMode::Shell => c.shell_area * PANEL_FILL,
+                };
+                self.cell_volume() * fraction
+            }
             None => self.cell_volume(),
         }
     }
@@ -934,11 +947,16 @@ impl VoxelCraft {
     }
 
     /// A voxel's mass centroid in the craft's local frame, metres: the cell
-    /// centre for an unshaped cell; the rotated form centroid for a shaped one.
+    /// centre for an unshaped cell; the rotated form centroid for a shaped one;
+    /// the rotated **skin** centroid for a shell (WI 836).
     pub fn voxel_centroid(&self, v: &Voxel) -> DVec3 {
         match self.shape_at(v.cell) {
             Some(s) => {
-                let c = crate::shape::constants(s.form).centroid_oriented(s.orientation);
+                let fc = crate::shape::constants(s.form);
+                let c = match s.fill {
+                    crate::shape::FillMode::Solid => fc.centroid_oriented(s.orientation),
+                    crate::shape::FillMode::Shell => fc.shell_centroid_oriented(s.orientation),
+                };
                 (v.cell.as_dvec3() + c) * self.cell_size
             }
             None => self.cell_center(v.cell),
@@ -947,9 +965,12 @@ impl VoxelCraft {
 
     /// A voxel's inertia tensor about its own centroid, kg·m² (WI 831): the
     /// solid-cube diagonal for an unshaped cell; `ρ·s⁵·R·I_unit·Rᵀ` for a shaped
-    /// one.
+    /// one; **zero** for a shell (WI 836) — a point mass at its skin centroid,
+    /// exactly the face-panel pattern (slab self-inertia stays an open
+    /// refinement there and here alike).
     pub fn voxel_self_inertia(&self, v: &Voxel) -> DMat3 {
         match self.shape_at(v.cell) {
+            Some(s) if s.fill == crate::shape::FillMode::Shell => DMat3::ZERO,
             Some(s) => {
                 let unit = crate::shape::constants(s.form).unit_inertia_oriented(s.orientation);
                 let scale = v.material.density * self.cell_size.powi(5);
@@ -1104,9 +1125,10 @@ impl VoxelCraft {
     /// Derived mass properties, or `None` for an empty craft (no mass).
     /// Cells are solid cubes — or their catalog form when shaped (WI 831:
     /// `voxel_mass`/`voxel_centroid`/`voxel_self_inertia` fold the form's
-    /// derived volume, centroid, and inertia); **face panels** fold as their
-    /// plate mass at their face centre (point-mass inertia, the device/part
-    /// pattern) — WI 824.
+    /// derived volume, centroid, and inertia; a **shell** cell masses its
+    /// plate-thickness skin as a point mass at the skin centroid — WI 836);
+    /// **face panels** fold as their plate mass at their face centre
+    /// (point-mass inertia, the device/part pattern) — WI 824.
     pub fn mass_properties(&self) -> Option<MassProperties> {
         // Accumulate mass and first moment for the centre of mass.
         let mut mass = 0.0;
@@ -1825,6 +1847,175 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- WI 836: shell fill-variants — plate-for-mass, solid-for-topology.
+
+    #[test]
+    fn a_glass_wedge_shell_masses_its_skin_and_seals_like_the_solid_wedge() {
+        // AC 1 (sim half): the shell's mass is the exact skin identity —
+        // shell_area × cell² × (PANEL_FILL × cell) × density, sitting at the
+        // oriented skin centroid — while the seal predicate answers exactly as
+        // the solid wedge's on every boundary (fill is never consulted).
+        use crate::shape::{constants, FillMode, Form, ShapedCell};
+        let build = |fill: FillMode| {
+            let mut c = VoxelCraft::new(1.0);
+            c.voxels.push(Voxel {
+                cell: IVec3::ZERO,
+                material: Material::GLASS,
+            });
+            c.set_shape(ShapedCell {
+                cell: IVec3::ZERO,
+                form: Form::Wedge,
+                orientation: 0,
+                fill,
+            });
+            c
+        };
+        let shell = build(FillMode::Shell);
+        let fc = constants(Form::Wedge);
+        let v = &shell.voxels[0];
+        let want_mass = Material::GLASS.density * fc.shell_area * PANEL_FILL;
+        assert!((shell.voxel_mass(v) - want_mass).abs() < 1e-12);
+        assert!((shell.voxel_centroid(v) - fc.shell_centroid_oriented(0)).length() < 1e-12);
+        assert_eq!(shell.voxel_self_inertia(v), DMat3::ZERO, "point mass");
+        // Solid-for-topology: every boundary of the cell seals identically.
+        let solid_variant = build(FillMode::Solid);
+        let occupied: HashSet<IVec3> = [IVec3::ZERO].into_iter().collect();
+        for dir in [
+            IVec3::X,
+            IVec3::NEG_X,
+            IVec3::Y,
+            IVec3::NEG_Y,
+            IVec3::Z,
+            IVec3::NEG_Z,
+        ] {
+            assert_eq!(
+                shell.boundary_sealed(&occupied, IVec3::ZERO, dir),
+                solid_variant.boundary_sealed(&occupied, IVec3::ZERO, dir),
+                "{dir:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shell_presents_its_solid_forms_station_areas() {
+        // Topology pin, aero half: the WI 834 wedge-faired shoulder with its
+        // three shoulder wedges as *shells* presents the identical area curve —
+        // the envelope never consults fill.
+        use crate::shape::{FillMode, Form, ShapedCell};
+        let build = |fill: FillMode| {
+            let mut c = VoxelCraft::new(1.0);
+            for x in 0..4 {
+                for y in 0..2 {
+                    for z in 0..2 {
+                        if x == 3 && (y, z) != (0, 0) {
+                            continue;
+                        }
+                        c.voxels.push(Voxel {
+                            cell: IVec3::new(x, y, z),
+                            material: Material::ALUMINIUM,
+                        });
+                    }
+                }
+            }
+            for (cell, o) in [
+                (IVec3::new(2, 1, 0), 0),
+                (IVec3::new(2, 1, 1), 0),
+                (IVec3::new(2, 0, 1), 0),
+            ] {
+                c.set_shape(ShapedCell {
+                    cell,
+                    form: Form::Wedge,
+                    orientation: o,
+                    fill,
+                });
+            }
+            c
+        };
+        let solid = build(FillMode::Solid);
+        let shell = build(FillMode::Shell);
+        for axis in [Axis::X, Axis::Y, Axis::Z] {
+            assert_eq!(
+                solid.area_curve(axis),
+                shell.area_curve(axis),
+                "{axis:?}: a shell is its solid form to the envelope"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shell_canopy_keeps_the_compartment_sealed_and_lightens_the_draft() {
+        // AC 2: a 9×9×9 ablator hull (buoyant — walls ≈ 386 cells over a 343-
+        // cell cavity) roofed with one glass cube canopy cell. Solid vs shell:
+        // the enclosure is identical (a cube shell is the full cube to the
+        // flood-fill — the bubble-canopy collapse), the shell craft is lighter
+        // by exactly (1 − shell fraction) × cell³ × ρ_glass, and the harbor
+        // float measure (weight ÷ fully-submerged displaced weight, enclosed
+        // air included — `would_float`'s model) strictly improves.
+        use crate::medium::enclosed_cells;
+        use crate::shape::{constants, FillMode, Form, ShapedCell};
+        let n = 9;
+        let canopy = IVec3::new(4, 8, 4);
+        let build = |fill: FillMode| {
+            let mut c = VoxelCraft::new(1.0);
+            for x in 0..n {
+                for y in 0..n {
+                    for z in 0..n {
+                        let interior = (1..n - 1).contains(&x)
+                            && (1..n - 1).contains(&y)
+                            && (1..n - 1).contains(&z);
+                        if interior {
+                            continue;
+                        }
+                        let cell = IVec3::new(x, y, z);
+                        c.voxels.push(Voxel {
+                            cell,
+                            material: if cell == canopy {
+                                Material::GLASS
+                            } else {
+                                Material::ABLATOR
+                            },
+                        });
+                    }
+                }
+            }
+            c.set_shape(ShapedCell {
+                cell: canopy,
+                form: Form::Cube,
+                orientation: 0,
+                fill,
+            });
+            c
+        };
+        let solid = build(FillMode::Solid);
+        let shell = build(FillMode::Shell);
+        let mut enc_solid = enclosed_cells(&solid);
+        let mut enc_shell = enclosed_cells(&shell);
+        enc_solid.sort_by_key(|c| (c.x, c.y, c.z));
+        enc_shell.sort_by_key(|c| (c.x, c.y, c.z));
+        assert_eq!(enc_solid, enc_shell, "the compartment stays sealed");
+        // Exactly the 7³ cavity — in particular the canopy cell itself is NOT
+        // an air node (the cube's float-fold volume is 1 − ~1e-16; the ledger
+        // thresholds at geometric epsilon, not > 0).
+        assert_eq!(enc_solid.len(), (n as usize - 2).pow(3));
+        let mass = |c: &VoxelCraft| c.mass_properties().unwrap().mass;
+        let want_delta =
+            (1.0 - constants(Form::Cube).shell_area * PANEL_FILL) * Material::GLASS.density;
+        assert!((mass(&solid) - mass(&shell) - want_delta).abs() < 1e-9);
+        // Weight ÷ fully-submerged displaced weight (hull + enclosed air), the
+        // model the harbor prediction runs. Both variants float; the shell
+        // floats strictly higher (glass is denser than water, so shedding its
+        // interior sheds proportionally more weight than displacement).
+        let ratio = |c: &VoxelCraft, enclosed: &[IVec3]| {
+            let displaced: f64 =
+                c.voxels.iter().map(|v| c.voxel_volume(v)).sum::<f64>() + enclosed.len() as f64;
+            mass(c) / (1_025.0 * displaced)
+        };
+        let rs = ratio(&solid, &enc_solid);
+        let rh = ratio(&shell, &enc_shell);
+        assert!(rs < 1.0 && rh < 1.0, "both float: {rs} {rh}");
+        assert!(rh < rs, "the shell canopy lightens the draft: {rh} vs {rs}");
     }
 
     #[test]

@@ -300,6 +300,7 @@ impl Plugin for HarborScenePlugin {
                 panel_mode: false,
                 form: sounding_sim::shape::Form::Cube,
                 orientation_pick: None,
+                fill: sounding_sim::shape::FillMode::Solid,
             })
             .init_resource::<OrbitCam>()
             .init_resource::<HoverState>()

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/sim", "crates/app", "crates/companion"]
 
 [workspace.package]
-version = "0.1.171"
+version = "0.1.172"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Dave <projectbrownpants@scienceranch.com>"]

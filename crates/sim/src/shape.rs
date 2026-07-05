@@ -117,6 +117,9 @@ pub struct FormConstants {
     pub face_coverage: [f64; 6],
     /// Total boundary surface area (unit cell) — the shell substrate (WI 836).
     pub shell_area: f64,
+    /// Area-weighted centroid of the boundary surface (unit-cell coordinates) —
+    /// where a shell's skin mass sits (WI 836).
+    pub shell_centroid: DVec3,
     /// Derived distinct orientations: the first rotation index of each
     /// congruence class (cube = `[0]`; wedge has 12).
     pub distinct_orientations: Vec<u8>,
@@ -134,6 +137,13 @@ impl FormConstants {
     pub fn unit_inertia_oriented(&self, orientation: u8) -> DMat3 {
         let r = rotations()[orientation as usize];
         r * self.unit_inertia * r.transpose()
+    }
+
+    /// The shell (skin) centroid under `orientation`, unit-cell coordinates
+    /// (rotation about the cell centre) — WI 836.
+    pub fn shell_centroid_oriented(&self, orientation: u8) -> DVec3 {
+        let r = rotations()[orientation as usize];
+        r * (self.shell_centroid - DVec3::splat(0.5)) + DVec3::splat(0.5)
     }
 }
 
@@ -155,7 +165,7 @@ pub fn catalog() -> &'static [FormConstants; 6] {
                 .unwrap_or_else(|e| panic!("shipped form {form:?} failed admission: {e}"));
             bevy_log::debug!(
                 "shape catalog: {:?} volume {:.6} centroid ({:.4},{:.4},{:.4}) \
-                 coverage {:?} shell {:.4} distinct {}",
+                 coverage {:?} shell {:.4} at ({:.4},{:.4},{:.4}) distinct {}",
                 c.form,
                 c.volume,
                 c.centroid.x,
@@ -163,6 +173,9 @@ pub fn catalog() -> &'static [FormConstants; 6] {
                 c.centroid.z,
                 c.face_coverage.map(|f| (f * 1e4).round() / 1e4),
                 c.shell_area,
+                c.shell_centroid.x,
+                c.shell_centroid.y,
+                c.shell_centroid.z,
                 c.distinct_orientations.len(),
             );
             c
@@ -607,9 +620,10 @@ pub(crate) fn derive_form(form: Form, mesh: &FormMesh) -> Result<FormConstants, 
         DVec3::new(ixz, iyz, izz),
     );
 
-    // --- Per-face coverage fractions + shell area.
+    // --- Per-face coverage fractions + shell area + skin centroid (WI 836).
     let mut face_coverage = [0.0_f64; 6];
     let mut shell_area = 0.0;
+    let mut shell_first = DVec3::ZERO;
     for t in &mesh.triangles {
         let (a, b, c) = (
             mesh.vertices[t[0]],
@@ -618,6 +632,7 @@ pub(crate) fn derive_form(form: Form, mesh: &FormMesh) -> Result<FormConstants, 
         );
         let area = 0.5 * (b - a).cross(c - a).length();
         shell_area += area;
+        shell_first += area * (a + b + c) / 3.0;
         for (face, axis, side) in [
             (0usize, 0usize, 0.0),
             (1, 0, 1.0),
@@ -768,6 +783,18 @@ pub(crate) fn derive_form(form: Form, mesh: &FormMesh) -> Result<FormConstants, 
         }
     }
 
+    // The skin centroid must sit inside the unit cell like the solid centroid
+    // does — a violation is a mesh-authoring error, caught at admission.
+    let shell_centroid = shell_first / shell_area;
+    if !(0.0..=1.0).contains(&shell_centroid.x)
+        || !(0.0..=1.0).contains(&shell_centroid.y)
+        || !(0.0..=1.0).contains(&shell_centroid.z)
+    {
+        return Err(format!(
+            "shell centroid {shell_centroid} outside the unit cell"
+        ));
+    }
+
     Ok(FormConstants {
         form,
         volume,
@@ -775,6 +802,7 @@ pub(crate) fn derive_form(form: Form, mesh: &FormMesh) -> Result<FormConstants, 
         unit_inertia,
         face_coverage,
         shell_area,
+        shell_centroid,
         distinct_orientations: distinct,
     })
 }
@@ -858,11 +886,42 @@ mod tests {
         }
         assert_eq!(c.face_coverage, [1.0; 6]);
         assert!((c.shell_area - 6.0).abs() < 1e-12);
+        assert!(
+            (c.shell_centroid - DVec3::splat(0.5)).length() < 1e-12,
+            "a cube's skin is centred on the cell (WI 836)"
+        );
         assert_eq!(
             c.distinct_orientations,
             vec![0],
             "a cube has one orientation"
         );
+    }
+
+    #[test]
+    fn shell_centroids_match_hand_values_and_stay_inside_the_cell() {
+        // WI 836: the wedge's five boundary faces — bottom y=0 (area 1, centroid
+        // y 0), back z=1 (area 1, centroid y 1/2), two half-triangle sides (area
+        // 1/2 each, centroid y 1/3), the hypotenuse quad (area √2, centroid y
+        // 1/2) — give skin 3 + √2 and ȳ = (5/6 + √2/2)/(3 + √2), independent
+        // arithmetic to the derivation's fold.
+        let c = constants(Form::Wedge);
+        let root2 = 2.0_f64.sqrt();
+        assert!((c.shell_area - (3.0 + root2)).abs() < 1e-12);
+        let want_y = (5.0 / 6.0 + root2 / 2.0) / (3.0 + root2);
+        assert!((c.shell_centroid.x - 0.5).abs() < 1e-12);
+        assert!((c.shell_centroid.y - want_y).abs() < 1e-12);
+        // The wedge maps to itself under (y, z) → (1−z, 1−y), forcing y + z = 1.
+        assert!((c.shell_centroid.y + c.shell_centroid.z - 1.0).abs() < 1e-12);
+        // Every catalog form's skin centroid sits strictly inside the unit cell.
+        for form in FORMS {
+            let sc = constants(form).shell_centroid;
+            for i in 0..3 {
+                assert!(sc[i] > 0.0 && sc[i] < 1.0, "{form:?} axis {i}: {sc:?}");
+            }
+        }
+        // The oriented accessor rotates about the cell centre like the solid
+        // centroid's: identity is a no-op.
+        assert!((c.shell_centroid_oriented(0) - c.shell_centroid).length() < 1e-12);
     }
 
     #[test]

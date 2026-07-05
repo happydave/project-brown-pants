@@ -1022,6 +1022,7 @@ impl Plugin for WorkshopScenePlugin {
                 panel_mode: false,
                 form: sounding_sim::shape::Form::Cube,
                 orientation_pick: None,
+                fill: sounding_sim::shape::FillMode::Solid,
             })
             .init_resource::<OrbitCam>()
             .init_resource::<HoverState>()
@@ -1159,7 +1160,7 @@ fn enter_build(mut commands: Commands) {
     ));
     commands.spawn((
         Text::new(
-            "left-click place · right-click remove · middle-drag orbit · scroll zoom · pad: right-stick orbit / bumpers zoom · Tab material · X rotate shape · T panel mode (thin plates on faces) · K save vehicle · O load vehicle · P pause · Enter → TEST (4 wheels ⇒ drive it)",
+            "left-click place · right-click remove · middle-drag orbit · scroll zoom · pad: right-stick orbit / bumpers zoom · Tab material · X rotate shape · H solid/shell fill · T panel mode (thin plates on faces) · K save vehicle · O load vehicle · P pause · Enter → TEST (4 wheels ⇒ drive it)",
         ),
         TextFont {
             font_size: 14.0,

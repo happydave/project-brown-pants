@@ -192,6 +192,11 @@ pub struct EditorState {
     /// `distinct_orientations`, advanced by `X`. `None` = the context-default
     /// orientation; cleared when a different form is selected.
     pub(crate) orientation_pick: Option<usize>,
+    /// The fill a placed structural voxel carries (WI 836): `Solid`, or `Shell`
+    /// (plate-thickness skin — a glass wedge shell is a sloped window, a glass
+    /// cube shell a bubble canopy). Toggled with `H`, the panel-mode toggle
+    /// family.
+    pub(crate) fill: FillMode,
 }
 
 impl EditorState {
@@ -225,6 +230,7 @@ impl Default for EditorState {
             panel_mode: false,
             form: Form::Cube,
             orientation_pick: None,
+            fill: FillMode::Solid,
         }
     }
 }
@@ -300,15 +306,19 @@ pub(crate) fn effective_orientation(state: &EditorState, context: Option<(IVec3,
     }
 }
 
-/// The Build HUD's shape read-out (WI 833): form, orientation position within the
-/// distinct set (`auto` = context default), and fill mode (`solid` until WI 836).
+/// The Build HUD's shape read-out (WI 833/836): form, orientation position within
+/// the distinct set (`auto` = context default), and the active fill mode.
 pub(crate) fn shape_hud_label(state: &EditorState) -> String {
     let len = constants(state.form).distinct_orientations.len();
     let orient = match state.orientation_pick {
         Some(i) => format!("{}/{len}", (i % len) + 1),
         None => format!("auto/{len}"),
     };
-    format!("{} · {orient} · solid [X]", form_label(state.form))
+    let fill = match state.fill {
+        FillMode::Solid => "solid",
+        FillMode::Shell => "shell",
+    };
+    format!("{} · {orient} · {fill} [X/H]", form_label(state.form))
 }
 
 /// The wheel-station id of any part mounted at (≈) `mount`, if one exists (WI 630): lets a suspension
@@ -333,13 +343,14 @@ fn next_station_id(craft: &VoxelCraft) -> u32 {
 
 /// Where the active brush lands (WI 612 → 833): a voxel at the empty face cell, a
 /// device in the hovered solid cell, a wheel/part at a continuous body-frame mount —
-/// plus the shape record a placed structural voxel carries (WI 833; `None` = plain
-/// cube, which writes no record).
+/// plus the shape record a placed structural voxel carries (WI 833/836; `None` =
+/// plain solid cube, which writes no record — a **cube shell** does carry a record,
+/// since the record is what makes a bubble canopy expressible).
 pub(crate) struct BrushTarget {
     pub voxel_cell: IVec3,
     pub device_cell: IVec3,
     pub wheel_mount: DVec3,
-    pub shape: Option<(Form, u8)>,
+    pub shape: Option<(Form, u8, FillMode)>,
 }
 
 /// Places the active `brush` into `craft` at the caller-aimed [`BrushTarget`].
@@ -359,16 +370,17 @@ fn place_brush(
                     cell: voxel_cell,
                     material,
                 });
-                // A non-cube form rides the cell as its shape record (WI 833); the
-                // log is the scripted-anchor evidence channel (WI 830).
-                if let Some((form, orientation)) = target.shape {
+                // A non-cube form — or any shell (WI 836) — rides the cell as its
+                // shape record (WI 833); the log is the scripted-anchor evidence
+                // channel (WI 830).
+                if let Some((form, orientation, fill)) = target.shape {
                     craft.set_shape(ShapedCell {
                         cell: voxel_cell,
                         form,
                         orientation,
-                        fill: FillMode::Solid,
+                        fill,
                     });
-                    info!("shape place: {form:?} o{orientation} at {voxel_cell:?}");
+                    info!("shape place: {form:?} o{orientation} {fill:?} at {voxel_cell:?}");
                 }
             }
         }
@@ -851,6 +863,16 @@ pub(crate) fn editor_input(
         state.motor = MotorTier::ALL[(i + 1) % MotorTier::ALL.len()];
     }
 
+    // Toggle the fill a placed structural voxel carries (WI 836): `H` (hollow)
+    // flips solid ↔ shell — the panel-mode toggle family, not a new brush.
+    if keys.just_pressed(KeyCode::KeyH) {
+        state.fill = match state.fill {
+            FillMode::Solid => FillMode::Shell,
+            FillMode::Shell => FillMode::Solid,
+        };
+        info!("fill mode: {:?}", state.fill);
+    }
+
     // Cycle the active form's distinct orientations (WI 833): `X` advances the
     // rotate pick; a single-orientation form (the cube) has nothing to cycle.
     if keys.just_pressed(KeyCode::KeyX) && state.brush == Brush::Voxel {
@@ -875,8 +897,9 @@ pub(crate) fn editor_input(
         let brush = state.brush;
         let motor = state.motor;
         // No hover context at the keyboard cursor: pick or first distinct (WI 833).
-        let shape =
-            (state.form != Form::Cube).then(|| (state.form, effective_orientation(&state, None)));
+        // A plain solid cube writes no record; a cube *shell* must (WI 836).
+        let shape = (state.form != Form::Cube || state.fill == FillMode::Shell)
+            .then(|| (state.form, effective_orientation(&state, None), state.fill));
         let target = BrushTarget {
             voxel_cell: cell,
             device_cell: cell,
@@ -1256,12 +1279,13 @@ pub(crate) fn mouse_build(
             return;
         }
         // Voxel/wheel go on the clicked face (the empty adjacent cell); a device goes into the
-        // hovered solid cell. A non-cube form rides the placement at the same
-        // effective orientation the ghost showed (WI 833).
-        let shape = (state.form != Form::Cube).then(|| {
+        // hovered solid cell. A non-cube form — or any shell (WI 836) — rides the
+        // placement at the same effective orientation the ghost showed (WI 833).
+        let shape = (state.form != Form::Cube || state.fill == FillMode::Shell).then(|| {
             (
                 state.form,
                 effective_orientation(&state, h.support.map(|sup| (sup, h.view))),
+                state.fill,
             )
         });
         let motor = state.motor;
@@ -1661,7 +1685,7 @@ mod tests {
             voxel_cell: IVec3::ZERO,
             device_cell: IVec3::ZERO,
             wheel_mount: DVec3::splat(0.5),
-            shape: Some((Form::Wedge, 3)),
+            shape: Some((Form::Wedge, 3, FillMode::Solid)),
         };
         place_brush(
             &mut craft,
@@ -1682,6 +1706,43 @@ mod tests {
             MotorTier::Standard,
         );
         assert!(plain.voxels.len() == 1 && plain.shapes.is_empty());
+    }
+
+    #[test]
+    fn a_shell_fill_rides_the_placement_and_a_cube_shell_writes_a_record() {
+        // WI 836: the active fill rides the shape record, and a cube *shell*
+        // writes a record (the bubble canopy) where a solid cube writes none
+        // (pinned by `a_placed_form_writes_its_shape_record_and_the_cube_does_not`).
+        let mut craft = VoxelCraft::new(1.0);
+        let target = BrushTarget {
+            voxel_cell: IVec3::ZERO,
+            device_cell: IVec3::ZERO,
+            wheel_mount: DVec3::splat(0.5),
+            shape: Some((Form::Cube, 0, FillMode::Shell)),
+        };
+        place_brush(
+            &mut craft,
+            Brush::Voxel,
+            Material::GLASS,
+            &target,
+            MotorTier::Standard,
+        );
+        let s = craft
+            .shape_at(IVec3::ZERO)
+            .expect("a cube shell writes a record");
+        assert_eq!((s.form, s.fill), (Form::Cube, FillMode::Shell));
+    }
+
+    #[test]
+    fn the_hud_shape_label_names_the_fill() {
+        // WI 836: the Build HUD names the active fill next to form/orientation.
+        let mut state = EditorState {
+            form: Form::Wedge,
+            ..Default::default()
+        };
+        assert_eq!(shape_hud_label(&state), "wedge · auto/12 · solid [X/H]");
+        state.fill = FillMode::Shell;
+        assert_eq!(shape_hud_label(&state), "wedge · auto/12 · shell [X/H]");
     }
 
     #[test]

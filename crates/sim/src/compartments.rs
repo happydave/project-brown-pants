@@ -67,7 +67,11 @@ fn shaped_air_fractions(craft: &VoxelCraft) -> HashMap<IVec3, f64> {
     for v in &craft.voxels {
         if let Some(s) = craft.shape_at(v.cell) {
             let air = 1.0 - crate::shape::constants(s.form).volume;
-            if air > 0.0 {
+            // Geometric epsilon, not `> 0.0`: derived volumes are float folds
+            // (the cube's is 6 × 1/6 ≈ 1 − 1e-16), and a remainder below any
+            // physical size must not mint a degenerate air node — surfaced by
+            // WI 836's cube shells, the first producer of `Cube` shape records.
+            if air > 1e-9 {
                 out.insert(v.cell, air);
             }
         }
