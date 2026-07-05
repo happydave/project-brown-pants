@@ -384,6 +384,15 @@ pub fn mask_popcount(m: &FaceMask) -> u32 {
     m.iter().map(|w| w.count_ones()).sum()
 }
 
+/// The vocabulary's second consumer operation (design R4; WI 835): the
+/// **overlap** of two coverages across a boundary — the number of samples
+/// (of 256) both sides cover. Bond strength scales by this; exact complements
+/// overlap zero (they partition the samples), so a mated complementary pair
+/// seals air yet carries no structural bond.
+pub fn masks_overlap(a: &FaceMask, b: &FaceMask) -> u32 {
+    (0..4).map(|w| (a[w] & b[w]).count_ones()).sum()
+}
+
 /// In-face jitter for the mask sample grid (fixed; shared by every face so
 /// boundary bits align — invariant, do not vary per face).
 const MASK_JITTER_U: f64 = 7.548776662e-5;
@@ -1007,6 +1016,31 @@ mod tests {
             256,
             "exact complements partition the samples"
         );
+    }
+
+    #[test]
+    fn overlap_and_seal_answer_consistently_on_one_pair() {
+        // WI 835: the vocabulary's two closure operations, mutually pinned on
+        // the mated-complement fixture — AND overlaps zero exactly where OR
+        // seals (the partition property, from both sides).
+        let a = face_masks(Form::Wedge, 0)[1];
+        let complement = constants(Form::Wedge)
+            .distinct_orientations
+            .iter()
+            .copied()
+            .find(|&o| {
+                let m = face_masks(Form::Wedge, o)[0];
+                masks_seal(&a, &m) && mask_popcount(&m) < 200
+            })
+            .expect("a complementary orientation exists");
+        let b = face_masks(Form::Wedge, complement)[0];
+        assert!(masks_seal(&a, &b), "complements seal");
+        assert_eq!(masks_overlap(&a, &b), 0, "and overlap nothing");
+        // Degenerate anchors: full-vs-full is total; anything vs full is its
+        // own popcount.
+        assert_eq!(masks_overlap(&MASK_FULL, &MASK_FULL), 256);
+        assert_eq!(masks_overlap(&a, &MASK_FULL), mask_popcount(&a));
+        assert_eq!(masks_overlap(&a, &MASK_EMPTY), 0);
     }
 
     #[test]

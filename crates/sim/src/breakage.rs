@@ -12,8 +12,10 @@
 //! - [`failing_cut`] / [`break_craft`] — a **stress proxy** (not FEA): a candidate
 //!   axis-aligned cut fails when the inertial load across it (the force to keep the
 //!   outboard side moving with the rigid body) exceeds the crossing bonds'
-//!   strength (cross-section × material tensile strength). One cross-section
-//!   comparison — no stress field, no equilibrium solve.
+//!   strength (cross-section × material tensile strength; since WI 835 a
+//!   cell–cell bond scales by the two sides' **coverage overlap**, so a wedge's
+//!   half face bonds at ~half strength and zero overlap is no bond). One
+//!   cross-section comparison — no stress field, no equilibrium solve.
 //! - [`split_active`] / [`fracture`] — a **momentum-conserving** rigid split: each
 //!   fragment inherits the parent's linear and angular velocity (`v = v_cm + ω×r`),
 //!   re-deriving its own mass/inertia, conserving total momentum.
@@ -80,14 +82,21 @@ struct StructuralBond {
 ///
 /// - **cell–cell**: face-adjacent occupied cells; strength = the negative-side
 ///   cell's material × `cell²` (the pre-828 convention, kept so voxel-only crafts
-///   evaluate exactly as before).
+///   evaluate exactly as before), **scaled by the coverage overlap** (WI 835,
+///   design R4's second operation): the fraction of the boundary both sides'
+///   oriented face masks cover — a wedge bonded on its half face holds at ~half
+///   strength, and **zero overlap means no bond** (a form touching only
+///   edge-to-edge does not secretly hold; mated *complementary* wedges seal air
+///   but carry no bond). Unshaped pairs are full-against-full (fraction 1); a
+///   shape-free craft takes the exact pre-835 path.
 /// - **panel–cell** and **panel–panel**: a panel bonds along its four lattice
 ///   edges ([`panel_edges`]) to every occupied cell ([`edge_cells`]) and every
 ///   other panel sharing an edge. Each shared edge contributes the plate's edge
 ///   cross-section (`PANEL_FILL × cell²`) × the **weaker** endpoint's material —
 ///   the WI 716 R2 discipline: a plate joint is never stronger than the solid face
 ///   bond it stands in for (a skin plate reaches its backing cell through all four
-///   edges: 0.2 of a face bond, still 5× weaker).
+///   edges: 0.2 of a face bond, still 5× weaker). Panel bonds stay *edge*-keyed —
+///   the WI 835 fractional rule applies to the face bond, by design.
 fn structural_bonds(craft: &VoxelCraft) -> Vec<StructuralBond> {
     let face_area = craft.cell_size * craft.cell_size;
     let edge_area = PANEL_FILL * face_area;
@@ -99,12 +108,34 @@ fn structural_bonds(craft: &VoxelCraft) -> Vec<StructuralBond> {
     let mut acc: HashMap<(BreakNode, BreakNode), f64> = HashMap::new();
 
     // Cell–cell face bonds (positive offsets only: each pair once, negative-side
-    // cell's material — the pre-828 numbers).
+    // cell's material — the pre-828 numbers; coverage-overlap-scaled since 835).
+    let shaped = !craft.shapes.is_empty();
+    // A cell's coverage mask on the face toward `dir` (face order
+    // [x0, x1, y0, y1, z0, z1] — the boundary_sealed/WI 833 convention).
+    let face_mask = |c: IVec3, face: usize| -> crate::shape::FaceMask {
+        match craft.shape_at(c) {
+            Some(s) => crate::shape::face_masks(s.form, s.orientation)[face],
+            None => crate::shape::MASK_FULL,
+        }
+    };
     for v in &craft.voxels {
-        for off in [IVec3::X, IVec3::Y, IVec3::Z] {
+        for (axis, off) in [IVec3::X, IVec3::Y, IVec3::Z].into_iter().enumerate() {
             let n = v.cell + off;
-            if material_of.contains_key(&n) {
-                *acc.entry(bond(v.cell, n)).or_default() += v.material.strength * face_area;
+            if !material_of.contains_key(&n) {
+                continue;
+            }
+            let full = v.material.strength * face_area;
+            if shaped {
+                // Own face toward +axis, the neighbour's face back toward us.
+                let a = face_mask(v.cell, 2 * axis + 1);
+                let b = face_mask(n, 2 * axis);
+                let overlap = crate::shape::masks_overlap(&a, &b);
+                if overlap == 0 {
+                    continue; // zero overlap: no bond at all
+                }
+                *acc.entry(bond(v.cell, n)).or_default() += full * overlap as f64 / 256.0;
+            } else {
+                *acc.entry(bond(v.cell, n)).or_default() += full;
             }
         }
     }
@@ -1227,5 +1258,130 @@ mod tests {
         let mut c = VoxelCraft::new(1.0);
         c.set_face_panel(IVec3::ZERO, IVec3::Y, Some(Material::ALUMINIUM));
         assert!(break_craft(&c, DVec3::new(0.0, -1.0e9, 0.0), DVec3::ZERO).is_none());
+    }
+
+    // --- WI 835: bond strength from coverage overlap ---
+
+    use crate::shape::{FillMode, Form, ShapedCell};
+
+    fn wedge_at(craft: &mut VoxelCraft, cell: IVec3, orientation: u8) {
+        craft.set_shape(ShapedCell {
+            cell,
+            form: Form::Wedge,
+            orientation,
+            fill: FillMode::Solid,
+        });
+    }
+
+    #[test]
+    fn a_half_face_bond_carries_the_overlap_fraction_exactly() {
+        // The minimal pair: an inboard wedge (its half x=1 face toward the
+        // neighbour) bonded to a cube. The bond equals the mask overlap ÷ 256
+        // × the full-face strength — exactly (derived-vs-derived: the strength
+        // cannot drift from the vocabulary) — and lands in the raster's
+        // diagonal-tie-broken half window [0.4, 0.6].
+        use crate::shape::{face_masks, masks_overlap, MASK_FULL};
+        let mut c = bar(2, Material::ALUMINIUM);
+        wedge_at(&mut c, IVec3::ZERO, 0);
+        let bonds = structural_bonds(&c);
+        assert_eq!(bonds.len(), 1);
+        let full = Material::ALUMINIUM.strength * 1.0; // cell² = 1
+        let overlap = masks_overlap(&face_masks(Form::Wedge, 0)[1], &MASK_FULL);
+        assert_eq!(bonds[0].strength, full * overlap as f64 / 256.0);
+        let fraction = bonds[0].strength / full;
+        assert!(
+            (0.4..0.6).contains(&fraction),
+            "half face bonds at ~half strength: {fraction}"
+        );
+    }
+
+    #[test]
+    fn a_half_face_joint_breaks_where_the_full_face_holds() {
+        // The workitem's headline AC, behaviorally: a 4-cell aluminium beam
+        // (cubes 0,1 · wedge 2 · cube 3 — the wedge inboard so the outboard
+        // load stays a full cube). At pull 48 000 m/s² the all-cube beam's
+        // worst plane is k=1 (load 5400·a = 0.836·S → holds) while the shaped
+        // beam's is k=1 over the *half* bond cube1–wedge2 (load 4050·a ≈
+        // 1.2–1.3× the bond → breaks, severing exactly that bond).
+        let solid = bar(4, Material::ALUMINIUM);
+        let mut shaped = bar(4, Material::ALUMINIUM);
+        wedge_at(&mut shaped, IVec3::new(2, 0, 0), 0);
+        let pull = DVec3::new(48_000.0, 0.0, 0.0);
+        assert!(
+            failing_cut(&solid, pull, DVec3::ZERO).is_none(),
+            "the full-face beam holds this pull"
+        );
+        let severed = failing_cut(&shaped, pull, DVec3::ZERO)
+            .expect("the half-face joint fails the same pull");
+        let expected: Severed = [bond(IVec3::new(1, 0, 0), IVec3::new(2, 0, 0))]
+            .into_iter()
+            .collect();
+        assert_eq!(severed, expected, "exactly the half bond severs");
+        // Fragments carry their forms (workitem AC): the shed nose keeps the
+        // wedge record, and total mass stays the WI 831 fractional fold.
+        let before = shaped.mass_properties().unwrap().mass;
+        let frags = connected_components(&shaped, &severed);
+        assert_eq!(frags.len(), 2);
+        let nose = frags
+            .iter()
+            .find(|f| !f.shapes.is_empty())
+            .expect("the nose fragment keeps the wedge");
+        assert_eq!(nose.shapes[0].cell, IVec3::new(2, 0, 0));
+        assert!((total_mass(&frags) - before).abs() < 1e-9, "mass conserved");
+    }
+
+    #[test]
+    fn zero_overlap_neighbours_are_not_bonded() {
+        // Mated complementary wedges (the WI 832/833 seal fixture) share a
+        // boundary that seals air but overlaps nothing — no bond, so with
+        // nothing severed the craft already partitions into two fragments,
+        // each keeping its form (a form touching only edge-to-edge does not
+        // secretly hold).
+        use crate::shape::{constants, face_masks, mask_popcount, masks_seal};
+        let a = face_masks(Form::Wedge, 0)[1];
+        let complement = constants(Form::Wedge)
+            .distinct_orientations
+            .iter()
+            .copied()
+            .find(|&o| {
+                let m = face_masks(Form::Wedge, o)[0];
+                masks_seal(&a, &m) && mask_popcount(&m) < 200
+            })
+            .expect("a complementary orientation exists");
+        let mut c = bar(2, Material::ALUMINIUM);
+        wedge_at(&mut c, IVec3::ZERO, 0);
+        wedge_at(&mut c, IVec3::new(1, 0, 0), complement);
+        assert!(structural_bonds(&c).is_empty(), "no bond to carry");
+        let frags = connected_components(&c, &Severed::new());
+        assert_eq!(frags.len(), 2, "already two components");
+        assert!(frags.iter().all(|f| f.shapes.len() == 1), "forms ride");
+        // And the sealed boundary is real: the same pair passes the seal
+        // predicate — holds air, holds no load.
+        let solid: HashSet<IVec3> = c.voxels.iter().map(|v| v.cell).collect();
+        assert!(c.boundary_sealed(&solid, IVec3::ZERO, IVec3::X));
+    }
+
+    #[test]
+    fn identical_stacked_wedges_bond_at_their_shared_triangle() {
+        // The fractional middle case: same-orientation wedges meet
+        // triangle-on-triangle — the bond is the triangle's overlap, strictly
+        // between zero and full.
+        use crate::shape::{face_masks, masks_overlap};
+        let mut c = bar(2, Material::ALUMINIUM);
+        wedge_at(&mut c, IVec3::ZERO, 0);
+        wedge_at(&mut c, IVec3::new(1, 0, 0), 0);
+        let bonds = structural_bonds(&c);
+        assert_eq!(bonds.len(), 1);
+        let full = Material::ALUMINIUM.strength;
+        let overlap = masks_overlap(
+            &face_masks(Form::Wedge, 0)[1],
+            &face_masks(Form::Wedge, 0)[0],
+        );
+        assert_eq!(bonds[0].strength, full * overlap as f64 / 256.0);
+        let fraction = bonds[0].strength / full;
+        assert!(
+            fraction > 0.3 && fraction < 0.7,
+            "strictly fractional: {fraction}"
+        );
     }
 }
