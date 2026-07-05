@@ -18,7 +18,7 @@
 
 use crate::voxel::VoxelCraft;
 use glam::IVec3;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// One sealed interior volume: its enclosed empty cells and their total volume.
 #[derive(Clone, Debug, PartialEq)]
@@ -58,13 +58,57 @@ const NEIGHBOURS: [IVec3; 6] = [
     IVec3::new(0, 0, -1),
 ];
 
+/// Node semantics for the exterior fill (WI 832, the staged-rollout seam): the
+/// **compartment** fill walks every cell with any air fraction (an empty cell is
+/// all air; a shaped solid cell carries its form's remainder — the R1 admission
+/// invariant guarantees that remainder is one region reaching every open face,
+/// which is what licenses cell-granular through-flow); the **aero envelope**
+/// (WI 827) keeps boolean empty-cell nodes until WI 834 generalizes it.
+enum NodeMode<'a> {
+    /// Air = strictly-unoccupied cells (the pre-832 view; the aero envelope).
+    EmptyCells,
+    /// Air = any cell with air fraction > 0 (the map holds shaped solid cells'
+    /// remainders; unoccupied cells are implicitly fraction 1).
+    AirFractions(&'a HashMap<IVec3, f64>),
+}
+
+impl NodeMode<'_> {
+    /// Whether the fill may occupy `cell` as an air node.
+    fn is_air(&self, solid: &HashSet<IVec3>, cell: IVec3) -> bool {
+        match self {
+            NodeMode::EmptyCells => !solid.contains(&cell),
+            NodeMode::AirFractions(shaped) => {
+                !solid.contains(&cell) || shaped.get(&cell).is_some_and(|f| *f > 0.0)
+            }
+        }
+    }
+}
+
+/// The air remainders of a craft's shaped **voxel** cells (`1 − form volume`,
+/// omitting zero-air forms): the extra nodes the compartment fill walks. Keyed
+/// off voxels, so an orphan shape entry (or one on a door cell) contributes
+/// nothing.
+fn shaped_air_fractions(craft: &VoxelCraft) -> HashMap<IVec3, f64> {
+    let mut out = HashMap::new();
+    for v in &craft.voxels {
+        if let Some(s) = craft.shape_at(v.cell) {
+            let air = 1.0 - crate::shape::constants(s.form).volume;
+            if air > 0.0 {
+                out.insert(v.cell, air);
+            }
+        }
+    }
+    out
+}
+
 /// The exterior flood-fill shared by compartment derivation and the WI 827 aero
 /// **sealed envelope**: the expanded structure bounding box (`lo..=hi`, border all
 /// air by construction) and the air cells the exterior can reach through it,
 /// crossing a boundary only where **the** per-face coverage predicate
-/// ([`VoxelCraft::boundary_sealed`], WI 824) says it is not sealed. `solid` is the
-/// caller's barrier set — the one input the two consumers differ on (compartments:
-/// voxels + *closed* doors; the aero envelope: voxels + *all* doors).
+/// ([`VoxelCraft::boundary_sealed`], WI 824/832) says it is not sealed. `solid`
+/// is the caller's barrier set (compartments: voxels + *closed* doors; the aero
+/// envelope: voxels + *all* doors) and `mode` its node semantics (see
+/// [`NodeMode`]).
 struct ExteriorFill {
     /// Expanded bounding-box minimum (inclusive).
     lo: IVec3,
@@ -74,7 +118,7 @@ struct ExteriorFill {
     exterior: HashSet<IVec3>,
 }
 
-fn exterior_fill(craft: &VoxelCraft, solid: &HashSet<IVec3>) -> ExteriorFill {
+fn exterior_fill(craft: &VoxelCraft, solid: &HashSet<IVec3>, mode: &NodeMode<'_>) -> ExteriorFill {
     // Bounding box of the structure — solids and paneled boundaries (a craft can
     // be all plates, WI 824) — expanded by one cell so the border is all
     // exterior air.
@@ -93,7 +137,7 @@ fn exterior_fill(craft: &VoxelCraft, solid: &HashSet<IVec3>) -> ExteriorFill {
     let in_bbox = |c: IVec3| {
         c.x >= lo.x && c.x <= hi.x && c.y >= lo.y && c.y <= hi.y && c.z >= lo.z && c.z <= hi.z
     };
-    let is_air = |c: IVec3| in_bbox(c) && !solid.contains(&c);
+    let is_air = |c: IVec3| in_bbox(c) && mode.is_air(solid, c);
 
     // Flood the exterior from the expanded-bbox border (all air there is outside
     // the hull) inward through air cells.
@@ -140,7 +184,8 @@ pub fn sealed_envelope(craft: &VoxelCraft) -> HashSet<IVec3> {
     if solid.is_empty() && craft.face_panels.is_empty() {
         return HashSet::new();
     }
-    let fill = exterior_fill(craft, &solid);
+    // Boolean nodes until WI 834: shaped cells stay full-cube blockers for aero.
+    let fill = exterior_fill(craft, &solid, &NodeMode::EmptyCells);
     let mut envelope = HashSet::new();
     for x in fill.lo.x..=fill.hi.x {
         for y in fill.lo.y..=fill.hi.y {
@@ -157,9 +202,13 @@ pub fn sealed_envelope(craft: &VoxelCraft) -> HashSet<IVec3> {
 
 /// Compute the sealed compartments of `craft` given its current door states.
 /// Pure and deterministic. Passability between air cells is decided by **the**
-/// per-face coverage predicate ([`VoxelCraft::boundary_sealed`], WI 824) — solid
-/// occupancy (voxels + closed doors) and face panels both seal; no other seal
-/// logic exists here.
+/// per-face coverage predicate ([`VoxelCraft::boundary_sealed`], WI 824/832) —
+/// solid occupancy (voxels + closed doors), face panels, and shaped-cell
+/// coverage all seal through it; no other seal logic exists here. **Nodes are
+/// cells with any air fraction** (WI 832): an empty cell is all air, a shaped
+/// solid cell carries its form's remainder (per R1, one region reaching every
+/// open face), so air flows *through* a wedge cell where its faces are open,
+/// and a compartment's volume sums its members' air fractions.
 pub fn compartments(craft: &VoxelCraft) -> CompartmentSet {
     // Solid (air barrier) cells: structural voxels plus closed doors.
     let mut solid: HashSet<IVec3> = craft.voxels.iter().map(|v| v.cell).collect();
@@ -172,19 +221,27 @@ pub fn compartments(craft: &VoxelCraft) -> CompartmentSet {
         return CompartmentSet::default();
     }
 
-    let fill = exterior_fill(craft, &solid);
+    let shaped_air = shaped_air_fractions(craft);
+    let mode = NodeMode::AirFractions(&shaped_air);
+    let fill = exterior_fill(craft, &solid, &mode);
     let (lo, hi) = (fill.lo, fill.hi);
     let exterior = &fill.exterior;
-    let is_air = |c: IVec3| !solid.contains(&c);
+    let air_fraction = |c: IVec3| -> f64 {
+        if !solid.contains(&c) {
+            1.0
+        } else {
+            shaped_air.get(&c).copied().unwrap_or(0.0)
+        }
+    };
 
-    // Interior air = air cells the exterior never reached. Collect in a sorted
-    // order for deterministic component numbering.
+    // Interior air = air-carrying cells the exterior never reached. Collect in
+    // a sorted order for deterministic component numbering.
     let mut interior: Vec<IVec3> = Vec::new();
     for x in lo.x..=hi.x {
         for y in lo.y..=hi.y {
             for z in lo.z..=hi.z {
                 let c = IVec3::new(x, y, z);
-                if is_air(c) && !exterior.contains(&c) {
+                if air_fraction(c) > 0.0 && !exterior.contains(&c) {
                     interior.push(c);
                 }
             }
@@ -201,10 +258,12 @@ pub fn compartments(craft: &VoxelCraft) -> CompartmentSet {
             continue;
         }
         let mut cells = Vec::new();
+        let mut volume = 0.0;
         let mut stack = vec![seed];
         seen.insert(seed);
         while let Some(c) = stack.pop() {
             cells.push(c);
+            volume += air_fraction(c) * cell_volume;
             for off in NEIGHBOURS {
                 let n = c + off;
                 if interior_set.contains(&n)
@@ -215,7 +274,6 @@ pub fn compartments(craft: &VoxelCraft) -> CompartmentSet {
                 }
             }
         }
-        let volume = cells.len() as f64 * cell_volume;
         compartments.push(Compartment { cells, volume });
     }
 
@@ -294,6 +352,155 @@ mod tests {
             !(p.x > 0 && p.x < n - 1 && p.y > 0 && p.y < n - 1 && p.z > 0 && p.z < n - 1)
         });
         c
+    }
+
+    // --- WI 832: shaped-cell coverage through the one predicate ---
+
+    use crate::shape::{rotations, FillMode, Form, ShapedCell};
+    use glam::{DMat3, DVec3};
+
+    /// The rotation index whose matrix equals `want` (the table is frozen, so
+    /// the found index is stable).
+    fn orientation_of(want: DMat3) -> u8 {
+        rotations()
+            .iter()
+            .position(|r| r.abs_diff_eq(want, 1e-12))
+            .expect("rotation in the table") as u8
+    }
+
+    fn wedge_at(craft: &mut VoxelCraft, cell: IVec3, orientation: u8) {
+        craft.voxels.push(Voxel {
+            cell,
+            material: Material::ALUMINIUM,
+        });
+        craft.set_shape(ShapedCell {
+            cell,
+            form: Form::Wedge,
+            orientation,
+            fill: FillMode::Solid,
+        });
+    }
+
+    #[test]
+    fn mated_wedges_seal_and_identical_wedges_vent() {
+        // Canonical wedge: solid {y ≤ z}; both x faces cover the triangle
+        // {y ≤ z}. Rotating by diag(1,−1,−1) complements it ({y ≥ z}), so the
+        // pair jointly covers the shared boundary — sealed. Two identically
+        // oriented wedges cover the same half — open.
+        let complement = orientation_of(DMat3::from_diagonal(DVec3::new(1.0, -1.0, -1.0)));
+        let a = IVec3::ZERO;
+        let b = IVec3::new(1, 0, 0);
+
+        let mut mated = VoxelCraft::new(1.0);
+        wedge_at(&mut mated, a, 0);
+        wedge_at(&mut mated, b, complement);
+        let solid: HashSet<IVec3> = [a, b].into_iter().collect();
+        assert!(
+            mated.boundary_sealed(&solid, a, IVec3::X),
+            "complementary wedges seal their boundary"
+        );
+
+        let mut same = VoxelCraft::new(1.0);
+        wedge_at(&mut same, a, 0);
+        wedge_at(&mut same, b, 0);
+        assert!(
+            !same.boundary_sealed(&solid, a, IVec3::X),
+            "identical wedges leave the boundary open"
+        );
+    }
+
+    #[test]
+    fn a_paneled_half_face_seals() {
+        // A lone wedge's half-open boundary vents bare; a face panel on that
+        // boundary covers it fully.
+        let a = IVec3::ZERO;
+        let mut craft = VoxelCraft::new(1.0);
+        wedge_at(&mut craft, a, 0);
+        let solid: HashSet<IVec3> = [a].into_iter().collect();
+        assert!(
+            !craft.boundary_sealed(&solid, a, IVec3::X),
+            "a half-covered face is open"
+        );
+        craft.set_face_panel(a, IVec3::X, Some(Material::GLASS));
+        assert!(
+            craft.boundary_sealed(&solid, a, IVec3::X),
+            "a panel completes the coverage"
+        );
+    }
+
+    #[test]
+    fn a_hull_keeps_or_loses_its_compartment_per_the_wedge_geometry() {
+        // A 3³ hollow hull (cavity at (1,1,1)); the z=0 wall cell (1,1,0)
+        // becomes a wedge in three orientations:
+        //   (a) full face outward  → the cavity GAINS the wedge's air remainder
+        //       (volume 1.5 cells);
+        //   (b) full face inward   → the cavity stays sealed alone (1.0), the
+        //       remainder joins the exterior;
+        //   (c) half faces on the wall axis → the cavity VENTS (0 compartments).
+        let wall = IVec3::new(1, 1, 0);
+        let hull_with = |orientation: Option<u8>| {
+            let mut c = hollow_shell(3);
+            if let Some(o) = orientation {
+                c.set_shape(ShapedCell {
+                    cell: wall,
+                    form: Form::Wedge,
+                    orientation: o,
+                    fill: FillMode::Solid,
+                });
+            }
+            c
+        };
+
+        // (a) rotate by 180° about Y: solid {y ≤ 1−z} — z0 full, z1 empty.
+        let out = orientation_of(DMat3::from_diagonal(DVec3::new(-1.0, 1.0, -1.0)));
+        let set = compartments(&hull_with(Some(out)));
+        assert_eq!(set.count(), 1, "(a) sealed");
+        assert!(
+            (set.total_volume() - 1.5).abs() < 1e-9,
+            "(a) cavity + the wedge's air remainder: {}",
+            set.total_volume()
+        );
+        assert!(
+            set.compartments[0].cells.contains(&wall),
+            "(a) the wedge cell is a member"
+        );
+
+        // (b) canonical: z1 (inward) full, z0 (outward) empty.
+        let set = compartments(&hull_with(Some(0)));
+        assert_eq!(set.count(), 1, "(b) still sealed");
+        assert!(
+            (set.total_volume() - 1.0).abs() < 1e-9,
+            "(b) the cavity alone: {}",
+            set.total_volume()
+        );
+        assert!(
+            !set.compartments[0].cells.contains(&wall),
+            "(b) the wedge's remainder joined the exterior"
+        );
+
+        // (c) an orientation whose two z faces are both partial: air crosses
+        // the wall through the wedge — vented.
+        let c = crate::shape::constants(Form::Wedge);
+        let venting = c
+            .distinct_orientations
+            .iter()
+            .copied()
+            .find(|&o| {
+                let m = crate::shape::face_masks(Form::Wedge, o);
+                let partial = |f: usize| {
+                    let n = crate::shape::mask_popcount(&m[f]);
+                    n > 0 && n < 256
+                };
+                partial(4) && partial(5)
+            })
+            .expect("a wedge orientation with both z faces partial");
+        let set = compartments(&hull_with(Some(venting)));
+        assert_eq!(set.count(), 0, "(c) vented through the wedge");
+
+        // Control: the unshaped hull has its one full-cavity compartment.
+        let set = compartments(&hull_with(None));
+        assert_eq!(set.count(), 1);
+        assert!((set.total_volume() - 1.0).abs() < 1e-9);
     }
 
     // --- WI 824: face-panel sealing through the one coverage predicate ---

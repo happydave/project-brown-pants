@@ -20,11 +20,13 @@
 //! distinct-orientation set is derived by congruence deduplication, never
 //! authored.
 //!
-//! Staged rollout: this stage makes shapes exist, weigh, and float (mass /
-//! inertia / displacement / breakage-load folds). Compartments and sealing
-//! treat shaped cells as full cubes until WI 832, the aero envelope until
-//! WI 834, breakage *bonds* until WI 835, shell physics until WI 836, and
-//! collision stays the full cell box by design (review R3).
+//! Staged rollout: WI 831 made shapes exist, weigh, and float (mass / inertia /
+//! displacement / breakage-load folds); WI 832 made them **seal** — per-face
+//! coverage masks flow through the one `boundary_sealed` predicate and the
+//! compartment flood walks air fractions. The aero envelope treats shaped
+//! cells as full cubes until WI 834, breakage *bonds* until WI 835, shell
+//! physics until WI 836, and collision stays the full cell box by design
+//! (review R3).
 
 use glam::{DMat3, DVec3, IVec3};
 use serde::{Deserialize, Serialize};
@@ -355,6 +357,120 @@ pub(crate) fn form_mesh(form: Form) -> FormMesh {
     }
 }
 
+/// A face's coverage as a raster mask (WI 832): 16×16 jittered samples over the
+/// face, one bit each — **derived** from the form's face-plane triangles, never
+/// authored. The vocabulary's contract (design R4) is totality under the two
+/// consumer operations: **seal composition** (`masks_seal` — do the two sides of
+/// a boundary jointly cover it?) and, for WI 835, overlap area (bitwise AND
+/// popcount). Bit `i·16 + j` samples in-face point `((i+½)/16 + JU, (j+½)/16 +
+/// JV)` in the face's tangent axes (the fixed X→(Y,Z), Y→(X,Z), Z→(X,Y) order),
+/// so the two cells facing one boundary index the **same physical point with the
+/// same bit** — exactly-complementary coverages OR to full (the jitter
+/// tie-breaks the shared diagonal to exactly one side).
+pub type FaceMask = [u64; 4];
+/// No coverage (an unoccupied side).
+pub const MASK_EMPTY: FaceMask = [0; 4];
+/// Full coverage (an unshaped solid side).
+pub const MASK_FULL: FaceMask = [u64::MAX; 4];
+
+/// Seal composition: the boundary is sealed when the two sides' coverages
+/// jointly cover every sample.
+pub fn masks_seal(a: &FaceMask, b: &FaceMask) -> bool {
+    (0..4).all(|w| a[w] | b[w] == u64::MAX)
+}
+
+/// The number of covered samples in a mask (of 256).
+pub fn mask_popcount(m: &FaceMask) -> u32 {
+    m.iter().map(|w| w.count_ones()).sum()
+}
+
+/// In-face jitter for the mask sample grid (fixed; shared by every face so
+/// boundary bits align — invariant, do not vary per face).
+const MASK_JITTER_U: f64 = 7.548776662e-5;
+const MASK_JITTER_V: f64 = 5.6984029e-5;
+/// Mask resolution per axis.
+const MASK_N: usize = 16;
+
+/// The face masks of `form` under `orientation`, derived once per process for
+/// all (form, orientation) pairs by rotating the canonical mesh and
+/// re-rasterizing — one code path, so the table is rotation-closed by
+/// construction. Face order `[x0, x1, y0, y1, z0, z1]`.
+pub fn face_masks(form: Form, orientation: u8) -> &'static [FaceMask; 6] {
+    static TABLE: OnceLock<Vec<[FaceMask; 6]>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut out = Vec::with_capacity(FORMS.len() * 24);
+        for form in FORMS {
+            let mesh = form_mesh(form);
+            for r in rotations().iter() {
+                let rotated: Vec<DVec3> = mesh
+                    .vertices
+                    .iter()
+                    .map(|&p| *r * (p - DVec3::splat(0.5)) + DVec3::splat(0.5))
+                    .collect();
+                out.push(rasterize_face_masks(&rotated, &mesh.triangles));
+            }
+        }
+        out
+    });
+    let fi = FORMS.iter().position(|f| *f == form).expect("catalog form");
+    &table[fi * 24 + orientation as usize]
+}
+
+/// Rasterize the six face masks of a (possibly rotated) mesh: for each unit-cube
+/// face, collect the triangles lying wholly in its plane, project to the face's
+/// tangent axes, and sample the jittered grid.
+fn rasterize_face_masks(vertices: &[DVec3], triangles: &[[usize; 3]]) -> [FaceMask; 6] {
+    let mut masks = [MASK_EMPTY; 6];
+    for (face, axis, side) in [
+        (0usize, 0usize, 0.0),
+        (1, 0, 1.0),
+        (2, 1, 0.0),
+        (3, 1, 1.0),
+        (4, 2, 0.0),
+        (5, 2, 1.0),
+    ] {
+        let (t1, t2) = match axis {
+            0 => (1, 2), // X face: (y, z)
+            1 => (0, 2), // Y face: (x, z)
+            _ => (0, 1), // Z face: (x, y)
+        };
+        // Triangles wholly in this face plane, projected to (t1, t2).
+        let tris: Vec<[(f64, f64); 3]> = triangles
+            .iter()
+            .filter(|t| {
+                t.iter()
+                    .all(|&i| (vertices[i][axis] - side).abs() < GEOM_EPS)
+            })
+            .map(|t| t.map(|i| (vertices[i][t1], vertices[i][t2])))
+            .collect();
+        if tris.is_empty() {
+            continue;
+        }
+        let mut mask = MASK_EMPTY;
+        for i in 0..MASK_N {
+            for j in 0..MASK_N {
+                let u = (i as f64 + 0.5) / MASK_N as f64 + MASK_JITTER_U;
+                let v = (j as f64 + 0.5) / MASK_N as f64 + MASK_JITTER_V;
+                if tris.iter().any(|t| point_in_triangle_2d(u, v, t)) {
+                    let bit = i * MASK_N + j;
+                    mask[bit / 64] |= 1u64 << (bit % 64);
+                }
+            }
+        }
+        masks[face] = mask;
+    }
+    masks
+}
+
+/// 2D point-in-triangle by consistent edge signs (winding-agnostic).
+fn point_in_triangle_2d(u: f64, v: f64, t: &[(f64, f64); 3]) -> bool {
+    let sign = |a: (f64, f64), b: (f64, f64)| (b.0 - a.0) * (v - a.1) - (b.1 - a.1) * (u - a.0);
+    let s0 = sign(t[0], t[1]);
+    let s1 = sign(t[1], t[2]);
+    let s2 = sign(t[2], t[0]);
+    (s0 >= 0.0 && s1 >= 0.0 && s2 >= 0.0) || (s0 <= 0.0 && s1 <= 0.0 && s2 <= 0.0)
+}
+
 /// Derivation-time sampling resolution (per axis) for the admission checks.
 const SAMPLE_N: usize = 16;
 /// Fixed sub-grid jitter so no sample lies exactly on a form plane
@@ -470,6 +586,20 @@ pub(crate) fn derive_form(form: Form, mesh: &FormMesh) -> Result<FormConstants, 
             {
                 face_coverage[face] += area;
             }
+        }
+    }
+
+    // --- Mask cross-check (WI 832): the raster face masks must agree with the
+    // analytically-derived coverage fractions — the seal vocabulary cannot
+    // disagree with the geometry it was derived from.
+    let masks = rasterize_face_masks(&mesh.vertices, &mesh.triangles);
+    for (face, mask) in masks.iter().enumerate() {
+        let sampled = mask_popcount(mask) as f64 / (MASK_N * MASK_N) as f64;
+        if (sampled - face_coverage[face]).abs() > 0.05 {
+            return Err(format!(
+                "face {face}: raster mask covers {sampled:.3} but derived coverage is {:.3}",
+                face_coverage[face]
+            ));
         }
     }
 
@@ -814,6 +944,32 @@ mod tests {
         assert!(derive_form(Form::Wedge, &flipped)
             .unwrap_err()
             .contains("volume"));
+    }
+
+    #[test]
+    fn face_masks_seal_complements_and_vent_duplicates() {
+        // WI 832 mask level: a cube's faces are all FULL; the canonical wedge's
+        // x1 face ({y ≤ z}) plus the diag(1,−1,−1)-rotated wedge's x0 face
+        // ({y ≥ z}) jointly cover the boundary; two identical halves do not.
+        assert!(face_masks(Form::Cube, 0).iter().all(|m| *m == MASK_FULL));
+        let complement = rotations()
+            .iter()
+            .position(|r| r.abs_diff_eq(DMat3::from_diagonal(DVec3::new(1.0, -1.0, -1.0)), 1e-12))
+            .unwrap() as u8;
+        let a = face_masks(Form::Wedge, 0)[1];
+        let b = face_masks(Form::Wedge, complement)[0];
+        assert!(masks_seal(&a, &b), "complements cover the boundary");
+        let same = face_masks(Form::Wedge, 0)[0];
+        assert!(!masks_seal(&a, &same), "duplicate halves leave a gap");
+        // Half coverage reads as ~half the samples (the jitter tie-breaks the
+        // diagonal to one side).
+        let n = mask_popcount(&a);
+        assert!((100..156).contains(&n), "half face ≈ half the samples: {n}");
+        assert_eq!(
+            mask_popcount(&a) + mask_popcount(&b),
+            256,
+            "exact complements partition the samples"
+        );
     }
 
     #[test]

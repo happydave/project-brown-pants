@@ -235,13 +235,25 @@ pub fn buoyancy_wrench(
         draft = draft.max(surface_radius - world.length());
     }
     for &cell in enclosed {
+        // An enclosed shaped member contributes its **air remainder** (WI 832) —
+        // its solid part already displaced in the voxel loop above, so a fully
+        // enclosed shaped cell totals exactly one cell. Empty members are all
+        // air (fraction 1, the pre-832 behaviour). Graded at the cell centre,
+        // the same approximation full cells make.
+        let air = craft
+            .shape_at(cell)
+            .map(|s| 1.0 - crate::shape::constants(s.form).volume)
+            .unwrap_or(1.0);
+        if air <= 0.0 {
+            continue;
+        }
         let local = (cell.as_dvec3() + DVec3::splat(0.5)) * craft.cell_size - com;
         let world = body_position + body_orientation * local;
         let fraction = cell_submerged_fraction(world, craft.cell_size, surface_radius, time);
         if fraction <= 0.0 {
             continue;
         }
-        let displaced = cell_volume * fraction; // the water this cell displaces
+        let displaced = cell_volume * air * fraction; // the water this cell displaces
         let f = density * gravity * displaced * up;
         let arm = world - body_position; // offset from the centre of mass (the body integrates the CoM)
         force += f;
@@ -1281,6 +1293,64 @@ mod tests {
             w.submerged_volume
         );
         assert!((w.force.length() - 0.5 * f.force.length()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_enclosed_wedge_remainder_displaces_its_fraction() {
+        // WI 832: a 3³ hull whose z=0 wall cell is a wedge with its full face
+        // outward — the cavity gains the wedge's air remainder. Fully
+        // submerged, the craft displaces exactly its 27-cell bounding volume:
+        // 25 full walls + the wedge's solid ½ (voxel loop) + cavity 1 + the
+        // wedge's air ½ (enclosed loop).
+        use crate::medium::enclosed_cells;
+        use crate::shape::{rotations, FillMode, Form, ShapedCell};
+        use glam::DMat3;
+        let mut hull = VoxelCraft::new(1.0);
+        for x in 0..3 {
+            for y in 0..3 {
+                for z in 0..3 {
+                    if !(x == 1 && y == 1 && z == 1) {
+                        hull.voxels.push(Voxel {
+                            cell: IVec3::new(x, y, z),
+                            material: Material::ALUMINIUM,
+                        });
+                    }
+                }
+            }
+        }
+        let out = rotations()
+            .iter()
+            .position(|r| r.abs_diff_eq(DMat3::from_diagonal(DVec3::new(-1.0, 1.0, -1.0)), 1e-12))
+            .unwrap() as u8;
+        hull.set_shape(ShapedCell {
+            cell: IVec3::new(1, 1, 0),
+            form: Form::Wedge,
+            orientation: out,
+            fill: FillMode::Solid,
+        });
+        let enclosed = enclosed_cells(&hull);
+        assert!(
+            enclosed.contains(&IVec3::new(1, 1, 0)),
+            "the wedge cell is an enclosed member"
+        );
+        let com = hull.mass_properties().unwrap().center_of_mass;
+        let deep = DVec3::new(0.0, SURFACE_R - 100.0, 0.0);
+        let load = buoyancy_wrench(
+            &hull,
+            com,
+            deep,
+            glam::DQuat::IDENTITY,
+            SURFACE_R,
+            0.0,
+            1_000.0,
+            9.81,
+            &enclosed,
+        );
+        assert!(
+            (load.submerged_volume - 27.0).abs() < 1e-9,
+            "solids + cavity + the wedge's remainder = the full 27-cell box, got {}",
+            load.submerged_volume
+        );
     }
 
     #[test]

@@ -963,17 +963,56 @@ impl VoxelCraft {
         }
     }
 
-    /// **The per-face coverage predicate** (WI 824; the shaped-cell seam, panels
-    /// design R3): the boundary between `cell` and `cell + dir` is sealed iff
-    /// fully covered by solid occupancy on either side and/or a face panel.
-    /// `solid` is the caller's occupancy set (the compartment flood-fill passes
-    /// voxels + closed doors; other consumers pass voxels). Boolean-valued today;
-    /// shaped cells later supply partial coverage *through this one function* —
-    /// callers must not inline their own seal logic.
+    /// **The per-face coverage predicate** (WI 824; partial coverage since
+    /// WI 832): the boundary between `cell` and `cell + dir` is sealed iff
+    /// fully covered by the two sides' occupancy and/or a face panel. A side
+    /// contributes **no** coverage when not in `solid`, **full** coverage when
+    /// an unshaped `solid` member (voxels and closed doors alike), and its
+    /// form's **oriented face mask** when shaped — so mated complementary
+    /// wedges seal their shared boundary while a lone wedge's half-open face
+    /// does not. `solid` is the caller's occupancy set (the compartment
+    /// flood-fill passes voxels + closed doors; the aero fill passes voxels +
+    /// all doors). Callers must not inline their own seal logic — this is the
+    /// one function shaped coverage flows through.
     pub fn boundary_sealed(&self, solid: &HashSet<IVec3>, cell: IVec3, dir: IVec3) -> bool {
-        solid.contains(&cell)
-            || solid.contains(&(cell + dir))
-            || self.face_panel_between(cell, dir).is_some()
+        if self.face_panel_between(cell, dir).is_some() {
+            return true;
+        }
+        if self.shapes.is_empty() {
+            // Fast path: no shaped cells — the exact pre-832 rule.
+            return solid.contains(&cell) || solid.contains(&(cell + dir));
+        }
+        let axis = if dir.x != 0 {
+            0
+        } else if dir.y != 0 {
+            1
+        } else {
+            2
+        };
+        // Own face toward the neighbour, neighbour's face back toward us
+        // (face order [x0, x1, y0, y1, z0, z1]).
+        let positive = dir.x + dir.y + dir.z > 0;
+        let (face_a, face_b) = if positive {
+            (2 * axis + 1, 2 * axis)
+        } else {
+            (2 * axis, 2 * axis + 1)
+        };
+        let coverage = |c: IVec3, face: usize| -> crate::shape::FaceMask {
+            if !solid.contains(&c) {
+                crate::shape::MASK_EMPTY
+            } else {
+                match self.shape_at(c) {
+                    Some(s) => crate::shape::face_masks(s.form, s.orientation)[face],
+                    None => crate::shape::MASK_FULL,
+                }
+            }
+        };
+        let a = coverage(cell, face_a);
+        if a == crate::shape::MASK_FULL {
+            return true;
+        }
+        let b = coverage(cell + dir, face_b);
+        crate::shape::masks_seal(&a, &b)
     }
 
     /// Convert **legacy** cell-panel flags (WI 716) to face panels — the panels
@@ -1571,6 +1610,41 @@ mod tests {
                 (mp.inertia - want_i).abs_diff_eq(DMat3::ZERO, 1e-9),
                 "orientation {o}: inertia mismatch"
             );
+        }
+    }
+
+    #[test]
+    fn the_aero_envelope_ignores_shaped_cells_until_wi_834() {
+        // WI 832 keeps the envelope's boolean node semantics (invariant 5 of
+        // the plan): shaping a hull's wall cell changes compartments, not the
+        // area curve — WI 834 owns the aero generalization.
+        use crate::shape::{FillMode, Form, ShapedCell};
+        let hull = || {
+            let mut c = VoxelCraft::new(1.0);
+            for x in 0..3 {
+                for y in 0..3 {
+                    for z in 0..3 {
+                        if !(x == 1 && y == 1 && z == 1) {
+                            c.voxels.push(Voxel {
+                                cell: IVec3::new(x, y, z),
+                                material: Material::ALUMINIUM,
+                            });
+                        }
+                    }
+                }
+            }
+            c
+        };
+        let plain = hull();
+        let mut shaped = hull();
+        shaped.set_shape(ShapedCell {
+            cell: IVec3::new(1, 1, 0),
+            form: Form::Wedge,
+            orientation: 0,
+            fill: FillMode::Solid,
+        });
+        for axis in [Axis::X, Axis::Y, Axis::Z] {
+            assert_eq!(shaped.area_curve(axis), plain.area_curve(axis));
         }
     }
 
