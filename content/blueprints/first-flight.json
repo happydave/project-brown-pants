@@ -1,5 +1,5 @@
 {
-  "format_version": 1,
+  "format_version": 2,
   "payload": {
     "kind": "blueprint",
     "id": "first-flight",
@@ -110,7 +110,7 @@
       "attachments": [],
       "doors": [],
       "parts": [],
-      "panels": []
+      "face_panels": []
     },
     "resources": [],
     "crew": []

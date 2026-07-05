@@ -172,53 +172,30 @@ impl SavedDocument {
         let probe: VersionProbe =
             serde_json::from_str(s).map_err(|e| FormatError::Malformed(e.to_string()))?;
         match probe.format_version {
-            // v1 and v2 share the payload shape; a v1 craft may carry legacy
-            // cell-panel flags, which the WI 824 conversion turns into face
-            // panels. New documents are always written at v2.
-            1 | FORMAT_VERSION => {
+            // Format v1 (pre-WI-824 legacy cell-panel flags) was retired at
+            // WI 820 (pre-release, owner direction): its migration is gone and
+            // v1 files are rejected by version like any other unsupported one.
+            FORMAT_VERSION => {
                 let mut doc: SavedDocument =
                     serde_json::from_str(s).map_err(|e| FormatError::Malformed(e.to_string()))?;
-                doc.convert_craft_panels();
+                doc.normalize_craft();
                 doc.validate_craft_shapes()?;
-                // A migrated document *is* a current-format document: stamp it, so
-                // re-serializing it can never produce a v1 file carrying v2 content
-                // (which an old build would load and silently strip).
-                doc.format_version = FORMAT_VERSION;
                 Ok(doc)
             }
             other => Err(FormatError::UnsupportedVersion(other)),
         }
     }
 
-    /// The WI 824 migration: convert legacy cell-panel flags to face panels on a
-    /// craft-scope payload (the panels design's R1 rule), logging a per-craft
-    /// summary with the compartment-count delta. A document without flags is only
-    /// normalized (face-panel order), never altered.
-    fn convert_craft_panels(&mut self) {
+    /// Restore the sorted-store invariants on a craft-scope payload (defensive,
+    /// for documents whose producer did not order the stores — the WI 820
+    /// determinism discipline).
+    fn normalize_craft(&mut self) {
         let craft = match &mut self.payload {
-            Payload::Craft(c) | Payload::Subassembly(c) | Payload::Blueprint(c) => {
-                (c.id.clone(), &mut c.craft)
-            }
+            Payload::Craft(c) | Payload::Subassembly(c) | Payload::Blueprint(c) => &mut c.craft,
             Payload::WorldSave(_) | Payload::BodyAsset(_) | Payload::System(_) => return,
         };
-        let (id, craft) = craft;
         craft.normalize_shapes();
-        if craft.panels.is_empty() {
-            craft.normalize_face_panels();
-            return;
-        }
-        let before = crate::compartments::compartments(craft).count();
-        let report = craft.convert_legacy_panels();
-        let after = crate::compartments::compartments(craft).count();
-        if let Some(r) = report {
-            bevy_log::info!(
-                "craft `{id}`: converted {} legacy panel cell(s) to {} face panel(s) \
-                 ({} embedded cell(s) kept solid); compartments {before} -> {after}",
-                r.cells_converted,
-                r.plates_created,
-                r.cells_kept_solid,
-            );
-        }
+        craft.normalize_face_panels();
     }
 
     /// Validate shaped-cell data on a craft-scope payload (WI 831): the
@@ -297,35 +274,54 @@ mod tests {
     }
 
     #[test]
-    fn v1_legacy_panel_flags_convert_to_face_panels_at_load() {
-        // WI 824: a v1 document whose craft carries cell-panel flags loads,
-        // converts per the R1 rule, and comes out flag-free with face panels;
-        // a v2 (or flagless v1) document is untouched beyond normalization.
-        let mut craft = sample_craft(); // one voxel at the origin
-        craft.set_panel(IVec3::ZERO, true);
+    fn v1_documents_are_rejected_by_version_and_paneled_crafts_resave_byte_identically() {
+        // WI 820 (owner direction, pre-release): format-v1 support is retired —
+        // a v1 file is rejected by the version probe with a clear error, not
+        // migrated.
         let mut doc = SavedDocument::new(Payload::Craft(CraftSubgraph::new(
-            "legacy",
-            "Legacy",
+            "old",
+            "Old",
             sample_pos(),
-            craft,
+            sample_craft(),
         )));
         doc.format_version = 1; // pretend it was written pre-824
         let json = serde_json::to_string(&doc).unwrap();
-        let loaded = SavedDocument::from_json(&json).unwrap();
-        let Payload::Craft(c) = &loaded.payload else {
-            panic!("craft payload expected");
-        };
         assert_eq!(
-            loaded.format_version, FORMAT_VERSION,
-            "a migrated document is stamped at the current format"
+            SavedDocument::from_json(&json),
+            Err(FormatError::UnsupportedVersion(1)),
+            "v1 is rejected by version"
         );
-        assert!(c.craft.panels.is_empty(), "flags consumed");
-        assert!(c.craft.voxels.is_empty(), "the lone flagged cell emptied");
-        assert_eq!(
-            c.craft.face_panels.len(),
-            6,
-            "a free-standing flagged cell plates all six faces"
+
+        // The WI's founding AC, on the panel-carrying case that motivated it:
+        // a plated hull re-saves byte-identically (no unordered persisted
+        // containers remain — the panel store is sorted by construction), and
+        // the retired legacy field is gone from the encoding entirely.
+        let mut cells = Vec::new();
+        for x in 0..3 {
+            for y in 0..3 {
+                for z in 0..3 {
+                    if !(x == 1 && y == 1 && z == 1) {
+                        cells.push(IVec3::new(x, y, z));
+                    }
+                }
+            }
+        }
+        let mut hull = VoxelCraft::new(0.5);
+        hull.plate_shell(&cells, Material::ALUMINIUM);
+        let doc = SavedDocument::new(Payload::Craft(CraftSubgraph::new(
+            "hull",
+            "Hull",
+            sample_pos(),
+            hull,
+        )));
+        let s1 = doc.to_json().unwrap();
+        assert!(
+            !s1.contains("\"panels\""),
+            "the legacy field is not encoded"
         );
+        assert!(s1.contains("\"face_panels\""), "the plated hull is real");
+        let s2 = SavedDocument::from_json(&s1).unwrap().to_json().unwrap();
+        assert_eq!(s2, s1, "paneled re-save is byte-identical");
 
         // A flagless craft round-trips bit-stable through the same seam.
         let plain = SavedDocument::new(Payload::Craft(CraftSubgraph::new(
@@ -516,7 +512,9 @@ mod tests {
 
     #[test]
     fn unknown_kind_is_rejected() {
-        let s = r#"{ "format_version": 1, "payload": { "kind": "spaceship", "id": "a", "name": "b" } }"#;
+        // Current-format version, so the *kind* is what gets judged (v1 itself
+        // is rejected by version since WI 820).
+        let s = r#"{ "format_version": 2, "payload": { "kind": "spaceship", "id": "a", "name": "b" } }"#;
         assert!(matches!(
             SavedDocument::from_json(s),
             Err(FormatError::Malformed(_))

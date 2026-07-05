@@ -557,20 +557,17 @@ mod tests {
     }
 
     #[test]
-    fn converting_a_legacy_panel_shell_preserves_separation() {
-        // R1 topology preservation end-to-end: a flagged shell encloses before
-        // conversion and still encloses after (the cavity never reaches the
-        // exterior), with the converted wall cells joining sealed space.
-        let mut legacy = hollow_shell(5);
-        for v in legacy.voxels.clone() {
-            legacy.set_panel(v.cell, true);
-        }
-        assert_eq!(compartments(&legacy).count(), 1, "pre-conversion: sealed");
-        legacy.convert_legacy_panels();
-        assert!(legacy.voxels.is_empty());
-        let set = compartments(&legacy);
-        assert!(set.count() >= 1, "post-conversion: still sealed");
-        // The 3³ cavity is still enclosed, plus the double-hull wall voids.
+    fn a_directly_plated_shell_encloses_its_cavity_and_wall_voids() {
+        // The R1 double-skin topology, built directly (WI 820 — fixture rebuilt,
+        // converter retired): a plated shell seals its cavity from the exterior,
+        // with the double-hull wall voids joining sealed space.
+        let cells: Vec<IVec3> = hollow_shell(5).voxels.iter().map(|v| v.cell).collect();
+        let mut plated = VoxelCraft::new(1.0);
+        plated.plate_shell(&cells, Material::ALUMINIUM);
+        assert!(plated.voxels.is_empty());
+        let set = compartments(&plated);
+        assert!(set.count() >= 1, "the plated shell seals");
+        // The 3³ cavity is enclosed, plus the double-hull wall voids.
         assert!(
             set.total_volume() >= 27.0,
             "cavity (27) plus wall voids enclosed: {}",

@@ -1,5 +1,5 @@
 {
-  "format_version": 1,
+  "format_version": 2,
   "payload": {
     "kind": "blueprint",
     "id": "dive-capsule",
@@ -760,7 +760,7 @@
       "attachments": [],
       "doors": [],
       "parts": [],
-      "panels": []
+      "face_panels": []
     },
     "resources": [],
     "crew": []

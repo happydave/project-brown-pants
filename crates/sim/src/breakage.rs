@@ -1070,13 +1070,12 @@ mod tests {
                 material: Material::ALUMINIUM,
             });
         }
-        // The converted form of a legacy panel beam: plates only, no voxels.
-        let mut panel = solid.clone();
-        for v in solid.voxels.clone() {
-            panel.set_panel(v.cell, true);
-        }
-        panel.convert_legacy_panels();
-        assert!(panel.voxels.is_empty(), "converted beam is all plates");
+        // The beam as plates only, no voxels (WI 820: built directly via
+        // plate_shell — the converted-legacy form this fixture used to build).
+        let cells: Vec<IVec3> = solid.voxels.iter().map(|v| v.cell).collect();
+        let mut panel = VoxelCraft::new(solid.cell_size);
+        panel.plate_shell(&cells, Material::ALUMINIUM);
+        assert!(panel.voxels.is_empty(), "plated beam is all plates");
 
         let heavy = DVec3::new(0.0, 200_000.0, 0.0); // a bending load past the beam's strength
         let light = DVec3::new(0.0, 1_000.0, 0.0); // a load neither beam fails under

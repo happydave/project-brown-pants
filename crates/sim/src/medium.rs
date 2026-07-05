@@ -2770,11 +2770,10 @@ mod tests {
     #[test]
     fn a_panel_hull_floats_where_a_solid_hull_sinks() {
         let solid = sealed_box(7, Material::ALUMINIUM); // hollow enough that panels can float it
-        let mut panel = solid.clone();
-        for v in &solid.voxels {
-            panel.set_panel(v.cell, true); // every wall cell is a thin panel
-        }
-        panel.convert_legacy_panels(); // WI 824: plates on faces, cells emptied
+                                                        // The same geometry as plates (WI 820: built directly, converter retired).
+        let cells: Vec<IVec3> = solid.voxels.iter().map(|v| v.cell).collect();
+        let mut panel = VoxelCraft::new(solid.cell_size);
+        panel.plate_shell(&cells, Material::ALUMINIUM);
         let enc = enclosed_cells(&solid); // the solid hull's enclosed set
         let g = 9.81;
         let rho = 1_025.0;

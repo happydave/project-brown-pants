@@ -332,30 +332,43 @@ mod tests {
 
     /// The harbor seed hull (also the shipped `harbor-seed` blueprint): a
     /// sealed **panel** pontoon — light, so it floats honestly under real
-    /// mass; the same hull in solid cubes would sink.
+    /// mass; the same hull in solid cubes would sink. Built directly as face
+    /// panels (WI 820 — the legacy flag converter is retired): inner+outer
+    /// skins around a double-hull void, the model the shipped blueprint
+    /// carries (pinned against the shipped file below).
     pub(crate) fn seed_hull() -> VoxelCraft {
         let mut c = VoxelCraft::new(0.5);
         let (w, h, l) = (7, 5, 11);
+        let mut cells = Vec::new();
         for x in 0..w {
             for y in 0..h {
                 for z in 0..l {
                     let on_surface =
                         x == 0 || x == w - 1 || y == 0 || y == h - 1 || z == 0 || z == l - 1;
                     if on_surface {
-                        let cell = glam::IVec3::new(x, y, z);
-                        c.voxels.push(Voxel {
-                            cell,
-                            material: Material::ALUMINIUM,
-                        });
-                        c.set_panel(cell, true); // a thin hull plate, not a solid cube (WI 716)
+                        cells.push(glam::IVec3::new(x, y, z));
                     }
                 }
             }
         }
-        // Face-panel form (WI 824): the shell converts to inner+outer skins
-        // around a double-hull void — the model the shipped blueprint carries.
-        c.convert_legacy_panels();
+        c.plate_shell(&cells, Material::ALUMINIUM);
         c
+    }
+
+    /// WI 820 fixture-faithfulness pin: the rewritten `seed_hull` (direct
+    /// plating, no legacy conversion) is exactly the craft the shipped
+    /// blueprint carries — the fixture rewrite cannot silently change shipped
+    /// content.
+    #[test]
+    fn the_seed_hull_matches_the_shipped_blueprint() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../content/blueprints/harbor-seed.json");
+        let json = std::fs::read_to_string(path).expect("shipped blueprint readable");
+        let doc = crate::persist::SavedDocument::from_json(&json).expect("shipped blueprint loads");
+        let crate::persist::Payload::Blueprint(c) = &doc.payload else {
+            panic!("blueprint payload expected");
+        };
+        assert_eq!(c.craft, seed_hull(), "fixture == shipped content");
     }
 
     /// The seed geometry in **solid cubes** (no panels) — the sinking

@@ -718,12 +718,6 @@ pub struct VoxelCraft {
     /// Defaulted on load so pre-parts saves stay backward-loadable.
     #[serde(default)]
     pub parts: Vec<Part>,
-    /// **Legacy** cell-panel flags (WI 716, superseded by [`FacePanel`]s in WI 824):
-    /// decode-only — loaders convert flagged cells to face panels
-    /// ([`convert_legacy_panels`]) and in-play craft never carry flags. Kept so
-    /// pre-824 saves load; never re-written.
-    #[serde(default)]
-    pub panels: HashSet<IVec3>,
     /// **Face panels** (WI 824): thin plates on cell boundaries — the first-class
     /// panel model (cells are solid cubes; plates live on faces). Kept sorted by
     /// [`FacePanel::key`] for deterministic encode; defaulted on load so pre-824
@@ -750,18 +744,6 @@ pub struct VoxelCraft {
 /// honestly (the double-hull accounting audited in the WI 824 plan).
 pub const PANEL_FILL: f64 = 0.05;
 
-/// The summary [`VoxelCraft::convert_legacy_panels`] returns for the conversion
-/// log (WI 824): what the R1 migration did to one craft.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LegacyPanelConversion {
-    /// Flagged cells emptied into face panels.
-    pub cells_converted: usize,
-    /// Fully-embedded flagged cells kept as solid cells (inert plating).
-    pub cells_kept_solid: usize,
-    /// Face panels created.
-    pub plates_created: usize,
-}
-
 impl Default for VoxelCraft {
     fn default() -> Self {
         Self {
@@ -771,7 +753,6 @@ impl Default for VoxelCraft {
             attachments: Vec::new(),
             doors: Vec::new(),
             parts: Vec::new(),
-            panels: HashSet::new(),
             face_panels: Vec::new(),
             shapes: Vec::new(),
         }
@@ -795,23 +776,6 @@ impl VoxelCraft {
     /// Total occupied voxel volume, m³ (excludes devices).
     pub fn occupied_volume(&self) -> f64 {
         self.voxels.len() as f64 * self.cell_volume()
-    }
-
-    /// Whether `cell` carries a **legacy** cell-panel flag (WI 716; decode-only
-    /// since WI 824 — see [`Self::convert_legacy_panels`]).
-    pub fn is_panel(&self, cell: IVec3) -> bool {
-        self.panels.contains(&cell)
-    }
-
-    /// Set (or clear) a **legacy** cell-panel flag. Retained for building
-    /// pre-conversion fixtures and the conversion tests; in-play craft use
-    /// [`FacePanel`]s (WI 824).
-    pub fn set_panel(&mut self, cell: IVec3, panel: bool) {
-        if panel {
-            self.panels.insert(cell);
-        } else {
-            self.panels.remove(&cell);
-        }
     }
 
     /// Canonicalize the boundary between `cell` and `cell + dir` (`dir` a ±unit
@@ -1036,21 +1000,16 @@ impl VoxelCraft {
         crate::shape::masks_seal(&a, &b)
     }
 
-    /// Convert **legacy** cell-panel flags (WI 716) to face panels — the panels
-    /// design's R1 migration rule, applied at document load. Evaluated against
-    /// the craft's *original* occupancy (order-independent, deterministic): each
-    /// flagged cell gains a face panel of its material on every face adjacent to
-    /// an empty cell, then empties; a flagged cell with **no** empty neighbour is
-    /// inert embedded plating and stays a solid cell. Sealing topology is
-    /// preserved by construction (every crossing the solid cell blocked is now
-    /// blocked by a plate or remains solid). Returns a per-craft summary for the
-    /// conversion log; a craft with no flags is untouched (idempotent).
-    pub fn convert_legacy_panels(&mut self) -> Option<LegacyPanelConversion> {
-        if self.panels.is_empty() {
-            self.normalize_face_panels();
-            return None;
-        }
-        let occupied: HashSet<IVec3> = self.voxels.iter().map(|v| v.cell).collect();
+    /// Plate a shell **directly** (WI 820): for every cell of `cells` (the
+    /// intended shell occupancy), add a face panel of `material` on each face
+    /// adjacent to a cell *outside* that occupancy — the WI 824 R1 double-skin
+    /// topology (a hull wall gains an inner and an outer skin around its void),
+    /// as a builder rather than a migration (the legacy flag converter this
+    /// replaces was retired with format v1). The shell cells themselves hold no
+    /// voxels; callers building mixed hulls add solid cells separately.
+    /// Deterministic regardless of `cells` order (the panel store is sorted).
+    pub fn plate_shell(&mut self, cells: &[IVec3], material: Material) {
+        let occupied: HashSet<IVec3> = cells.iter().copied().collect();
         let dirs = [
             IVec3::X,
             IVec3::NEG_X,
@@ -1059,43 +1018,13 @@ impl VoxelCraft {
             IVec3::Z,
             IVec3::NEG_Z,
         ];
-        let flagged: Vec<IVec3> = {
-            let mut f: Vec<IVec3> = self.panels.iter().copied().collect();
-            f.sort_by_key(|c| (c.x, c.y, c.z));
-            f
-        };
-        let mut cells_converted = 0usize;
-        let mut cells_kept_solid = 0usize;
-        let mut plates_created = 0usize;
-        let mut emptied: HashSet<IVec3> = HashSet::new();
-        for cell in flagged {
-            let Some(voxel) = self.voxels.iter().find(|v| v.cell == cell).copied() else {
-                continue; // a stray flag on an unoccupied cell is dropped
-            };
-            let empty_neighbours: Vec<IVec3> = dirs
-                .iter()
-                .copied()
-                .filter(|d| !occupied.contains(&(cell + *d)))
-                .collect();
-            if empty_neighbours.is_empty() {
-                cells_kept_solid += 1; // fully embedded: inert plating stays solid
-                continue;
+        for &cell in cells {
+            for d in dirs {
+                if !occupied.contains(&(cell + d)) {
+                    self.set_face_panel(cell, d, Some(material));
+                }
             }
-            for d in empty_neighbours {
-                self.set_face_panel(cell, d, Some(voxel.material));
-                plates_created += 1;
-            }
-            emptied.insert(cell);
-            cells_converted += 1;
         }
-        self.voxels.retain(|v| !emptied.contains(&v.cell));
-        self.panels.clear();
-        self.normalize_face_panels();
-        Some(LegacyPanelConversion {
-            cells_converted,
-            cells_kept_solid,
-            plates_created,
-        })
     }
 
     /// Whether this craft (or breakage fragment) carries a control point — a
@@ -2196,18 +2125,16 @@ mod tests {
     }
 
     #[test]
-    fn conversion_preserves_the_cross_section_via_the_envelope() {
-        // WI 827 sealed envelope: a converted flagged hull is plates around
-        // sealed air, and the envelope (everything the exterior cannot reach)
-        // is exactly the legacy solid region — so the curve stays at the legacy
-        // value, now for the physically-right reason (the flow goes around a
-        // closed hull, not through it).
+    fn a_plated_shell_presents_the_solid_cross_section_via_the_envelope() {
+        // WI 827 sealed envelope (fixture rebuilt at WI 820, converter retired):
+        // a plated hull is plates around sealed air, and the envelope
+        // (everything the exterior cannot reach) is exactly the solid region —
+        // so the curve equals the solid hull's (the flow goes around a closed
+        // hull, not through it).
         let solid = block(2, 2, 2, 0.5, Material::ALUMINIUM);
-        let mut panel = solid.clone();
-        for v in &solid.voxels {
-            panel.set_panel(v.cell, true);
-        }
-        panel.convert_legacy_panels();
+        let cells: Vec<IVec3> = solid.voxels.iter().map(|v| v.cell).collect();
+        let mut panel = VoxelCraft::new(0.5);
+        panel.plate_shell(&cells, Material::ALUMINIUM);
         assert!(panel.voxels.is_empty());
         assert_eq!(panel.area_curve(Axis::X), solid.area_curve(Axis::X));
         assert_eq!(panel.area_curve(Axis::Y), solid.area_curve(Axis::Y));
@@ -2318,44 +2245,33 @@ mod tests {
     }
 
     #[test]
-    fn legacy_conversion_follows_the_r1_rule() {
-        // A 3×3×3 flagged shell around a cavity: wall cells convert to inner and
-        // outer skins (the audited double-skin accounting); the craft empties.
-        let mut shell = VoxelCraft::new(0.5);
+    fn plate_shell_follows_the_r1_double_skin_rule() {
+        // WI 820 (the builder that replaced the retired legacy converter): a
+        // 3×3×3 shell around a cavity plates every face adjacent to a cell
+        // outside the shell — inner and outer skins (the WI 824 audited
+        // double-skin accounting), no voxels. Face cells (not corners/edges)
+        // have exactly two such faces: exterior + cavity. Total plates:
+        // 6×(1+1) + 12×2 + 8×3 = 60.
+        let mut cells = Vec::new();
         for x in 0..3 {
             for y in 0..3 {
                 for z in 0..3 {
-                    if x == 1 && y == 1 && z == 1 {
-                        continue; // the cavity
+                    if !(x == 1 && y == 1 && z == 1) {
+                        cells.push(IVec3::new(x, y, z));
                     }
-                    let c = IVec3::new(x, y, z);
-                    shell.voxels.push(Voxel {
-                        cell: c,
-                        material: Material::ALUMINIUM,
-                    });
-                    shell.set_panel(c, true);
                 }
             }
         }
-        let report = shell.convert_legacy_panels().expect("flags converted");
-        assert_eq!(report.cells_converted, 26);
-        assert_eq!(report.cells_kept_solid, 0);
-        assert!(shell.voxels.is_empty(), "every flagged cell emptied");
-        // Face cells (not corners/edges) have exactly two empty-adjacent faces:
-        // exterior + cavity — the double skin. 6 of them; corners have 3
-        // exterior faces; edges 2 exterior. Total plates: 6×(1+1) + 12×2 + 8×3 = 60.
-        assert_eq!(report.plates_created, 60);
+        let mut shell = VoxelCraft::new(0.5);
+        shell.plate_shell(&cells, Material::ALUMINIUM);
+        assert!(shell.voxels.is_empty(), "a plated shell holds no voxels");
         assert_eq!(shell.face_panels.len(), 60);
-
-        // A fully-embedded flagged cell stays solid (inert plating).
-        let mut embedded = block(3, 3, 3, 0.5, Material::ALUMINIUM);
-        embedded.set_panel(IVec3::new(1, 1, 1), true);
-        let r = embedded.convert_legacy_panels().unwrap();
-        assert_eq!(r.cells_kept_solid, 1);
-        assert_eq!(r.cells_converted, 0);
-        assert_eq!(embedded.voxels.len(), 27, "embedded cell kept");
-
-        // Idempotent: a craft with no flags is untouched.
-        assert!(embedded.convert_legacy_panels().is_none());
+        // Deterministic regardless of input order: the sorted panel store makes
+        // reversed input build the identical craft.
+        let mut reversed = VoxelCraft::new(0.5);
+        let mut rev = cells.clone();
+        rev.reverse();
+        reversed.plate_shell(&rev, Material::ALUMINIUM);
+        assert_eq!(reversed, shell);
     }
 }
