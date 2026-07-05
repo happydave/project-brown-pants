@@ -16,8 +16,8 @@
 //! - `cargo run -p sounding -- play` — fly a craft by hand **from scenario data** (WI 739): `content/scenarios/play.ron`, with the full flight HUD (Δv, apsides, energy)
 //! - `cargo run -p sounding -- skins` — voxel-skin comparison: the same craft flown side by side, blocky vs greedy-meshed hull
 //! - `cargo run -p sounding -- land` — drop a craft and watch the collision response bring it to rest
-//! - `cargo run -p sounding -- collide` — fire a craft at another (and a debris pile) — craft↔craft collision
-//! - `cargo run -p sounding -- crash` — ram a frangible craft into a block — breakage-on-impact (it shatters)
+//! - `cargo run -p sounding -- collide [projectile] [target]` — fire a craft at another (and a debris pile) — craft↔craft collision; optional saved-craft fixtures (WI 843)
+//! - `cargo run -p sounding -- crash [projectile] [target]` — ram a frangible craft into a block — breakage-on-impact (it shatters); optional saved-craft fixtures (WI 843, try `wedge-dart`)
 //! - `cargo run -p sounding -- workshop` — grounded build-and-test sandbox: Build (edit a craft) ↔ Test (fly what you built, with live ground collision), toggle with Enter. Add `moon [seed]` (`-- workshop moon`) to Test a built rover on a generated cratered moon (WI 775)
 //! - `cargo run -p sounding -- materials` — preview a generated PBR material set on lit geometry
 //! - `cargo run -p sounding -- terrainmesh` — preview a generated MoGe terrain relief (glTF)
@@ -54,6 +54,7 @@ mod gallery_scene;
 mod gamepad;
 mod ground;
 mod harbor_scene;
+mod harness_fixture;
 mod input_inject;
 mod land_scene;
 mod materials_scene;

@@ -10,18 +10,26 @@
 //! uniform gravity, small coordinates — no floating origin. Each substep composes, per piece,
 //! gravity + ground + pairwise contact, integrates, then tests the (still-intact) projectile's
 //! **contact** force against its fracture threshold.
+//!
+//! Fixture loading (WI 843): `-- crash [projectile] [target]` swaps either procedural fixture
+//! for a saved craft (see [`crate::harness_fixture`]; `-` keeps a slot's default), so shaped
+//! builds reach the WI 837 form-aware contact path here. Shaped cells draw their form outline
+//! instead of a cube gizmo, and face panels draw their plate rectangles, so nothing collides
+//! invisibly. `R` resets to the *loaded* fixtures.
 
 use bevy::math::{DVec3, Isometry3d};
 use bevy::prelude::*;
 use std::f64::consts::FRAC_PI_2;
 
+use crate::harness_fixture::{fixture_arg, rest_height, slot_name, Fixture};
 use sounding_sim::active::ActiveBody;
 use sounding_sim::breakage::fracture_on_impact;
 use sounding_sim::collision::{
     craft_bounds, craft_collision_shape, ground_half_space, Bounds, CollisionShape,
 };
 use sounding_sim::contact::{body_contact_wrench, ground_contact_wrench, ContactParams};
-use sounding_sim::voxel::{Material, Thermal, Voxel, VoxelCraft};
+use sounding_sim::shape::form_outline;
+use sounding_sim::voxel::{Axis, Material, Thermal, Voxel, VoxelCraft};
 
 /// Uniform gravity for the local sandbox, m/s² (Earth surface).
 const G: f64 = 9.85;
@@ -97,22 +105,41 @@ fn block(n: i32, material: Material) -> VoxelCraft {
     c
 }
 
-/// The two starting pieces: a frangible projectile to the left, a heavy steel target.
-fn initial_pieces() -> Vec<(VoxelCraft, ActiveBody, Color)> {
-    let proj = frangible_bar(6);
+/// The scene's fixture slots (WI 843): a loaded craft per slot, or `None` for the
+/// procedural default (frangible bar / steel block). Resolved once at plugin build
+/// from the CLI arguments; `R` reset rebuilds from these, not the defaults.
+#[derive(Resource, Default)]
+struct CrashFixtures {
+    projectile: Option<Fixture>,
+    target: Option<Fixture>,
+}
+
+/// The two starting pieces: a projectile to the left (default: a frangible bar), a
+/// heavy target (default: 3³ steel). Each spawns at its slot's x/z with its AABB
+/// resting on the ground (`rest_height`, the generalization of the old hard-coded
+/// 0.5/1.5 CoM heights).
+fn initial_pieces(fixtures: &CrashFixtures) -> Vec<(VoxelCraft, ActiveBody, Color)> {
+    let proj = fixtures
+        .projectile
+        .as_ref()
+        .map(|f| f.craft.clone())
+        .unwrap_or_else(|| frangible_bar(6));
     let pmp = proj.mass_properties().unwrap();
-    // Bar is 1 cell tall → its CoM rests 0.5 m above the ground.
     let pbody = ActiveBody::new(
-        DVec3::new(-9.0, 0.5, 0.0),
+        DVec3::new(-9.0, rest_height(&proj), 0.0),
         DVec3::ZERO,
         pmp.mass,
         pmp.inertia,
     );
 
-    let target = block(3, Material::STEEL);
+    let target = fixtures
+        .target
+        .as_ref()
+        .map(|f| f.craft.clone())
+        .unwrap_or_else(|| block(3, Material::STEEL));
     let tmp = target.mass_properties().unwrap();
     let tbody = ActiveBody::new(
-        DVec3::new(3.0, 1.5, 0.0),
+        DVec3::new(3.0, rest_height(&target), 0.0),
         DVec3::ZERO,
         tmp.mass,
         tmp.inertia,
@@ -137,9 +164,9 @@ struct CrashWorld {
 }
 
 impl CrashWorld {
-    fn new() -> Self {
+    fn new(fixtures: &CrashFixtures) -> Self {
         Self {
-            pieces: initial_pieces()
+            pieces: initial_pieces(fixtures)
                 .into_iter()
                 .map(|(voxels, body, color)| Piece {
                     voxels,
@@ -155,8 +182,8 @@ impl CrashWorld {
         }
     }
 
-    fn reset(&mut self) {
-        *self = Self::new();
+    fn reset(&mut self, fixtures: &CrashFixtures) {
+        *self = Self::new(fixtures);
     }
 
     /// Advance every piece one substep, then fracture the projectile if its contact load is high
@@ -249,7 +276,13 @@ pub struct CrashScenePlugin;
 
 impl Plugin for CrashScenePlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(CrashWorld::new())
+        // Fixture arguments resolve at build so a bad craft name fails fast (WI 843).
+        let fixtures = CrashFixtures {
+            projectile: fixture_arg(2),
+            target: fixture_arg(3),
+        };
+        app.insert_resource(CrashWorld::new(&fixtures))
+            .insert_resource(fixtures)
             .add_systems(Startup, setup_view)
             .add_systems(
                 Update,
@@ -258,7 +291,12 @@ impl Plugin for CrashScenePlugin {
     }
 }
 
-fn setup_view(mut commands: Commands) {
+fn setup_view(mut commands: Commands, fixtures: Res<CrashFixtures>) {
+    info!(
+        "crash fixtures: projectile={} target={}",
+        slot_name(&fixtures.projectile),
+        slot_name(&fixtures.target),
+    );
     commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(6.0, 7.0, 22.0).looking_at(Vec3::new(-1.0, 1.0, 0.0), Vec3::Y),
@@ -286,7 +324,11 @@ fn setup_view(mut commands: Commands) {
         Hud,
     ));
     commands.spawn((
-        Text::new("hold SPACE to ram the projectile into the block · R reset"),
+        Text::new(format!(
+            "hold SPACE to ram the projectile into the target · R reset\nfixtures: {} / {}",
+            slot_name(&fixtures.projectile),
+            slot_name(&fixtures.target),
+        )),
         TextFont {
             font_size: 14.0,
             ..default()
@@ -301,11 +343,15 @@ fn setup_view(mut commands: Commands) {
     ));
 }
 
-/// Holding SPACE rams the projectile; R resets.
-fn crash_input(keys: Res<ButtonInput<KeyCode>>, mut world: ResMut<CrashWorld>) {
+/// Holding SPACE rams the projectile; R resets (to the loaded fixtures).
+fn crash_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut world: ResMut<CrashWorld>,
+    fixtures: Res<CrashFixtures>,
+) {
     world.thrust = keys.pressed(KeyCode::Space);
     if keys.just_pressed(KeyCode::KeyR) {
-        world.reset();
+        world.reset(&fixtures);
     }
 }
 
@@ -327,25 +373,74 @@ fn draw_scene(mut gizmos: Gizmos, world: Res<CrashWorld>) {
         Vec2::splat(1.0),
         Color::srgb(0.30, 0.33, 0.38),
     );
-    // Each piece: a coloured cube per voxel, placed by the body's rigid transform.
+    // Each piece, placed by the body's rigid transform: a coloured cube gizmo per
+    // unshaped voxel; shaped cells draw their form's crease outline instead (WI 843 —
+    // the collision hull *is* the form, WI 837, so the drawing must not lie); face
+    // panels draw their plate rectangles so no colliding geometry is invisible.
     for piece in &world.pieces {
         let Some(mp) = piece.voxels.mass_properties() else {
             continue;
         };
         let q = piece.body.orientation;
         let qf = q.as_quat();
-        let size = piece.voxels.cell_size as f32;
+        let s = piece.voxels.cell_size;
+        let size = s as f32;
         for v in &piece.voxels.voxels {
-            let local = (v.cell.as_dvec3() + DVec3::splat(0.5)) * piece.voxels.cell_size
-                - mp.center_of_mass;
-            let world_pos = piece.body.position + q * local;
-            gizmos.primitive_3d(
-                &Cuboid::new(size, size, size),
-                Isometry3d::new(world_pos.as_vec3(), qf),
-                piece.color,
-            );
+            if let Some(sc) = piece.voxels.shape_at(v.cell) {
+                for (a, b) in form_outline(sc.form, sc.orientation) {
+                    body_line(
+                        &mut gizmos,
+                        &piece.body,
+                        piece.color,
+                        (v.cell.as_dvec3() + a) * s - mp.center_of_mass,
+                        (v.cell.as_dvec3() + b) * s - mp.center_of_mass,
+                    );
+                }
+            } else {
+                let local = (v.cell.as_dvec3() + DVec3::splat(0.5)) * s - mp.center_of_mass;
+                let world_pos = piece.body.position + q * local;
+                gizmos.primitive_3d(
+                    &Cuboid::new(size, size, size),
+                    Isometry3d::new(world_pos.as_vec3(), qf),
+                    piece.color,
+                );
+            }
+        }
+        for p in &piece.voxels.face_panels {
+            let n = p.axis.unit().as_dvec3();
+            let (u, w) = match p.axis {
+                Axis::X => (DVec3::Y, DVec3::Z),
+                Axis::Y => (DVec3::X, DVec3::Z),
+                Axis::Z => (DVec3::X, DVec3::Y),
+            };
+            let center = (p.cell.as_dvec3() + DVec3::splat(0.5) + 0.5 * n) * s - mp.center_of_mass;
+            let h = 0.5 * s;
+            let corners = [
+                center + (u + w) * h,
+                center + (u - w) * h,
+                center - (u + w) * h,
+                center - (u - w) * h,
+            ];
+            for i in 0..4 {
+                body_line(
+                    &mut gizmos,
+                    &piece.body,
+                    piece.color,
+                    corners[i],
+                    corners[(i + 1) % 4],
+                );
+            }
         }
     }
+}
+
+/// One gizmo line segment given in a body's CoM-local frame.
+fn body_line(gizmos: &mut Gizmos, body: &ActiveBody, color: Color, a: DVec3, b: DVec3) {
+    gizmos.line(
+        (body.position + body.orientation * a).as_vec3(),
+        (body.position + body.orientation * b).as_vec3(),
+        color,
+    );
 }
 
 fn update_hud(world: Res<CrashWorld>, mut hud: Query<&mut Text, With<Hud>>) {
@@ -356,5 +451,73 @@ fn update_hud(world: Res<CrashWorld>, mut hud: Query<&mut Text, With<Hud>>) {
             world.projectile_speed(),
             world.pieces.len(),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sounding_sim::shape::{FillMode, Form, ShapedCell};
+
+    /// A frangible bar with a shaped (wedge) nose cell — the minimal craft that
+    /// forces the WI 837 mixed compound.
+    fn shaped_dart() -> VoxelCraft {
+        let mut c = frangible_bar(4);
+        c.set_shape(ShapedCell {
+            cell: IVec3::new(3, 0, 0),
+            form: Form::Wedge,
+            orientation: 0,
+            fill: FillMode::Solid,
+        });
+        c
+    }
+
+    #[test]
+    fn default_fixtures_are_the_procedural_bar_and_block_at_their_historic_heights() {
+        let w = CrashWorld::new(&CrashFixtures::default());
+        assert_eq!(w.pieces[0].voxels.voxels.len(), 6);
+        assert_eq!(w.pieces[1].voxels.voxels.len(), 27);
+        // The rest_height generalization reproduces the old hard-coded 0.5 / 1.5.
+        assert!((w.pieces[0].body.position.y - 0.5).abs() < 1e-12);
+        assert!((w.pieces[1].body.position.y - 1.5).abs() < 1e-12);
+        assert!(matches!(
+            w.pieces[0].shape(),
+            CollisionShape::CuboidCompound(_)
+        ));
+    }
+
+    #[test]
+    fn a_loaded_shaped_projectile_takes_the_compound_path_and_reset_restores_it() {
+        let fixtures = CrashFixtures {
+            projectile: Some(Fixture {
+                name: "dart".into(),
+                craft: shaped_dart(),
+            }),
+            target: None,
+        };
+        let mut w = CrashWorld::new(&fixtures);
+        // Slot 0 carries the loaded shaped craft (mixed compound, WI 837); slot 1
+        // keeps the procedural target (box fast path).
+        assert!(matches!(
+            w.pieces[0].shape(),
+            CollisionShape::Compound { .. }
+        ));
+        assert!(matches!(
+            w.pieces[1].shape(),
+            CollisionShape::CuboidCompound(_)
+        ));
+        assert!((w.pieces[0].body.position.y - rest_height(&w.pieces[0].voxels)).abs() < 1e-12);
+        // R after some simulation restores the *loaded* fixture, not the default bar.
+        for _ in 0..10 {
+            w.substep(SUBSTEP_DT);
+        }
+        w.reset(&fixtures);
+        assert_eq!(w.pieces.len(), 2);
+        assert!(w.intact);
+        assert_eq!(w.pieces[0].voxels.voxels.len(), 4);
+        assert!(matches!(
+            w.pieces[0].shape(),
+            CollisionShape::Compound { .. }
+        ));
     }
 }

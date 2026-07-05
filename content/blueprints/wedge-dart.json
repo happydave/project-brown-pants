@@ -1,0 +1,160 @@
+{
+  "format_version": 2,
+  "payload": {
+    "kind": "blueprint",
+    "id": "wedge-dart",
+    "name": "wedge dart",
+    "reference_position": {
+      "frame": 0,
+      "pos": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "craft": {
+      "cell_size": 1.0,
+      "voxels": [
+        {
+          "cell": [
+            0,
+            0,
+            0
+          ],
+          "material": {
+            "density": 2700.0,
+            "strength": 2000000.0,
+            "thermal": {
+              "specific_heat": 900.0,
+              "conductivity": 200.0,
+              "emissivity": 0.1,
+              "max_temp": 1000000000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            1,
+            0,
+            0
+          ],
+          "material": {
+            "density": 2700.0,
+            "strength": 2000000.0,
+            "thermal": {
+              "specific_heat": 900.0,
+              "conductivity": 200.0,
+              "emissivity": 0.1,
+              "max_temp": 1000000000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            2,
+            0,
+            0
+          ],
+          "material": {
+            "density": 2700.0,
+            "strength": 2000000.0,
+            "thermal": {
+              "specific_heat": 900.0,
+              "conductivity": 200.0,
+              "emissivity": 0.1,
+              "max_temp": 1000000000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            3,
+            0,
+            0
+          ],
+          "material": {
+            "density": 2700.0,
+            "strength": 2000000.0,
+            "thermal": {
+              "specific_heat": 900.0,
+              "conductivity": 200.0,
+              "emissivity": 0.1,
+              "max_temp": 1000000000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            4,
+            0,
+            0
+          ],
+          "material": {
+            "density": 2700.0,
+            "strength": 2000000.0,
+            "thermal": {
+              "specific_heat": 900.0,
+              "conductivity": 200.0,
+              "emissivity": 0.1,
+              "max_temp": 1000000000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        },
+        {
+          "cell": [
+            5,
+            0,
+            0
+          ],
+          "material": {
+            "density": 2700.0,
+            "strength": 2000000.0,
+            "thermal": {
+              "specific_heat": 900.0,
+              "conductivity": 200.0,
+              "emissivity": 0.1,
+              "max_temp": 1000000000.0,
+              "ablation_temp": 0.0,
+              "latent_heat": 0.0,
+              "ablator_fraction": 0.0
+            }
+          }
+        }
+      ],
+      "devices": [],
+      "attachments": [],
+      "doors": [],
+      "parts": [],
+      "face_panels": [],
+      "shapes": [
+        {
+          "cell": [
+            5,
+            0,
+            0
+          ],
+          "form": "wedge",
+          "orientation": 18,
+          "fill": "solid"
+        }
+      ]
+    },
+    "resources": [],
+    "crew": []
+  }
+}

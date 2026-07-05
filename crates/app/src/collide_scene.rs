@@ -8,6 +8,12 @@
 //! (`body_contact_wrench`, WI 593), then integrates each `ActiveBody` — so the same penalty
 //! response resolves resting, sliding, head-on impact, and stacking. `R` resets the scene; the
 //! HUD shows the closing speed, the projectile↔target separation, and a RESTING flag.
+//!
+//! Fixture loading (WI 843): `-- collide [projectile] [target]` swaps either slot's procedural
+//! 2³ cube for a saved craft (see [`crate::harness_fixture`]; `-` keeps a slot's default), so
+//! shaped builds reach the WI 837 form-aware contact path here. Each collider's skin is built
+//! from **its own** lattice via the shape-aware submesh path (WI 833), so a wedge nose renders
+//! as a wedge; the debris pile is untouched.
 
 use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::Tonemapping;
@@ -25,7 +31,8 @@ use sounding_sim::sim::CentralBody;
 use sounding_sim::voxel::{Material, Voxel, VoxelCraft};
 
 use crate::floating_origin::{AnchorCamera, FloatingOriginPlugin, WorldPlacement};
-use crate::voxel_skin::{build_skin_mesh, pbr_material, VoxelSkin};
+use crate::harness_fixture::{fixture_arg, rest_height, slot_name, Fixture};
+use crate::voxel_skin::{panel_render_pieces, pbr_material, skin_submeshes, VoxelSkin};
 use sounding_sim::frame::{FrameId, WorldPos};
 
 const BODY: CentralBody = CentralBody::EARTHLIKE;
@@ -36,8 +43,10 @@ const PROJECTILE_ACCEL: f64 = 25.0;
 /// Speed below which a body counts as resting, m/s.
 const REST_SPEED: f64 = 0.1;
 
-/// One collidable body: its rigid state plus the derived, static collision data.
+/// One collidable body: its lattice (kept for skin building, WI 843), rigid state,
+/// and the derived, static collision data.
 struct Collider {
+    voxels: VoxelCraft,
     body: ActiveBody,
     shape: CollisionShape,
     bounds: Option<Bounds>,
@@ -52,6 +61,7 @@ impl Collider {
         let mp = voxels.mass_properties().expect("non-empty craft");
         let body = ActiveBody::new(position, velocity, mp.mass, mp.inertia);
         Self {
+            voxels: voxels.clone(),
             shape: craft_collision_shape(voxels),
             bounds: craft_bounds(voxels),
             com: mp.center_of_mass,
@@ -59,6 +69,15 @@ impl Collider {
             body,
         }
     }
+}
+
+/// The scene's fixture slots (WI 843): a loaded craft per slot, or `None` for the
+/// procedural 2³ composite cube. Resolved once at plugin build from the CLI
+/// arguments; `R` reset restores the loaded bodies via their homes as always.
+#[derive(Resource, Default)]
+struct CollideFixtures {
+    projectile: Option<Fixture>,
+    target: Option<Fixture>,
 }
 
 /// The collide demo world: a fixed set of colliders. Index 0 is the projectile, 1 the target;
@@ -91,18 +110,34 @@ fn cube_craft(n: i32, material: Material) -> VoxelCraft {
 }
 
 impl CollideWorld {
-    fn new() -> Self {
+    fn new(fixtures: &CollideFixtures) -> Self {
         let surface = BODY.radius;
-        // The box half-height of a 2-cell cube is 1 m → its CoM rests 1 m above the surface.
-        let rest_y = surface + 1.0;
-        let target = cube_craft(2, Material::COMPOSITE);
-        let projectile = cube_craft(2, Material::COMPOSITE);
+        // Each fixture rests with its AABB on the surface (`rest_height` — for the
+        // default 2³ cube this is the historic `surface + 1.0`).
+        let projectile = fixtures
+            .projectile
+            .as_ref()
+            .map(|f| f.craft.clone())
+            .unwrap_or_else(|| cube_craft(2, Material::COMPOSITE));
+        let target = fixtures
+            .target
+            .as_ref()
+            .map(|f| f.craft.clone())
+            .unwrap_or_else(|| cube_craft(2, Material::COMPOSITE));
 
         let mut colliders = vec![
             // 0: projectile, parked to the left at rest (fired with SPACE).
-            Collider::new(&projectile, DVec3::new(-8.0, rest_y, 0.0), DVec3::ZERO),
+            Collider::new(
+                &projectile,
+                DVec3::new(-8.0, surface + rest_height(&projectile), 0.0),
+                DVec3::ZERO,
+            ),
             // 1: target, parked at the origin.
-            Collider::new(&target, DVec3::new(0.0, rest_y, 0.0), DVec3::ZERO),
+            Collider::new(
+                &target,
+                DVec3::new(0.0, surface + rest_height(&target), 0.0),
+                DVec3::ZERO,
+            ),
         ];
 
         // Debris: three 1-cell fragments dropped straight down with >1 m vertical gaps (so they
@@ -216,8 +251,14 @@ pub struct CollideScenePlugin;
 
 impl Plugin for CollideScenePlugin {
     fn build(&self, app: &mut App) {
+        // Fixture arguments resolve at build so a bad craft name fails fast (WI 843).
+        let fixtures = CollideFixtures {
+            projectile: fixture_arg(2),
+            target: fixture_arg(3),
+        };
         app.add_plugins(FloatingOriginPlugin)
-            .insert_resource(CollideWorld::new())
+            .insert_resource(CollideWorld::new(&fixtures))
+            .insert_resource(fixtures)
             .add_systems(Startup, setup_scene)
             .add_systems(
                 Update,
@@ -233,28 +274,42 @@ fn setup_scene(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut scattering: ResMut<Assets<ScatteringMedium>>,
     world: Res<CollideWorld>,
+    fixtures: Res<CollideFixtures>,
 ) {
+    info!(
+        "collide fixtures: projectile={} target={}",
+        slot_name(&fixtures.projectile),
+        slot_name(&fixtures.target),
+    );
     crate::ground::spawn_ground(&mut commands, &mut meshes, &mut materials, &asset_server);
 
-    // One skinned mesh per collider. Projectile + target are COMPOSITE; debris is ALUMINIUM,
-    // both rebuilt from their own lattice so the cube and fragment shapes render correctly.
-    let cube = cube_craft(2, Material::COMPOSITE);
-    let frag = cube_craft(1, Material::ALUMINIUM);
-    for (i, _) in world.colliders.iter().enumerate() {
-        let (voxels, mat) = if i < 2 {
-            (&cube, Material::COMPOSITE)
-        } else {
-            (&frag, Material::ALUMINIUM)
-        };
-        let mesh = meshes.add(build_skin_mesh(voxels, VoxelSkin::Hull));
-        let material = pbr_material(mat, &asset_server, &mut materials);
-        commands.spawn((
-            Mesh3d(mesh),
-            MeshMaterial3d(material),
-            Transform::default(),
-            WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, world.render_pos(i))),
-            ColliderTag(i),
-        ));
+    // Skins per collider, built from **its own** lattice via the shape-aware submesh
+    // path (one submesh per distinct material, plus panel plates) — so loaded shaped
+    // crafts render their forms (WI 843). Every piece of a collider carries the same
+    // `ColliderTag`, so `track_bodies` moves them together.
+    for (i, c) in world.colliders.iter().enumerate() {
+        let placement = WorldPos::new(FrameId::CENTRAL_BODY, world.render_pos(i));
+        for (material, mesh) in skin_submeshes(&c.voxels, VoxelSkin::Hull) {
+            let material = pbr_material(material, &asset_server, &mut materials);
+            commands.spawn((
+                Mesh3d(meshes.add(mesh)),
+                MeshMaterial3d(material),
+                Transform::default(),
+                WorldPlacement(placement),
+                ColliderTag(i),
+            ));
+        }
+        for (mesh, mat) in
+            panel_render_pieces(&c.voxels, &asset_server, &mut materials, &mut meshes)
+        {
+            commands.spawn((
+                Mesh3d(mesh),
+                MeshMaterial3d(mat),
+                Transform::default(),
+                WorldPlacement(placement),
+                ColliderTag(i),
+            ));
+        }
     }
 
     commands.spawn((
@@ -283,7 +338,11 @@ fn setup_scene(
     ));
 
     commands.spawn((
-        Text::new("hold SPACE to accelerate projectile · R reset"),
+        Text::new(format!(
+            "hold SPACE to accelerate projectile · R reset\nfixtures: {} / {}",
+            slot_name(&fixtures.projectile),
+            slot_name(&fixtures.target),
+        )),
         TextFont {
             font_size: 14.0,
             ..default()
@@ -356,5 +415,45 @@ fn update_hud(world: Res<CollideWorld>, mut hud: Query<&mut Text, With<Hud>>) {
         text.0 = format!(
             "collide: {state}\nclosing:    {closing:6.2} m/s\nseparation: {separation:6.2} m",
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sounding_sim::shape::{FillMode, Form, ShapedCell};
+
+    #[test]
+    fn a_loaded_shaped_target_swaps_only_its_slot_and_rests_by_its_own_height() {
+        let mut shaped = cube_craft(2, Material::ALUMINIUM);
+        shaped.set_shape(ShapedCell {
+            cell: IVec3::new(0, 1, 0),
+            form: Form::Wedge,
+            orientation: 0,
+            fill: FillMode::Solid,
+        });
+        let fixtures = CollideFixtures {
+            projectile: None,
+            target: Some(Fixture {
+                name: "shaped".into(),
+                craft: shaped,
+            }),
+        };
+        let w = CollideWorld::new(&fixtures);
+        // Five bodies as always: slots 0/1 plus the untouched three-fragment pile.
+        assert_eq!(w.colliders.len(), 5);
+        // Slot 1 is the loaded shaped craft (mixed compound, WI 837); slot 0 keeps
+        // the procedural cube at the historic `surface + 1.0` rest height.
+        assert!(matches!(
+            w.colliders[1].shape,
+            CollisionShape::Compound { .. }
+        ));
+        assert!(matches!(
+            w.colliders[0].shape,
+            CollisionShape::CuboidCompound(_)
+        ));
+        assert!((w.colliders[0].body.position.y - BODY.radius - 1.0).abs() < 1e-9);
+        let want = BODY.radius + rest_height(&w.colliders[1].voxels);
+        assert!((w.colliders[1].body.position.y - want).abs() < 1e-9);
     }
 }
