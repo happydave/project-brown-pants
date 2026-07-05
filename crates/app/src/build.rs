@@ -211,6 +211,14 @@ pub(crate) fn draw_build_overlays(
                 let tint = crate::voxel_skin::material_visual(editor.active_material()).tint;
                 gizmos.primitive_3d(&Cuboid::from_size(dims), centre, tint);
             }
+        } else if let Some(outline) = crate::editor::shape_ghost(&editor, &h) {
+            // Shaped placement (WI 833): ghost the oriented form's crease-edge
+            // wireframe at the add cell — the same effective orientation the click
+            // will place — in the palette material's swatch colour.
+            let tint = crate::voxel_skin::material_visual(editor.active_material()).tint;
+            for (a, b) in outline {
+                gizmos.line(a, b, tint);
+            }
         } else {
             gizmos.primitive_3d(
                 &Cuboid::new(s * 0.94, s * 0.94, s * 0.94),

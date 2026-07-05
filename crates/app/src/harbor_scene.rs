@@ -298,6 +298,8 @@ impl Plugin for HarborScenePlugin {
                 subassembly: None,
                 motor: MotorTier::Standard,
                 panel_mode: false,
+                form: sounding_sim::shape::Form::Cube,
+                orientation_pick: None,
             })
             .init_resource::<OrbitCam>()
             .init_resource::<HoverState>()
@@ -834,8 +836,10 @@ fn update_build_hud(editor: Res<EditorState>, mut hud: Query<&mut Text, With<Bui
         } else {
             "will SINK".to_string()
         };
+        // Shape read-out (WI 833): the same shared-editor state the workshop names.
+        let shape = crate::editor::shape_hud_label(&editor);
         text.0 = format!(
-            "harbor — Build (Enter: Float)\nmouse: orbit/zoom · L-click place · R-click remove · click palette (left) to pick\nT: place mode — {mode} · Tab: material\ncells: {cells}  panels: {panels}\n>> {prediction} <<"
+            "harbor — Build (Enter: Float)\nmouse: orbit/zoom · L-click place · R-click remove · click palette (left) to pick\nT: place mode — {mode} · Tab: material · shape: {shape}\ncells: {cells}  panels: {panels}\n>> {prediction} <<"
         );
     }
 }

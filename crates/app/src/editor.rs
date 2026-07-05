@@ -14,6 +14,7 @@ use sounding_sim::control::{BatterySpec, ControlComputer};
 use sounding_sim::frame::{FrameId, WorldPos};
 use sounding_sim::persist::{CraftSubgraph, FormatError, Kind, Payload, SavedDocument};
 use sounding_sim::powertrain::MotorTier;
+use sounding_sim::shape::{constants, face_masks, mask_popcount, FillMode, Form, ShapedCell};
 use sounding_sim::voxel::{
     device_mass, AttachmentPoint, Axis, Device, DeviceKind, Face, Material, Part, PartKind,
     RimSpec, SuspensionSpec, TireSpec, Voxel, VoxelCraft,
@@ -184,6 +185,13 @@ pub struct EditorState {
     /// Panel-build mode (WI 716): when on, a placed structural voxel is marked a **thin panel**
     /// (light, for floating hulls). Toggled with `B`.
     pub(crate) panel_mode: bool,
+    /// The active catalog form a structural placement carries (WI 833); `Cube`
+    /// places a plain voxel (no shape record — an unshaped cell *is* the cube).
+    pub(crate) form: Form,
+    /// The user's rotate pick (WI 833): an index into the active form's
+    /// `distinct_orientations`, advanced by `X`. `None` = the context-default
+    /// orientation; cleared when a different form is selected.
+    pub(crate) orientation_pick: Option<usize>,
 }
 
 impl EditorState {
@@ -215,8 +223,92 @@ impl Default for EditorState {
             subassembly: None,
             motor: MotorTier::Standard,
             panel_mode: false,
+            form: Form::Cube,
+            orientation_pick: None,
         }
     }
+}
+
+/// The human-readable name of a catalog form (palette label + HUD, WI 833).
+pub(crate) fn form_label(form: Form) -> &'static str {
+    match form {
+        Form::Cube => "cube",
+        Form::Wedge => "wedge",
+        Form::OuterCorner => "outer corner",
+        Form::InnerCorner => "inner corner",
+        Form::SlopeLow => "slope low",
+        Form::SlopeHigh => "slope high",
+    }
+}
+
+/// Advance the rotate pick one step through a form's distinct-orientation list
+/// (WI 833): the pure cycle behind the `X` key. `None` (context default) starts
+/// the cycle at the first distinct orientation.
+pub(crate) fn advance_pick(pick: Option<usize>, distinct_len: usize) -> usize {
+    pick.map_or(0, |i| (i + 1) % distinct_len)
+}
+
+/// The **context-default orientation** (WI 833): among `form`'s distinct
+/// orientations, prefer maximal coverage on the support face (the form rests on
+/// what was clicked), tie-broken by the oriented centroid's lateral offset
+/// aligning away from the viewer (a ramp ascends away from the camera), then by
+/// lowest index (deterministic). Uses only derived catalog data — no per-form
+/// authored cases. `support` is the direction from the placement cell back
+/// toward the clicked face; `view` is the hover ray's direction.
+pub(crate) fn default_orientation(form: Form, support: IVec3, view: Vec3) -> u8 {
+    let c = constants(form);
+    let axis = if support.x != 0 {
+        0
+    } else if support.y != 0 {
+        1
+    } else {
+        2
+    };
+    let face = 2 * axis + usize::from(support[axis] > 0);
+    // "Away from the viewer" within the face plane: the view direction with its
+    // support-axis component removed.
+    let mut away = DVec3::new(view.x as f64, view.y as f64, view.z as f64);
+    away[axis] = 0.0;
+    let mut best = c.distinct_orientations[0];
+    let mut best_score = (0u32, f64::NEG_INFINITY);
+    for &o in &c.distinct_orientations {
+        let coverage = mask_popcount(&face_masks(form, o)[face]);
+        let mut lateral = c.centroid_oriented(o) - DVec3::splat(0.5);
+        lateral[axis] = 0.0;
+        let alignment = lateral.dot(away);
+        if coverage > best_score.0 || (coverage == best_score.0 && alignment > best_score.1 + 1e-12)
+        {
+            best_score = (coverage, alignment);
+            best = o;
+        }
+    }
+    best
+}
+
+/// The orientation a placement — and its ghost — uses (WI 833): the user's
+/// rotate pick if set, else the context default from the hover, else the form's
+/// first distinct orientation. The one function both the click and the preview
+/// consume, so the ghost cannot lie.
+pub(crate) fn effective_orientation(state: &EditorState, context: Option<(IVec3, Vec3)>) -> u8 {
+    let distinct = &constants(state.form).distinct_orientations;
+    if let Some(i) = state.orientation_pick {
+        return distinct[i % distinct.len()];
+    }
+    match context {
+        Some((support, view)) => default_orientation(state.form, support, view),
+        None => distinct[0],
+    }
+}
+
+/// The Build HUD's shape read-out (WI 833): form, orientation position within the
+/// distinct set (`auto` = context default), and fill mode (`solid` until WI 836).
+pub(crate) fn shape_hud_label(state: &EditorState) -> String {
+    let len = constants(state.form).distinct_orientations.len();
+    let orient = match state.orientation_pick {
+        Some(i) => format!("{}/{len}", (i % len) + 1),
+        None => format!("auto/{len}"),
+    };
+    format!("{} · {orient} · solid [X]", form_label(state.form))
 }
 
 /// The wheel-station id of any part mounted at (≈) `mount`, if one exists (WI 630): lets a suspension
@@ -239,18 +331,27 @@ fn next_station_id(craft: &VoxelCraft) -> u32 {
         .map_or(0, |m| m + 1)
 }
 
-/// Places the active `brush` into `craft`. The three cells let the caller aim each kind: a voxel at
-/// `voxel_cell` (the empty face cell for the mouse), a device at `device_cell` (the hovered solid
-/// cell), and a wheel at `wheel_mount` (a continuous body-frame point).
+/// Where the active brush lands (WI 612 → 833): a voxel at the empty face cell, a
+/// device in the hovered solid cell, a wheel/part at a continuous body-frame mount —
+/// plus the shape record a placed structural voxel carries (WI 833; `None` = plain
+/// cube, which writes no record).
+pub(crate) struct BrushTarget {
+    pub voxel_cell: IVec3,
+    pub device_cell: IVec3,
+    pub wheel_mount: DVec3,
+    pub shape: Option<(Form, u8)>,
+}
+
+/// Places the active `brush` into `craft` at the caller-aimed [`BrushTarget`].
 fn place_brush(
     craft: &mut VoxelCraft,
     brush: Brush,
     material: Material,
-    voxel_cell: IVec3,
-    device_cell: IVec3,
-    wheel_mount: DVec3,
+    target: &BrushTarget,
     motor: MotorTier,
 ) {
+    let (voxel_cell, device_cell, wheel_mount) =
+        (target.voxel_cell, target.device_cell, target.wheel_mount);
     match brush {
         Brush::Voxel => {
             if !craft.voxels.iter().any(|v| v.cell == voxel_cell) {
@@ -258,6 +359,17 @@ fn place_brush(
                     cell: voxel_cell,
                     material,
                 });
+                // A non-cube form rides the cell as its shape record (WI 833); the
+                // log is the scripted-anchor evidence channel (WI 830).
+                if let Some((form, orientation)) = target.shape {
+                    craft.set_shape(ShapedCell {
+                        cell: voxel_cell,
+                        form,
+                        orientation,
+                        fill: FillMode::Solid,
+                    });
+                    info!("shape place: {form:?} o{orientation} at {voxel_cell:?}");
+                }
             }
         }
         Brush::Wheel { preset, steer } => {
@@ -361,12 +473,16 @@ pub(crate) fn material_label(index: usize) -> &'static str {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PaletteEntry {
     Material(usize),
+    /// A catalog form for structural placement (WI 833): selects the form and the
+    /// voxel brush, leaving the material selection alone (a steel wedge is
+    /// "steel" + "wedge" — the material and shape entries highlight together).
+    Shape(Form),
     Tool(Brush),
 }
 
-/// The palette's grouped, ordered entries: structural blocks, then devices, then attached parts.
-/// Adding a buildable item is one line here; the entry↔state mappings and the round-trip test then
-/// cover it automatically.
+/// The palette's grouped, ordered entries: structural blocks, then shapes, then devices, then
+/// attached parts. Adding a buildable item is one line here; the entry↔state mappings and the
+/// round-trip test then cover it automatically.
 pub(crate) const PALETTE_GROUPS: &[(&str, &[PaletteEntry])] = &[
     (
         "BLOCKS",
@@ -376,6 +492,17 @@ pub(crate) const PALETTE_GROUPS: &[(&str, &[PaletteEntry])] = &[
             PaletteEntry::Material(2),
             PaletteEntry::Material(3),
             PaletteEntry::Material(4),
+        ],
+    ),
+    (
+        "SHAPES",
+        &[
+            PaletteEntry::Shape(Form::Cube),
+            PaletteEntry::Shape(Form::Wedge),
+            PaletteEntry::Shape(Form::OuterCorner),
+            PaletteEntry::Shape(Form::InnerCorner),
+            PaletteEntry::Shape(Form::SlopeLow),
+            PaletteEntry::Shape(Form::SlopeHigh),
         ],
     ),
     (
@@ -438,17 +565,28 @@ impl PaletteEntry {
                 state.material = i % PALETTE.len();
                 state.brush = Brush::Voxel;
             }
+            PaletteEntry::Shape(form) => {
+                // Selecting a form keeps the material; a fresh form starts at its
+                // context-default orientation (WI 833).
+                if state.form != form {
+                    state.orientation_pick = None;
+                }
+                state.form = form;
+                state.brush = Brush::Voxel;
+            }
             PaletteEntry::Tool(brush) => state.brush = brush,
         }
     }
 
-    /// Whether this entry is the one currently selected. For the Voxel brush, the active entry is the
-    /// *material* being placed (so the palette shows which block), not a generic voxel entry.
+    /// Whether this entry is the one currently selected. For the Voxel brush, the active entries are
+    /// the *material* being placed and the *form* it takes (WI 833) — the two highlight together —
+    /// not a generic voxel entry.
     pub(crate) fn is_active(self, state: &EditorState) -> bool {
         match self {
             PaletteEntry::Material(i) => {
                 state.brush == Brush::Voxel && state.material % PALETTE.len() == i % PALETTE.len()
             }
+            PaletteEntry::Shape(form) => state.brush == Brush::Voxel && state.form == form,
             PaletteEntry::Tool(brush) => state.brush == brush,
         }
     }
@@ -457,6 +595,7 @@ impl PaletteEntry {
     pub(crate) fn label(self) -> &'static str {
         match self {
             PaletteEntry::Material(i) => material_label(i),
+            PaletteEntry::Shape(form) => form_label(form),
             PaletteEntry::Tool(brush) => brush.label(),
         }
     }
@@ -466,6 +605,12 @@ impl PaletteEntry {
     pub(crate) fn swatch_color(self) -> Color {
         match self {
             PaletteEntry::Material(i) => material_color(PALETTE[i % PALETTE.len()].1),
+            // Shapes are a slate family, brightness graded by solid fraction so the
+            // group reads as one kind; identity rests on the label (WI 613 rule).
+            PaletteEntry::Shape(form) => {
+                let v = 0.30 + 0.45 * (constants(form).volume as f32);
+                Color::srgb(v * 0.95, v, v * 1.08)
+            }
             PaletteEntry::Tool(brush) => match brush {
                 Brush::Voxel => Color::srgb(0.70, 0.72, 0.78),
                 Brush::ControlPoint => Color::srgb(0.30, 0.80, 0.90),
@@ -706,20 +851,46 @@ pub(crate) fn editor_input(
         state.motor = MotorTier::ALL[(i + 1) % MotorTier::ALL.len()];
     }
 
+    // Cycle the active form's distinct orientations (WI 833): `X` advances the
+    // rotate pick; a single-orientation form (the cube) has nothing to cycle.
+    if keys.just_pressed(KeyCode::KeyX) && state.brush == Brush::Voxel {
+        let distinct = &constants(state.form).distinct_orientations;
+        if distinct.len() > 1 {
+            let next = advance_pick(state.orientation_pick, distinct.len());
+            state.orientation_pick = Some(next);
+            info!(
+                "shape rotate: {:?} orientation {}/{} (o{})",
+                state.form,
+                next + 1,
+                distinct.len(),
+                distinct[next]
+            );
+        }
+    }
+
     // Place the active brush at the cursor (keyboard fallback; the mouse is the primary path).
     if keys.just_pressed(KeyCode::Space) {
         let cell = state.cursor;
         let material = PALETTE[state.material].1;
         let brush = state.brush;
-        let mount = (cell.as_dvec3() + DVec3::splat(0.5)) * state.craft.cell_size;
         let motor = state.motor;
-        place_brush(&mut state.craft, brush, material, cell, cell, mount, motor);
+        // No hover context at the keyboard cursor: pick or first distinct (WI 833).
+        let shape =
+            (state.form != Form::Cube).then(|| (state.form, effective_orientation(&state, None)));
+        let target = BrushTarget {
+            voxel_cell: cell,
+            device_cell: cell,
+            wheel_mount: (cell.as_dvec3() + DVec3::splat(0.5)) * state.craft.cell_size,
+            shape,
+        };
+        place_brush(&mut state.craft, brush, material, &target, motor);
     }
     // Remove any voxel, device, or attached part at the cursor.
     if keys.just_pressed(KeyCode::Backspace) {
         let cell = state.cursor;
         let center = (cell.as_dvec3() + DVec3::splat(0.5)) * state.craft.cell_size;
         state.craft.voxels.retain(|v| v.cell != cell);
+        state.craft.clear_shape(cell); // no orphan shape records (WI 833)
         state.craft.devices.retain(|d| d.cell != cell);
         state
             .craft
@@ -785,6 +956,14 @@ pub(crate) struct Hovered {
     /// possible (ground / empty hover). Drives both `mouse_build` and the
     /// plate-ghost preview.
     pub panel_target: Option<(IVec3, IVec3)>,
+    /// The placement-context **support direction** (WI 833): from the placement
+    /// cell back toward the clicked face (a voxel hit) or the ground (−Y);
+    /// `None` when hovering a plate (no cell context). Feeds the
+    /// context-default orientation.
+    pub support: Option<IVec3>,
+    /// The hover ray's direction (WI 833): the "away from the viewer" input of
+    /// the context-default orientation.
+    pub view: Vec3,
 }
 
 /// The current mouse hover, recomputed each frame (WI 612). `None` when the cursor is off-window or
@@ -986,6 +1165,8 @@ pub(crate) fn update_hover(
             highlight: near,
             panel: Some((near, dir)),
             panel_target: Some(extend),
+            support: None, // a plate hit has no cell-face context (WI 833)
+            view: d,
         });
     } else if let Some((cell, n, _)) = voxel_hit {
         hover.0 = Some(Hovered {
@@ -995,6 +1176,8 @@ pub(crate) fn update_hover(
             panel: None,
             // A panel-mode click on a voxel face plates that boundary (WI 824).
             panel_target: Some((cell, n)),
+            support: Some(-n), // the placed cell rests against the clicked face
+            view: d,
         });
     } else if d.y.abs() > 1e-6 {
         let t = -o.y / d.y;
@@ -1007,9 +1190,31 @@ pub(crate) fn update_hover(
                 highlight: cell,
                 panel: None,
                 panel_target: None, // the ground plane is not a cell boundary
+                support: Some(IVec3::NEG_Y), // resting on the ground plane
+                view: d,
             });
         }
     }
+}
+
+/// The oriented form-outline **ghost** for the pending placement (WI 833):
+/// world-space line segments at the hover's add cell — `None` when the plain
+/// cube ghost applies (cube form, non-voxel brush). Consumes the same
+/// [`effective_orientation`] the click placement uses, so the preview cannot
+/// lie about what lands.
+pub(crate) fn shape_ghost(state: &EditorState, h: &Hovered) -> Option<Vec<(Vec3, Vec3)>> {
+    if state.brush != Brush::Voxel || state.form == Form::Cube {
+        return None;
+    }
+    let orientation = effective_orientation(state, h.support.map(|sup| (sup, h.view)));
+    let s = state.craft.cell_size;
+    let base = h.add_cell.as_dvec3() * s;
+    Some(
+        sounding_sim::shape::form_outline(state.form, orientation)
+            .into_iter()
+            .map(|(a, b)| ((base + a * s).as_vec3(), (base + b * s).as_vec3()))
+            .collect(),
+    )
 }
 
 /// Mouse building (WI 612): left-click adds a voxel of the active material at the hovered face;
@@ -1051,19 +1256,22 @@ pub(crate) fn mouse_build(
             return;
         }
         // Voxel/wheel go on the clicked face (the empty adjacent cell); a device goes into the
-        // hovered solid cell.
-        let device_cell = h.remove_cell.unwrap_or(h.add_cell);
-        let wheel_mount = (h.add_cell.as_dvec3() + DVec3::splat(0.5)) * state.craft.cell_size;
+        // hovered solid cell. A non-cube form rides the placement at the same
+        // effective orientation the ghost showed (WI 833).
+        let shape = (state.form != Form::Cube).then(|| {
+            (
+                state.form,
+                effective_orientation(&state, h.support.map(|sup| (sup, h.view))),
+            )
+        });
         let motor = state.motor;
-        place_brush(
-            &mut state.craft,
-            brush,
-            material,
-            h.add_cell,
-            device_cell,
-            wheel_mount,
-            motor,
-        );
+        let target = BrushTarget {
+            voxel_cell: h.add_cell,
+            device_cell: h.remove_cell.unwrap_or(h.add_cell),
+            wheel_mount: (h.add_cell.as_dvec3() + DVec3::splat(0.5)) * state.craft.cell_size,
+            shape,
+        };
+        place_brush(&mut state.craft, brush, material, &target, motor);
     }
     if buttons.just_pressed(MouseButton::Right) {
         let s = state.craft.cell_size;
@@ -1075,6 +1283,7 @@ pub(crate) fn mouse_build(
         // Remove the voxel/device in the hovered solid cell.
         if let Some(cell) = h.remove_cell {
             state.craft.voxels.retain(|v| v.cell != cell);
+            state.craft.clear_shape(cell); // no orphan shape records (WI 833)
             state.craft.devices.retain(|dd| dd.cell != cell);
         }
         // Remove a wheel/part near the hovered cells. Wheels mount on a **face** (the empty adjacent
@@ -1366,8 +1575,9 @@ mod tests {
 
     #[test]
     fn palette_entries_round_trip_to_selection() {
-        // Applying each palette entry to a fresh state must select it, and exactly that entry must
-        // then report active — for every block, device, and part (WI 613).
+        // Applying each palette entry to a fresh state must select it, and exactly the expected
+        // entries then report active (WI 613 → 833): a Tool is active alone; a Material or Shape
+        // shares the Voxel brush, so its *pair* (the default form or material) highlights with it.
         for (_group, entries) in PALETTE_GROUPS {
             for &entry in *entries {
                 let mut state = EditorState::default();
@@ -1377,20 +1587,146 @@ mod tests {
                     "applied entry must read back as active: {}",
                     entry.label()
                 );
-                // No other entry claims to be active at the same time.
                 let active: Vec<&str> = PALETTE_GROUPS
                     .iter()
                     .flat_map(|(_, es)| es.iter())
                     .filter(|e| e.is_active(&state))
                     .map(|e| e.label())
                     .collect();
-                assert_eq!(
-                    active,
-                    vec![entry.label()],
-                    "exactly one entry active for {}",
-                    entry.label()
-                );
+                let expected: Vec<&str> = match entry {
+                    // The material entry + the (default cube) shape entry, in palette order.
+                    PaletteEntry::Material(_) => vec![entry.label(), form_label(Form::Cube)],
+                    // The (default aluminium) material entry + the shape entry —
+                    // unless the shape *is* the cube, which is also the default.
+                    PaletteEntry::Shape(f) => vec![material_label(0), form_label(f)],
+                    PaletteEntry::Tool(_) => vec![entry.label()],
+                };
+                assert_eq!(active, expected, "active set for {}", entry.label());
             }
+        }
+    }
+
+    #[test]
+    fn rotate_cycles_exactly_the_distinct_orientations() {
+        // WI 833: advancing the pick walks the wedge's 12 distinct orientations in
+        // order and wraps — the effective orientation never leaves the derived set.
+        let mut state = EditorState {
+            form: Form::Wedge,
+            ..Default::default()
+        };
+        let distinct = constants(Form::Wedge).distinct_orientations.clone();
+        assert_eq!(distinct.len(), 12);
+        let mut seen = Vec::new();
+        for _ in 0..distinct.len() * 2 {
+            let next = advance_pick(state.orientation_pick, distinct.len());
+            state.orientation_pick = Some(next);
+            seen.push(effective_orientation(&state, None));
+        }
+        assert_eq!(&seen[..12], &distinct[..], "first lap visits each once");
+        assert_eq!(&seen[12..], &distinct[..], "second lap wraps identically");
+        // The cube has nothing to cycle.
+        assert_eq!(
+            constants(Form::Cube).distinct_orientations.len(),
+            1,
+            "cube is rotation-inert"
+        );
+    }
+
+    #[test]
+    fn the_context_default_rests_the_wedge_on_the_clicked_face_ascending_away() {
+        // WI 833: placing on top of a block (support −Y), viewing along +Z — the
+        // default orientation has a fully-covered base and its mass biased away
+        // from the viewer (the ramp ascends away). Deterministic.
+        let view = Vec3::new(0.15, -0.4, 0.9);
+        let o = default_orientation(Form::Wedge, IVec3::NEG_Y, view);
+        let c = constants(Form::Wedge);
+        assert_eq!(
+            mask_popcount(&face_masks(Form::Wedge, o)[2]),
+            256,
+            "the y=0 base face is fully covered"
+        );
+        assert!(
+            c.centroid_oriented(o).z > 0.5,
+            "mass biased +Z: ascends away from the viewer"
+        );
+        assert_eq!(o, default_orientation(Form::Wedge, IVec3::NEG_Y, view));
+    }
+
+    #[test]
+    fn a_placed_form_writes_its_shape_record_and_the_cube_does_not() {
+        // WI 833: the shape rides the placement; the cube stays a plain voxel so
+        // pre-shape builds keep re-saving byte-identically.
+        let mut craft = VoxelCraft::new(1.0);
+        let target = BrushTarget {
+            voxel_cell: IVec3::ZERO,
+            device_cell: IVec3::ZERO,
+            wheel_mount: DVec3::splat(0.5),
+            shape: Some((Form::Wedge, 3)),
+        };
+        place_brush(
+            &mut craft,
+            Brush::Voxel,
+            Material::ALUMINIUM,
+            &target,
+            MotorTier::Standard,
+        );
+        let s = craft.shape_at(IVec3::ZERO).expect("shape record placed");
+        assert_eq!((s.form, s.orientation), (Form::Wedge, 3));
+
+        let mut plain = VoxelCraft::new(1.0);
+        place_brush(
+            &mut plain,
+            Brush::Voxel,
+            Material::ALUMINIUM,
+            &target_at(DVec3::splat(0.5)),
+            MotorTier::Standard,
+        );
+        assert!(plain.voxels.len() == 1 && plain.shapes.is_empty());
+    }
+
+    #[test]
+    fn the_ghost_outline_matches_the_placement_orientation() {
+        // WI 833: the ghost is the oriented form outline at the add cell — the same
+        // effective orientation a click consumes — and the cube draws no form ghost.
+        let state = EditorState {
+            form: Form::Wedge,
+            orientation_pick: Some(4),
+            ..Default::default()
+        };
+        let h = Hovered {
+            add_cell: IVec3::new(2, 1, 0),
+            remove_cell: Some(IVec3::new(2, 0, 0)),
+            highlight: IVec3::new(2, 0, 0),
+            panel: None,
+            panel_target: None,
+            support: Some(IVec3::NEG_Y),
+            view: Vec3::NEG_Y,
+        };
+        let ghost = shape_ghost(&state, &h).expect("a wedge ghosts");
+        let o = effective_orientation(&state, Some((IVec3::NEG_Y, Vec3::NEG_Y)));
+        let want = sounding_sim::shape::form_outline(Form::Wedge, o);
+        assert_eq!(ghost.len(), want.len());
+        let base = h.add_cell.as_dvec3() * state.craft.cell_size;
+        for ((a, b), (wa, wb)) in ghost.iter().zip(want.iter()) {
+            let s = state.craft.cell_size;
+            assert!((*a - (base + *wa * s).as_vec3()).length() < 1e-6);
+            assert!((*b - (base + *wb * s).as_vec3()).length() < 1e-6);
+        }
+        let cube = EditorState::default();
+        assert!(
+            shape_ghost(&cube, &h).is_none(),
+            "the cube keeps the plain ghost"
+        );
+    }
+
+    /// A shape-less brush target aiming everything at the origin / `mount` (the
+    /// pre-WI-833 test call shape).
+    fn target_at(mount: DVec3) -> BrushTarget {
+        BrushTarget {
+            voxel_cell: IVec3::ZERO,
+            device_cell: IVec3::ZERO,
+            wheel_mount: mount,
+            shape: None,
         }
     }
 
@@ -1420,9 +1756,7 @@ mod tests {
                 steer: true,
             },
             Material::COMPOSITE,
-            IVec3::ZERO,
-            IVec3::ZERO,
-            mount,
+            &target_at(mount),
             MotorTier::Standard,
         );
         let rim = craft
@@ -1456,18 +1790,14 @@ mod tests {
                 steer: false,
             },
             Material::COMPOSITE,
-            IVec3::ZERO,
-            IVec3::ZERO,
-            mount,
+            &target_at(mount),
             MotorTier::Standard,
         );
         place_brush(
             &mut craft,
             Brush::Suspension,
             Material::COMPOSITE,
-            IVec3::ZERO,
-            IVec3::ZERO,
-            mount,
+            &target_at(mount),
             MotorTier::Standard,
         );
         let ids: std::collections::BTreeSet<_> =
@@ -1496,9 +1826,7 @@ mod tests {
                     steer: false,
                 },
                 Material::COMPOSITE,
-                IVec3::ZERO,
-                IVec3::ZERO,
-                mount,
+                &target_at(mount),
                 MotorTier::Standard,
             );
         };
@@ -1542,9 +1870,7 @@ mod tests {
                 steer: true,
             },
             Material::COMPOSITE,
-            IVec3::ZERO,
-            IVec3::ZERO,
-            DVec3::new(0.5, -0.2, 0.5),
+            &target_at(DVec3::new(0.5, -0.2, 0.5)),
             MotorTier::Standard,
         );
 

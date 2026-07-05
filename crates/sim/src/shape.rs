@@ -416,6 +416,43 @@ pub fn face_masks(form: Form, orientation: u8) -> &'static [FaceMask; 6] {
     &table[fi * 24 + orientation as usize]
 }
 
+/// The oriented **crease-edge outline** of a form (WI 833): the canonical mesh's
+/// undirected edges whose two adjacent triangles are non-coplanar (triangulation
+/// diagonals inside flat faces are dropped), rotated about the cell centre —
+/// the wireframe the editor's placement ghost draws, in unit-cell coordinates.
+/// Derived from the same mesh the skins emit, so the preview cannot drift from
+/// the render. Deterministic order (sorted by vertex index pair).
+pub fn form_outline(form: Form, orientation: u8) -> Vec<(DVec3, DVec3)> {
+    let mesh = form_mesh(form);
+    let mut edge_normals: HashMap<(usize, usize), Vec<DVec3>> = HashMap::new();
+    for t in &mesh.triangles {
+        let (a, b, c) = (
+            mesh.vertices[t[0]],
+            mesh.vertices[t[1]],
+            mesh.vertices[t[2]],
+        );
+        let n = (b - a).cross(c - a).normalize();
+        for (i, j) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+            edge_normals
+                .entry((i.min(j), i.max(j)))
+                .or_default()
+                .push(n);
+        }
+    }
+    let mut keys: Vec<(usize, usize)> = edge_normals
+        .iter()
+        // A manifold edge has exactly two triangles; keep it when they crease.
+        .filter(|(_, ns)| ns.len() != 2 || ns[0].dot(ns[1]) < 1.0 - 1e-6)
+        .map(|(k, _)| *k)
+        .collect();
+    keys.sort_unstable();
+    let r = rotations()[orientation as usize];
+    let orient = |p: DVec3| r * (p - DVec3::splat(0.5)) + DVec3::splat(0.5);
+    keys.into_iter()
+        .map(|(i, j)| (orient(mesh.vertices[i]), orient(mesh.vertices[j])))
+        .collect()
+}
+
 /// Rasterize the six face masks of a (possibly rotated) mesh: for each unit-cube
 /// face, collect the triangles lying wholly in its plane, project to the face's
 /// tangent axes, and sample the jittered grid.
@@ -970,6 +1007,38 @@ mod tests {
             256,
             "exact complements partition the samples"
         );
+    }
+
+    #[test]
+    fn the_outline_is_the_crease_edges_of_each_form() {
+        // WI 833: the ghost wireframe drops triangulation diagonals and keeps the
+        // polyhedron's real edges — cube 12, wedge (triangular prism) 9,
+        // outer-corner tetrahedron 6.
+        assert_eq!(form_outline(Form::Cube, 0).len(), 12);
+        assert_eq!(form_outline(Form::Wedge, 0).len(), 9);
+        assert_eq!(form_outline(Form::OuterCorner, 0).len(), 6);
+    }
+
+    #[test]
+    fn the_outline_rotates_with_the_orientation() {
+        // Every oriented outline endpoint is the rotation of a canonical endpoint,
+        // and stays inside the unit cell (rotation is about the cell centre).
+        for &o in &constants(Form::Wedge).distinct_orientations {
+            let base = form_outline(Form::Wedge, 0);
+            let oriented = form_outline(Form::Wedge, o);
+            assert_eq!(base.len(), oriented.len());
+            let r = rotations()[o as usize];
+            let map = |p: DVec3| r * (p - DVec3::splat(0.5)) + DVec3::splat(0.5);
+            for ((a0, b0), (a, b)) in base.iter().zip(oriented.iter()) {
+                assert!((map(*a0) - *a).length() < 1e-12);
+                assert!((map(*b0) - *b).length() < 1e-12);
+                for p in [a, b] {
+                    assert!((-1e-9..=1.0 + 1e-9).contains(&p.x));
+                    assert!((-1e-9..=1.0 + 1e-9).contains(&p.y));
+                    assert!((-1e-9..=1.0 + 1e-9).contains(&p.z));
+                }
+            }
+        }
     }
 
     #[test]

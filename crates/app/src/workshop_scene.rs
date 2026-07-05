@@ -1020,6 +1020,8 @@ impl Plugin for WorkshopScenePlugin {
                 subassembly: None,
                 motor: sounding_sim::powertrain::MotorTier::Standard,
                 panel_mode: false,
+                form: sounding_sim::shape::Form::Cube,
+                orientation_pick: None,
             })
             .init_resource::<OrbitCam>()
             .init_resource::<HoverState>()
@@ -1157,7 +1159,7 @@ fn enter_build(mut commands: Commands) {
     ));
     commands.spawn((
         Text::new(
-            "left-click place · right-click remove · middle-drag orbit · scroll zoom · pad: right-stick orbit / bumpers zoom · Tab material · T panel mode (thin plates on faces) · K save vehicle · O load vehicle · P pause · Enter → TEST (4 wheels ⇒ drive it)",
+            "left-click place · right-click remove · middle-drag orbit · scroll zoom · pad: right-stick orbit / bumpers zoom · Tab material · X rotate shape · T panel mode (thin plates on faces) · K save vehicle · O load vehicle · P pause · Enter → TEST (4 wheels ⇒ drive it)",
         ),
         TextFont {
             font_size: 14.0,
@@ -1209,8 +1211,10 @@ fn update_build_hud(
         } else {
             "solid"
         };
+        // Shape read-out (WI 833): form · orientation (auto = context default) · fill.
+        let shape = crate::editor::shape_hud_label(&editor);
         text.0 = format!(
-            "workshop · BUILD\nbrush:   {brush}\nplace:   {mode} [T]\nvoxels:  {}\npanels:  {}\ndevices: {}\nwheels:  {}\nmass:    {mass:.0} kg\nmotor:   {} ({:.0} N·m, top {:.0}) [M]{pad}",
+            "workshop · BUILD\nbrush:   {brush}\nshape:   {shape}\nplace:   {mode} [T]\nvoxels:  {}\npanels:  {}\ndevices: {}\nwheels:  {}\nmass:    {mass:.0} kg\nmotor:   {} ({:.0} N·m, top {:.0}) [M]{pad}",
             editor.craft.voxels.len(),
             editor.craft.face_panels.len(),
             editor.craft.devices.len(),

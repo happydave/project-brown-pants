@@ -118,6 +118,16 @@ pub fn skin_submeshes(craft: &VoxelCraft, skin: VoxelSkin) -> Vec<(Material, Mes
                 .filter(|v| v.material == m)
                 .cloned()
                 .collect::<Vec<Voxel>>();
+            // Shape records ride the split (WI 833) so shaped cells render shaped
+            // in every solid-render path — without this they'd silently emit cubes.
+            let carried: Vec<_> = sub
+                .voxels
+                .iter()
+                .filter_map(|v| craft.shape_at(v.cell).copied())
+                .collect();
+            for s in carried {
+                sub.set_shape(s);
+            }
             (m, build_skin_mesh(&sub, skin))
         })
         .collect()
@@ -409,6 +419,37 @@ mod tests {
     fn empty_craft_has_no_submeshes() {
         let craft = VoxelCraft::new(1.0);
         assert!(skin_submeshes(&craft, VoxelSkin::Hull).is_empty());
+    }
+
+    #[test]
+    fn shape_records_ride_the_material_split() {
+        // WI 833: a shaped aluminium wedge next to a steel cube — the aluminium
+        // sub-mesh must be the wedge's 8 form triangles, not a 12-triangle cube
+        // (the carry that makes shapes visible in every solid-render path).
+        use sounding_sim::shape::{FillMode, Form, ShapedCell};
+        let mut craft = VoxelCraft::new(1.0);
+        craft.voxels.push(Voxel {
+            cell: IVec3::ZERO,
+            material: Material::ALUMINIUM,
+        });
+        craft.set_shape(ShapedCell {
+            cell: IVec3::ZERO,
+            form: Form::Wedge,
+            orientation: 0,
+            fill: FillMode::Solid,
+        });
+        craft.voxels.push(Voxel {
+            cell: IVec3::new(5, 0, 0),
+            material: Material::STEEL,
+        });
+        for (m, mesh) in skin_submeshes(&craft, VoxelSkin::Hull) {
+            let tris = mesh.indices().map(|i| i.len() / 3).unwrap_or(0);
+            if m == Material::ALUMINIUM {
+                assert_eq!(tris, 8, "the wedge renders as its form");
+            } else {
+                assert_eq!(tris, 12, "the lone cube keeps its six quads");
+            }
+        }
     }
 
     #[test]
