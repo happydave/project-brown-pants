@@ -1470,10 +1470,7 @@ fn enter_test(
                 ));
             }
             for (j, part) in rs.lattice.parts.iter().enumerate() {
-                if matches!(
-                    part.kind,
-                    PartKind::Wheel(_) | PartKind::Rim(_) | PartKind::Tire(_)
-                ) {
+                if matches!(part.kind, PartKind::Rim(_) | PartKind::Tire(_)) {
                     continue; // wheels are rendered by the dedicated slip-spoke wheel render
                 }
                 // Render the part as its mechanical-kit mesh (WI 654); `track_rover_meshes` poses it
@@ -2984,18 +2981,45 @@ mod tests {
         assert!(assemble_from_lattice(&VoxelCraft::new(1.0)).is_none());
     }
 
-    /// A lattice with wheel parts is a rover: `assemble_rover` returns Some, and the rover Test
+    /// A lattice with wheel stations is a rover: `assemble_rover` returns Some, and the rover Test
     /// world places it resting on the pad with its drivetrain groups intact.
     #[test]
     fn wheeled_lattice_drives_as_a_rover() {
-        use sounding_sim::voxel::{Part, PartKind, WheelPart};
+        use sounding_sim::voxel::{Part, PartKind, RimSpec, SuspensionSpec, TireSpec};
         let mut v = default_lattice();
-        for (x, z, steer) in [(0, 0, false), (1, 0, false), (0, 1, true), (1, 1, true)] {
+        for (id, (x, z, steer)) in [(0, 0, false), (1, 0, false), (0, 1, true), (1, 1, true)]
+            .into_iter()
+            .enumerate()
+        {
+            // One complete component station per corner (WI 847 — the retired legacy
+            // wheel's 0.35 m radius split as rim 0.245 + tire profile 0.105).
+            let mount = DVec3::new(x as f64, -0.3, z as f64);
+            let id = Some(id as u32);
             v.parts.push(Part {
-                mount: DVec3::new(x as f64, -0.3, z as f64),
-                mass: 60.0,
-                kind: PartKind::Wheel(WheelPart::new(true, steer)),
-                station: None,
+                mount,
+                mass: 0.0,
+                kind: PartKind::Suspension(SuspensionSpec {
+                    rest_length: 0.35,
+                    travel: 0.35,
+                    rigid: false,
+                }),
+                station: id,
+            });
+            v.parts.push(Part {
+                mount,
+                mass: 30.0,
+                kind: PartKind::Rim(RimSpec {
+                    radius: 0.245,
+                    drive: true,
+                    steer,
+                }),
+                station: id,
+            });
+            v.parts.push(Part {
+                mount,
+                mass: 30.0,
+                kind: PartKind::Tire(TireSpec::new(0.105)),
+                station: id,
             });
         }
         let asm = assemble_rover(&v, DVec3::ZERO, ROVER_GRAVITY).expect("wheels ⇒ rover");

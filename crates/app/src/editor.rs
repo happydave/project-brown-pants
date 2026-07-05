@@ -1430,19 +1430,10 @@ pub(crate) fn draw_editor(mut gizmos: Gizmos, state: Res<EditorState>) {
             Color::srgb(1.0, 0.55, 0.0),
         );
     }
-    // Attached wheel parts (dark spheres at their continuous mount; steer wheels tinted). Both the
-    // legacy monolithic wheel and the new rim+tire components draw the wheel; a suspension draws a
-    // small amber marker so an added strut is visible (WI 630).
+    // Attached wheel parts (dark spheres at their continuous mount; steer wheels tinted). The rim
+    // draws the wheel; a suspension draws a small amber marker so an added strut is visible (WI 630).
     for p in &state.craft.parts {
         match p.kind {
-            PartKind::Wheel(spec) => {
-                let color = if spec.steer {
-                    Color::srgb(0.15, 0.18, 0.28)
-                } else {
-                    Color::srgb(0.12, 0.12, 0.14)
-                };
-                gizmos.sphere(p.mount.as_vec3(), spec.radius as f32, color);
-            }
             PartKind::Rim(r) => {
                 let color = if r.steer {
                     Color::srgb(0.15, 0.18, 0.28)

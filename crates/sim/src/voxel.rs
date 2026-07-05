@@ -445,8 +445,8 @@ pub struct MassProperties {
 /// mounts at an arbitrary sub-cell offset — which is why wheels (and seat / antenna /
 /// solar / bumper) are parts, not devices: the rover core mounts wheels at sub-cell,
 /// outboard positions a cell grid cannot express. A part contributes mass and
-/// (point-mass, parallel-axis) inertia like a device, and is render-relevant; a
-/// [`PartKind::Wheel`] is additionally physics-relevant (it becomes a rover wheel).
+/// (point-mass, parallel-axis) inertia like a device, and is render-relevant; the
+/// wheel-station components are additionally physics-relevant (they become rover wheels).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Part {
     /// Mount position in the craft's local (lattice) frame, metres — the same frame
@@ -459,23 +459,21 @@ pub struct Part {
     pub kind: PartKind,
     /// Wheel-station id (WI 630): groups a [`PartKind::Suspension`] + [`PartKind::Rim`] +
     /// [`PartKind::Tire`] into one wheel. `None` for parts that are not part of a station
-    /// (seat, antenna, solar, bumper, and legacy monolithic [`PartKind::Wheel`]). A station is
-    /// **complete** when all three component kinds share an id; only complete stations become rover
-    /// wheels. Defaulted on load so pre-component saves stay backward-loadable.
+    /// (seat, antenna, solar, bumper). A station is **complete** when all three component
+    /// kinds share an id; only complete stations become rover wheels. Defaulted on load so
+    /// pre-component saves stay backward-loadable.
     #[serde(default)]
     pub station: Option<u32>,
 }
 
-/// The kind of a catalog [`Part`] (WI 607). `Wheel` carries the physical and
-/// group parameters that assembly turns into a rover wheel; the remaining kinds are
-/// inert mass with a recognisable role (their meshes land in WI 608).
+/// The kind of a catalog [`Part`] (WI 607). The wheel-station components (WI 630) carry
+/// the physical and group parameters that assembly turns into a rover wheel; the remaining
+/// kinds are inert mass with a recognisable role (their meshes land in WI 608). The WI 607
+/// legacy monolithic `Wheel` variant and its decode-migration were retired at WI 847
+/// (pre-release, nothing encoded it) — stations are the only wheel representation.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PartKind {
-    /// A **legacy** monolithic wheel + suspension + tire (WI 607). Still authored by the editor and
-    /// loadable from old saves; assembly migrates it to a [`Suspension`]/[`Rim`]/[`Tire`] station via
-    /// [`WheelPart::to_components`] (WI 630). New authoring places the three components instead.
-    Wheel(WheelPart),
     /// The spring-damper strut of a wheel station (WI 630): anchors the station and owns ride height
     /// and travel. Optional — a station with a rigid/zero-travel strut still rides on tire compliance.
     Suspension(SuspensionSpec),
@@ -611,91 +609,6 @@ impl TireSpec {
     /// with any sized suspension spring is the suspension spring to within f64 tolerance (WI 630).
     pub fn default_stiffness() -> f64 {
         1.0e9
-    }
-}
-
-/// Physical and drivetrain parameters of a [`PartKind::Wheel`] (WI 607). The
-/// physical fields mirror [`crate::rover::Wheel`]'s suspension/tire parameters so
-/// assembly maps a wheel part straight onto a rover wheel; the group flags record
-/// the drivetrain membership the rover Test path commands (drive torque / steering)
-/// by group rather than by hard-coded index.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct WheelPart {
-    /// Wheel radius (m).
-    pub radius: f64,
-    /// Suspension free length (m).
-    pub rest_length: f64,
-    /// Spring stiffness (N/m).
-    pub stiffness: f64,
-    /// Suspension damping (N·s/m).
-    pub damping: f64,
-    /// Maximum suspension normal force (N).
-    pub max_force: f64,
-    /// Wheel rotational inertia (kg·m²).
-    pub wheel_inertia: f64,
-    /// In the drive group (receives engine/motor torque).
-    pub drive: bool,
-    /// In the steer group (turns with steering input).
-    pub steer: bool,
-}
-
-impl WheelPart {
-    /// A wheel part with the rover core's sensible defaults (mirrors
-    /// [`crate::rover::Wheel::new`]); `drive`/`steer` choose the drivetrain groups.
-    pub fn new(drive: bool, steer: bool) -> Self {
-        Self {
-            radius: 0.35,
-            rest_length: 0.35,
-            stiffness: 4.5e4,
-            damping: 8.0e3,
-            max_force: 1.0e6,
-            wheel_inertia: 8.0,
-            drive,
-            steer,
-        }
-    }
-
-    /// A wheel part sized to the build's `cell_size` (WI 612 feedback): radius and suspension
-    /// travel scale with the cell so a 0.1 m build gets small wheels on short suspension, not
-    /// metre-scale stilts. The force parameters (`stiffness`/`damping`/`max_force`) are placeholders
-    /// — [`crate::rover::assemble_rover`] re-sizes them to the assembled rover's mass.
-    pub fn for_cell_size(cell_size: f64, drive: bool, steer: bool) -> Self {
-        let radius = 1.5 * cell_size;
-        Self {
-            radius,
-            rest_length: 0.5 * cell_size,
-            stiffness: 4.5e4,
-            damping: 8.0e3,
-            max_force: 1.0e6,
-            // ~ m·r² for a light wheel; keeps spin-up responsive at small scale.
-            wheel_inertia: (radius * radius * 40.0).max(0.05),
-            drive,
-            steer,
-        }
-    }
-
-    /// Migrate a legacy monolithic wheel to the three station components (WI 630). The split is
-    /// behaviour-preserving: the effective rolling radius (rim + tire profile) equals the old radius
-    /// exactly, the tire reproduces the pre-split grip/slip, and `rest_length` / `drive` / `steer`
-    /// carry over. The component masses are the caller's concern (the legacy part's single mass is
-    /// used directly for inertia by [`crate::rover::assemble_rover`]).
-    pub fn to_components(&self) -> (SuspensionSpec, RimSpec, TireSpec) {
-        // 30 % of the radius is tire profile; the rest is rim. Computing rim as `radius - profile`
-        // keeps `rim + profile == radius` exact in IEEE arithmetic.
-        let profile = 0.3 * self.radius;
-        (
-            SuspensionSpec {
-                rest_length: self.rest_length,
-                travel: self.rest_length,
-                rigid: false,
-            },
-            RimSpec {
-                radius: self.radius - profile,
-                drive: self.drive,
-                steer: self.steer,
-            },
-            TireSpec::new(profile),
-        )
     }
 }
 
@@ -1392,7 +1305,7 @@ mod tests {
         craft.parts.push(Part {
             mount,
             mass: 500.0,
-            kind: PartKind::Wheel(WheelPart::new(true, false)),
+            kind: PartKind::Seat,
             station: None,
         });
         let mp = craft.mass_properties().unwrap();

@@ -1057,14 +1057,15 @@ fn compose_wheel(
 
 /// Assemble a [`Rover`] from a built `craft` (WI 607), placing its centre of mass at
 /// world `position` under `gravity`. Mass / inertia / CoM come from the chassis voxels
-/// **and** attached parts ([`VoxelCraft::mass_properties`]). Each wheel comes from either a legacy
-/// monolithic [`PartKind::Wheel`] part (migrated to components) or a **complete component station**
-/// (a [`PartKind::Suspension`] + [`PartKind::Rim`] + [`PartKind::Tire`] sharing a station id), composed
-/// into a [`Wheel`] by [`compose_wheel`] (WI 630); drive/steer groups come from the rim flags.
+/// **and** attached parts ([`VoxelCraft::mass_properties`]). Each wheel comes from a **complete
+/// component station** (a [`PartKind::Suspension`] + [`PartKind::Rim`] + [`PartKind::Tire`] sharing
+/// a station id — the only wheel representation since the legacy monolithic part was retired,
+/// WI 847), composed into a [`Wheel`] by [`compose_wheel`] (WI 630); drive/steer groups come from
+/// the rim flags.
 ///
-/// Returns `None` when the craft has no mass or **no wheels** (no legacy wheel parts and no complete
-/// stations) — a lattice without wheels is not a rover (the rocket assembly path handles those). This
-/// is the deterministic rocket-vs-rover discriminator: wheels ⇒ rover.
+/// Returns `None` when the craft has no mass or **no wheels** (no complete stations) — a lattice
+/// without wheels is not a rover (the rocket assembly path handles those). This is the
+/// deterministic rocket-vs-rover discriminator: wheels ⇒ rover.
 pub fn assemble_rover(craft: &VoxelCraft, position: DVec3, gravity: f64) -> Option<RoverAssembly> {
     let mp = craft.mass_properties()?;
 
@@ -1079,22 +1080,7 @@ pub fn assemble_rover(craft: &VoxelCraft, position: DVec3, gravity: f64) -> Opti
     }
     let mut raw: Vec<RawWheel> = Vec::new();
 
-    // Pass 1a — legacy monolithic wheels (still authored by the editor, and loaded from pre-630 saves)
-    // migrate to the three components (WI 630). Iterated in part order so wheel indices are stable.
-    for part in &craft.parts {
-        if let PartKind::Wheel(spec) = part.kind {
-            let (susp, rim, tire) = spec.to_components();
-            raw.push(RawWheel {
-                susp,
-                rim,
-                tire,
-                mount: part.mount,
-                unsprung: part.mass,
-            });
-        }
-    }
-
-    // Pass 1b — component stations: group the components by station id. A station becomes a wheel when
+    // Component stations: group the components by station id. A station becomes a wheel when
     // it has a **rim and a tire**; the **suspension is optional** — when absent the wheel rides on the
     // tire via a rigid strut (WI 630). Sorted by id for a deterministic wheel order; incomplete
     // stations are skipped. The unsprung mass of each wheel is its rim + tire mass.
@@ -1384,13 +1370,59 @@ mod tests {
     use crate::terrain::Terrain;
     use crate::voxel::{
         Device, DeviceKind, Material, Part, PartKind, RimSpec, SuspensionSpec, TireSpec, Voxel,
-        VoxelCraft, WheelPart,
+        VoxelCraft,
     };
     use glam::IVec3;
 
-    /// A 3×5 voxel chassis (the rover-scene block) with `n_parts` wheel parts mounted
-    /// at the four corners (front pair steering, all driving).
-    fn chassis_with_wheels() -> VoxelCraft {
+    /// One complete wheel station (suspension + rim + tire sharing `id`) at `mount` — the
+    /// component successor to the retired legacy monolithic-wheel fixtures (WI 847), encoding the
+    /// WI 630 split exactly: rim = radius − 0.3·radius (the IEEE-exact subtraction form),
+    /// tire profile = 0.3·radius, suspension travel = rest_length (massless strut), and the
+    /// wheel's unsprung `mass` split evenly across rim + tire (only the total reaches
+    /// `compose_wheel`). All fixtures drive; `steer` picks the steer group.
+    fn wheel_station(
+        id: u32,
+        mount: DVec3,
+        mass: f64,
+        radius: f64,
+        rest_length: f64,
+        steer: bool,
+    ) -> [Part; 3] {
+        let profile = 0.3 * radius;
+        [
+            Part {
+                mount,
+                mass: 0.0,
+                kind: PartKind::Suspension(SuspensionSpec {
+                    rest_length,
+                    travel: rest_length,
+                    rigid: false,
+                }),
+                station: Some(id),
+            },
+            Part {
+                mount,
+                mass: 0.5 * mass,
+                kind: PartKind::Rim(RimSpec {
+                    radius: radius - profile,
+                    drive: true,
+                    steer,
+                }),
+                station: Some(id),
+            },
+            Part {
+                mount,
+                mass: 0.5 * mass,
+                kind: PartKind::Tire(TireSpec::new(profile)),
+                station: Some(id),
+            },
+        ]
+    }
+
+    /// A 3×5 voxel chassis (the rover-scene block) with a component wheel station at each of
+    /// the four corners (front pair steering, all driving; 40 kg unsprung per corner, the
+    /// rover core's 0.35 m radius / 0.35 m ride height).
+    fn chassis_with_stations() -> VoxelCraft {
         let mut craft = VoxelCraft::new(0.5);
         for x in 0..3 {
             for z in 0..5 {
@@ -1406,61 +1438,10 @@ mod tests {
             (DVec3::new(-1.0, -0.2, 2.0), true),   // front-left: drive + steer
             (DVec3::new(1.0, -0.2, 2.0), true),    // front-right: drive + steer
         ];
-        for (mount, steer) in mounts {
-            craft.parts.push(Part {
-                mount,
-                mass: 40.0,
-                kind: PartKind::Wheel(WheelPart::new(true, steer)),
-                station: None,
-            });
-        }
-        craft
-    }
-
-    /// The same 3×5 chassis as [`chassis_with_wheels`], but each wheel authored as a **component
-    /// station** (suspension + rim + tire) instead of a legacy monolithic wheel (WI 630). The
-    /// component split is behaviour-preserving: each wheel's total mass (40 kg, all on the rim+tire so
-    /// it counts toward inertia exactly like the legacy single-mass part) and rolling radius match.
-    fn chassis_with_stations() -> VoxelCraft {
-        let mut craft = VoxelCraft::new(0.5);
-        for x in 0..3 {
-            for z in 0..5 {
-                craft.voxels.push(Voxel {
-                    cell: IVec3::new(x, 0, z),
-                    material: Material::COMPOSITE,
-                });
-            }
-        }
-        let mounts = [
-            (DVec3::new(-1.0, -0.2, -2.0), false),
-            (DVec3::new(1.0, -0.2, -2.0), false),
-            (DVec3::new(-1.0, -0.2, 2.0), true),
-            (DVec3::new(1.0, -0.2, 2.0), true),
-        ];
-        // Components mirror `WheelPart::new(true, steer).to_components()` so the composed wheel equals
-        // the legacy one; suspension carries no mass, rim+tire split the 40 kg.
-        let (susp, _rim, _tire) = WheelPart::new(true, false).to_components();
         for (id, (mount, steer)) in mounts.into_iter().enumerate() {
-            let (_, rim, tire) = WheelPart::new(true, steer).to_components();
-            let id = id as u32;
-            craft.parts.push(Part {
-                mount,
-                mass: 0.0,
-                kind: PartKind::Suspension(susp),
-                station: Some(id),
-            });
-            craft.parts.push(Part {
-                mount,
-                mass: 20.0,
-                kind: PartKind::Rim(rim),
-                station: Some(id),
-            });
-            craft.parts.push(Part {
-                mount,
-                mass: 20.0,
-                kind: PartKind::Tire(tire),
-                station: Some(id),
-            });
+            craft
+                .parts
+                .extend(wheel_station(id as u32, mount, 40.0, 0.35, 0.35, steer));
         }
         craft
     }
@@ -1473,37 +1454,6 @@ mod tests {
         assert_eq!(t.slip_long, C_LONG);
         assert_eq!(t.slip_lat, C_LAT);
         assert_eq!(t.grip_scale, 1.0);
-    }
-
-    #[test]
-    fn migration_equivalence_legacy_wheel_and_station_compose_identically() {
-        // A pre-split (legacy WheelPart) build and the same build authored as component stations must
-        // assemble to numerically identical wheels — the WI 630 migration-equivalence criterion.
-        let legacy =
-            assemble_rover(&chassis_with_wheels(), DVec3::new(0.0, 5.0, 0.0), 9.81).unwrap();
-        let split =
-            assemble_rover(&chassis_with_stations(), DVec3::new(0.0, 5.0, 0.0), 9.81).unwrap();
-        assert_eq!(legacy.rover.wheels.len(), split.rover.wheels.len());
-        assert_eq!(legacy.drive, split.drive);
-        assert_eq!(legacy.steer, split.steer);
-        for (a, b) in legacy.rover.wheels.iter().zip(&split.rover.wheels) {
-            assert!((a.mount - b.mount).length() < 1e-12, "mount {a:?} {b:?}");
-            assert!(
-                (a.radius - b.radius).abs() < 1e-12,
-                "radius {} {}",
-                a.radius,
-                b.radius
-            );
-            assert!((a.rest_length - b.rest_length).abs() < 1e-12);
-            assert!((a.wheel_inertia - b.wheel_inertia).abs() < 1e-9, "inertia");
-            assert!((a.stiffness - b.stiffness).abs() < 1e-6, "stiffness");
-            assert!((a.damping - b.damping).abs() < 1e-6, "damping");
-            assert!((a.max_force - b.max_force).abs() < 1e-6, "max_force");
-            assert!((a.shear_speed - b.shear_speed).abs() < 1e-12, "shear");
-            assert_eq!(a.grip_scale, b.grip_scale);
-            assert_eq!(a.slip_long, b.slip_long);
-            assert_eq!(a.slip_lat, b.slip_lat);
-        }
     }
 
     #[test]
@@ -1520,19 +1470,9 @@ mod tests {
             }
         }
         let mount = DVec3::new(-1.0, -0.2, -2.0);
-        let (susp, rim, _tire) = WheelPart::new(true, false).to_components();
-        craft.parts.push(Part {
-            mount,
-            mass: 0.0,
-            kind: PartKind::Suspension(susp),
-            station: Some(0),
-        });
-        craft.parts.push(Part {
-            mount,
-            mass: 20.0,
-            kind: PartKind::Rim(rim),
-            station: Some(0),
-        });
+        let [susp, rim, _tire] = wheel_station(0, mount, 40.0, 0.35, 0.35, false);
+        craft.parts.push(susp);
+        craft.parts.push(rim);
         // No tire → station incomplete → no wheel → not a rover.
         assert!(assemble_rover(&craft, DVec3::new(0.0, 5.0, 0.0), 9.81).is_none());
     }
@@ -3426,7 +3366,7 @@ mod tests {
 
     #[test]
     fn assemble_rover_builds_wheels_and_groups() {
-        let craft = chassis_with_wheels();
+        let craft = chassis_with_stations();
         let mp = craft.mass_properties().unwrap();
         let asm = assemble_rover(&craft, DVec3::new(0.0, 5.0, 0.0), 9.81).unwrap();
 
@@ -3480,14 +3420,19 @@ mod tests {
                 });
             }
         }
-        for (cx, cz, steer) in [(0, 0, false), (3, 0, false), (0, 5, true), (3, 5, true)] {
+        for (id, (cx, cz, steer)) in [(0, 0, false), (3, 0, false), (0, 5, true), (3, 5, true)]
+            .into_iter()
+            .enumerate()
+        {
             let mount = DVec3::new((cx as f64 + 0.5) * s, -0.1, (cz as f64 + 0.5) * s);
-            craft.parts.push(Part {
+            craft.parts.extend(wheel_station(
+                id as u32,
                 mount,
-                mass: 3.0,
-                kind: PartKind::Wheel(WheelPart::for_cell_size(s, true, steer)),
-                station: None,
-            });
+                3.0,
+                1.5 * s,
+                0.5 * s,
+                steer,
+            ));
         }
         let mass = craft.mass_properties().unwrap().mass;
         let asm = assemble_rover(&craft, DVec3::ZERO, 9.81).unwrap();
@@ -3541,13 +3486,18 @@ mod tests {
                 });
             }
         }
-        for (cx, cz, st) in [(0, 0, false), (3, 0, false), (0, 5, true), (3, 5, true)] {
-            craft.parts.push(Part {
-                mount: DVec3::new((cx as f64 + 0.5) * s, -0.1, (cz as f64 + 0.5) * s),
-                mass: 3.0,
-                kind: PartKind::Wheel(WheelPart::for_cell_size(s, true, st)),
-                station: None,
-            });
+        for (id, (cx, cz, st)) in [(0, 0, false), (3, 0, false), (0, 5, true), (3, 5, true)]
+            .into_iter()
+            .enumerate()
+        {
+            craft.parts.extend(wheel_station(
+                id as u32,
+                DVec3::new((cx as f64 + 0.5) * s, -0.1, (cz as f64 + 0.5) * s),
+                3.0,
+                1.5 * s,
+                0.5 * s,
+                st,
+            ));
         }
         let mp = craft.mass_properties().unwrap();
         let com = mp.center_of_mass;
@@ -3635,13 +3585,15 @@ mod tests {
             }
         }
         // Four corner wheels, all steerable (front at z≈max, rear at z≈min).
-        for (cx, cz) in [(0, 0), (3, 0), (0, 5), (3, 5)] {
-            craft.parts.push(Part {
-                mount: DVec3::new((cx as f64 + 0.5) * s, -0.1, (cz as f64 + 0.5) * s),
-                mass: 3.0,
-                kind: PartKind::Wheel(WheelPart::for_cell_size(s, true, true)),
-                station: None,
-            });
+        for (id, (cx, cz)) in [(0, 0), (3, 0), (0, 5), (3, 5)].into_iter().enumerate() {
+            craft.parts.extend(wheel_station(
+                id as u32,
+                DVec3::new((cx as f64 + 0.5) * s, -0.1, (cz as f64 + 0.5) * s),
+                3.0,
+                1.5 * s,
+                0.5 * s,
+                true,
+            ));
         }
         let mut rover = assemble_rover(&craft, DVec3::ZERO, 9.81).unwrap().rover;
         let steer: Vec<usize> = (0..rover.wheels.len()).collect();
@@ -3674,7 +3626,7 @@ mod tests {
     #[test]
     fn engine_and_tank_make_a_combustion_powertrain() {
         // An Engine device on a rover is a combustion engine (drivetrain), fed by a Tank (WI 609).
-        let mut craft = chassis_with_wheels();
+        let mut craft = chassis_with_stations();
         craft.devices.push(Device::structural(
             IVec3::new(1, 0, 2),
             100.0,
@@ -3984,13 +3936,15 @@ mod tests {
             (DVec3::new(0.1, -0.3, 1.25), true),
             (DVec3::new(0.4, -0.3, 1.25), true),
         ];
-        for (mount, steer) in mounts {
-            craft.parts.push(Part {
+        for (id, (mount, steer)) in mounts.into_iter().enumerate() {
+            craft.parts.extend(wheel_station(
+                id as u32,
                 mount,
-                mass: 8.0,
-                kind: PartKind::Wheel(WheelPart::for_cell_size(s, true, steer)),
-                station: None,
-            });
+                8.0,
+                1.5 * s,
+                0.5 * s,
+                steer,
+            ));
         }
         let terrain = Terrain {
             amplitude: 0.0,
@@ -4101,13 +4055,18 @@ mod tests {
                 });
             }
         }
-        for (cx, cz, st) in [(0, 0, false), (3, 0, false), (0, 5, true), (3, 5, true)] {
-            craft.parts.push(Part {
-                mount: DVec3::new((cx as f64 + 0.5) * s, -0.1, (cz as f64 + 0.5) * s),
-                mass: 3.0,
-                kind: PartKind::Wheel(WheelPart::for_cell_size(s, true, st)),
-                station: None,
-            });
+        for (id, (cx, cz, st)) in [(0, 0, false), (3, 0, false), (0, 5, true), (3, 5, true)]
+            .into_iter()
+            .enumerate()
+        {
+            craft.parts.extend(wheel_station(
+                id as u32,
+                DVec3::new((cx as f64 + 0.5) * s, -0.1, (cz as f64 + 0.5) * s),
+                3.0,
+                1.5 * s,
+                0.5 * s,
+                st,
+            ));
         }
         let mass = craft.mass_properties().unwrap().mass;
         let asm = assemble_rover(&craft, DVec3::ZERO, 9.81).unwrap();
@@ -4158,7 +4117,7 @@ mod tests {
         // WI 618: shearing is keyed to impact (closing) speed vs. each mount's rated speed, and to
         // which side faces the obstacle. `into_obstacle = +Z` means the front wheels (mount.z > 0)
         // face the impact.
-        let craft = chassis_with_wheels();
+        let craft = chassis_with_stations();
         let mut rover = assemble_rover(&craft, DVec3::new(0.0, 5.0, 0.0), 9.81)
             .unwrap()
             .rover;

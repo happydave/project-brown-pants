@@ -275,10 +275,9 @@ pub fn device_part_name(kind: DeviceKind) -> Option<&'static str> {
 }
 
 /// The glb basename a `PartKind` renders as (the workshop retrofit mapping). Every kind maps to a
-/// catalogued part; the legacy monolithic `Wheel` shows as a `tire`.
+/// catalogued part.
 pub fn part_kind_name(kind: PartKind) -> &'static str {
     match kind {
-        PartKind::Wheel(_) => "tire",
         PartKind::Suspension(_) => "suspension",
         PartKind::Rim(_) => "rim",
         PartKind::Tire(_) => "tire",
@@ -347,7 +346,7 @@ pub fn device_face_normal(craft: &VoxelCraft, cell: IVec3) -> Vec3 {
 pub fn part_build_pose(kind: PartKind, mount: Vec3, normal: Vec3, cell: f32) -> (Vec3, Quat) {
     let n = normal.normalize_or(Vec3::Y);
     let (axis, at_face) = match kind {
-        PartKind::Wheel(_) | PartKind::Rim(_) | PartKind::Tire(_) => (Vec3::X, false),
+        PartKind::Rim(_) | PartKind::Tire(_) => (Vec3::X, false),
         _ => (Vec3::Y, true),
     };
     let rotation = Quat::from_rotation_arc(axis, n);
@@ -370,7 +369,7 @@ pub const TIRE_GLB_RADIUS: f64 = 0.30;
 pub fn part_glb_scale(kind: PartKind, craft: &VoxelCraft, mount: DVec3, cell: f64) -> f32 {
     let cell_scale = (cell / REFERENCE_CELL) as f32;
     match kind {
-        PartKind::Wheel(_) | PartKind::Rim(_) | PartKind::Tire(_) => {
+        PartKind::Rim(_) | PartKind::Tire(_) => {
             let mut rim = 0.0;
             let mut profile = 0.0;
             for p in &craft.parts {
