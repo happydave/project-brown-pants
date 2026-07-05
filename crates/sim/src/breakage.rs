@@ -1029,13 +1029,15 @@ mod tests {
         assert!(fracture_on_impact(&c, &body, DVec3::new(-5.0e6, 0.0, 0.0)).is_none());
     }
 
-    // --- durable-format backward compatibility (the serde default) ---
+    // --- durable-format strictness (WI 848) ---
 
     #[test]
-    fn material_without_strength_loads_with_default() {
-        let m: Material = serde_json::from_str(r#"{"density": 1234.0}"#).unwrap();
-        assert_eq!(m.density, 1234.0);
-        assert_eq!(m.strength, Material::default_strength());
+    fn material_without_strength_is_rejected() {
+        // WI 848 retired the pre-strength load default (1e12 Pa, "effectively
+        // unbreakable") — it masked drift rather than enabling additive schema.
+        // A strength-less material must now fail loudly, not load indestructible.
+        let err = serde_json::from_str::<Material>(r#"{"density": 1234.0}"#).unwrap_err();
+        assert!(err.to_string().contains("strength"), "{err}");
     }
 
     #[test]

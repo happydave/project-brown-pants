@@ -23,8 +23,8 @@ pub struct Material {
     pub density: f64,
     /// Tensile strength, Pa — the structural stress a bond of this material
     /// withstands before breaking (consumed by connected-component breakage,
-    /// WI 518). Defaulted on load so pre-strength saves stay backward-loadable.
-    #[serde(default = "Material::default_strength")]
+    /// WI 518). Required on decode (WI 848 retired the pre-strength load
+    /// default, which silently made a strength-less material unbreakable).
     pub strength: f64,
     /// Thermal properties (WI 687): heat capacity, conductivity, emissivity, and
     /// failure temperature, consumed by the two-node thermal model
@@ -76,13 +76,6 @@ impl Material {
         strength: 4.0e7,
         thermal: Thermal::GLASS,
     };
-
-    /// The strength assumed for a material loaded from a pre-strength save: high
-    /// enough to be effectively unbreakable, so old craft do not spontaneously
-    /// shatter.
-    pub fn default_strength() -> f64 {
-        1.0e12
-    }
 }
 
 /// The thermal properties of a [`Material`] (WI 687) — the data the two-node
