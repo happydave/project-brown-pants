@@ -65,8 +65,9 @@ fn tangents(axis: Axis) -> (Axis, Axis) {
 
 /// The four lattice edges bounding panel `p`'s face, as `(origin, axis)` pairs.
 /// The face lies in the plane one step along `p.axis` from `p.cell`'s corner and
-/// spans the two tangent axes.
-fn panel_edges(p: &FacePanel) -> [(IVec3, Axis); 4] {
+/// spans the two tangent axes. Shared with the breakage graph (WI 828): a panel
+/// bonds along exactly these edges.
+pub(crate) fn panel_edges(p: &FacePanel) -> [(IVec3, Axis); 4] {
     let corner = p.cell + p.axis.unit(); // the face's lower lattice corner
     let (u, v) = tangents(p.axis);
     [
@@ -79,7 +80,8 @@ fn panel_edges(p: &FacePanel) -> [(IVec3, Axis); 4] {
 
 /// The up-to-four cells sharing lattice edge `(origin, axis)`: fixed edge-axis
 /// coordinate, and each combination of `-1/0` offsets along the two other axes.
-fn edge_cells(origin: IVec3, axis: Axis) -> [IVec3; 4] {
+/// Shared with the breakage graph (WI 828): the cells a panel's edge can seat into.
+pub(crate) fn edge_cells(origin: IVec3, axis: Axis) -> [IVec3; 4] {
     let (w1, w2) = tangents(axis);
     [
         origin - w1.unit() - w2.unit(),

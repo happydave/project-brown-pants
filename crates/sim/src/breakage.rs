@@ -21,70 +21,190 @@
 use crate::active::ActiveBody;
 use crate::collision::{craft_bounds, craft_collision_shape, Bounds, CollisionShape};
 use crate::contact::{body_contact_wrench, ground_contact_wrench, ContactParams};
-use crate::voxel::{Axis, VoxelCraft};
+use crate::panel_mesh::{edge_cells, panel_edges};
+use crate::voxel::{Axis, VoxelCraft, PANEL_FILL};
 use glam::{DVec3, IVec3};
 use std::collections::{HashMap, HashSet};
 
-/// A severed bond: the unordered pair of adjacent cells whose face connection is
-/// cut. Stored canonically (smaller cell first) so lookups are order-independent.
-pub type Severed = HashSet<(IVec3, IVec3)>;
+/// A node in the structural connectivity graph (WI 828): a solid cell, or a face
+/// panel keyed exactly as it is stored (owner cell + normal axis). Pre-828 the
+/// graph was cells only; panels join it bonded along their four lattice edges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BreakNode {
+    /// An occupied structural cell.
+    Cell(IVec3),
+    /// A face panel on the boundary owned by `(cell, axis)`.
+    Panel(IVec3, Axis),
+}
 
-/// Canonical ordering of a cell pair, so `(a, b)` and `(b, a)` are the same bond.
-fn bond(a: IVec3, b: IVec3) -> (IVec3, IVec3) {
-    if (a.x, a.y, a.z) <= (b.x, b.y, b.z) {
+impl BreakNode {
+    /// Total ordering key (cells before panels, then coordinates), used for the
+    /// canonical bond ordering and deterministic bond-list sorting.
+    fn key(self) -> (u8, i32, i32, i32, u8) {
+        match self {
+            BreakNode::Cell(c) => (0, c.x, c.y, c.z, 0),
+            BreakNode::Panel(c, a) => (1, c.x, c.y, c.z, a as u8),
+        }
+    }
+}
+
+/// A severed bond: the unordered pair of graph nodes whose connection is cut.
+/// Stored canonically (smaller key first) so lookups are order-independent.
+pub type Severed = HashSet<(BreakNode, BreakNode)>;
+
+/// Canonical ordering of a node pair, so `(a, b)` and `(b, a)` are the same bond.
+fn bond_nodes(a: BreakNode, b: BreakNode) -> (BreakNode, BreakNode) {
+    if a.key() <= b.key() {
         (a, b)
     } else {
         (b, a)
     }
 }
 
-/// The six face-neighbour offsets.
-const NEIGHBOURS: [IVec3; 6] = [
-    IVec3::new(1, 0, 0),
-    IVec3::new(-1, 0, 0),
-    IVec3::new(0, 1, 0),
-    IVec3::new(0, -1, 0),
-    IVec3::new(0, 0, 1),
-    IVec3::new(0, 0, -1),
-];
+/// Canonical cell–cell bond (the pre-828 shape, kept for callers/tests that sever
+/// between two solid cells).
+fn bond(a: IVec3, b: IVec3) -> (BreakNode, BreakNode) {
+    bond_nodes(BreakNode::Cell(a), BreakNode::Cell(b))
+}
 
-/// Partition the craft's voxels into maximal **face-connected** components,
-/// excluding any `severed` bonds from adjacency. Each component becomes a fragment
-/// [`VoxelCraft`] (same `cell_size`, its voxels plus the devices and attachment
-/// points whose cell lies in it). A connected craft yields one fragment; an
-/// already-disconnected lattice yields its true components.
-pub fn connected_components(craft: &VoxelCraft, severed: &Severed) -> Vec<VoxelCraft> {
-    // Index occupied cells.
-    let occupied: HashMap<IVec3, usize> = craft
+/// One structural bond: an unordered node pair (canonical order) and the tensile
+/// strength it withstands, N.
+struct StructuralBond {
+    a: BreakNode,
+    b: BreakNode,
+    strength: f64,
+}
+
+/// Every structural bond of the craft with its strength, deterministically ordered
+/// (WI 828). Three bond kinds:
+///
+/// - **cell–cell**: face-adjacent occupied cells; strength = the negative-side
+///   cell's material × `cell²` (the pre-828 convention, kept so voxel-only crafts
+///   evaluate exactly as before).
+/// - **panel–cell** and **panel–panel**: a panel bonds along its four lattice
+///   edges ([`panel_edges`]) to every occupied cell ([`edge_cells`]) and every
+///   other panel sharing an edge. Each shared edge contributes the plate's edge
+///   cross-section (`PANEL_FILL × cell²`) × the **weaker** endpoint's material —
+///   the WI 716 R2 discipline: a plate joint is never stronger than the solid face
+///   bond it stands in for (a skin plate reaches its backing cell through all four
+///   edges: 0.2 of a face bond, still 5× weaker).
+fn structural_bonds(craft: &VoxelCraft) -> Vec<StructuralBond> {
+    let face_area = craft.cell_size * craft.cell_size;
+    let edge_area = PANEL_FILL * face_area;
+    let material_of: HashMap<IVec3, f64> = craft
         .voxels
         .iter()
-        .enumerate()
-        .map(|(i, v)| (v.cell, i))
+        .map(|v| (v.cell, v.material.strength))
         .collect();
+    let mut acc: HashMap<(BreakNode, BreakNode), f64> = HashMap::new();
 
-    // Flood-fill face-connected components over the occupied cells.
-    let mut component_of: HashMap<IVec3, usize> = HashMap::new();
-    let mut next_component = 0;
+    // Cell–cell face bonds (positive offsets only: each pair once, negative-side
+    // cell's material — the pre-828 numbers).
     for v in &craft.voxels {
-        if component_of.contains_key(&v.cell) {
+        for off in [IVec3::X, IVec3::Y, IVec3::Z] {
+            let n = v.cell + off;
+            if material_of.contains_key(&n) {
+                *acc.entry(bond(v.cell, n)).or_default() += v.material.strength * face_area;
+            }
+        }
+    }
+
+    // Panel–cell edge bonds.
+    for p in &craft.face_panels {
+        let node = BreakNode::Panel(p.cell, p.axis);
+        for (origin, axis) in panel_edges(p) {
+            for c in edge_cells(origin, axis) {
+                if let Some(&cell_strength) = material_of.get(&c) {
+                    let s = p.material.strength.min(cell_strength);
+                    *acc.entry(bond_nodes(node, BreakNode::Cell(c))).or_default() += s * edge_area;
+                }
+            }
+        }
+    }
+
+    // Panel–panel edge bonds: pairwise among the panels sharing each lattice edge.
+    let mut edge_panels: HashMap<(i32, i32, i32, u8), Vec<usize>> = HashMap::new();
+    for (i, p) in craft.face_panels.iter().enumerate() {
+        for (origin, axis) in panel_edges(p) {
+            edge_panels
+                .entry((origin.x, origin.y, origin.z, axis as u8))
+                .or_default()
+                .push(i);
+        }
+    }
+    for list in edge_panels.values() {
+        for (i, &pi) in list.iter().enumerate() {
+            for &pj in &list[i + 1..] {
+                let (a, b) = (&craft.face_panels[pi], &craft.face_panels[pj]);
+                let s = a.material.strength.min(b.material.strength);
+                *acc.entry(bond_nodes(
+                    BreakNode::Panel(a.cell, a.axis),
+                    BreakNode::Panel(b.cell, b.axis),
+                ))
+                .or_default() += s * edge_area;
+            }
+        }
+    }
+
+    let mut bonds: Vec<StructuralBond> = acc
+        .into_iter()
+        .map(|((a, b), strength)| StructuralBond { a, b, strength })
+        .collect();
+    bonds.sort_by_key(|b| (b.a.key(), b.b.key()));
+    bonds
+}
+
+/// Partition the craft's structural nodes — occupied cells **and face panels**
+/// (WI 828) — into maximal connected components, excluding any `severed` bonds
+/// from adjacency (cell–cell face bonds; panel edge bonds). Each component becomes
+/// a fragment [`VoxelCraft`] (same `cell_size`, its voxels **and panels** plus the
+/// devices and attachment points whose cell lies in it). A connected craft yields
+/// one fragment; an already-disconnected lattice yields its true components — so a
+/// torn-off plate is a fragment like any other, and a plate-only hull partitions
+/// by edge adjacency.
+pub fn connected_components(craft: &VoxelCraft, severed: &Severed) -> Vec<VoxelCraft> {
+    // Adjacency from the structural bond list, minus the severed pairs.
+    // Bond order is deterministic, so neighbour lists (and thus fragment
+    // numbering) are too.
+    let mut adjacency: HashMap<BreakNode, Vec<BreakNode>> = HashMap::new();
+    for b in structural_bonds(craft) {
+        if severed.contains(&(b.a, b.b)) {
             continue;
         }
-        // BFS from this seed.
+        adjacency.entry(b.a).or_default().push(b.b);
+        adjacency.entry(b.b).or_default().push(b.a);
+    }
+
+    // Flood-fill components; seeds in store order (voxels, then panels).
+    let seeds: Vec<BreakNode> = craft
+        .voxels
+        .iter()
+        .map(|v| BreakNode::Cell(v.cell))
+        .chain(
+            craft
+                .face_panels
+                .iter()
+                .map(|p| BreakNode::Panel(p.cell, p.axis)),
+        )
+        .collect();
+    let mut component_of: HashMap<BreakNode, usize> = HashMap::new();
+    let mut next_component = 0;
+    for &seed in &seeds {
+        if component_of.contains_key(&seed) {
+            continue;
+        }
         let id = next_component;
         next_component += 1;
-        let mut stack = vec![v.cell];
-        component_of.insert(v.cell, id);
-        while let Some(cell) = stack.pop() {
-            for off in NEIGHBOURS {
-                let n = cell + off;
-                if !occupied.contains_key(&n) || component_of.contains_key(&n) {
-                    continue;
+        let mut stack = vec![seed];
+        component_of.insert(seed, id);
+        while let Some(node) = stack.pop() {
+            if let Some(neighbours) = adjacency.get(&node) {
+                for &n in neighbours {
+                    if let std::collections::hash_map::Entry::Vacant(e) = component_of.entry(n) {
+                        e.insert(id);
+                        stack.push(n);
+                    }
                 }
-                if severed.contains(&bond(cell, n)) {
-                    continue;
-                }
-                component_of.insert(n, id);
-                stack.push(n);
             }
         }
     }
@@ -94,15 +214,22 @@ pub fn connected_components(craft: &VoxelCraft, severed: &Severed) -> Vec<VoxelC
         .map(|_| VoxelCraft::new(craft.cell_size))
         .collect();
     for v in &craft.voxels {
-        fragments[component_of[&v.cell]].voxels.push(*v);
+        fragments[component_of[&BreakNode::Cell(v.cell)]]
+            .voxels
+            .push(*v);
+    }
+    for p in &craft.face_panels {
+        fragments[component_of[&BreakNode::Panel(p.cell, p.axis)]]
+            .face_panels
+            .push(*p);
     }
     for d in &craft.devices {
-        if let Some(&id) = component_of.get(&d.cell) {
+        if let Some(&id) = component_of.get(&BreakNode::Cell(d.cell)) {
             fragments[id].devices.push(*d);
         }
     }
     for a in &craft.attachments {
-        if let Some(&id) = component_of.get(&a.cell) {
+        if let Some(&id) = component_of.get(&BreakNode::Cell(a.cell)) {
             fragments[id].attachments.push(*a);
         }
     }
@@ -127,13 +254,24 @@ fn cell_center(cell_size: f64, c: IVec3) -> DVec3 {
 /// load exceeds its bond strength — or `None` if the structure holds. Pure proxy:
 /// one cross-section comparison per candidate plane, no stress field. ([`fracture`]
 /// converts a world-frame body load into this local frame.)
+///
+/// **Panels (WI 828)**: plates are graph nodes; their edge bonds cross planes like
+/// any other, plate masses load the outboard side at their face centres, and the
+/// candidate planes span panel extents (a plate-only hull has planes to fail at).
+/// Side rule: a cell sides by its layer, a panel by its owner cell's layer —
+/// except a **normal-axis panel lying exactly on the cut plane, which sides
+/// outboard** (the skin peels outward; without this a skin plate could never be
+/// cut from its backing).
 pub fn failing_cut(craft: &VoxelCraft, a_cm: DVec3, omega: DVec3) -> Option<Severed> {
     let mp = craft.mass_properties()?;
     let com = mp.center_of_mass;
     let cell_size = craft.cell_size;
     let cell_volume = craft.cell_volume();
-    let face_area = cell_size * cell_size;
-    let occupied: HashSet<IVec3> = craft.voxels.iter().map(|v| v.cell).collect();
+    let panel_mass = |p: &crate::voxel::FacePanel| p.material.density * craft.panel_volume();
+    let bonds = structural_bonds(craft);
+    if bonds.is_empty() {
+        return None; // a single node cannot be cut apart
+    }
 
     let mut best: Option<(f64, Severed)> = None; // (load/strength ratio, bonds)
 
@@ -143,45 +281,26 @@ pub fn failing_cut(craft: &VoxelCraft, a_cm: DVec3, omega: DVec3) -> Option<Seve
             Axis::Y => c.y,
             Axis::Z => c.z,
         };
-        let off = match axis {
-            Axis::X => IVec3::new(1, 0, 0),
-            Axis::Y => IVec3::new(0, 1, 0),
-            Axis::Z => IVec3::new(0, 0, 1),
-        };
-        let (lo, hi) = match craft
+        // Candidate planes span the voxel layers and the panel extents (a
+        // normal-axis panel touches both boundary layers).
+        let range = craft
             .voxels
             .iter()
             .map(|v| coord(v.cell))
-            .fold(None, |acc, k| {
+            .chain(
+                craft
+                    .face_panels
+                    .iter()
+                    .flat_map(|p| [coord(p.cell), coord(p.cell + p.axis.unit())]),
+            )
+            .fold(None, |acc: Option<(i32, i32)>, k| {
                 let (mn, mx) = acc.unwrap_or((k, k));
                 Some((mn.min(k), mx.max(k)))
-            }) {
-            Some(range) => range,
-            None => continue,
-        };
+            });
+        let Some((lo, hi)) = range else { continue };
 
         // Each plane sits between layer k and k+1.
         for k in lo..hi {
-            // Bonds crossing the plane: occupied cells at layer ≤k adjacent to an
-            // occupied cell one step up the axis.
-            let mut bonds: Severed = HashSet::new();
-            let mut strength = 0.0;
-            for v in &craft.voxels {
-                if coord(v.cell) != k {
-                    continue;
-                }
-                let n = v.cell + off;
-                if occupied.contains(&n) {
-                    bonds.insert(bond(v.cell, n));
-                    // Cells are solid cubes since WI 824 (plates live on faces;
-                    // face-panel bonds join this graph in WI 828).
-                    strength += v.material.strength * face_area;
-                }
-            }
-            if bonds.is_empty() {
-                continue;
-            }
-
             // Outboard side = the layers farther from the CoM along this axis.
             let com_layer = match axis {
                 Axis::X => com.x,
@@ -192,20 +311,52 @@ pub fn failing_cut(craft: &VoxelCraft, a_cm: DVec3, omega: DVec3) -> Option<Seve
             let high_is_outboard =
                 (k as f64 + 1.0 - com_layer).abs() > (k as f64 - com_layer).abs();
 
+            // Which side of the plane a node is on (`true` = the high side).
+            let on_high = |n: BreakNode| -> bool {
+                match n {
+                    BreakNode::Cell(c) => coord(c) > k,
+                    BreakNode::Panel(c, a) => {
+                        if a == axis && coord(c) == k {
+                            high_is_outboard // on-plane skin peels outward
+                        } else {
+                            coord(c) > k
+                        }
+                    }
+                }
+            };
+
+            // Bonds crossing the plane, and their total strength.
+            let mut crossing: Severed = HashSet::new();
+            let mut strength = 0.0;
+            for b in &bonds {
+                if on_high(b.a) != on_high(b.b) {
+                    crossing.insert((b.a, b.b));
+                    strength += b.strength;
+                }
+            }
+            if crossing.is_empty() {
+                continue;
+            }
+
             // Net inertial force the bonds must transmit to the outboard side.
             let mut load = DVec3::ZERO;
             for v in &craft.voxels {
-                let on_high = coord(v.cell) > k;
-                if on_high != high_is_outboard {
+                if on_high(BreakNode::Cell(v.cell)) != high_is_outboard {
                     continue;
                 }
                 let m = v.material.density * cell_volume;
                 let r = cell_center(cell_size, v.cell) - com;
                 load += m * point_acceleration(a_cm, omega, r);
             }
+            for p in &craft.face_panels {
+                if on_high(BreakNode::Panel(p.cell, p.axis)) != high_is_outboard {
+                    continue;
+                }
+                let r = craft.face_center(p) - com;
+                load += panel_mass(p) * point_acceleration(a_cm, omega, r);
+            }
             for d in &craft.devices {
-                let on_high = coord(d.cell) > k;
-                if on_high != high_is_outboard {
+                if (coord(d.cell) > k) != high_is_outboard {
                     continue;
                 }
                 let r = cell_center(cell_size, d.cell) - com;
@@ -214,7 +365,7 @@ pub fn failing_cut(craft: &VoxelCraft, a_cm: DVec3, omega: DVec3) -> Option<Seve
 
             let ratio = load.length() / strength;
             if ratio > 1.0 && best.as_ref().is_none_or(|(b, _)| ratio > *b) {
-                best = Some((ratio, bonds));
+                best = Some((ratio, crossing));
             }
         }
     }
@@ -867,15 +1018,13 @@ mod tests {
         }
     }
 
-    /// WI 824 interim (the panels design's stage-5 gap, accepted in the plan):
-    /// face panels are **not yet** in the connectivity graph, so an all-panel
-    /// beam is unbreakable until WI 828 adds face bonds — this test pins the
-    /// interim so 828 has a red/green seam to flip, and asserts the solid beam's
-    /// behavior is untouched by the panel-model change. (The WI 716 R2 property —
-    /// a panel is never stronger than the solid it replaces — returns as a
-    /// face-bond test in WI 828.)
+    // --- WI 828: face panels in the breakage graph ---
+
+    /// The WI 824 interim seam, flipped by WI 828: a converted all-plate beam is
+    /// a structure now — its mullion edge bonds carry load and fail like any
+    /// other, while the solid beam's behaviour is untouched.
     #[test]
-    fn face_panels_are_outside_the_breakage_graph_until_wi_828() {
+    fn a_converted_plate_beam_breaks_like_a_structure() {
         let mut solid = VoxelCraft::new(0.5);
         for x in 0..6 {
             solid.voxels.push(Voxel {
@@ -895,12 +1044,156 @@ mod tests {
         let light = DVec3::new(0.0, 1_000.0, 0.0); // a load neither beam fails under
         assert!(
             failing_cut(&solid, heavy, DVec3::ZERO).is_some(),
-            "solid fractures under heavy load (unchanged by WI 824)"
+            "solid fractures under heavy load (unchanged)"
         );
         assert!(failing_cut(&solid, light, DVec3::ZERO).is_none());
         assert!(
-            failing_cut(&panel, heavy, DVec3::ZERO).is_none(),
-            "plates carry no bonds yet — the WI 828 seam"
+            failing_cut(&panel, heavy, DVec3::ZERO).is_some(),
+            "the plate tube's edge bonds fail under the heavy load (WI 828)"
         );
+        assert!(
+            failing_cut(&panel, light, DVec3::ZERO).is_none(),
+            "the plate tube holds a light load"
+        );
+    }
+
+    #[test]
+    fn a_plate_joint_is_never_stronger_than_the_solid_it_replaces() {
+        // The R2 comparison with the outboard mass held constant: two cells with a
+        // one-cell gap, bridged (a) by a solid cell (full face bonds, 1.0·S·s²)
+        // and (b) by a plate spanning the gap's top boundary (one lattice edge to
+        // each side, 0.05·S·s²). Pulling the far cell at the same acceleration:
+        // the plate bridge tears where the solid bridge holds.
+        //   plate bond: 0.05 · 3.1e8 = 1.55e7 N; far cell 2700 kg
+        //   solid bond: 3.1e8 N
+        //   a = 2.0e4 → load 5.4e7 N: plate ratio 3.5 (breaks), solid 0.17 (holds)
+        let far = IVec3::new(2, 0, 0);
+        let mut solid_bridge = VoxelCraft::new(1.0);
+        for cell in [IVec3::ZERO, IVec3::new(1, 0, 0), far] {
+            solid_bridge.voxels.push(Voxel {
+                cell,
+                material: Material::ALUMINIUM,
+            });
+        }
+        let mut plate_bridge = VoxelCraft::new(1.0);
+        for cell in [IVec3::ZERO, far] {
+            plate_bridge.voxels.push(Voxel {
+                cell,
+                material: Material::ALUMINIUM,
+            });
+        }
+        // The plate lies on the gap cell's +Y boundary; its x=1 and x=2 lattice
+        // edges seat into the two cells (one edge each).
+        plate_bridge.set_face_panel(IVec3::new(1, 0, 0), IVec3::Y, Some(Material::ALUMINIUM));
+
+        let pull = DVec3::new(2.0e4, 0.0, 0.0);
+        assert!(
+            failing_cut(&plate_bridge, pull, DVec3::ZERO).is_some(),
+            "the plate bridge tears"
+        );
+        assert!(
+            failing_cut(&solid_bridge, pull, DVec3::ZERO).is_none(),
+            "the solid bridge holds the same pull"
+        );
+    }
+
+    #[test]
+    fn an_overloaded_plate_sail_sheds_while_the_frame_survives() {
+        // A 3-cell beam continued by a 5-plate coplanar sail (each joint one
+        // mullion edge, 0.05·S·s² = 1.55e7 N). Per unit acceleration:
+        //   shed joint:  5 plates · 135 kg = 675 kg  / 1.55e7 → fails above a ≈ 2.3e4
+        //   beam plane:  (1 cell + sail) = 3375 kg   / 3.1e8  → fails above a ≈ 9.2e4
+        //   all-solid 8-cell beam, worst plane: 4·2700 / 3.1e8 → fails above a ≈ 2.87e4
+        // a = 2.6e4 sits in the window: the sail sheds, both beams' solid joints hold.
+        let mut framed = VoxelCraft::new(1.0);
+        for x in 0..3 {
+            framed.voxels.push(Voxel {
+                cell: IVec3::new(x, 0, 0),
+                material: Material::ALUMINIUM,
+            });
+        }
+        for x in 3..8 {
+            framed.set_face_panel(IVec3::new(x, 0, 0), IVec3::Y, Some(Material::ALUMINIUM));
+        }
+        let mut all_solid = VoxelCraft::new(1.0);
+        for x in 0..8 {
+            all_solid.voxels.push(Voxel {
+                cell: IVec3::new(x, 0, 0),
+                material: Material::ALUMINIUM,
+            });
+        }
+
+        let pull = DVec3::new(2.6e4, 0.0, 0.0);
+        let frags = break_craft(&framed, pull, DVec3::ZERO).expect("the sail sheds");
+        assert_eq!(frags.len(), 2);
+        let sail = frags
+            .iter()
+            .find(|f| f.voxels.is_empty())
+            .expect("one fragment is the plate sail");
+        let frame = frags
+            .iter()
+            .find(|f| !f.voxels.is_empty())
+            .expect("one fragment is the solid frame");
+        assert_eq!(
+            sail.face_panels.len(),
+            5,
+            "the whole sail sheds as one piece"
+        );
+        assert_eq!(frame.voxels.len(), 3, "the frame survives intact");
+        assert!(frame.face_panels.is_empty());
+        assert!(
+            break_craft(&all_solid, pull, DVec3::ZERO).is_none(),
+            "the equivalent all-solid beam holds the same pull"
+        );
+    }
+
+    #[test]
+    fn fragments_inherit_their_plates() {
+        // A two-cell beam with an end-cap plate on each cell: severing the middle
+        // yields two fragments, each carrying its own plate — nothing dropped.
+        let mut c = VoxelCraft::new(1.0);
+        for cell in [IVec3::ZERO, IVec3::new(1, 0, 0)] {
+            c.voxels.push(Voxel {
+                cell,
+                material: Material::ALUMINIUM,
+            });
+        }
+        c.set_face_panel(IVec3::ZERO, IVec3::NEG_X, Some(Material::ALUMINIUM));
+        c.set_face_panel(IVec3::new(1, 0, 0), IVec3::X, Some(Material::GLASS));
+        let before = c.mass_properties().unwrap().mass;
+
+        let mut severed = Severed::new();
+        severed.insert(bond(IVec3::ZERO, IVec3::new(1, 0, 0)));
+        let frags = connected_components(&c, &severed);
+        assert_eq!(frags.len(), 2);
+        assert!(frags.iter().all(|f| f.face_panels.len() == 1));
+        assert!(
+            (total_mass(&frags) - before).abs() < 1e-9,
+            "plates keep their mass"
+        );
+    }
+
+    #[test]
+    fn plate_only_crafts_partition_by_edge_adjacency() {
+        // Two coplanar plates sharing a lattice edge are one component; two
+        // disjoint plates are two — a plate-only hull is breakable structure.
+        let mut joined = VoxelCraft::new(1.0);
+        joined.set_face_panel(IVec3::ZERO, IVec3::Y, Some(Material::ALUMINIUM));
+        joined.set_face_panel(IVec3::new(1, 0, 0), IVec3::Y, Some(Material::ALUMINIUM));
+        assert_eq!(connected_components(&joined, &Severed::new()).len(), 1);
+
+        let mut apart = VoxelCraft::new(1.0);
+        apart.set_face_panel(IVec3::ZERO, IVec3::Y, Some(Material::ALUMINIUM));
+        apart.set_face_panel(IVec3::new(3, 0, 0), IVec3::Y, Some(Material::ALUMINIUM));
+        assert_eq!(connected_components(&apart, &Severed::new()).len(), 2);
+    }
+
+    #[test]
+    fn a_lone_plate_never_breaks() {
+        // The panel analogue of `single_voxel_never_breaks`: one node, no bonds,
+        // nothing to cut.
+        let mut c = VoxelCraft::new(1.0);
+        c.set_face_panel(IVec3::ZERO, IVec3::Y, Some(Material::ALUMINIUM));
+        assert!(break_craft(&c, DVec3::new(0.0, -1.0e9, 0.0), DVec3::ZERO).is_none());
     }
 }

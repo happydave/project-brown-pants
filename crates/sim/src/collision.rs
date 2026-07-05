@@ -5,7 +5,7 @@
 //! the detection backend's types (`parry3d-f64`); keeping parry out of this module means the
 //! shapes stay pure, headless, and unit-testable, and the backend is swappable.
 
-use crate::voxel::VoxelCraft;
+use crate::voxel::{FacePanel, VoxelCraft, PANEL_FILL};
 use glam::DVec3;
 
 /// An axis-aligned box: centre + half-extents, in some frame (a craft's local frame here).
@@ -19,8 +19,8 @@ pub struct BoxShape {
 /// flat ground is a half-space. (Heightfield / trimesh terrain are future shapes.)
 #[derive(Clone, Debug, PartialEq)]
 pub enum CollisionShape {
-    /// A union of axis-aligned boxes (one per occupied cell now; greedy solid-box merging is
-    /// a future optimization).
+    /// A union of axis-aligned boxes (one per occupied cell plus one thin box per face
+    /// panel — WI 828; greedy solid-box merging is a future optimization).
     CuboidCompound(Vec<BoxShape>),
     /// A flat ground plane: points with `p·normal < offset` are below the surface
     /// (penetrating). `normal` is unit.
@@ -38,8 +38,21 @@ pub struct Bounds {
     pub sphere_radius: f64,
 }
 
-/// The craft's collision shape: one solid cuboid per occupied cell, in the craft's local
-/// frame (the same frame `mass_properties`/the lattice use). Pure and deterministic.
+/// A face panel's thin axis-aligned collision box (WI 828): full face span in the
+/// tangent axes, plate thickness along the normal, centred on the plate.
+fn panel_box(craft: &VoxelCraft, p: &FacePanel) -> BoxShape {
+    let s = craft.cell_size;
+    let n = p.axis.unit().as_dvec3();
+    BoxShape {
+        center: craft.face_center(p),
+        half_extents: DVec3::splat(0.5 * s) * (DVec3::ONE - n) + n * (0.5 * PANEL_FILL * s),
+    }
+}
+
+/// The craft's collision shape: one solid cuboid per occupied cell **plus one thin box per
+/// face panel** (WI 828 — so a shed plate lands on the pad instead of ghosting through it),
+/// in the craft's local frame (the same frame `mass_properties`/the lattice use). Pure and
+/// deterministic; voxel geometry is unchanged from pre-828.
 pub fn craft_collision_shape(craft: &VoxelCraft) -> CollisionShape {
     let s = craft.cell_size;
     let half = DVec3::splat(s * 0.5);
@@ -50,14 +63,15 @@ pub fn craft_collision_shape(craft: &VoxelCraft) -> CollisionShape {
             center: (v.cell.as_dvec3() + DVec3::splat(0.5)) * s,
             half_extents: half,
         })
+        .chain(craft.face_panels.iter().map(|p| panel_box(craft, p)))
         .collect();
     CollisionShape::CuboidCompound(boxes)
 }
 
 /// The craft's broad-phase bounds (local AABB + bounding sphere), or `None` for an empty
-/// craft.
+/// craft. Face panels bound by their plate boxes (WI 828).
 pub fn craft_bounds(craft: &VoxelCraft) -> Option<Bounds> {
-    if craft.voxels.is_empty() {
+    if craft.voxels.is_empty() && craft.face_panels.is_empty() {
         return None;
     }
     let s = craft.cell_size;
@@ -67,6 +81,11 @@ pub fn craft_bounds(craft: &VoxelCraft) -> Option<Bounds> {
         let lo = v.cell.as_dvec3() * s;
         min = min.min(lo);
         max = max.max(lo + DVec3::splat(s));
+    }
+    for p in &craft.face_panels {
+        let b = panel_box(craft, p);
+        min = min.min(b.center - b.half_extents);
+        max = max.max(b.center + b.half_extents);
     }
     let center = 0.5 * (min + max);
     Some(Bounds {
@@ -187,5 +206,28 @@ mod tests {
             }
             _ => panic!("expected a half-space"),
         }
+    }
+
+    #[test]
+    fn a_shed_plate_has_a_thin_collision_box_and_bounds() {
+        // WI 828: a plate-only fragment collides as its thin plate — full face
+        // span tangentially, plate thickness along the normal — so shed plates
+        // land on the pad instead of ghosting through it.
+        use crate::voxel::PANEL_FILL;
+        let mut craft = VoxelCraft::new(2.0);
+        craft.set_face_panel(IVec3::ZERO, IVec3::Y, Some(Material::ALUMINIUM));
+        let b = boxes(&craft_collision_shape(&craft)).to_vec();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].center, DVec3::new(1.0, 2.0, 1.0)); // the +Y face centre
+        assert_eq!(
+            b[0].half_extents,
+            DVec3::new(1.0, 0.5 * PANEL_FILL * 2.0, 1.0) // tangent half-cells, thin normal
+        );
+        let bounds = craft_bounds(&craft).expect("a plate bounds itself");
+        assert!(
+            bounds.aabb_max.y - bounds.aabb_min.y < 0.5,
+            "thin along the normal"
+        );
+        assert!((bounds.aabb_max.x - bounds.aabb_min.x - 2.0).abs() < 1e-9);
     }
 }

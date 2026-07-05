@@ -26,13 +26,19 @@ struct BreakWorld {
 
 impl BreakWorld {
     fn new() -> Self {
-        // A 9-cell aluminium bar, centre of mass at the origin, spinning about z.
+        // A 9-cell aluminium bar with a 3-plate sail off its +x end (WI 828):
+        // the plate edge bonds are the weakest joints, so the ramping spin sheds
+        // the sail first — the stage-5 "hull sheds a plate" drama — before the
+        // bar itself would snap. Spinning about z, CoM at the origin.
         let mut craft = VoxelCraft::new(1.0);
         for x in 0..9 {
             craft.voxels.push(Voxel {
                 cell: IVec3::new(x, 0, 0),
                 material: Material::ALUMINIUM,
             });
+        }
+        for x in 9..12 {
+            craft.set_face_panel(IVec3::new(x, 0, 0), IVec3::Y, Some(Material::ALUMINIUM));
         }
         let mp = craft.mass_properties().expect("non-empty");
         let body = ActiveBody::new(DVec3::ZERO, DVec3::ZERO, mp.mass, mp.inertia)
@@ -135,6 +141,23 @@ fn draw_pieces(mut gizmos: Gizmos, world: Res<BreakWorld>) {
             let world_pos = body.position + q * local;
             gizmos.primitive_3d(
                 &Cuboid::new(size, size, size),
+                Isometry3d::new(world_pos.as_vec3(), qf),
+                color,
+            );
+        }
+        // Face panels as thin plates (WI 828): full face span, plate thickness
+        // along the normal — a shed plate reads as a plate, not a cube.
+        for p in &craft.face_panels {
+            let local = craft.face_center(p) - mp.center_of_mass;
+            let world_pos = body.position + q * local;
+            let thin = (sounding_sim::voxel::PANEL_FILL * craft.cell_size) as f32;
+            let dims = match p.axis {
+                sounding_sim::voxel::Axis::X => Vec3::new(thin, size, size),
+                sounding_sim::voxel::Axis::Y => Vec3::new(size, thin, size),
+                sounding_sim::voxel::Axis::Z => Vec3::new(size, size, thin),
+            };
+            gizmos.primitive_3d(
+                &Cuboid::from_size(dims),
                 Isometry3d::new(world_pos.as_vec3(), qf),
                 color,
             );
