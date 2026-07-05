@@ -214,15 +214,27 @@ pub fn buoyancy_wrench(
     let mut torque = DVec3::ZERO;
     let mut submerged_volume = 0.0;
     let mut draft = 0.0_f64;
-    // Displacement = solid voxels (the hull) + enclosed compartment cells (the air it
-    // encloses) as full cells, plus **face panels** displacing their plate volume at
-    // their face centre (WI 824 — cells are cubes; plates live on faces).
-    let cells = craft
-        .voxels
-        .iter()
-        .map(|v| v.cell)
-        .chain(enclosed.iter().copied());
-    for cell in cells {
+    // Displacement = solid voxels (the hull; a shaped cell displaces its form's
+    // volume fraction at its rotated centroid — WI 831, graded the same way full
+    // cells are) + enclosed compartment cells (the air it encloses) as full
+    // cells, plus **face panels** displacing their plate volume at their face
+    // centre (WI 824 — cells are cubes; plates live on faces).
+    for v in &craft.voxels {
+        let local = craft.voxel_centroid(v) - com;
+        let world = body_position + body_orientation * local;
+        let fraction = cell_submerged_fraction(world, craft.cell_size, surface_radius, time);
+        if fraction <= 0.0 {
+            continue;
+        }
+        let displaced = craft.voxel_volume(v) * fraction; // the water this cell displaces
+        let f = density * gravity * displaced * up;
+        let arm = world - body_position; // offset from the centre of mass (the body integrates the CoM)
+        force += f;
+        torque += arm.cross(f);
+        submerged_volume += displaced;
+        draft = draft.max(surface_radius - world.length());
+    }
+    for &cell in enclosed {
         let local = (cell.as_dvec3() + DVec3::splat(0.5)) * craft.cell_size - com;
         let world = body_position + body_orientation * local;
         let fraction = cell_submerged_fraction(world, craft.cell_size, surface_radius, time);
@@ -1222,6 +1234,53 @@ mod tests {
         assert_eq!((a + b).torque, DVec3::new(0.0, 1.0, 3.0));
         // Order-independent (additive contributors).
         assert_eq!(a + b, b + a);
+    }
+
+    #[test]
+    fn a_wedge_cell_displaces_half_a_cube() {
+        // WI 831: a fully submerged single-cell craft displaces half as much
+        // when shaped as a wedge — the form's volume fraction drives buoyancy.
+        use crate::shape::{FillMode, Form, ShapedCell};
+        let one_cell = || {
+            let mut c = VoxelCraft::new(1.0);
+            c.voxels.push(Voxel {
+                cell: IVec3::ZERO,
+                material: Material::ALUMINIUM,
+            });
+            c
+        };
+        let full = one_cell();
+        let mut wedge = one_cell();
+        wedge.set_shape(ShapedCell {
+            cell: IVec3::ZERO,
+            form: Form::Wedge,
+            orientation: 0,
+            fill: FillMode::Solid,
+        });
+        let deep = DVec3::new(0.0, SURFACE_R - 100.0, 0.0); // well below the surface
+        let load = |c: &VoxelCraft| {
+            let com = c.mass_properties().unwrap().center_of_mass;
+            buoyancy_wrench(
+                c,
+                com,
+                deep,
+                glam::DQuat::IDENTITY,
+                SURFACE_R,
+                0.0,
+                1_000.0,
+                9.81,
+                &[],
+            )
+        };
+        let f = load(&full);
+        let w = load(&wedge);
+        assert!((f.submerged_volume - 1.0).abs() < 1e-9, "full cube: 1 m³");
+        assert!(
+            (w.submerged_volume - 0.5).abs() < 1e-9,
+            "wedge: half a cube ({})",
+            w.submerged_volume
+        );
+        assert!((w.force.length() - 0.5 * f.force.length()).abs() < 1e-6);
     }
 
     #[test]

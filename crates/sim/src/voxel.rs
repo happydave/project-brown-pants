@@ -730,6 +730,14 @@ pub struct VoxelCraft {
     /// saves stay backward-loadable.
     #[serde(default)]
     pub face_panels: Vec<FacePanel>,
+    /// **Shaped cells** (WI 831, the shape catalog): a sorted sidecar keyed by
+    /// cell — an occupied cell with an entry takes its [`crate::shape::Form`] +
+    /// orientation (+ fill mode, WI 836); one without is a full solid cube.
+    /// **Skipped when empty** so pre-shape saves re-serialize byte-identically;
+    /// an entry whose cell is unoccupied is inert (the folds are voxel-driven).
+    /// Kept sorted by cell for deterministic encode (the WI 820 discipline).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shapes: Vec<crate::shape::ShapedCell>,
 }
 
 /// A **plate's thickness** as a fraction of the cell size (WI 716 → WI 824): a
@@ -765,6 +773,7 @@ impl Default for VoxelCraft {
             parts: Vec::new(),
             panels: HashSet::new(),
             face_panels: Vec::new(),
+            shapes: Vec::new(),
         }
     }
 }
@@ -875,6 +884,85 @@ impl VoxelCraft {
         self.face_panels.dedup_by_key(|p| p.key());
     }
 
+    /// The shape entry for `cell`, if any (WI 831). An occupied cell without one
+    /// is a full solid cube.
+    pub fn shape_at(&self, cell: IVec3) -> Option<&crate::shape::ShapedCell> {
+        let key = (cell.x, cell.y, cell.z);
+        self.shapes
+            .binary_search_by(|s| s.key().cmp(&key))
+            .ok()
+            .map(|i| &self.shapes[i])
+    }
+
+    /// Set (or replace) the shape of a cell, keeping the store sorted (the
+    /// deterministic-encode invariant). A `Cube` entry at identity is stored as
+    /// given — the caller decides whether to canonicalize.
+    pub fn set_shape(&mut self, shape: crate::shape::ShapedCell) {
+        match self.shapes.binary_search_by(|s| s.key().cmp(&shape.key())) {
+            Ok(i) => self.shapes[i] = shape,
+            Err(i) => self.shapes.insert(i, shape),
+        }
+    }
+
+    /// Remove the shape entry of `cell` (back to a full solid cube), if any.
+    pub fn clear_shape(&mut self, cell: IVec3) {
+        let key = (cell.x, cell.y, cell.z);
+        if let Ok(i) = self.shapes.binary_search_by(|s| s.key().cmp(&key)) {
+            self.shapes.remove(i);
+        }
+    }
+
+    /// Restore the shape-store sort invariant (defensive, for decoded documents
+    /// whose producer did not order the store).
+    pub fn normalize_shapes(&mut self) {
+        self.shapes.sort_by_key(|s| s.key());
+        self.shapes.dedup_by_key(|s| s.key());
+    }
+
+    /// A voxel's solid volume, m³ (WI 831): the cell volume × its form's volume
+    /// fraction (1 for an unshaped cell).
+    pub fn voxel_volume(&self, v: &Voxel) -> f64 {
+        match self.shape_at(v.cell) {
+            Some(s) => self.cell_volume() * crate::shape::constants(s.form).volume,
+            None => self.cell_volume(),
+        }
+    }
+
+    /// A voxel's mass, kg (WI 831): `density × voxel_volume`.
+    pub fn voxel_mass(&self, v: &Voxel) -> f64 {
+        v.material.density * self.voxel_volume(v)
+    }
+
+    /// A voxel's mass centroid in the craft's local frame, metres: the cell
+    /// centre for an unshaped cell; the rotated form centroid for a shaped one.
+    pub fn voxel_centroid(&self, v: &Voxel) -> DVec3 {
+        match self.shape_at(v.cell) {
+            Some(s) => {
+                let c = crate::shape::constants(s.form).centroid_oriented(s.orientation);
+                (v.cell.as_dvec3() + c) * self.cell_size
+            }
+            None => self.cell_center(v.cell),
+        }
+    }
+
+    /// A voxel's inertia tensor about its own centroid, kg·m² (WI 831): the
+    /// solid-cube diagonal for an unshaped cell; `ρ·s⁵·R·I_unit·Rᵀ` for a shaped
+    /// one.
+    pub fn voxel_self_inertia(&self, v: &Voxel) -> DMat3 {
+        match self.shape_at(v.cell) {
+            Some(s) => {
+                let unit = crate::shape::constants(s.form).unit_inertia_oriented(s.orientation);
+                let scale = v.material.density * self.cell_size.powi(5);
+                unit * scale
+            }
+            None => {
+                // m·s²/6 per diagonal — the exact pre-831 cube self-inertia.
+                let m = v.material.density * self.cell_volume();
+                DMat3::from_diagonal(DVec3::splat(m * self.cell_size * self.cell_size / 6.0))
+            }
+        }
+    }
+
     /// **The per-face coverage predicate** (WI 824; the shaped-cell seam, panels
     /// design R3): the boundary between `cell` and `cell + dir` is sealed iff
     /// fully covered by solid occupancy on either side and/or a face panel.
@@ -975,17 +1063,19 @@ impl VoxelCraft {
     }
 
     /// Derived mass properties, or `None` for an empty craft (no mass).
-    /// Cells are solid cubes; **face panels** fold as their plate mass at their
-    /// face centre (point-mass inertia, the device/part pattern) — WI 824.
+    /// Cells are solid cubes — or their catalog form when shaped (WI 831:
+    /// `voxel_mass`/`voxel_centroid`/`voxel_self_inertia` fold the form's
+    /// derived volume, centroid, and inertia); **face panels** fold as their
+    /// plate mass at their face centre (point-mass inertia, the device/part
+    /// pattern) — WI 824.
     pub fn mass_properties(&self) -> Option<MassProperties> {
         // Accumulate mass and first moment for the centre of mass.
         let mut mass = 0.0;
         let mut moment = DVec3::ZERO;
-        let cell_volume = self.cell_volume();
         for v in &self.voxels {
-            let m = v.material.density * cell_volume;
+            let m = self.voxel_mass(v);
             mass += m;
-            moment += m * self.cell_center(v.cell);
+            moment += m * self.voxel_centroid(v);
         }
         for p in &self.face_panels {
             let m = p.material.density * self.panel_volume();
@@ -1012,17 +1102,18 @@ impl VoxelCraft {
         let mut ixy = 0.0;
         let mut ixz = 0.0;
         let mut iyz = 0.0;
-        // Solid-cube self inertia (per diagonal): m·s²/6.
-        let cube_self = self.cell_size * self.cell_size / 6.0;
+        // Per-voxel self inertia about its own centroid (solid-cube diagonal, or
+        // the rotated form tensor — WI 831) plus the parallel-axis point terms.
         for v in &self.voxels {
-            let m = v.material.density * cell_volume;
-            let r = self.cell_center(v.cell) - com;
-            ixx += m * (cube_self + r.y * r.y + r.z * r.z);
-            iyy += m * (cube_self + r.x * r.x + r.z * r.z);
-            izz += m * (cube_self + r.x * r.x + r.y * r.y);
-            ixy -= m * r.x * r.y;
-            ixz -= m * r.x * r.z;
-            iyz -= m * r.y * r.z;
+            let m = self.voxel_mass(v);
+            let r = self.voxel_centroid(v) - com;
+            let si = self.voxel_self_inertia(v);
+            ixx += si.col(0).x + m * (r.y * r.y + r.z * r.z);
+            iyy += si.col(1).y + m * (r.x * r.x + r.z * r.z);
+            izz += si.col(2).z + m * (r.x * r.x + r.y * r.y);
+            ixy += si.col(1).x - m * r.x * r.y;
+            ixz += si.col(2).x - m * r.x * r.z;
+            iyz += si.col(2).y - m * r.y * r.z;
         }
         // Face panels as point masses at their face centres (WI 824; the
         // device/part pattern — slab self-inertia is a refinement left open).
@@ -1114,8 +1205,9 @@ impl VoxelCraft {
         areas.into_iter().collect()
     }
 
-    /// Inserts another craft's voxels and devices, offset by `offset` cells (used
-    /// to place a reusable subassembly). Attachment points are not copied.
+    /// Inserts another craft's voxels, devices, and cell shapes, offset by
+    /// `offset` cells (used to place a reusable subassembly). Attachment points
+    /// are not copied.
     pub fn insert(&mut self, other: &VoxelCraft, offset: IVec3) {
         for v in &other.voxels {
             self.voxels.push(Voxel {
@@ -1127,6 +1219,12 @@ impl VoxelCraft {
             self.devices.push(Device {
                 cell: d.cell + offset,
                 ..*d
+            });
+        }
+        for s in &other.shapes {
+            self.set_shape(crate::shape::ShapedCell {
+                cell: s.cell + offset,
+                ..*s
             });
         }
     }
@@ -1402,6 +1500,101 @@ mod tests {
         // Cell centres at x=0.5 and x=1.5; mass-weighted mean > 1.0 (midpoint).
         assert!(mp.center_of_mass.x > 1.0);
         assert!(mp.center_of_mass.x < 1.5);
+    }
+
+    #[test]
+    fn a_wedge_cell_masses_half_a_cube_at_its_centroid() {
+        // WI 831: one aluminium wedge at the origin (canonical: the ramp y ≤ z).
+        // Mass = ρ·s³/2; CoM at the wedge centroid (1/2, 1/3, 2/3)·s.
+        use crate::shape::{FillMode, Form, ShapedCell};
+        let s = 0.5;
+        let mut craft = VoxelCraft::new(s);
+        craft.voxels.push(Voxel {
+            cell: IVec3::ZERO,
+            material: Material::ALUMINIUM,
+        });
+        let full = craft.mass_properties().unwrap();
+        craft.set_shape(ShapedCell {
+            cell: IVec3::ZERO,
+            form: Form::Wedge,
+            orientation: 0,
+            fill: FillMode::Solid,
+        });
+        let mp = craft.mass_properties().unwrap();
+        assert!(
+            (mp.mass - 0.5 * full.mass).abs() < 1e-9,
+            "half a cube's mass"
+        );
+        let want = DVec3::new(0.5, 1.0 / 3.0, 2.0 / 3.0) * s;
+        assert!(
+            (mp.center_of_mass - want).length() < 1e-12,
+            "CoM at the wedge centroid: {} vs {want}",
+            mp.center_of_mass
+        );
+        // Clearing the shape restores the full cube exactly.
+        craft.clear_shape(IVec3::ZERO);
+        let back = craft.mass_properties().unwrap();
+        assert!((back.mass - full.mass).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rotating_a_wedge_moves_com_and_inertia_as_the_rotation() {
+        use crate::shape::{constants, rotations, FillMode, Form, ShapedCell};
+        let s = 1.0;
+        let base = |orientation: u8| {
+            let mut craft = VoxelCraft::new(s);
+            craft.voxels.push(Voxel {
+                cell: IVec3::ZERO,
+                material: Material::STEEL,
+            });
+            craft.set_shape(ShapedCell {
+                cell: IVec3::ZERO,
+                form: Form::Wedge,
+                orientation,
+                fill: FillMode::Solid,
+            });
+            craft.mass_properties().unwrap()
+        };
+        let c = constants(Form::Wedge);
+        for &o in &c.distinct_orientations {
+            let mp = base(o);
+            let r = rotations()[o as usize];
+            let want_com = r * (c.centroid - DVec3::splat(0.5)) + DVec3::splat(0.5);
+            assert!(
+                (mp.center_of_mass - want_com).length() < 1e-12,
+                "orientation {o}"
+            );
+            // The craft inertia about the CoM is the rotated form inertia
+            // (single voxel at its own centroid — no parallel-axis term).
+            let want_i = r * c.unit_inertia * r.transpose() * Material::STEEL.density;
+            assert!(
+                (mp.inertia - want_i).abs_diff_eq(DMat3::ZERO, 1e-9),
+                "orientation {o}: inertia mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn shapes_ride_subassembly_insertion() {
+        use crate::shape::{FillMode, Form, ShapedCell};
+        let mut sub = VoxelCraft::new(1.0);
+        sub.voxels.push(Voxel {
+            cell: IVec3::ZERO,
+            material: Material::ALUMINIUM,
+        });
+        sub.set_shape(ShapedCell {
+            cell: IVec3::ZERO,
+            form: Form::OuterCorner,
+            orientation: 3,
+            fill: FillMode::Solid,
+        });
+        let mut craft = VoxelCraft::new(1.0);
+        craft.insert(&sub, IVec3::new(5, 0, 0));
+        let s = craft
+            .shape_at(IVec3::new(5, 0, 0))
+            .expect("shape offset with its cell");
+        assert_eq!(s.form, Form::OuterCorner);
+        assert_eq!(s.orientation, 3);
     }
 
     #[test]

@@ -223,6 +223,13 @@ pub fn connected_components(craft: &VoxelCraft, severed: &Severed) -> Vec<VoxelC
             .face_panels
             .push(*p);
     }
+    // Cell shapes follow their voxel's fragment (WI 831) — a shaped fragment
+    // keeps its form; an inert entry with no matching voxel is dropped.
+    for s in &craft.shapes {
+        if let Some(&id) = component_of.get(&BreakNode::Cell(s.cell)) {
+            fragments[id].shapes.push(*s);
+        }
+    }
     for d in &craft.devices {
         if let Some(&id) = component_of.get(&BreakNode::Cell(d.cell)) {
             fragments[id].devices.push(*d);
@@ -266,7 +273,6 @@ pub fn failing_cut(craft: &VoxelCraft, a_cm: DVec3, omega: DVec3) -> Option<Seve
     let mp = craft.mass_properties()?;
     let com = mp.center_of_mass;
     let cell_size = craft.cell_size;
-    let cell_volume = craft.cell_volume();
     let panel_mass = |p: &crate::voxel::FacePanel| p.material.density * craft.panel_volume();
     let bonds = structural_bonds(craft);
     if bonds.is_empty() {
@@ -339,13 +345,14 @@ pub fn failing_cut(craft: &VoxelCraft, a_cm: DVec3, omega: DVec3) -> Option<Seve
             }
 
             // Net inertial force the bonds must transmit to the outboard side.
+            // A shaped cell loads what it weighs, at its own centroid (WI 831).
             let mut load = DVec3::ZERO;
             for v in &craft.voxels {
                 if on_high(BreakNode::Cell(v.cell)) != high_is_outboard {
                     continue;
                 }
-                let m = v.material.density * cell_volume;
-                let r = cell_center(cell_size, v.cell) - com;
+                let m = craft.voxel_mass(v);
+                let r = craft.voxel_centroid(v) - com;
                 load += m * point_acceleration(a_cm, omega, r);
             }
             for p in &craft.face_panels {
@@ -1186,6 +1193,31 @@ mod tests {
         apart.set_face_panel(IVec3::ZERO, IVec3::Y, Some(Material::ALUMINIUM));
         apart.set_face_panel(IVec3::new(3, 0, 0), IVec3::Y, Some(Material::ALUMINIUM));
         assert_eq!(connected_components(&apart, &Severed::new()).len(), 2);
+    }
+
+    #[test]
+    fn fragments_inherit_their_cell_shapes() {
+        // WI 831: severing a two-cell beam whose far cell is a wedge yields two
+        // fragments, the wedge riding its cell — total mass conserved.
+        use crate::voxel::Material;
+        let mut c = bar(2, Material::ALUMINIUM);
+        c.set_shape(crate::shape::ShapedCell {
+            cell: IVec3::new(1, 0, 0),
+            form: crate::shape::Form::Wedge,
+            orientation: 0,
+            fill: crate::shape::FillMode::Solid,
+        });
+        let before = c.mass_properties().unwrap().mass;
+        let mut severed = Severed::new();
+        severed.insert(bond(IVec3::ZERO, IVec3::new(1, 0, 0)));
+        let frags = connected_components(&c, &severed);
+        assert_eq!(frags.len(), 2);
+        let shaped = frags
+            .iter()
+            .find(|f| !f.shapes.is_empty())
+            .expect("one fragment keeps the wedge");
+        assert_eq!(shaped.shapes.len(), 1);
+        assert!((total_mass(&frags) - before).abs() < 1e-9, "mass conserved");
     }
 
     #[test]

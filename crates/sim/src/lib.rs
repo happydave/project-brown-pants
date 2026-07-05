@@ -45,6 +45,7 @@ pub mod resource;
 pub mod rover;
 pub mod scenario;
 pub mod session;
+pub mod shape;
 pub mod sim;
 pub mod surface;
 pub mod surface_field;

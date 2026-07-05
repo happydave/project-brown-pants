@@ -179,6 +179,7 @@ impl SavedDocument {
                 let mut doc: SavedDocument =
                     serde_json::from_str(s).map_err(|e| FormatError::Malformed(e.to_string()))?;
                 doc.convert_craft_panels();
+                doc.validate_craft_shapes()?;
                 // A migrated document *is* a current-format document: stamp it, so
                 // re-serializing it can never produce a v1 file carrying v2 content
                 // (which an old build would load and silently strip).
@@ -201,6 +202,7 @@ impl SavedDocument {
             Payload::WorldSave(_) | Payload::BodyAsset(_) | Payload::System(_) => return,
         };
         let (id, craft) = craft;
+        craft.normalize_shapes();
         if craft.panels.is_empty() {
             craft.normalize_face_panels();
             return;
@@ -217,6 +219,27 @@ impl SavedDocument {
                 r.cells_kept_solid,
             );
         }
+    }
+
+    /// Validate shaped-cell data on a craft-scope payload (WI 831): the
+    /// orientation is an index into the frozen 24-entry rotation table — an
+    /// out-of-range value is malformed input, rejected at the boundary (never a
+    /// panic or a silent modulo). Unknown form names are already rejected by the
+    /// enum decode itself.
+    fn validate_craft_shapes(&self) -> Result<(), FormatError> {
+        let craft = match &self.payload {
+            Payload::Craft(c) | Payload::Subassembly(c) | Payload::Blueprint(c) => &c.craft,
+            Payload::WorldSave(_) | Payload::BodyAsset(_) | Payload::System(_) => return Ok(()),
+        };
+        for s in &craft.shapes {
+            if s.orientation as usize >= crate::shape::rotations().len() {
+                return Err(FormatError::Malformed(format!(
+                    "shaped cell ({}, {}, {}): orientation {} out of range (0..24)",
+                    s.cell.x, s.cell.y, s.cell.z, s.orientation
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -313,6 +336,72 @@ mod tests {
         )));
         let back = SavedDocument::from_json(&plain.to_json().unwrap()).unwrap();
         assert_eq!(plain, back);
+    }
+
+    #[test]
+    fn pre_shape_documents_resave_byte_identically_and_shapes_round_trip() {
+        use crate::shape::{FillMode, Form, ShapedCell};
+        // WI 831 byte-compat: a craft without shapes serializes with no shapes
+        // field at all, so load → save is byte-identical.
+        let plain = SavedDocument::new(Payload::Craft(CraftSubgraph::new(
+            "plain",
+            "Plain",
+            sample_pos(),
+            sample_craft(),
+        )));
+        let s1 = plain.to_json().unwrap();
+        assert!(!s1.contains("\"shapes\""), "absent field is skipped");
+        let s2 = SavedDocument::from_json(&s1).unwrap().to_json().unwrap();
+        assert_eq!(s1, s2, "pre-shape re-save is byte-identical");
+
+        // A shaped craft round-trips form/orientation/fill exactly.
+        let mut craft = sample_craft();
+        craft.set_shape(ShapedCell {
+            cell: IVec3::ZERO,
+            form: Form::SlopeHigh,
+            orientation: 7,
+            fill: FillMode::Solid,
+        });
+        let doc = SavedDocument::new(Payload::Craft(CraftSubgraph::new(
+            "shaped",
+            "Shaped",
+            sample_pos(),
+            craft,
+        )));
+        let loaded = SavedDocument::from_json(&doc.to_json().unwrap()).unwrap();
+        let Payload::Craft(c) = &loaded.payload else {
+            panic!("craft payload expected");
+        };
+        let s = c.craft.shape_at(IVec3::ZERO).expect("shape survives");
+        assert_eq!(
+            (s.form, s.orientation, s.fill),
+            (Form::SlopeHigh, 7, FillMode::Solid)
+        );
+    }
+
+    #[test]
+    fn out_of_range_orientation_is_rejected_at_load() {
+        use crate::shape::{FillMode, Form, ShapedCell};
+        // WI 831: orientation indexes the frozen 24-entry table; 24+ is
+        // malformed input, rejected at the boundary — never a silent modulo.
+        let mut craft = sample_craft();
+        craft.set_shape(ShapedCell {
+            cell: IVec3::ZERO,
+            form: Form::Wedge,
+            orientation: 24,
+            fill: FillMode::Solid,
+        });
+        let doc = SavedDocument::new(Payload::Craft(CraftSubgraph::new(
+            "bad",
+            "Bad",
+            sample_pos(),
+            craft,
+        )));
+        let err = SavedDocument::from_json(&doc.to_json().unwrap()).unwrap_err();
+        let FormatError::Malformed(msg) = err else {
+            panic!("expected Malformed, got {err:?}");
+        };
+        assert!(msg.contains("orientation"), "{msg}");
     }
 
     #[test]
