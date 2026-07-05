@@ -58,32 +58,6 @@ const NEIGHBOURS: [IVec3; 6] = [
     IVec3::new(0, 0, -1),
 ];
 
-/// Node semantics for the exterior fill (WI 832, the staged-rollout seam): the
-/// **compartment** fill walks every cell with any air fraction (an empty cell is
-/// all air; a shaped solid cell carries its form's remainder — the R1 admission
-/// invariant guarantees that remainder is one region reaching every open face,
-/// which is what licenses cell-granular through-flow); the **aero envelope**
-/// (WI 827) keeps boolean empty-cell nodes until WI 834 generalizes it.
-enum NodeMode<'a> {
-    /// Air = strictly-unoccupied cells (the pre-832 view; the aero envelope).
-    EmptyCells,
-    /// Air = any cell with air fraction > 0 (the map holds shaped solid cells'
-    /// remainders; unoccupied cells are implicitly fraction 1).
-    AirFractions(&'a HashMap<IVec3, f64>),
-}
-
-impl NodeMode<'_> {
-    /// Whether the fill may occupy `cell` as an air node.
-    fn is_air(&self, solid: &HashSet<IVec3>, cell: IVec3) -> bool {
-        match self {
-            NodeMode::EmptyCells => !solid.contains(&cell),
-            NodeMode::AirFractions(shaped) => {
-                !solid.contains(&cell) || shaped.get(&cell).is_some_and(|f| *f > 0.0)
-            }
-        }
-    }
-}
-
 /// The air remainders of a craft's shaped **voxel** cells (`1 − form volume`,
 /// omitting zero-air forms): the extra nodes the compartment fill walks. Keyed
 /// off voxels, so an orphan shape entry (or one on a door cell) contributes
@@ -107,8 +81,10 @@ fn shaped_air_fractions(craft: &VoxelCraft) -> HashMap<IVec3, f64> {
 /// crossing a boundary only where **the** per-face coverage predicate
 /// ([`VoxelCraft::boundary_sealed`], WI 824/832) says it is not sealed. `solid`
 /// is the caller's barrier set (compartments: voxels + *closed* doors; the aero
-/// envelope: voxels + *all* doors) and `mode` its node semantics (see
-/// [`NodeMode`]).
+/// envelope: voxels + *all* doors). **Nodes are cells with any air fraction**
+/// (WI 832 → 834, one semantics for both consumers): an unoccupied cell is all
+/// air; a shaped solid cell is walkable through its form's remainder
+/// (`shaped_air`, keyed off voxels); the WI 832 `NodeMode` staging seam is gone.
 struct ExteriorFill {
     /// Expanded bounding-box minimum (inclusive).
     lo: IVec3,
@@ -118,7 +94,11 @@ struct ExteriorFill {
     exterior: HashSet<IVec3>,
 }
 
-fn exterior_fill(craft: &VoxelCraft, solid: &HashSet<IVec3>, mode: &NodeMode<'_>) -> ExteriorFill {
+fn exterior_fill(
+    craft: &VoxelCraft,
+    solid: &HashSet<IVec3>,
+    shaped_air: &HashMap<IVec3, f64>,
+) -> ExteriorFill {
     // Bounding box of the structure — solids and paneled boundaries (a craft can
     // be all plates, WI 824) — expanded by one cell so the border is all
     // exterior air.
@@ -137,7 +117,9 @@ fn exterior_fill(craft: &VoxelCraft, solid: &HashSet<IVec3>, mode: &NodeMode<'_>
     let in_bbox = |c: IVec3| {
         c.x >= lo.x && c.x <= hi.x && c.y >= lo.y && c.y <= hi.y && c.z >= lo.z && c.z <= hi.z
     };
-    let is_air = |c: IVec3| in_bbox(c) && mode.is_air(solid, c);
+    let is_air = |c: IVec3| {
+        in_bbox(c) && (!solid.contains(&c) || shaped_air.get(&c).is_some_and(|f| *f > 0.0))
+    };
 
     // Flood the exterior from the expanded-bbox border (all air there is outside
     // the hull) inward through air cells.
@@ -166,33 +148,48 @@ fn exterior_fill(craft: &VoxelCraft, solid: &HashSet<IVec3>, mode: &NodeMode<'_>
     ExteriorFill { lo, hi, exterior }
 }
 
-/// The **sealed envelope** (WI 827, panels design stage 4): every cell the exterior
-/// flood-fill cannot reach — occupied structure plus the enclosed air sealed behind
-/// it. This is the aero cross-section input: a closed plated hull presents its full
-/// body to the flow (the air inside goes around). Derived on demand from the same
-/// fill machinery compartments use — never stored.
+/// The **sealed envelope as per-cell presented fractions** (WI 827 → 834, design
+/// review R2): what each cell presents to the flow — the aero cross-section input.
+/// A cell the exterior flood-fill cannot reach presents **1** (occupied structure,
+/// or enclosed air the flow must go around — including a shaped cell whose air
+/// remainder is sealed inside: it *counts fully*). A **shaped solid cell whose
+/// remainder the exterior reached** presents only its form's **solid volume
+/// fraction** (an exterior-facing wedge presents its solid half). Exterior-reached
+/// air presents nothing and is absent from the map. Derived on demand from the
+/// same fill machinery compartments use — one flood, one node semantics, so the
+/// envelope and the compartment model cannot disagree about what is enclosed.
 ///
-/// **Doors are structure for aero**: every door cell is a barrier (and an envelope
-/// member) *regardless of open state*, so the area curve is a build-time property —
-/// an open hatch does not delete the fuselage's cross-section. (Compartments keep
-/// their open/closed door semantics; only the aero input treats doors as fixed.)
-pub fn sealed_envelope(craft: &VoxelCraft) -> HashSet<IVec3> {
+/// **Doors are structure for aero**: every door cell is a barrier presenting 1
+/// *regardless of open state* (and never carries a shape fraction — shapes key
+/// off voxels), so the area curve is a build-time property — an open hatch does
+/// not delete the fuselage's cross-section. (Compartments keep their open/closed
+/// door semantics; only the aero input treats doors as fixed.)
+pub fn envelope_fractions(craft: &VoxelCraft) -> HashMap<IVec3, f64> {
     let mut solid: HashSet<IVec3> = craft.voxels.iter().map(|v| v.cell).collect();
     for d in &craft.doors {
         solid.insert(d.cell);
     }
     if solid.is_empty() && craft.face_panels.is_empty() {
-        return HashSet::new();
+        return HashMap::new();
     }
-    // Boolean nodes until WI 834: shaped cells stay full-cube blockers for aero.
-    let fill = exterior_fill(craft, &solid, &NodeMode::EmptyCells);
-    let mut envelope = HashSet::new();
+    let shaped_air = shaped_air_fractions(craft);
+    let fill = exterior_fill(craft, &solid, &shaped_air);
+    let mut envelope = HashMap::new();
     for x in fill.lo.x..=fill.hi.x {
         for y in fill.lo.y..=fill.hi.y {
             for z in fill.lo.z..=fill.hi.z {
                 let c = IVec3::new(x, y, z);
-                if !fill.exterior.contains(&c) {
-                    envelope.insert(c);
+                if fill.exterior.contains(&c) {
+                    // Exterior-reached: a shaped solid still presents its solid
+                    // fraction; reached air presents nothing.
+                    if solid.contains(&c) {
+                        let air = shaped_air.get(&c).copied().unwrap_or(0.0);
+                        envelope.insert(c, 1.0 - air);
+                    }
+                } else {
+                    // Unreached: structure or enclosed air — presents fully
+                    // (the R2 enclosed-remainder term collapses to 1 here).
+                    envelope.insert(c, 1.0);
                 }
             }
         }
@@ -222,8 +219,7 @@ pub fn compartments(craft: &VoxelCraft) -> CompartmentSet {
     }
 
     let shaped_air = shaped_air_fractions(craft);
-    let mode = NodeMode::AirFractions(&shaped_air);
-    let fill = exterior_fill(craft, &solid, &mode);
+    let fill = exterior_fill(craft, &solid, &shaped_air);
     let (lo, hi) = (fill.lo, fill.hi);
     let exterior = &fill.exterior;
     let air_fraction = |c: IVec3| -> f64 {

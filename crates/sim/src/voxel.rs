@@ -1204,33 +1204,41 @@ impl VoxelCraft {
     }
 
     /// The cross-sectional-area curve along `axis`: `(station, area_m2)` pairs,
-    /// sorted by station. **The sealed envelope** (WI 827, panels design stage 4):
-    /// area = envelope cells in the slice × cell² (devices excluded), where the
-    /// envelope is everything the exterior flood-fill cannot reach — occupied
-    /// structure plus the enclosed air sealed behind it
-    /// ([`crate::compartments::sealed_envelope`]). A closed plated hull presents
-    /// its full body to the flow (the air inside goes around); a breached hull
-    /// presents only its structure (the cavity vents). A **free-standing plate**
-    /// (neither side in the envelope) presents itself: its full face area sliced
-    /// along its normal (attributed to its owning cell's station), its
+    /// sorted by station. **The sealed envelope, fractionally** (WI 827 → 834,
+    /// design R2): area = Σ presented fraction × cell² over envelope cells in
+    /// the slice (devices excluded), from
+    /// [`crate::compartments::envelope_fractions`] — everything the exterior
+    /// flood-fill cannot reach presents fully (structure *and* enclosed air,
+    /// including a shaped cell's sealed remainder), while a shaped cell whose
+    /// remainder the exterior reached presents its **solid volume fraction**
+    /// (the mean-slice identity: average cross-section = volume / length —
+    /// orientation-independent by design; sub-station profiles stay a
+    /// door-open refinement). A wedge-faired shoulder thus spreads one area
+    /// step into two smaller ones, which the area-ruling factor rewards. A
+    /// closed plated hull presents its full body to the flow; a breached hull
+    /// presents only its structure (the cavity vents). A **free-standing
+    /// plate** (neither side presenting) presents itself: its full face area
+    /// sliced along its normal (attributed to its owning cell's station), its
     /// [`PANEL_FILL`] edge sliced tangentially; a plate on the envelope's skin
-    /// adds nothing (the cell behind it already presents). Replaces the WI 824
-    /// interim ≥2-paneled-faces bridge.
+    /// adds nothing (the cell behind it already presents). The fold runs in
+    /// sorted cell order — mixed fractional sums must be order-deterministic.
     pub fn area_curve(&self, axis: Axis) -> Vec<(i32, f64)> {
-        let envelope = crate::compartments::sealed_envelope(self);
+        let envelope = crate::compartments::envelope_fractions(self);
         let cell_area = self.cell_size * self.cell_size;
         let station = |c: IVec3| match axis {
             Axis::X => c.x,
             Axis::Y => c.y,
             Axis::Z => c.z,
         };
+        let mut members: Vec<(IVec3, f64)> = envelope.iter().map(|(&c, &f)| (c, f)).collect();
+        members.sort_unstable_by_key(|(c, _)| (c.x, c.y, c.z));
         let mut areas: BTreeMap<i32, f64> = BTreeMap::new();
-        for &cell in &envelope {
-            *areas.entry(station(cell)).or_default() += cell_area;
+        for (cell, fraction) in members {
+            *areas.entry(station(cell)).or_default() += fraction * cell_area;
         }
+        let presents = |c: IVec3| envelope.get(&c).is_some_and(|f| *f > 0.0);
         for p in &self.face_panels {
-            let free_standing =
-                !envelope.contains(&p.cell) && !envelope.contains(&(p.cell + p.axis.unit()));
+            let free_standing = !presents(p.cell) && !presents(p.cell + p.axis.unit());
             if !free_standing {
                 continue;
             }
@@ -1613,38 +1621,209 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_aero_envelope_ignores_shaped_cells_until_wi_834() {
-        // WI 832 keeps the envelope's boolean node semantics (invariant 5 of
-        // the plan): shaping a hull's wall cell changes compartments, not the
-        // area curve — WI 834 owns the aero generalization.
+    // --- WI 834: shaped cells present fractional station areas (design R2).
+    // The WI 832 staging pin (`the_aero_envelope_ignores_shaped_cells_until_
+    // wi_834`) was deleted by this stage, as designed, and replaced by the
+    // positive tests below.
+
+    /// The 3×3×3 hull with a one-cell central cavity (the WI 832 fixture).
+    fn cavity_hull() -> VoxelCraft {
+        let mut c = VoxelCraft::new(1.0);
+        for x in 0..3 {
+            for y in 0..3 {
+                for z in 0..3 {
+                    if !(x == 1 && y == 1 && z == 1) {
+                        c.voxels.push(Voxel {
+                            cell: IVec3::new(x, y, z),
+                            material: Material::ALUMINIUM,
+                        });
+                    }
+                }
+            }
+        }
+        c
+    }
+
+    fn shape_wedge(craft: &mut VoxelCraft, cell: IVec3, orientation: u8) {
         use crate::shape::{FillMode, Form, ShapedCell};
-        let hull = || {
+        craft.set_shape(ShapedCell {
+            cell,
+            form: Form::Wedge,
+            orientation,
+            fill: FillMode::Solid,
+        });
+    }
+
+    #[test]
+    fn a_wedge_faired_shoulder_smooths_the_area_curve() {
+        // The workitem's headline AC: a 2×2 body with a 1×1 nose stub steps
+        // [4, 4, 4, 1]; wedging the three shoulder cells fairs it to
+        // [4, 4, 2.5, 1] — the same occupancy is strictly smoother (one
+        // 3-cell² step spread into 1.5 + 1.5) over the same peak area. At
+        // mean-slice granularity shaping smooths *transitions* — the
+        // area-ruling factor scores interior steps only.
+        use crate::aero::area_ruling_factor;
+        let build = |shaped: bool| {
             let mut c = VoxelCraft::new(1.0);
             for x in 0..3 {
-                for y in 0..3 {
-                    for z in 0..3 {
-                        if !(x == 1 && y == 1 && z == 1) {
-                            c.voxels.push(Voxel {
-                                cell: IVec3::new(x, y, z),
-                                material: Material::ALUMINIUM,
-                            });
-                        }
+                for y in 0..2 {
+                    for z in 0..2 {
+                        c.voxels.push(Voxel {
+                            cell: IVec3::new(x, y, z),
+                            material: Material::ALUMINIUM,
+                        });
                     }
+                }
+            }
+            c.voxels.push(Voxel {
+                cell: IVec3::new(3, 0, 0),
+                material: Material::ALUMINIUM,
+            });
+            if shaped {
+                for cell in [
+                    IVec3::new(2, 1, 0),
+                    IVec3::new(2, 0, 1),
+                    IVec3::new(2, 1, 1),
+                ] {
+                    shape_wedge(&mut c, cell, 0);
                 }
             }
             c
         };
-        let plain = hull();
-        let mut shaped = hull();
-        shaped.set_shape(ShapedCell {
-            cell: IVec3::new(1, 1, 0),
-            form: Form::Wedge,
-            orientation: 0,
-            fill: FillMode::Solid,
-        });
+        let stepped = build(false).area_curve(Axis::X);
+        let faired = build(true).area_curve(Axis::X);
+        assert_eq!(
+            stepped,
+            vec![(0, 4.0), (1, 4.0), (2, 4.0), (3, 1.0)],
+            "the unshaped stub steps"
+        );
+        assert_eq!(
+            faired,
+            vec![(0, 4.0), (1, 4.0), (2, 2.5), (3, 1.0)],
+            "the wedged shoulder fairs the transition"
+        );
+        let (fs, ff) = (area_ruling_factor(&stepped), area_ruling_factor(&faired));
+        assert!(ff < fs, "faired {ff} strictly smoother than stepped {fs}");
+        let peak = |c: &[(i32, f64)]| c.iter().map(|&(_, a)| a).fold(0.0_f64, f64::max);
+        assert_eq!(peak(&stepped), peak(&faired), "same peak area");
+    }
+
+    #[test]
+    fn an_enclosed_wedge_remainder_counts_fully_and_an_exterior_one_does_not() {
+        // Design R2, both halves on the WI 832 hull: a wedge whose open half
+        // sits inside the sealed hull presents the full cell (the curve is the
+        // unshaped hull's, exactly); a wedge whose open half faces the
+        // exterior presents only its solid half (its station drops by the
+        // remainder × cell²) — and the cavity stays sealed either way.
+        use crate::shape::rotations;
+        use glam::DMat3;
+        let orientation_of = |want: DMat3| -> u8 {
+            rotations()
+                .iter()
+                .position(|r| r.abs_diff_eq(want, 1e-12))
+                .expect("rotation in the table") as u8
+        };
+        let plain = cavity_hull();
+        let wedge_cell = IVec3::new(1, 1, 0);
+
+        // Full face outward (−Z): the remainder joins the sealed cavity.
+        let mut enclosed = cavity_hull();
+        let out = orientation_of(DMat3::from_diagonal(glam::DVec3::new(-1.0, 1.0, -1.0)));
+        shape_wedge(&mut enclosed, wedge_cell, out);
         for axis in [Axis::X, Axis::Y, Axis::Z] {
-            assert_eq!(shaped.area_curve(axis), plain.area_curve(axis));
+            assert_eq!(
+                enclosed.area_curve(axis),
+                plain.area_curve(axis),
+                "enclosed remainder counts fully"
+            );
+        }
+
+        // Identity: the full face points at the cavity (+Z), the open half at
+        // the exterior — the remainder vents, the solid half presents.
+        let mut vented = cavity_hull();
+        shape_wedge(&mut vented, wedge_cell, 0);
+        for axis in [Axis::X, Axis::Y, Axis::Z] {
+            let station = match axis {
+                Axis::X => wedge_cell.x,
+                Axis::Y => wedge_cell.y,
+                Axis::Z => wedge_cell.z,
+            };
+            let expected: Vec<(i32, f64)> = plain
+                .area_curve(axis)
+                .into_iter()
+                .map(|(s, a)| (s, if s == station { a - 0.5 } else { a }))
+                .collect();
+            assert_eq!(vented.area_curve(axis), expected);
+        }
+    }
+
+    #[test]
+    fn a_cavity_behind_a_half_open_wall_vents_from_the_curve() {
+        // The mode flip's topology: the exterior flows *through* a shaped
+        // cell's open faces (exactly as the compartment fill does — one flood,
+        // one semantics), so the WI 832 vented orientation empties the cavity
+        // from the envelope: structure presents, the cavity and the wedge's
+        // remainder do not.
+        use crate::shape::{constants, face_masks, mask_popcount, Form};
+        // A wedge orientation whose two Z faces are both partial (the WI 832
+        // compartments fixture's mask-searched vented case).
+        let partial = |m: &crate::shape::FaceMask| {
+            let n = mask_popcount(m);
+            n > 0 && n < 256
+        };
+        let vented_o = constants(Form::Wedge)
+            .distinct_orientations
+            .iter()
+            .copied()
+            .find(|&o| {
+                let masks = face_masks(Form::Wedge, o);
+                partial(&masks[4]) && partial(&masks[5])
+            })
+            .expect("a both-z-partial orientation exists");
+        let mut c = cavity_hull();
+        shape_wedge(&mut c, IVec3::new(1, 1, 0), vented_o);
+        // Along X: stations 0 and 2 are solid 3×3 walls (9); station 1 loses
+        // the cavity (1.0) and the wedge's remainder (0.5).
+        assert_eq!(
+            c.area_curve(Axis::X),
+            vec![(0, 9.0), (1, 7.5), (2, 9.0)],
+            "the cavity and the remainder vent; the structure presents"
+        );
+    }
+
+    #[test]
+    fn a_lone_shaped_cell_presents_its_mean_slice_everywhere() {
+        // The mean-slice identity, exhaustively: one shaped cell contributes
+        // its solid volume fraction × cell² at its station — identical for
+        // every catalog form, every distinct orientation, and every axis
+        // (orientation-independence is the design invariant).
+        use crate::shape::{constants, FillMode, ShapedCell, FORMS};
+        for form in FORMS {
+            let c = constants(form);
+            for &o in &c.distinct_orientations {
+                let mut craft = VoxelCraft::new(1.0);
+                craft.voxels.push(Voxel {
+                    cell: IVec3::ZERO,
+                    material: Material::ALUMINIUM,
+                });
+                craft.set_shape(ShapedCell {
+                    cell: IVec3::ZERO,
+                    form,
+                    orientation: o,
+                    fill: FillMode::Solid,
+                });
+                for axis in [Axis::X, Axis::Y, Axis::Z] {
+                    let curve = craft.area_curve(axis);
+                    assert_eq!(curve.len(), 1, "{form:?} o{o} {axis:?}");
+                    assert_eq!(curve[0].0, 0);
+                    assert!(
+                        (curve[0].1 - c.volume).abs() < 1e-12,
+                        "{form:?} o{o} {axis:?}: presents {} want {}",
+                        curve[0].1,
+                        c.volume
+                    );
+                }
+            }
         }
     }
 
