@@ -183,6 +183,21 @@ pub fn catalog() -> &'static [FormConstants; 6] {
     })
 }
 
+/// The canonical mesh's vertex set under `orientation`, unit-cell coordinates
+/// (rotation about the cell centre) — the form's **convex hull vertices**, the
+/// collision substrate (WI 837). Every admitted form is convex (the unit cube
+/// intersected with at most one half-space), so the mesh's vertex list *is*
+/// the hull vertex set; the derived-vs-derived pin lives in the collision
+/// adapter's tests (hull volume == catalog volume).
+pub fn hull_vertices(form: Form, orientation: u8) -> Vec<DVec3> {
+    let r = rotations()[orientation as usize];
+    form_mesh(form)
+        .vertices
+        .iter()
+        .map(|&p| r * (p - DVec3::splat(0.5)) + DVec3::splat(0.5))
+        .collect()
+}
+
 /// The 24 proper rotations of the cube, as matrices, in a **frozen** order
 /// (index 0 = identity): axis permutations in a fixed nested order × sign
 /// combinations `+` before `−`, keeping determinant +1. The order is a

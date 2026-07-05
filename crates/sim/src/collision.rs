@@ -15,6 +15,15 @@ pub struct BoxShape {
     pub half_extents: DVec3,
 }
 
+/// A convex collision part (WI 837): the hull vertices of a shaped cell's oriented
+/// canonical form, in the body's local frame. Pure glam — the parry conversion
+/// lives in the detection adapter.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConvexShape {
+    /// The hull vertex set (a form mesh's vertices, oriented, scaled, translated).
+    pub points: Vec<DVec3>,
+}
+
 /// A collision shape in a body's local frame. The craft is a union of axis-aligned boxes;
 /// flat ground is a half-space. (Heightfield / trimesh terrain are future shapes.)
 #[derive(Clone, Debug, PartialEq)]
@@ -22,6 +31,14 @@ pub enum CollisionShape {
     /// A union of axis-aligned boxes (one per occupied cell plus one thin box per face
     /// panel — WI 828; greedy solid-box merging is a future optimization).
     CuboidCompound(Vec<BoxShape>),
+    /// A **mixed** compound (WI 837): unshaped cells + panels as boxes, shaped cells
+    /// as their oriented form hulls. Only produced for crafts with shape records —
+    /// an unshaped craft stays a [`CollisionShape::CuboidCompound`] (the fast path),
+    /// so a mixed compound with zero convex parts never occurs.
+    Compound {
+        boxes: Vec<BoxShape>,
+        convexes: Vec<ConvexShape>,
+    },
     /// A flat ground plane: points with `p·normal < offset` are below the surface
     /// (penetrating). `normal` is unit.
     HalfSpace { normal: DVec3, offset: f64 },
@@ -52,20 +69,46 @@ fn panel_box(craft: &VoxelCraft, p: &FacePanel) -> BoxShape {
 /// The craft's collision shape: one solid cuboid per occupied cell **plus one thin box per
 /// face panel** (WI 828 — so a shed plate lands on the pad instead of ghosting through it),
 /// in the craft's local frame (the same frame `mass_properties`/the lattice use). Pure and
-/// deterministic; voxel geometry is unchanged from pre-828.
+/// deterministic; voxel geometry is unchanged from pre-828. **WI 837:** a shaped cell
+/// contributes its oriented form hull (the same canonical mesh that renders/weighs/seals;
+/// a shell collides as its solid form — the outer surface) instead of its cell box; a
+/// craft with no shape records keeps the exact pre-837 cuboid compound.
 pub fn craft_collision_shape(craft: &VoxelCraft) -> CollisionShape {
     let s = craft.cell_size;
     let half = DVec3::splat(s * 0.5);
-    let boxes = craft
-        .voxels
-        .iter()
-        .map(|v| BoxShape {
-            center: (v.cell.as_dvec3() + DVec3::splat(0.5)) * s,
-            half_extents: half,
-        })
-        .chain(craft.face_panels.iter().map(|p| panel_box(craft, p)))
-        .collect();
-    CollisionShape::CuboidCompound(boxes)
+    if craft.shapes.is_empty() {
+        // Fast path: no shaped cells — the exact pre-837 shape and variant.
+        let boxes = craft
+            .voxels
+            .iter()
+            .map(|v| BoxShape {
+                center: (v.cell.as_dvec3() + DVec3::splat(0.5)) * s,
+                half_extents: half,
+            })
+            .chain(craft.face_panels.iter().map(|p| panel_box(craft, p)))
+            .collect();
+        return CollisionShape::CuboidCompound(boxes);
+    }
+    let mut boxes = Vec::new();
+    let mut convexes = Vec::new();
+    for v in &craft.voxels {
+        match craft.shape_at(v.cell) {
+            // A `Cube` record hulls as its full box would — kept a convex part so
+            // the fast-path/mixed fork stays the single `shapes.is_empty()` test.
+            Some(sh) => convexes.push(ConvexShape {
+                points: crate::shape::hull_vertices(sh.form, sh.orientation)
+                    .into_iter()
+                    .map(|p| (v.cell.as_dvec3() + p) * s)
+                    .collect(),
+            }),
+            None => boxes.push(BoxShape {
+                center: (v.cell.as_dvec3() + DVec3::splat(0.5)) * s,
+                half_extents: half,
+            }),
+        }
+    }
+    boxes.extend(craft.face_panels.iter().map(|p| panel_box(craft, p)));
+    CollisionShape::Compound { boxes, convexes }
 }
 
 /// The craft's broad-phase bounds (local AABB + bounding sphere), or `None` for an empty
@@ -206,6 +249,64 @@ mod tests {
             }
             _ => panic!("expected a half-space"),
         }
+    }
+
+    #[test]
+    fn a_shaped_cell_contributes_its_form_hull_and_a_shell_matches_its_solid() {
+        // WI 837: the wedge cell becomes its 6-vertex oriented hull (inside the
+        // cell box, the two empty top-front cube corners absent — the phantom
+        // corners are not in the geometry at all); unshaped neighbours stay
+        // boxes; a shell twin produces the identical shape (solid-for-topology).
+        use crate::shape::{FillMode, Form, ShapedCell};
+        use glam::IVec3;
+        let mut craft = craft_from(&[IVec3::ZERO, IVec3::new(1, 0, 0)], 2.0);
+        craft.set_shape(ShapedCell {
+            cell: IVec3::ZERO,
+            form: Form::Wedge,
+            orientation: 0,
+            fill: FillMode::Solid,
+        });
+        let shape = craft_collision_shape(&craft);
+        let CollisionShape::Compound { boxes, convexes } = &shape else {
+            panic!("a shaped craft is a mixed compound");
+        };
+        assert_eq!(boxes.len(), 1, "the unshaped neighbour stays a box");
+        assert_eq!(convexes.len(), 1);
+        let pts = &convexes[0].points;
+        assert_eq!(pts.len(), 6, "the wedge hull has six vertices");
+        for p in pts {
+            for i in 0..3 {
+                assert!(
+                    (-1e-12..=2.0 + 1e-12).contains(&p[i]),
+                    "inside the cell box"
+                );
+            }
+        }
+        for empty in [DVec3::new(0.0, 2.0, 0.0), DVec3::new(2.0, 2.0, 0.0)] {
+            assert!(
+                pts.iter().all(|p| (*p - empty).length() > 1e-9),
+                "no phantom corner at {empty:?}"
+            );
+        }
+        let mut shell = craft.clone();
+        shell.set_shape(ShapedCell {
+            cell: IVec3::ZERO,
+            form: Form::Wedge,
+            orientation: 0,
+            fill: FillMode::Shell,
+        });
+        assert_eq!(
+            craft_collision_shape(&shell),
+            shape,
+            "a shell collides as its solid form"
+        );
+        // And the fast path: clearing the record restores the exact box compound.
+        let mut plain = craft.clone();
+        plain.clear_shape(IVec3::ZERO);
+        assert!(matches!(
+            craft_collision_shape(&plain),
+            CollisionShape::CuboidCompound(b) if b.len() == 2
+        ));
     }
 
     #[test]

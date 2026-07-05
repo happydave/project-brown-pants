@@ -429,6 +429,56 @@ mod tests {
     }
 
     #[test]
+    fn a_wedge_dropped_hypotenuse_down_settles_on_that_face() {
+        // WI 837 AC (dynamic half): a single-wedge craft dropped hypotenuse-down
+        // comes to rest ON the hypotenuse — resting CoM height 1/(3√2) ≈ 0.2357
+        // (the centroid's distance to the y = z plane; plan-derived), not the
+        // 0.5 cube rest — with the orientation essentially unchanged (no
+        // phantom-corner tip: the empty cube corners sit 1/√2 below the resting
+        // face and must never touch).
+        use crate::shape::{FillMode, Form, ShapedCell};
+        let mut craft = unit_craft();
+        craft.set_shape(ShapedCell {
+            cell: IVec3::ZERO,
+            form: Form::Wedge,
+            orientation: 0,
+            fill: FillMode::Solid,
+        });
+        let shape = craft_collision_shape(&craft);
+        let bounds = craft_bounds(&craft);
+        let mp = craft.mass_properties().unwrap();
+        let ground = ground_half_space(0.0);
+        let params = ContactParams::default();
+        let q = DQuat::from_axis_angle(DVec3::X, (-135.0_f64).to_radians());
+        let g = 9.81;
+        let dt = 0.004;
+        let mut body = ActiveBody::new(DVec3::new(0.0, 1.0, 0.0), DVec3::ZERO, mp.mass, mp.inertia);
+        body.orientation = q;
+        for _ in 0..6_000 {
+            let weight = DVec3::new(0.0, -g * body.mass, 0.0);
+            let (cf, ct) =
+                ground_contact_wrench(&body, &shape, bounds, mp.center_of_mass, &ground, &params);
+            body.integrate_wrench(weight + cf, ct, dt);
+        }
+        let rest = 1.0 / (3.0 * 2.0_f64.sqrt()); // ≈ 0.2357
+        assert!(
+            body.velocity.length() < 0.05,
+            "came to rest: v={}",
+            body.velocity.length()
+        );
+        assert!(
+            body.position.y > rest - 0.1 && body.position.y <= rest + 1e-6,
+            "resting on the hypotenuse (CoM ≈ {rest:.4}): y={}",
+            body.position.y
+        );
+        assert!(
+            body.orientation.dot(q).abs() > 0.999,
+            "no phantom-corner tip: q·q0 = {}",
+            body.orientation.dot(q).abs()
+        );
+    }
+
+    #[test]
     fn craft_dropped_under_gravity_settles_to_rest() {
         // Isolate collision: constant gravity + the contact wrench through integrate_wrench.
         let craft = unit_craft();

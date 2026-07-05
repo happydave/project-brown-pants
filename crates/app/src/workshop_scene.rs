@@ -1888,9 +1888,11 @@ fn step_workshop(
         // shape is the chassis hull ∪ the live wheels' swept proxies (WI 631c), so a tire pushes off
         // an obstacle and the contact can be attributed to tire/rim/chassis (rebuilt below per sub-step
         // so a sheared wheel loses its collider). Chassis boxes are the static base.
-        let chassis_boxes = match craft_collision_shape(&rs.lattice) {
-            CollisionShape::CuboidCompound(b) => b,
-            _ => Vec::new(),
+        // A shaped chassis carries its convex form hulls too (WI 837); wheels stay boxes.
+        let (chassis_boxes, chassis_convexes) = match craft_collision_shape(&rs.lattice) {
+            CollisionShape::CuboidCompound(b) => (b, Vec::new()),
+            CollisionShape::Compound { boxes, convexes } => (boxes, convexes),
+            _ => (Vec::new(), Vec::new()),
         };
         let com = rs.com;
         let contact = ContactParams::default();
@@ -1914,7 +1916,14 @@ fn step_workshop(
             // Bounds `None` so the wheel proxies (outside the chassis AABB) are never broad-phase culled.
             let mut rover_boxes = chassis_boxes.clone();
             rover_boxes.extend(rs.rover.wheel_collider_boxes(com));
-            let rover_shape = CollisionShape::CuboidCompound(rover_boxes);
+            let rover_shape = if chassis_convexes.is_empty() {
+                CollisionShape::CuboidCompound(rover_boxes)
+            } else {
+                CollisionShape::Compound {
+                    boxes: rover_boxes,
+                    convexes: chassis_convexes.clone(),
+                }
+            };
             // The shape's world pose (the convention `body_contact_wrench` uses internally), so we can
             // fetch the contact points to attribute the impact site.
             let a_pose = (
