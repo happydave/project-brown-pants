@@ -54,6 +54,7 @@ live in the project's `tickets` repository under `docs/projects/sounding/`.
 - Run the windowed app: `cargo run -p sounding`
 - Run with dev tooling (Bevy Remote Protocol over HTTP): `cargo run -p sounding --features dev`
 - Run the universe server (multiplayer arc, `multiplayer` branch): `cargo run -p sounding_server -- --invite-token <token>` (`--addr`/`--content`/`--ttl`/`--save` optional; wire contract in `crates/server/src/router.rs` docs; LAN threat model — no TLS)
+- Join a shared universe (M1, observe-only): set `SOUNDING_SERVER=http://<host>:8790 SOUNDING_INVITE=<token> SOUNDING_PLAYER=<name>` and run any scenario scene (e.g. `cargo run -p sounding -- scenario`); peers appear as labeled translucent ghosts + a `peers` telemetry block. Unset ⇒ single-player, byte-identical
 - Test the headless core (no display required): `cargo test -p sounding_sim`
 - Quality gates: `cargo fmt --all --check` and `cargo clippy --all-targets`
 - Dev-build performance: the dev profile optimizes dependencies and the sim crate (root `Cargo.toml`

@@ -344,6 +344,7 @@ fn publish_telemetry(
     rover: Res<GroundedRover>,
     thermal: Res<DiveThermal>,
     scenario: Option<Res<sounding_sim::director::ScenarioFlight>>,
+    peers: Option<Res<crate::net::NetPeers>>,
     mut frame: Local<u32>,
 ) {
     let orbit = craft.single().ok().map(|c| c.orbit);
@@ -365,6 +366,11 @@ fn publish_telemetry(
     // — the same constructor the mission evaluator queries, so wire and evaluator agree.
     if let Some(f) = scenario.as_ref() {
         snapshot = snapshot.with_scenario(f.telemetry());
+    }
+    // Attach the multiplayer peers block while the net adapter is connected
+    // (WI 857) — the data-side ghosts, verifiable over the MCP bridge.
+    if let Some(p) = peers.as_ref().and_then(|p| p.0.clone()) {
+        snapshot = snapshot.with_peers(p);
     }
     // Decimate the per-frame publish into the bounded history ring (WI 644) so it spans several
     // seconds without an oversized payload; the newest entry is always `GET /telemetry`.

@@ -20,6 +20,8 @@ dev = ["bevy/bevy_remote"]
 [dependencies]
 bevy = { workspace = true }
 sounding_sim = { workspace = true }
+# Multiplayer net-adapter core (WI 857): render-free client the NetPlugin drives.
+sounding_netclient = { path = "../netclient" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tiny_http = "0.12"
