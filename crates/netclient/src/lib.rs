@@ -20,6 +20,7 @@
 //!   mutex snapshot the caller polls (frame systems / a headless loop).
 
 pub mod ghost;
+pub mod participant;
 pub mod sync;
 
 pub use ghost::{GhostStore, PeerView};
