@@ -815,6 +815,11 @@ pub struct Entry {
 pub struct Catalog {
     pub pack_id: String,
     pub pack_version: String,
+    /// The composed base packs as (id, version) pairs in resolution order —
+    /// the save-recordable half of the catalog's identity (WI 553; the
+    /// content design's "resolved-catalog identity"). `sources` names every
+    /// ladder input; this names the versioned pack artifacts specifically.
+    pub packs: Vec<(String, String)>,
     /// All source ids (settings, then packs, then override sets — the
     /// design's ladder numbering) in resolution order.
     pub sources: Vec<String>,
@@ -1298,11 +1303,13 @@ fn merge_composition(
     let mut raws: BTreeMap<String, RawRecord> = BTreeMap::new();
     let mut defining: HashMap<String, Provenance> = HashMap::new();
     let mut first_pack: Option<(String, String)> = None;
+    let mut pack_identities: Vec<(String, String)> = Vec::with_capacity(pack_order.len());
     for pack_id in &pack_order {
         let pack = packs_by_id.remove(pack_id).expect("ordered from this set");
         if first_pack.is_none() {
             first_pack = Some((pack.id.clone(), pack.version.clone()));
         }
+        pack_identities.push((pack.id.clone(), pack.version.clone()));
         for r in pack.records {
             let id = r.id().to_string();
             if raws.insert(id.clone(), r).is_some() {
@@ -1461,6 +1468,7 @@ fn merge_composition(
     Ok(Catalog {
         pack_id,
         pack_version,
+        packs: pack_identities,
         sources,
         settings,
         records,

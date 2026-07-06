@@ -61,6 +61,7 @@ pub mod vessel;
 pub mod voxel;
 pub mod voxel_mesh;
 pub mod warp;
+pub mod world_save;
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;

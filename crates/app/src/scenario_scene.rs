@@ -19,7 +19,7 @@
 //! Controls: Shift/Ctrl throttle up/down, Z/X full/cutoff · W/S/A/D/Q/E
 //! attitude · T SAS hold toggle, R kill-rotation, F off, G recapture policy ·
 //! 1/2/3/0 canned autopilots · [ ] − = SAS gains · C/V control tier · ,/.
-//! warp · P pause, `.` step while paused.
+//! warp · P pause, `.` step while paused · F5 world quicksave (WI 553).
 
 use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::Tonemapping;
@@ -62,16 +62,30 @@ struct Hud;
 #[derive(Resource)]
 struct DefaultDoc(&'static str);
 
+/// Whether this launch resumes a world save (`-- resume [slug]`, WI 553)
+/// instead of starting the default document fresh.
+#[derive(Resource)]
+struct ResumeMode(bool);
+
+/// The loaded world save's vessel table, carried **uninterpreted** so the
+/// next quicksave writes it back (the multiplayer J1 table survives an
+/// edit-resume-save cycle). Empty for a fresh session.
+#[derive(Resource, Default)]
+struct CarriedVessels(Vec<sounding_sim::vessel::VesselRecord>);
+
 /// The scenario scene: data in, flight out.
 pub struct ScenarioScenePlugin {
     /// The alias's shipped scenario document.
     pub default_doc: &'static str,
+    /// Resume a world save instead of starting fresh (WI 553).
+    pub resume: bool,
 }
 
 impl Default for ScenarioScenePlugin {
     fn default() -> Self {
         Self {
             default_doc: DEFAULT_SCENARIO,
+            resume: false,
         }
     }
 }
@@ -81,12 +95,15 @@ impl Plugin for ScenarioScenePlugin {
         app.add_plugins(FloatingOriginPlugin)
             .add_plugins(DirectorPlugin)
             .insert_resource(DefaultDoc(self.default_doc))
+            .insert_resource(ResumeMode(self.resume))
+            .init_resource::<CarriedVessels>()
             .add_systems(Startup, load_and_stage)
             .add_systems(
                 Update,
                 (
                     spawn_visuals.run_if(resource_added::<ScenarioFlight>),
                     scenario_input,
+                    world_quicksave,
                     crate::pause::toggle_pause,
                     crate::pause::step_scene,
                     publish_active_flight,
@@ -106,14 +123,62 @@ impl Plugin for ScenarioScenePlugin {
 /// fails fast with the loader's message — no half-built world.
 fn load_and_stage(
     default_doc: Res<DefaultDoc>,
+    resume: Res<ResumeMode>,
+    mut carried: ResMut<CarriedVessels>,
     mut pending: ResMut<PendingSpawn>,
     mut commands: MessageWriter<Command>,
 ) {
-    let path = std::env::args()
-        .nth(2)
-        .unwrap_or_else(|| default_doc.0.to_string());
+    let mut spawn;
+    if resume.0 {
+        // `-- resume [slug]`: load the world save, re-resolve the recorded
+        // scenario through the content build pass (the design's migration
+        // posture — current content stands), report any drift by name, and
+        // stage the spawn with the saved state riding it.
+        let dir = worlds_dir();
+        let path = match std::env::args().nth(2) {
+            Some(slug) => dir.join(format!("{slug}.json")),
+            None => match sounding_sim::world_save::latest_world(&dir) {
+                Some(entry) => entry.path,
+                None => panic!("no world saves found in {}", dir.display()),
+            },
+        };
+        let world = match sounding_sim::world_save::load_world(&path) {
+            Ok(w) => w,
+            Err(e) => panic!("world save `{}` failed to load: {e}", path.display()),
+        };
+        let Some(saved) = world.scenario else {
+            panic!(
+                "world save `{}` has no scenario state (a vessels-only world save is not resumable)",
+                path.display()
+            );
+        };
+        let scenario = load(&format!(
+            "content/scenarios/{}.ron",
+            saved.content.scenario_id
+        ));
+        let current = sounding_sim::world_save::ContentIdentity::from_scenario(&scenario);
+        for line in sounding_sim::world_save::drift_report(&saved.content, &current) {
+            warn!("content drift since save: {line}");
+        }
+        carried.0 = world.vessels;
+        info!("resuming `{}` from {}", scenario.id, path.display());
+        spawn = ScenarioSpawn::from_scenario(&scenario);
+        spawn.resume = Some(saved);
+    } else {
+        let path = std::env::args()
+            .nth(2)
+            .unwrap_or_else(|| default_doc.0.to_string());
+        spawn = ScenarioSpawn::from_scenario(&load(&path));
+    }
+    pending.0 = Some(spawn);
+    commands.write(Command::SpawnScenario);
+}
+
+/// Loads + validates a scenario document, failing fast with the loader's
+/// message (no half-built world).
+fn load(path: &str) -> sounding_sim::scenario::Scenario {
     let roots = ScenarioRoots::default();
-    let scenario = match load_scenario(std::path::Path::new(&path), &roots) {
+    let scenario = match load_scenario(std::path::Path::new(path), &roots) {
         Ok(s) => s,
         Err(e) => panic!("scenario `{path}` failed to load: {e}"),
     };
@@ -125,8 +190,35 @@ fn load_and_stage(
         scenario.catalog.settings.len(),
         scenario.missions.len(),
     );
-    pending.0 = Some(ScenarioSpawn::from_scenario(&scenario));
-    commands.write(Command::SpawnScenario);
+    scenario
+}
+
+/// The world-save directory (the persistence family's fourth member).
+fn worlds_dir() -> std::path::PathBuf {
+    ScenarioRoots::default().saves.join("worlds")
+}
+
+/// F5 quicksave (WI 553): captures the running flight + the carried vessel
+/// table into `saves/worlds/<scenario-id>.json` — one slot per scenario,
+/// overwrite is the quicksave semantics. Inert (with a log) before the
+/// flight exists; a terminal Recovery save is a valid save of a finished run.
+fn world_quicksave(
+    keys: Res<ButtonInput<KeyCode>>,
+    flight: Option<Res<ScenarioFlight>>,
+    carried: Res<CarriedVessels>,
+) {
+    if !keys.just_pressed(KeyCode::F5) {
+        return;
+    }
+    let Some(flight) = flight else {
+        info!("quicksave: no flight to save yet");
+        return;
+    };
+    let payload = sounding_sim::world_save::capture(&flight, carried.0.clone());
+    match sounding_sim::world_save::save_world(&worlds_dir(), &flight.id, &payload) {
+        Ok(path) => info!("world saved: {}", path.display()),
+        Err(e) => warn!("world save failed: {e}"),
+    }
 }
 
 /// Once the director has spawned the flight, dress the scene: ground, the

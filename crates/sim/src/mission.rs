@@ -159,8 +159,9 @@ impl fmt::Display for MissionState {
 }
 
 /// Per-node latch state mirroring a [`Condition`] tree (monotone progress —
-/// the warp-safety rule).
-#[derive(Debug, Clone, PartialEq)]
+/// the warp-safety rule). Serde-able because mission progress rides the
+/// world save (WI 553) — the shape (latched + children) is format surface.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeState {
     /// Latched satisfaction (never un-sets).
     latched: bool,
@@ -225,6 +226,20 @@ impl NodeState {
             self.latched = true;
         }
         self.latched
+    }
+
+    /// Whether this latch tree is shaped like `condition` — same arity at
+    /// every composite node (leaves have no children). A restored world save
+    /// applies its saved latches only when the shape still matches the
+    /// re-resolved objective; a drifted objective gets a fresh tree (WI 553).
+    pub fn matches(&self, condition: &Condition) -> bool {
+        match condition {
+            Condition::All(cs) | Condition::Any(cs) | Condition::Sequence(cs) => {
+                self.children.len() == cs.len()
+                    && cs.iter().zip(&self.children).all(|(c, st)| st.matches(c))
+            }
+            _ => self.children.is_empty(),
+        }
     }
 
     /// Latched-leaf fraction in `[0, 1]` (HUD/agent progress readability).

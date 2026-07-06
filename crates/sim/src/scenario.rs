@@ -52,6 +52,12 @@ pub struct ScenarioDoc {
     pub format: u32,
     /// Stable identifier; when loaded by reference it must match the file stem.
     pub id: String,
+    /// The scenario's own version — an opaque identity string like a pack's
+    /// (WI 553: recorded into world saves so a save can be re-resolved
+    /// against a drifted document). Optional/additive: absent means
+    /// unversioned and is recorded as such.
+    #[serde(default)]
+    pub version: Option<String>,
     /// Human-facing display name.
     pub name: String,
     /// The world this scenario plays in (referenced, never defined here).
@@ -290,6 +296,8 @@ impl Default for ScenarioRoots {
 pub struct Scenario {
     /// Stable identifier (matches the document).
     pub id: String,
+    /// The document's own (opaque) version string, if authored (WI 553).
+    pub version: Option<String>,
     /// Display name.
     pub name: String,
     /// The composed, resolved content catalog (settings baked in).
@@ -521,6 +529,7 @@ pub fn load_doc(doc: ScenarioDoc, roots: &ScenarioRoots) -> Result<Scenario, Sce
 
     Ok(Scenario {
         id: doc.id,
+        version: doc.version,
         name: doc.name,
         catalog,
         universe,

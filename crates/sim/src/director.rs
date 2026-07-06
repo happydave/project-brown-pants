@@ -37,6 +37,7 @@ use crate::scenario::{Scenario, StartPlacement};
 use crate::session::GameSession;
 use crate::sim::SimClock;
 use crate::voxel::{DeviceKind, VoxelCraft};
+use crate::world_save::{ContentIdentity, MissionSave, ScenarioSaveState};
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_time::prelude::*;
@@ -112,6 +113,13 @@ pub struct ScenarioSpawn {
     /// The scenario's mission definitions, in declared order (WI 551).
     #[serde(default)]
     pub missions: Vec<Mission>,
+    /// The resolved-content identity (WI 553) — recorded into world saves.
+    #[serde(default)]
+    pub content: ContentIdentity,
+    /// Saved state to restore after assembly (WI 553): resume = fresh spawn
+    /// + dynamic overwrite, one spawn path. Boxed — it embeds a full craft.
+    #[serde(default)]
+    pub resume: Option<Box<ScenarioSaveState>>,
 }
 
 impl ScenarioSpawn {
@@ -157,6 +165,8 @@ impl ScenarioSpawn {
             placement: s.placement,
             settings: s.catalog.settings.clone(),
             missions: s.missions.clone(),
+            content: ContentIdentity::from_scenario(s),
+            resume: None,
         }
     }
 }
@@ -204,6 +214,9 @@ pub struct ScenarioFlight {
     pub session: GameSession,
     /// Felt (proper) acceleration over the last sub-step, in g (WI 739).
     pub g_force: f64,
+    /// The resolved-content identity this flight was composed from (WI 553)
+    /// — what a world save records.
+    pub content: ContentIdentity,
 }
 
 /// One mission's runtime state: its definition, lifecycle state, and the
@@ -367,7 +380,7 @@ pub fn instantiate(spawn: &ScenarioSpawn) -> Option<ScenarioFlight> {
         }),
     };
 
-    Some(ScenarioFlight {
+    let mut flight = ScenarioFlight {
         id: spawn.id.clone(),
         name: spawn.name.clone(),
         body,
@@ -399,7 +412,110 @@ pub fn instantiate(spawn: &ScenarioSpawn) -> Option<ScenarioFlight> {
             s
         },
         g_force: 1.0,
-    })
+        content: spawn.content.clone(),
+    };
+    if let Some(saved) = &spawn.resume {
+        apply_resume(&mut flight, saved, &spawn.missions);
+    }
+    Some(flight)
+}
+
+/// Overwrites a freshly-assembled flight with saved dynamic state (WI 553):
+/// resume = fresh spawn + overwrite, so there is exactly one assembly path.
+///
+/// The restored craft replaces the assembled one wholesale (it carries its
+/// own reservoirs, SAS, control, autopilot); the body's dynamic degrees of
+/// freedom come from the save while mass stays stepper-derived (the flight
+/// step recomputes wet mass from the craft's reservoirs every sub-step) and
+/// inertia is rebuilt from the restored lattice, so nothing saved can
+/// disagree with what the stepper derives. The mission evaluator's poll
+/// clock re-seeds from the restored elapsed time (no burst poll); the dry
+/// mass/CoM caches re-derive from the restored lattice.
+fn apply_resume(flight: &mut ScenarioFlight, saved: &ScenarioSaveState, defs: &[Mission]) {
+    flight.craft = saved.craft.clone();
+    if let Some(mp) = flight.craft.voxels.mass_properties() {
+        flight.craft.dry_mass = mp.mass;
+        flight.craft.dry_com = mp.center_of_mass;
+        flight.body = ActiveBody::new(
+            saved.body.position,
+            saved.body.velocity,
+            mp.mass,
+            mp.inertia,
+        );
+    } else {
+        flight.body.position = saved.body.position;
+        flight.body.velocity = saved.body.velocity;
+    }
+    flight.body.orientation = saved.body.orientation;
+    flight.body.angular_momentum = saved.body.angular_momentum;
+    flight.pad = saved.pad;
+    flight.session = saved.session;
+    flight.elapsed = saved.elapsed;
+    flight.last_poll = saved.elapsed;
+    flight.lore = saved.lore.clone();
+    flight.g_force = saved.g_force;
+    let (missions, report) = reconcile_missions(defs, &saved.missions);
+    flight.missions = missions;
+    for line in report {
+        bevy_log::warn!("resume: {line}");
+    }
+}
+
+/// Rebuilds mission runtime state from saved rows against the re-resolved
+/// definitions (WI 553's drift-tolerant reconcile):
+///
+/// - a saved row applies where its id exists **and** its latch tree still
+///   matches the current objective's shape; a shape mismatch resets that
+///   mission's latches (reported);
+/// - a saved id absent from the current scenario is dropped (reported);
+/// - a definition with no saved row starts fresh;
+/// - `AfterMission` activation is then recomputed from restored completion,
+///   so a completed prerequisite's successor is Active after resume.
+pub fn reconcile_missions(
+    defs: &[Mission],
+    saved: &[MissionSave],
+) -> (Vec<MissionRun>, Vec<String>) {
+    let mut report = Vec::new();
+    let mut runs: Vec<MissionRun> = defs.iter().cloned().map(MissionRun::new).collect();
+    for row in saved {
+        match runs.iter_mut().find(|r| r.def.id == row.id) {
+            Some(run) => {
+                // The lifecycle state always applies (a Completed mission
+                // must stay Completed — its effects were already issued);
+                // the latch tree applies only while it still matches the
+                // re-resolved objective's shape.
+                run.state = row.state;
+                if row.nodes.matches(&run.def.objective) {
+                    run.nodes = row.nodes.clone();
+                } else {
+                    report.push(format!(
+                        "mission `{}` objective changed since the save — progress reset",
+                        row.id
+                    ));
+                }
+            }
+            None => report.push(format!(
+                "mission `{}` is no longer in the scenario — saved state dropped",
+                row.id
+            )),
+        }
+    }
+    // Recompute AfterMission activation from restored completion.
+    let completed: Vec<String> = runs
+        .iter()
+        .filter(|r| r.state == MissionState::Completed)
+        .map(|r| r.def.id.clone())
+        .collect();
+    for run in &mut runs {
+        if run.state == MissionState::Pending {
+            if let Offer::AfterMission(dep) = &run.def.offer {
+                if completed.iter().any(|c| c == dep) {
+                    run.state = MissionState::Active;
+                }
+            }
+        }
+    }
+    (runs, report)
 }
 
 /// The structural arm for [`Command::SpawnScenario`] (the `SetGear` pattern):
@@ -442,21 +558,38 @@ fn apply_spawn_scenario(
         bevy_log::warn!("SpawnScenario with no staged payload — no-op");
         return;
     };
+    // A saved-state resume is honest only for the Pad flight family (WI 553);
+    // if the recorded scenario's placement drifted to another regime, the
+    // spawn proceeds fresh and says so.
+    if spawn.resume.is_some() && !matches!(spawn.placement, StartPlacement::Pad) {
+        bevy_log::warn!(
+            "resume: scenario `{}` placement is no longer Pad — saved state ignored, spawning fresh",
+            spawn.id
+        );
+    }
     match spawn.placement {
-        StartPlacement::Pad => match instantiate(&spawn) {
-            Some(flight) => {
-                bevy_log::info!(
-                    "scenario `{}` spawned: {} on the pad",
-                    flight.id,
-                    flight.name
-                );
-                commands.insert_resource(flight);
-                messages
-                    .p1()
-                    .write(Command::SetSas(crate::command::SasMode::Hold));
+        StartPlacement::Pad => {
+            let resumed = spawn.resume.is_some();
+            match instantiate(&spawn) {
+                Some(flight) => {
+                    bevy_log::info!(
+                        "scenario `{}` spawned: {} on the pad{}",
+                        flight.id,
+                        flight.name,
+                        if resumed { " (resumed from save)" } else { "" }
+                    );
+                    commands.insert_resource(flight);
+                    if !resumed {
+                        // The restored craft carries its own SAS state; only a
+                        // fresh spawn gets the director's hold-attitude nudge.
+                        messages
+                            .p1()
+                            .write(Command::SetSas(crate::command::SasMode::Hold));
+                    }
+                }
+                None => bevy_log::warn!("scenario spawn: blueprint has no mass — nothing spawned"),
             }
-            None => bevy_log::warn!("scenario spawn: blueprint has no mass — nothing spawned"),
-        },
+        }
         StartPlacement::Orbit {
             altitude,
             speed,
@@ -793,6 +926,8 @@ mod tests {
             placement: StartPlacement::Pad,
             settings: BTreeMap::new(),
             missions: Vec::new(),
+            content: ContentIdentity::default(),
+            resume: None,
         }
     }
 
@@ -1380,5 +1515,143 @@ mod tests {
             MissionState::Completed
         );
         assert_eq!(app.world().resource::<SimClock>().warp, 4.0);
+    }
+
+    /// WI 553: capture → JSON → restore is a live-state round-trip — the
+    /// resumed flight matches the saved one (dynamic state, reservoirs,
+    /// session, elapsed, mission latches) and keeps flying.
+    #[test]
+    fn world_save_resume_restores_an_equivalent_flight() {
+        // Fly: two missions (one completes mid-burn, one chained), full
+        // throttle, a few seconds of ascent.
+        let missions = vec![
+            hop("first", Offer::Immediate, 10.0),
+            hop("second", Offer::AfterMission("first".into()), 1.0e7),
+        ];
+        let mut app = mission_app(missions.clone());
+        app.world_mut().write_message(Command::SetThrottle(1.0));
+        app.update();
+        step_sim(&mut app, 4.0);
+        step_sim(&mut app, 4.0);
+
+        // Capture through the persist envelope (the real save path).
+        let json = {
+            let flight = app.world().resource::<ScenarioFlight>();
+            assert!(flight.pad.released, "airborne before capture");
+            assert_eq!(flight.missions[0].state, MissionState::Completed);
+            assert_eq!(flight.missions[1].state, MissionState::Active);
+            let payload = crate::world_save::capture(flight, vec![]);
+            crate::persist::SavedDocument::new(crate::persist::Payload::WorldSave(payload))
+                .to_json()
+                .unwrap()
+        };
+        let world = match crate::persist::SavedDocument::from_json(&json)
+            .unwrap()
+            .payload
+        {
+            crate::persist::Payload::WorldSave(w) => w,
+            _ => panic!("world scope"),
+        };
+        let saved = world.scenario.expect("scenario state present");
+
+        // Resume in a fresh app: same defs, saved state riding the spawn.
+        let mut app2 = App::new();
+        app2.add_plugins(bevy_time::TimePlugin);
+        app2.init_resource::<SimClock>();
+        app2.add_plugins(crate::command::FlightControlPlugin);
+        app2.add_plugins(DirectorPlugin);
+        app2.world_mut().resource_mut::<PendingSpawn>().0 = Some(ScenarioSpawn {
+            resume: Some(saved.clone()),
+            ..spawn_with_missions(missions)
+        });
+        app2.world_mut().write_message(Command::SpawnScenario);
+        app2.update();
+        // Freeze the clock (the harness convention) so continuation is
+        // driven deterministically by Command::Step.
+        app2.world_mut().write_message(Command::SetPaused(true));
+        app2.update();
+
+        {
+            let a = app2.world().resource::<ScenarioFlight>();
+            let tol = 1e-9;
+            assert!((a.body.position - saved.body.position).length() < tol);
+            assert!((a.body.velocity - saved.body.velocity).length() < tol);
+            assert!((a.body.angular_momentum - saved.body.angular_momentum).length() < tol);
+            assert!(a.pad.released, "pad release restored");
+            assert_eq!(a.session, saved.session, "session restored verbatim");
+            assert!((a.elapsed - saved.elapsed).abs() < tol);
+            assert_eq!(a.last_poll, a.elapsed, "poll clock re-seeded, no burst");
+            assert_eq!(a.missions[0].state, MissionState::Completed);
+            assert_eq!(a.missions[1].state, MissionState::Active, "chain restored");
+            assert!(
+                (a.craft.propulsion.graph.reservoirs[0].amount
+                    - saved.craft.propulsion.graph.reservoirs[0].amount)
+                    .abs()
+                    < tol,
+                "reservoir levels restored"
+            );
+            // The telemetry block (the wire equivalence surface) agrees.
+            let t = a.telemetry();
+            assert!((t.elapsed - saved.elapsed).abs() < tol);
+            assert_eq!(t.missions.len(), 2);
+        }
+
+        // The resumed flight keeps flying: still under the throttle the
+        // restored craft carries, it climbs on.
+        let y0 = app2.world().resource::<ScenarioFlight>().body.position.y;
+        step_sim(&mut app2, 2.0);
+        let flight = app2.world().resource::<ScenarioFlight>();
+        assert!(flight.body.position.is_finite());
+        assert!(flight.body.position.y > y0, "resumed flight continues");
+    }
+
+    /// WI 553: the drift-tolerant mission reconcile — unknown saved ids
+    /// drop (reported), shape mismatches reset (reported), and AfterMission
+    /// activation recomputes from restored completion.
+    #[test]
+    fn reconcile_missions_handles_drift() {
+        use crate::world_save::MissionSave;
+        let defs = vec![
+            hop("a", Offer::Immediate, 10.0),
+            hop("b", Offer::AfterMission("a".into()), 20.0),
+        ];
+        // `a` completed with a matching (leaf) tree; `ghost` no longer
+        // exists; `b` saved with a wrong-shape tree (composite of 2). The
+        // latched leaf arrives through serde — exactly how a save delivers it.
+        let done: NodeState =
+            serde_json::from_str(r#"{"latched":true,"children":[]}"#).expect("latch tree decodes");
+        let wrong_shape = NodeState::for_condition(&crate::mission::Condition::All(vec![
+            crate::mission::Condition::Airborne,
+            crate::mission::Condition::Airborne,
+        ]));
+        let saved = vec![
+            MissionSave {
+                id: "a".into(),
+                state: MissionState::Completed,
+                nodes: done,
+            },
+            MissionSave {
+                id: "ghost".into(),
+                state: MissionState::Active,
+                nodes: NodeState::for_condition(&crate::mission::Condition::Airborne),
+            },
+            MissionSave {
+                id: "b".into(),
+                state: MissionState::Active,
+                nodes: wrong_shape,
+            },
+        ];
+        let (runs, report) = reconcile_missions(&defs, &saved);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].state, MissionState::Completed);
+        assert!(runs[0].nodes.matches(&defs[0].objective));
+        // b keeps its lifecycle state (Active) but its mismatched latch tree
+        // was reset to the re-resolved objective's fresh shape.
+        assert_eq!(runs[1].state, MissionState::Active);
+        assert!(runs[1].nodes.matches(&defs[1].objective), "fresh tree");
+        assert_eq!(runs[1].nodes.progress(&defs[1].objective), 0.0, "reset");
+        let text = report.join("\n");
+        assert!(text.contains("ghost"), "{text}");
+        assert!(text.contains("`b` objective changed"), "{text}");
     }
 }

@@ -123,9 +123,19 @@ pub struct WorldPayload {
     /// outside tests existed), every prior document holds `[]`/absent, which
     /// decodes identically under both types, so the migration liability is
     /// exactly zero. Converter timestamps / terrain patches remain future
-    /// world-persistence concerns (WI 553).
+    /// world-persistence concerns.
     #[serde(default)]
     pub vessels: Vec<VesselRecord>,
+    /// The played scenario's savable state (WI 553): content identity
+    /// (scenario + packs + the frozen settings map), mission/session
+    /// progress, and the flight state. Additive/optional — absent in every
+    /// pre-553 document (and in the multiplayer server's vessels-only world
+    /// saves), so `FORMAT_VERSION` is unchanged per the additive rule above.
+    /// Economy state joins this member additively with WI 552.
+    /// Boxed so the rarely-present member does not inflate every
+    /// [`Payload`] (the same discipline as the netclient's boxed publish).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenario: Option<Box<crate::world_save::ScenarioSaveState>>,
 }
 
 /// The payload, internally tagged by `kind`. The three craft-scope kinds share

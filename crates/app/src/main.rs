@@ -14,6 +14,7 @@
 //! - `cargo run -p sounding -- launch` — surface lift-off **from scenario data** (WI 739): `content/scenarios/launch.ron` on the scenario scene (the liftoff mission throttles it up)
 //! - `cargo run -p sounding -- autopilot` — a hands-off sounding **from scenario data** (WI 739): `content/scenarios/autopilot.ron`
 //! - `cargo run -p sounding -- play` — fly a craft by hand **from scenario data** (WI 739): `content/scenarios/play.ron`, with the full flight HUD (Δv, apsides, energy)
+//! - `cargo run -p sounding -- resume [slug]` — resume a world save (WI 553): `saves/worlds/<slug>.json`, or the most recent save when the slug is omitted
 //! - `cargo run -p sounding -- skins` — voxel-skin comparison: the same craft flown side by side, blocky vs greedy-meshed hull
 //! - `cargo run -p sounding -- land` — drop a craft and watch the collision response bring it to rest
 //! - `cargo run -p sounding -- collide [projectile] [target]` — fire a craft at another (and a debris pile) — craft↔craft collision; optional saved-craft fixtures (WI 843)
@@ -127,6 +128,9 @@ enum Scene {
     /// The scenario scene with the given default document (an explicit
     /// `-- <alias> <path>` still overrides it).
     Scenario(&'static str),
+    /// Resume a world save (`-- resume [slug]`, WI 553): the slug names
+    /// `saves/worlds/<slug>.json`; omitted, the most recent save resumes.
+    Resume,
 }
 
 fn selected_scene() -> Scene {
@@ -154,6 +158,7 @@ fn selected_scene() -> Scene {
         Some("surface") => Scene::Surface,
         Some("moon") => Scene::Moon,
         Some("scenario") => Scene::Scenario("content/scenarios/first-flight.ron"),
+        Some("resume") => Scene::Resume,
         _ => Scene::Editor,
     }
 }
@@ -259,7 +264,16 @@ fn main() {
             app.add_plugins(MoonScenePlugin);
         }
         Scene::Scenario(default_doc) => {
-            app.add_plugins(ScenarioScenePlugin { default_doc });
+            app.add_plugins(ScenarioScenePlugin {
+                default_doc,
+                resume: false,
+            });
+        }
+        Scene::Resume => {
+            app.add_plugins(ScenarioScenePlugin {
+                resume: true,
+                ..Default::default()
+            });
         }
     }
 

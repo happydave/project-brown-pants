@@ -122,6 +122,9 @@ pub fn load_store(options: &ServerOptions) -> Result<UniverseStore, StartError> 
 pub fn world_save_json(store: &UniverseStore) -> Result<String, FormatError> {
     SavedDocument::new(Payload::WorldSave(WorldPayload {
         vessels: store.vessels(),
+        // The server persists the shared vessel table only; scenario state
+        // (WI 553) is a client-side solo-save concern.
+        ..Default::default()
     }))
     .to_json()
 }
