@@ -57,6 +57,7 @@ pub mod telemetry;
 pub mod terrain;
 pub mod thermal;
 pub mod universe;
+pub mod vessel;
 pub mod voxel;
 pub mod voxel_mesh;
 pub mod warp;

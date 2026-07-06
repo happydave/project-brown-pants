@@ -1,0 +1,27 @@
+[package]
+name = "sounding_server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Sounding universe server — headless store + arbiter for the multiplayer arc; never simulates."
+
+[dependencies]
+# Record/persist types only (VesselRecord, SavedDocument): the server stores and
+# arbitrates, it never simulates. Pulls Bevy sub-crates transitively (accepted —
+# see the multiplayer design; a shared proto crate is deferred until a consumer
+# needs it). Rendering-free: `cargo tree -p sounding_server` must show no
+# bevy_render/bevy_winit/wgpu.
+sounding_sim = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Session ids + tokens (public id / secret token pairs).
+uuid = { workspace = true }
+# The same minimal HTTP server the app bus uses (WI 496 lineage).
+tiny_http = "0.12"
+
+[dev-dependencies]
+# In-process socket round-trip test (the companion's client library).
+ureq = "3"
+# Test fixtures build sim types (orbits, world positions) with glam vectors.
+glam = { workspace = true }

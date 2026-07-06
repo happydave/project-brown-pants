@@ -15,11 +15,15 @@
 //! lattice, devices, resource graph, and crew arrive with later toys. So the
 //! payload here is **skeletal and extensible**: it embeds the real WI 497
 //! world-coordinate types plus metadata, and reserves empty, opaque containers
-//! that later toys fill in (a future format-version change).
+//! that later toys fill in. Filling a reserved container that has **never had a
+//! producer** is treated like the additive-variant rule (no format bump — zero
+//! documents exist whose meaning changes; see `WorldPayload::vessels`, WI 856);
+//! a bump remains reserved for reshaping a payload that real documents carry.
 
 use crate::body_asset::BodyAsset;
 use crate::frame::WorldPos;
 use crate::system::System;
+use crate::vessel::VesselRecord;
 use crate::voxel::VoxelCraft;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -48,6 +52,9 @@ pub enum Kind {
     BodyAsset,
     /// A star system (WI 761): body-asset references + placements. Added additively.
     System,
+    /// A vessel record (WI 855, multiplayer arc): a vessel's identity + time-stamped
+    /// semantic state — the sync unit and world-save element. Added additively.
+    VesselRecord,
 }
 
 /// A craft-scope serialized subgraph. A craft, a subassembly, and a blueprint are
@@ -58,10 +65,18 @@ pub enum Kind {
 /// containers remain reserved (opaque `Value`s, empty) until their toys.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CraftSubgraph {
-    /// Stable identifier.
+    /// Stable identifier. **Document/slug identity** (a blueprint's name-derived
+    /// id, the library slot) — *not* instance identity: two spawns of one
+    /// blueprint share this but are different vessels (see `vessel_id`).
     pub id: String,
     /// Human-facing display name.
     pub name: String,
+    /// Durable vessel **instance** identity (WI 855, multiplayer arc): minted by
+    /// [`crate::vessel::mint_vessel_id`] when a craft first becomes a shareable
+    /// universe instance, kept for the vessel's life. Absent (and not encoded)
+    /// for blueprints/templates and pre-855 documents — additive, no format bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vessel_id: Option<String>,
     /// A WI 497 world-coordinate value — the craft's reference placement.
     pub reference_position: WorldPos,
     /// The voxel lattice + devices + attachment interface (WI 505).
@@ -86,6 +101,7 @@ impl CraftSubgraph {
         Self {
             id: id.into(),
             name: name.into(),
+            vessel_id: None,
             reference_position,
             craft,
             resources: Vec::new(),
@@ -94,14 +110,22 @@ impl CraftSubgraph {
     }
 }
 
-/// Reserved, skeletal world-save payload — the same machinery scaled to the
-/// universe, **distinct** from a craft subgraph. Empty at format version 1.
+/// World-save payload — the same machinery scaled to the universe, **distinct**
+/// from a craft subgraph. Skeletal until its reserved containers are consumed.
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub struct WorldPayload {
-    /// On-rails vessels and their orbits, converter timestamps, terrain patches
-    /// (world persistence, later).
+    /// The universe's vessels as [`VesselRecord`]s (WI 856: the universe
+    /// server's table serialized — the multiplayer design's "world-save as the
+    /// snapshot substrate"; content WI 553 composes on this same shape, seam J1).
+    ///
+    /// Typed from the reserved opaque stub **without a format bump**: the
+    /// container never had a producer (verified at WI 856 — no constructor
+    /// outside tests existed), every prior document holds `[]`/absent, which
+    /// decodes identically under both types, so the migration liability is
+    /// exactly zero. Converter timestamps / terrain patches remain future
+    /// world-persistence concerns (WI 553).
     #[serde(default)]
-    pub vessels: Vec<serde_json::Value>,
+    pub vessels: Vec<VesselRecord>,
 }
 
 /// The payload, internally tagged by `kind`. The three craft-scope kinds share
@@ -119,6 +143,11 @@ pub enum Payload {
     /// A star system (WI 761): body-asset references + placements that compile to a
     /// `Universe`.
     System(System),
+    /// A vessel record (WI 855, multiplayer arc): identity + ownership + a
+    /// universe-time-stamped craft subgraph and rails motion — the multiplayer
+    /// sync unit and the world-save vessel element. Added additively; the format
+    /// version is unchanged per the additive-variant rule.
+    VesselRecord(VesselRecord),
 }
 
 impl Payload {
@@ -131,6 +160,7 @@ impl Payload {
             Payload::WorldSave(_) => Kind::WorldSave,
             Payload::BodyAsset(_) => Kind::BodyAsset,
             Payload::System(_) => Kind::System,
+            Payload::VesselRecord(_) => Kind::VesselRecord,
         }
     }
 }
@@ -192,6 +222,9 @@ impl SavedDocument {
     fn normalize_craft(&mut self) {
         let craft = match &mut self.payload {
             Payload::Craft(c) | Payload::Subassembly(c) | Payload::Blueprint(c) => &mut c.craft,
+            // A vessel record embeds a full craft subgraph — it gets the same
+            // load hygiene as the craft-scope kinds (WI 855).
+            Payload::VesselRecord(r) => &mut r.structure.craft,
             Payload::WorldSave(_) | Payload::BodyAsset(_) | Payload::System(_) => return,
         };
         craft.normalize_shapes();
@@ -206,6 +239,8 @@ impl SavedDocument {
     fn validate_craft_shapes(&self) -> Result<(), FormatError> {
         let craft = match &self.payload {
             Payload::Craft(c) | Payload::Subassembly(c) | Payload::Blueprint(c) => &c.craft,
+            // Same boundary validation for the subgraph a vessel record embeds.
+            Payload::VesselRecord(r) => &r.structure.craft,
             Payload::WorldSave(_) | Payload::BodyAsset(_) | Payload::System(_) => return Ok(()),
         };
         for s in &craft.shapes {
@@ -539,6 +574,94 @@ mod tests {
         assert_eq!(c.craft.voxels.len(), 1);
         assert!(c.resources.is_empty());
         assert!(c.crew.is_empty());
+    }
+
+    #[test]
+    fn vessel_id_is_absent_by_default_and_round_trips_when_present() {
+        // WI 855 additive discipline: a subgraph without a vessel id encodes
+        // with NO vessel_id field — pre-855 documents and re-saves are
+        // byte-unchanged (the paneled byte-identity test above covers the
+        // re-save; this pins the field's absence explicitly).
+        let doc = SavedDocument::new(Payload::Craft(CraftSubgraph::new(
+            "plain",
+            "Plain",
+            sample_pos(),
+            sample_craft(),
+        )));
+        let json = doc.to_json().unwrap();
+        assert!(!json.contains("\"vessel_id\""), "absent field is skipped");
+        let back = SavedDocument::from_json(&json).unwrap();
+        assert_eq!(doc, back);
+
+        // Present, it round-trips exactly.
+        let mut cs = CraftSubgraph::new("mine", "Mine", sample_pos(), sample_craft());
+        cs.vessel_id = Some(crate::vessel::mint_vessel_id());
+        let want = cs.vessel_id.clone();
+        let doc = SavedDocument::new(Payload::Craft(cs));
+        let back = SavedDocument::from_json(&doc.to_json().unwrap()).unwrap();
+        let Payload::Craft(c) = &back.payload else {
+            panic!("craft payload expected");
+        };
+        assert_eq!(c.vessel_id, want);
+    }
+
+    #[test]
+    fn vessel_record_round_trips_through_the_envelope_in_all_shapes() {
+        use crate::orbit::Orbit;
+        use crate::vessel::{Fate, MotionState, VesselRecord};
+        use glam::DVec2;
+
+        // WI 855: the additive vessel-record kind — both motion variants, with
+        // and without the optional authority/subspace/fate fields, preserve
+        // version + kind and round-trip exactly.
+        let mu = crate::sim::CentralBody::EARTHLIKE.mu;
+        let orbit = Orbit::from_state(
+            mu,
+            DVec2::new(7.0e6, 0.0),
+            DVec2::new(0.0, (mu / 7.0e6).sqrt()),
+            0.0,
+        )
+        .unwrap();
+        let structure = CraftSubgraph::new("s", "S", sample_pos(), sample_craft());
+
+        let minimal = VesselRecord::from_rails(
+            crate::vessel::mint_vessel_id(),
+            "Ranger",
+            "dave",
+            10.0,
+            FrameId::CENTRAL_BODY,
+            orbit,
+            structure.clone(),
+        );
+        let mut full = VesselRecord::from_surface(
+            crate::vessel::mint_vessel_id(),
+            "Lander",
+            "dave",
+            20.0,
+            sample_pos(),
+            structure,
+        );
+        full.authority = Some("session-1".into());
+        full.subspace = Some("subspace-1".into());
+        full.live = true;
+        full.fate = Some(Fate::Destroyed);
+
+        for rec in [minimal, full] {
+            let doc = SavedDocument::new(Payload::VesselRecord(rec.clone()));
+            let json = doc.to_json().unwrap();
+            let back = SavedDocument::from_json(&json).unwrap();
+            assert_eq!(back.format_version, FORMAT_VERSION);
+            assert_eq!(back.kind(), Kind::VesselRecord);
+            let Payload::VesselRecord(r) = &back.payload else {
+                panic!("vessel record expected");
+            };
+            assert_eq!(r, &rec);
+            match (&r.motion, &rec.motion) {
+                (MotionState::Conic { .. }, MotionState::Conic { .. })
+                | (MotionState::SurfaceFix { .. }, MotionState::SurfaceFix { .. }) => {}
+                _ => panic!("motion variant preserved"),
+            }
+        }
     }
 
     #[test]

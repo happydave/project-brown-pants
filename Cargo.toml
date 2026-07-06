@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/sim", "crates/app", "crates/companion"]
+members = ["crates/sim", "crates/app", "crates/companion", "crates/server", "crates/netclient"]
 
 [workspace.package]
-version = "0.1.177"
+version = "0.1.181"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Dave <projectbrownpants@scienceranch.com>"]
@@ -19,6 +19,7 @@ glam = { version = "0.30", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ron = "0.12"
+uuid = { version = "1", features = ["v4", "serde"] }
 sounding_sim = { path = "crates/sim" }
 
 # Dev-build performance (WI 778). A plain `cargo run` is a debug build; at opt-level 0 the engine and

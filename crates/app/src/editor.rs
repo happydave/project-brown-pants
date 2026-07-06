@@ -1348,7 +1348,12 @@ fn craft_to_json(craft: &VoxelCraft, kind: Kind) -> Result<String, FormatError> 
 fn craft_from_json(json: &str) -> Option<VoxelCraft> {
     match SavedDocument::from_json(json).ok()?.payload {
         Payload::Craft(c) | Payload::Subassembly(c) | Payload::Blueprint(c) => Some(c.craft),
-        Payload::WorldSave(_) | Payload::BodyAsset(_) | Payload::System(_) => None,
+        // A vessel record (WI 855) is a universe-instance artifact, not an
+        // editor save — wrong scope here, like the others.
+        Payload::WorldSave(_)
+        | Payload::BodyAsset(_)
+        | Payload::System(_)
+        | Payload::VesselRecord(_) => None,
     }
 }
 

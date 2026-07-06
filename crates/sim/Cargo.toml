@@ -31,4 +31,7 @@ serde_json = { workspace = true }
 # the loader validates and rejects; nothing in a pack executes. Rendering-free —
 # does not affect the headless invariant.
 ron = { workspace = true }
+# Durable vessel identity (WI 855, multiplayer arc): client-minted UUIDv4 instance
+# ids on the persist line. Rendering-free — does not affect the headless invariant.
+uuid = { workspace = true }
 parry3d-f64 = "0.28.0"

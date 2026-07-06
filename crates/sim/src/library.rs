@@ -180,11 +180,14 @@ pub fn load_craft(path: &Path) -> Result<VoxelCraft, LibraryError> {
 pub fn craft_from_document(json: &str) -> Result<VoxelCraft, LibraryError> {
     match SavedDocument::from_json(json)?.payload {
         Payload::Craft(c) | Payload::Subassembly(c) | Payload::Blueprint(c) => Ok(c.craft),
-        Payload::WorldSave(_) | Payload::BodyAsset(_) | Payload::System(_) => {
-            Err(LibraryError::Format(FormatError::Malformed(
-                "expected a craft-scope document".to_string(),
-            )))
-        }
+        // A vessel record (WI 855) embeds a craft but is a universe-instance
+        // artifact, not an editor save — wrong scope here, like the others.
+        Payload::WorldSave(_)
+        | Payload::BodyAsset(_)
+        | Payload::System(_)
+        | Payload::VesselRecord(_) => Err(LibraryError::Format(FormatError::Malformed(
+            "expected a craft-scope document".to_string(),
+        ))),
     }
 }
 
@@ -213,7 +216,10 @@ pub fn list_crafts(dir: &Path) -> Vec<CraftEntry> {
             Ok(bytes) => match SavedDocument::from_json(&bytes) {
                 Ok(doc) => match doc.payload {
                     Payload::Craft(c) | Payload::Subassembly(c) | Payload::Blueprint(c) => c.name,
-                    Payload::WorldSave(_) | Payload::BodyAsset(_) | Payload::System(_) => continue,
+                    Payload::WorldSave(_)
+                    | Payload::BodyAsset(_)
+                    | Payload::System(_)
+                    | Payload::VesselRecord(_) => continue,
                 },
                 Err(_) => continue,
             },

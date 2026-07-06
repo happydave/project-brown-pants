@@ -1,0 +1,24 @@
+[package]
+name = "sounding_netclient"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Sounding net-adapter core — render-free client for the universe server (session lifecycle, publish/fetch, ghost store)."
+
+[dependencies]
+# Record types + minting (the wire vocabulary, WI 855). Pulls Bevy sub-crates
+# transitively; rendering-free — `cargo tree -p sounding_netclient` must show no
+# bevy_render/bevy_winit/wgpu (the WI 857 render-free-core constraint for 858).
+sounding_sim = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Blocking HTTP client (the companion's library); all I/O lives on the sync
+# worker thread, never on a frame path.
+ureq = "3"
+# f64 vectors for record positions (same glam the sim re-exports).
+glam = { workspace = true }
+
+[dev-dependencies]
+# In-process server fixture (the WI 856 ephemeral-port pattern).
+sounding_server = { path = "../server" }

@@ -59,6 +59,7 @@ mod input_inject;
 mod land_scene;
 mod materials_scene;
 mod moon_scene;
+mod net;
 mod overlay;
 mod parts;
 mod pause;
@@ -191,7 +192,10 @@ fn main() {
         .add_plugins(SimDiagnosticsPlugin)
         .add_plugins(bus::BusPlugin::default())
         .add_plugins(replay::ReplayPlugin)
-        .add_plugins(debug_control::DebugControlPlugin);
+        .add_plugins(debug_control::DebugControlPlugin)
+        // Multiplayer net adapter (WI 857): dormant unless SOUNDING_SERVER/
+        // SOUNDING_INVITE/SOUNDING_PLAYER are set — single-player is untouched.
+        .add_plugins(net::NetPlugin);
 
     match selected_scene() {
         Scene::Editor => {

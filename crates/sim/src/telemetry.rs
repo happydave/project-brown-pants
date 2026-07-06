@@ -67,6 +67,30 @@ pub struct Telemetry {
     /// line. Additive/serde-defaulted: snapshots without it deserialize to `None`.
     #[serde(default)]
     pub scenario: Option<ScenarioTelemetry>,
+    /// Multiplayer peers (WI 857): the remote vessels this client currently
+    /// materializes as rails ghosts, when the net adapter is connected. Absent
+    /// in single-player / when dormant. Additive/serde-defaulted.
+    #[serde(default)]
+    pub peers: Option<Vec<PeerTelemetry>>,
+}
+
+/// One materialized remote vessel on the bus (WI 857): the data-side view of a
+/// rails ghost, so multiplayer scenes are verifiable over the MCP bridge from
+/// data, not pixels (the aspect's verification culture).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PeerTelemetry {
+    /// Durable vessel instance id (WI 855).
+    pub vessel_id: String,
+    /// Vessel display name.
+    pub name: String,
+    /// Owning player.
+    pub player: String,
+    /// Owner is currently flying it (its record is going stale).
+    pub live: bool,
+    /// The shown record's universe-time stamp (the peer's subspace time).
+    pub stamp: f64,
+    /// Local seconds since the shown record's stamp (staleness).
+    pub stale: f64,
 }
 
 /// The running scenario's readout on the bus (WI 550): which scenario is loaded and
@@ -421,6 +445,7 @@ impl Telemetry {
             marine: None,
             ballast: None,
             scenario: None,
+            peers: None,
         }
     }
 
@@ -476,6 +501,13 @@ impl Telemetry {
     /// Builder-style, mirroring the other additive blocks.
     pub fn with_scenario(mut self, scenario: ScenarioTelemetry) -> Self {
         self.scenario = Some(scenario);
+        self
+    }
+
+    /// Attach the multiplayer peers block (WI 857). Builder-style, mirroring
+    /// the other additive blocks.
+    pub fn with_peers(mut self, peers: Vec<PeerTelemetry>) -> Self {
+        self.peers = Some(peers);
         self
     }
 }
@@ -771,5 +803,40 @@ mod tests {
             r#"{"time":0.0,"warp":1.0,"paused":false,"mu":1.0,"craft":null,"energy_drift":null}"#;
         let snap: Telemetry = serde_json::from_str(legacy).unwrap();
         assert!(snap.thermal.is_none());
+    }
+
+    #[test]
+    fn peers_block_is_additive_and_round_trips() {
+        // WI 857: absent by default (single-player snapshots unchanged), and a
+        // legacy snapshot without it deserializes to None.
+        let clock = SimClock::default();
+        let snap = Telemetry::capture(&clock, None, 1.0, None);
+        assert!(snap.peers.is_none());
+        // House convention for additive blocks: absent = JSON null on encode
+        // (additivity is the *decode* discipline — see the sibling blocks).
+        let value = serde_json::to_value(&snap).unwrap();
+        assert!(value["peers"].is_null());
+        let legacy =
+            r#"{"time":0.0,"warp":1.0,"paused":false,"mu":1.0,"craft":null,"energy_drift":null}"#;
+        let back: Telemetry = serde_json::from_str(legacy).unwrap();
+        assert!(back.peers.is_none());
+
+        // Attached, the ghost rows round-trip exactly.
+        let snap = snap.with_peers(vec![PeerTelemetry {
+            vessel_id: "v-1".into(),
+            name: "Ranger".into(),
+            player: "alice".into(),
+            live: true,
+            stamp: 120.0,
+            stale: 4.5,
+        }]);
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: Telemetry = serde_json::from_str(&json).unwrap();
+        let peers = back.peers.expect("peers attached");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].vessel_id, "v-1");
+        assert_eq!(peers[0].player, "alice");
+        assert!(peers[0].live);
+        assert_eq!(peers[0].stale, 4.5);
     }
 }
