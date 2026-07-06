@@ -53,6 +53,7 @@ live in the project's `tickets` repository under `docs/projects/sounding/`.
 - Build everything: `cargo build`
 - Run the windowed app: `cargo run -p sounding`
 - Run with dev tooling (Bevy Remote Protocol over HTTP): `cargo run -p sounding --features dev`
+- Run the universe server (multiplayer arc, `multiplayer` branch): `cargo run -p sounding_server -- --invite-token <token>` (`--addr`/`--content`/`--ttl`/`--save` optional; wire contract in `crates/server/src/router.rs` docs; LAN threat model — no TLS)
 - Test the headless core (no display required): `cargo test -p sounding_sim`
 - Quality gates: `cargo fmt --all --check` and `cargo clippy --all-targets`
 - Dev-build performance: the dev profile optimizes dependencies and the sim crate (root `Cargo.toml`

@@ -15,7 +15,10 @@
 //! lattice, devices, resource graph, and crew arrive with later toys. So the
 //! payload here is **skeletal and extensible**: it embeds the real WI 497
 //! world-coordinate types plus metadata, and reserves empty, opaque containers
-//! that later toys fill in (a future format-version change).
+//! that later toys fill in. Filling a reserved container that has **never had a
+//! producer** is treated like the additive-variant rule (no format bump — zero
+//! documents exist whose meaning changes; see `WorldPayload::vessels`, WI 856);
+//! a bump remains reserved for reshaping a payload that real documents carry.
 
 use crate::body_asset::BodyAsset;
 use crate::frame::WorldPos;
@@ -107,14 +110,22 @@ impl CraftSubgraph {
     }
 }
 
-/// Reserved, skeletal world-save payload — the same machinery scaled to the
-/// universe, **distinct** from a craft subgraph. Empty at format version 1.
+/// World-save payload — the same machinery scaled to the universe, **distinct**
+/// from a craft subgraph. Skeletal until its reserved containers are consumed.
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub struct WorldPayload {
-    /// On-rails vessels and their orbits, converter timestamps, terrain patches
-    /// (world persistence, later).
+    /// The universe's vessels as [`VesselRecord`]s (WI 856: the universe
+    /// server's table serialized — the multiplayer design's "world-save as the
+    /// snapshot substrate"; content WI 553 composes on this same shape, seam J1).
+    ///
+    /// Typed from the reserved opaque stub **without a format bump**: the
+    /// container never had a producer (verified at WI 856 — no constructor
+    /// outside tests existed), every prior document holds `[]`/absent, which
+    /// decodes identically under both types, so the migration liability is
+    /// exactly zero. Converter timestamps / terrain patches remain future
+    /// world-persistence concerns (WI 553).
     #[serde(default)]
-    pub vessels: Vec<serde_json::Value>,
+    pub vessels: Vec<VesselRecord>,
 }
 
 /// The payload, internally tagged by `kind`. The three craft-scope kinds share
