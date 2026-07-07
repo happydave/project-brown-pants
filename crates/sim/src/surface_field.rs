@@ -18,9 +18,13 @@
 //! **Bounded crater cost (R3).** Craters are a deterministic seed-derived
 //! population addressed by a 3D spatial cell hash. An elevation sample sums only
 //! the craters in the query's own + adjacent cells (a fixed 3×3×3 = 27-cell
-//! neighbourhood); a crater's angular reach is kept below one cell so that
-//! neighbourhood is exact. Per-sample cost is therefore **independent of the
-//! total crater count**.
+//! neighbourhood). The neighbourhood is **exact by construction** (WI 866): a
+//! crater is a *lattice-space* ball around its unnormalized jittered centre, its
+//! reach is strictly below one cell per axis, and its centre lies inside its own
+//! cell — so any crater able to influence a query lives in one of the 27 cells,
+//! and nothing pops in or out as the query crosses a lattice plane. Per-sample
+//! cost is therefore **independent of the total crater count**, and the crater
+//! term is continuous (its profile is exactly zero at reach, rim included).
 
 use crate::body_asset::BodyAsset;
 use crate::surface::SurfaceMaterial;
@@ -165,14 +169,27 @@ impl SurfaceField {
     /// The crater-population elevation delta at a direction (usually a depression).
     /// Sums only craters in the 3×3×3 cell neighbourhood of the query — a fixed,
     /// bounded amount of work regardless of the total crater count.
+    ///
+    /// Continuity (WI 866): the whole per-crater profile is exactly zero at and
+    /// beyond its reach, and influence is measured **in lattice space against the
+    /// unnormalized centre** — a crater's reach (< 1 cell per axis) plus its centre
+    /// lying inside its own cell means every crater that can influence `q` has its
+    /// cell within `floor(q) ± 1`, so the 27-cell window is exact by construction
+    /// and nothing can pop when the query crosses a lattice plane. (Projecting
+    /// centres onto the sphere — the pre-866 behaviour — displaced them radially by
+    /// up to ~1.7 cells and broke exactly that argument.)
     fn crater_delta(&self, d: DVec3) -> f64 {
         let cf = self.crater_freq;
         let q = d * cf;
         let base = q.floor();
-        // A crater's reach is kept under one cell so the 27-cell neighbourhood is
-        // exact (in direction-chord units, a cell spans ~1/cf).
-        let ar_max = 0.9 / cf;
-        let ar_min = 0.3 / cf;
+        // Reach in lattice units, strictly below one cell per axis (see above).
+        let ar_max = 0.9;
+        let ar_min = 0.3;
+        // The rim Gaussian's value at reach (t = 1); subtracted so the rim term is
+        // exactly zero where the crater's influence ends. The coefficient below is
+        // rescaled (0.25 → 0.3163) so the rim's peak height at t ≈ 0.85 is
+        // unchanged by the subtraction.
+        let rim_residual = (-((1.0_f64 - 0.85) / 0.12).powi(2)).exp();
         let mut delta = 0.0;
         for dx in -1..=1 {
             for dy in -1..=1 {
@@ -187,8 +204,12 @@ impl SurfaceField {
                         hash_unit(cx, cy, cz, self.seed ^ 0x22),
                         hash_unit(cx, cy, cz, self.seed ^ 0x33),
                     );
-                    let center = normalize_or_x(c + jitter);
-                    let chord = (d - center).length();
+                    // Lattice-space centre, inside cell `c`. Never projected onto
+                    // the sphere: the crater is a lattice-space ball and the
+                    // surface trace is its intersection with the |q| = cf shell
+                    // (cells whose ball misses the shell contribute nowhere).
+                    let center = c + jitter;
+                    let chord = (q - center).length();
                     let ar = ar_min + (ar_max - ar_min) * hash_unit(cx, cy, cz, self.seed ^ 0x44);
                     if chord >= ar {
                         continue;
@@ -197,10 +218,14 @@ impl SurfaceField {
                     let depth = self.crater_amp
                         * (0.3 + 0.7 * hash_unit(cx, cy, cz, self.seed ^ 0x55))
                         * (ar / ar_max);
-                    // Bowl: −depth at the centre rising to 0 at the rim; plus a
-                    // raised rim bump near t ≈ 0.85.
+                    // Bowl: −depth at the centre rising to exactly 0 at reach; plus
+                    // a raised rim bump near t ≈ 0.85, windowed to exactly 0 at
+                    // reach (the `.max(0.0)` also clips the Gaussian's inner tail,
+                    // where the bowl dominates anyway).
                     let bowl = -depth * (1.0 - t * t);
-                    let rim = 0.25 * depth * (-(((t - 0.85) / 0.12).powi(2))).exp();
+                    let rim = 0.3163
+                        * depth
+                        * ((-((t - 0.85) / 0.12).powi(2)).exp() - rim_residual).max(0.0);
                     delta += bowl + rim;
                 }
             }
@@ -369,6 +394,136 @@ mod tests {
             let delta = (f.elevation(d) - f.elevation(d2)).abs();
             assert!(delta < bound, "seam/discontinuity: Δ={delta} bound={bound}");
         }
+    }
+
+    #[test]
+    fn elevation_is_continuous_across_lattice_planes_and_crater_perimeters() {
+        // WI 866: the field must contain no step anywhere. Historically two defects
+        // in `crater_delta` broke this — craters popping in/out of the 27-cell
+        // window on lattice-plane crossings (whole-bowl steps, km-scale), and the
+        // rim term hard-truncated at reach (~5% of depth around every perimeter).
+        // March a great-circle arc at ~1.5 m spacing through a window known to
+        // cross several lattice planes and many crater perimeters; a continuous
+        // field changes < 10 m per step (measured smooth-field rate is < ~2 m),
+        // while either defect class exceeded 80 m.
+        fn rotate(v: DVec3, axis: DVec3, ang: f64) -> DVec3 {
+            v * ang.cos() + axis.cross(v) * ang.sin() + axis * axis.dot(v) * (1.0 - ang.cos())
+        }
+        for seed in [7u64, 11] {
+            let f = SurfaceField::new(seed, 730_000.0);
+            let start = DVec3::new(0.3, -0.9, 0.2).normalize();
+            let axis = start.cross(DVec3::Y).normalize();
+            let step = 2.0e-6; // rad ≈ 1.5 m of arc on this body
+            let (a0, a1) = (0.55_f64, 0.75_f64);
+            let n = ((a1 - a0) / step) as usize;
+            let mut prev_d = rotate(start, axis, a0);
+            let mut prev_e = f.elevation(prev_d);
+            let mut planes_crossed = 0u32;
+            let mut crater_samples = 0u32;
+            let mut violations: Vec<String> = Vec::new();
+            let (mut within_cell, mut on_plane) = (0u32, 0u32);
+            for i in 1..=n {
+                let d = rotate(start, axis, a0 + i as f64 * step);
+                let e = f.elevation(d);
+                assert!(
+                    e.abs() <= f.relief_bound(),
+                    "relief_bound violated: |{e}| > {} (seed {seed})",
+                    f.relief_bound()
+                );
+                let cell_a = (prev_d * f.crater_freq).floor();
+                let cell_b = (d * f.crater_freq).floor();
+                if cell_a != cell_b {
+                    planes_crossed += 1;
+                }
+                if f.crater_delta(d) < 0.0 {
+                    crater_samples += 1;
+                }
+                let de = (e - prev_e).abs();
+                if de > 10.0 {
+                    // Report up to 4 per class so both defect habitats stay visible
+                    // in a failure (within-cell hits are far denser than pops).
+                    let (class, count) = if cell_a == cell_b {
+                        ("within-cell (rim truncation)", &mut within_cell)
+                    } else {
+                        ("lattice-plane (membership pop)", &mut on_plane)
+                    };
+                    *count += 1;
+                    if *count <= 4 {
+                        violations.push(format!(
+                            "seed {seed} ang {:.6}: Δ={de:.1} m — {class}",
+                            a0 + i as f64 * step
+                        ));
+                    }
+                }
+                prev_d = d;
+                prev_e = e;
+            }
+            // Coverage guards: the march must actually exercise both defect
+            // habitats, or a constant change could quietly hollow the test out.
+            assert!(
+                planes_crossed >= 3,
+                "arc no longer crosses lattice planes (crossed {planes_crossed}); re-site it"
+            );
+            assert!(
+                crater_samples > 0,
+                "arc no longer passes through craters; re-site it"
+            );
+            assert!(
+                violations.is_empty(),
+                "elevation steps detected ({within_cell} within-cell, {on_plane} on-plane):\n{}",
+                violations.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn a_crater_profile_has_no_step_at_its_perimeter() {
+        // WI 866 fix B: the rim term is windowed to exactly zero at reach, so
+        // marching out of a crater must show no step — only smooth slope. Find a
+        // crater (same search as the bowl test), then march a tangent ray from its
+        // centre through the perimeter at ~7 cm arc steps; the crater term may not
+        // change faster than a smooth-slope bound per step. Pre-866 the truncated
+        // rim Gaussian left an ~5%-of-depth cliff exactly at the perimeter.
+        let f = SurfaceField::new(77, 2_000_000.0);
+        let mut center = None;
+        'search: for ix in 10..18 {
+            for iy in -3..=3 {
+                for iz in -3..=3 {
+                    if hash_unit(ix, iy, iz, f.seed ^ 0x00C0_FFEE) >= CRATER_DENSITY {
+                        continue;
+                    }
+                    let jitter = DVec3::new(
+                        hash_unit(ix, iy, iz, f.seed ^ 0x11),
+                        hash_unit(ix, iy, iz, f.seed ^ 0x22),
+                        hash_unit(ix, iy, iz, f.seed ^ 0x33),
+                    );
+                    let c = normalize_or_x(DVec3::new(ix as f64, iy as f64, iz as f64) + jitter);
+                    if c.x > 0.5 && f.crater_delta(c) < 0.0 {
+                        center = Some(c);
+                        break 'search;
+                    }
+                }
+            }
+        }
+        let center = center.expect("expected to find a crater near +X for this seed");
+        let (t1, _) = tangent_basis(center);
+        // 0.1 rad ≫ the maximum possible reach (0.9 lattice units / cf ≈ 0.064 rad),
+        // so the march provably crosses the perimeter.
+        let step = 1.0e-6;
+        let mut prev = f.crater_delta(center);
+        let mut max_step = 0.0_f64;
+        for i in 1..=100_000 {
+            let d = normalize_or_x(center + t1 * (i as f64 * step));
+            let cur = f.crater_delta(d);
+            max_step = max_step.max((cur - prev).abs());
+            prev = cur;
+        }
+        // Smooth-slope budget: the steepest crater wall moves the term well under
+        // 1 m per 1e-6 rad; the pre-fix perimeter cliff was 80–330 m in one step.
+        assert!(
+            max_step < 5.0,
+            "crater term stepped {max_step} m in one ~7 cm sample — perimeter discontinuity"
+        );
     }
 
     #[test]

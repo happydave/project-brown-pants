@@ -987,9 +987,15 @@ mod tests {
             .filter(|s| s.fine.level >= 8 && s.level_delta == 1)
             .max_by(|a, b| a.gap_m.total_cmp(&b.gap_m))
             .expect("fine-level fine/coarse samples exist at the known-bad pose");
+        // Magnitude floor re-anchored by WI 866: the original 10 m gate rode on a
+        // ~1 360 m raw step that was really a crater-cliff *field discontinuity*
+        // (WI 866's defect), not LOD geometry. On the continuous field the raw
+        // fine-level odd-vertex step at this pose is ~1.6 m — still well above the
+        // oracle's numeric noise, and the relative-agreement check below is the
+        // real sensitivity assertion.
         assert!(
-            w.gap_m > 10.0,
-            "un-morphed odd-vertex step must be large (blind oracle read ~2 m); got {:.2} m",
+            w.gap_m > 1.0,
+            "un-morphed odd-vertex step must be non-trivial; got {:.2} m",
             w.gap_m
         );
         // Independent recompute: find the odd vertex's grid position on its edge,
