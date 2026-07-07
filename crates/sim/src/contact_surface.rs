@@ -186,20 +186,34 @@ mod tests {
 
     #[test]
     fn patch_curves_away_from_the_origin() {
-        // On (near-)flat relief the ground drops ~ −d²/(2R) with horizontal distance
-        // d — the sphere curving away under the tangent plane.
+        // The ground drops away with horizontal distance d — the sphere curving
+        // under the tangent plane (a flat-plane patch would show no such drop).
+        // Asserted in the regime where curvature *provably* dominates terrain:
+        // with the exact spherical drop D(d) = R·(1 − 1/√(1+(d/R)²)) and
+        // |elevation| ≤ relief_bound everywhere, observed ≥ D − 2·relief_bound
+        // holds for any relief whatsoever, and the in-test regime guard
+        // D > 4·relief_bound makes that bound strictly beyond anything a flat
+        // patch could show (≤ 2·relief_bound). (The original small-d fixture rode
+        // on seed-0 luck — 1 km of curvature on this body is 0.5 m, far below
+        // ordinary relief slopes — and died when WI 782 reshaped the terrain.
+        // The small-angle d²/2R form overstates D by ~10% at these offsets, so
+        // the exact form is used.)
         let field = SurfaceField::new(0, 1_000_000.0);
         let patch = SurfacePatch::new(field, DVec3::Y);
         let r = field.radius();
-        for d in [1_000.0, 5_000.0, 20_000.0] {
-            let h0 = patch.height(0.0, 0.0);
-            let hd = patch.height(d, 0.0);
-            let curvature_drop = d * d / (2.0 * r);
-            // The drop is dominated by curvature (relief adds noise, so allow slack).
-            let observed_drop = h0 - hd;
+        let rb = field.relief_bound();
+        let d_regime = 1.25 * (2.0 * r * 4.0 * rb).sqrt();
+        for d in [d_regime, 2.0 * d_regime] {
+            let exact_drop = r * (1.0 - 1.0 / (1.0 + (d / r).powi(2)).sqrt());
             assert!(
-                observed_drop > 0.5 * curvature_drop,
-                "d={d}: expected ~{curvature_drop} drop, got {observed_drop}"
+                exact_drop > 4.0 * rb,
+                "d={d} is below the provable regime (drop {exact_drop} ≤ 4·{rb})"
+            );
+            let observed_drop = patch.height(0.0, 0.0) - patch.height(d, 0.0);
+            assert!(
+                observed_drop > exact_drop - 2.0 * rb,
+                "d={d}: expected ≥ {} drop, got {observed_drop}",
+                exact_drop - 2.0 * rb
             );
         }
     }

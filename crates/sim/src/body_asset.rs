@@ -55,10 +55,11 @@ impl Rotation {
 
 /// The recipe a body's procedural surface is generated from.
 ///
-/// At WI 760 only the master `seed` is load-bearing; the terrain/crater/material
-/// parameter areas are **reserved** (opaque, defaulted on load) for WI 763 to
-/// define, following the reserved-container idiom of [`crate::persist`]. This lets
-/// the surface-field work item populate them without a format-version bump.
+/// At WI 760 only the master `seed` was load-bearing; the terrain/crater/material
+/// parameter areas were **reserved** (opaque, defaulted on load), following the
+/// reserved-container idiom of [`crate::persist`], so surface work items could
+/// populate them without a format-version bump. WI 782 defined the `crater` area
+/// (see its field doc); `terrain` and `material` remain reserved.
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub struct SurfaceRecipe {
     /// Master seed — the deterministic source of the whole surface (same seed ⇒
@@ -67,7 +68,11 @@ pub struct SurfaceRecipe {
     /// Reserved: base-terrain noise parameters (WI 763).
     #[serde(default)]
     pub terrain: serde_json::Value,
-    /// Reserved: crater-population parameters (WI 763).
+    /// Crater-population parameters (defined by WI 782; reserved since WI 763).
+    /// Read leniently by `surface_field::CraterParams::from_value` — recognized
+    /// keys are `"density"` and `"depth"` (global multipliers over the crater
+    /// octave table, clamped to `[0, 4]`); anything absent or malformed means
+    /// defaults, so pre-782 assets read unchanged (no format bump).
     #[serde(default)]
     pub crater: serde_json::Value,
     /// Reserved: surface-material field parameters (WI 763).

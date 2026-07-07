@@ -16,15 +16,23 @@
 //! in the field itself.
 //!
 //! **Bounded crater cost (R3).** Craters are a deterministic seed-derived
-//! population addressed by a 3D spatial cell hash. An elevation sample sums only
-//! the craters in the query's own + adjacent cells (a fixed 3×3×3 = 27-cell
-//! neighbourhood). The neighbourhood is **exact by construction** (WI 866): a
-//! crater is a *lattice-space* ball around its unnormalized jittered centre, its
-//! reach is strictly below one cell per axis, and its centre lies inside its own
-//! cell — so any crater able to influence a query lives in one of the 27 cells,
-//! and nothing pops in or out as the query crosses a lattice plane. Per-sample
-//! cost is therefore **independent of the total crater count**, and the crater
-//! term is continuous (its profile is exactly zero at reach, rim included).
+//! population addressed by 3D spatial cell hashes — since WI 782 a small fixed
+//! set of **octaves** ([`CRATER_OCTAVES`]: large/sparse/deep, medium, small/
+//! dense/shallow) on **pairwise-incommensurate lattice frequencies**, so no two
+//! octaves' cell periods align and the population reads as a natural
+//! distribution instead of a single lattice's rows/chains. An elevation sample
+//! sums, per octave, only the query's own + adjacent cells (a fixed 3×3×3 =
+//! 27-cell neighbourhood). Each neighbourhood is **exact by construction**
+//! (WI 866, held per octave): a crater is a *lattice-space* ball around its
+//! unnormalized jittered centre, its reach is strictly below one cell per axis,
+//! and its centre lies inside its own cell — so any crater able to influence a
+//! query lives in one of the 27 cells, and nothing pops in or out as the query
+//! crosses a lattice plane. Per-sample cost is therefore a constant (octaves ×
+//! 27 cells), **independent of the total crater count**, and the crater term is
+//! continuous (every profile exactly zero at reach, rim included). Per-body
+//! crater **density/depth multipliers** ([`CraterParams`]) ride the reserved
+//! `SurfaceRecipe.crater` area (lenient parse, defaults on anything absent or
+//! malformed — no persistence-format change).
 
 use crate::body_asset::BodyAsset;
 use crate::surface::SurfaceMaterial;
@@ -32,8 +40,95 @@ use glam::DVec3;
 
 /// Domain-warp strength (fraction of a base-frequency cell).
 const WARP_STRENGTH: f64 = 0.35;
-/// Probability that a crater cell contains a crater.
-const CRATER_DENSITY: f64 = 0.45;
+
+/// One crater population: a lattice of jittered-centre bowls at its own frequency,
+/// evaluated by the shared WI 866 mechanism (see [`SurfaceField::crater_delta`]).
+#[derive(Clone, Copy, Debug)]
+struct CraterOctave {
+    /// Lattice frequency (cells across the direction sphere). Frequencies are
+    /// **pairwise incommensurate** across the table (non-integer ratios) so no two
+    /// octaves' lattice periods or plane families align — the WI 782 anti-grid
+    /// property (a single lattice reads as rows/chains of same-sized craters).
+    freq: f64,
+    /// Per-cell crater probability, before the per-body density multiplier.
+    density: f64,
+    /// Reach span in lattice units. `reach_max` strictly below 1 keeps the
+    /// 27-cell window exact per axis (the WI 866 invariant, per octave).
+    reach_min: f64,
+    reach_max: f64,
+    /// Depth scale as a fraction of the body's relief amplitude.
+    depth_frac: f64,
+}
+
+/// The default crater populations (WI 782): large/sparse/deep basins, the
+/// familiar medium scale (WI 763's original ~14), and small/dense/shallow
+/// texture craters. The summed `depth_frac` is [`CRATER_TOTAL_DEPTH_FRAC`],
+/// the crater half of [`SurfaceField::relief_bound`]'s budget.
+const CRATER_OCTAVES: [CraterOctave; 3] = [
+    CraterOctave {
+        freq: 6.3,
+        density: 0.30,
+        reach_min: 0.35,
+        reach_max: 0.9,
+        depth_frac: 0.50,
+    },
+    CraterOctave {
+        freq: 14.0,
+        density: 0.45,
+        reach_min: 0.3,
+        reach_max: 0.9,
+        depth_frac: 0.40,
+    },
+    CraterOctave {
+        freq: 29.7,
+        density: 0.55,
+        reach_min: 0.3,
+        reach_max: 0.9,
+        depth_frac: 0.15,
+    },
+];
+
+/// Σ `depth_frac` over [`CRATER_OCTAVES`] — the crater relief budget.
+const CRATER_TOTAL_DEPTH_FRAC: f64 = 0.50 + 0.40 + 0.15;
+
+/// Per-body crater parameters (WI 782), read from the **reserved**
+/// `SurfaceRecipe.crater` area (a defaulted `serde_json::Value`, so no
+/// persistence-format change). Lenient: absent / null / non-object values and
+/// missing or non-numeric keys all fall back to defaults; recognized keys are
+/// `"density"` and `"depth"` — global multipliers over the octave table, each
+/// clamped to `[0, 4]`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CraterParams {
+    /// Multiplier on every octave's per-cell crater probability (default 1).
+    pub density: f64,
+    /// Multiplier on every octave's depth scale (default 1).
+    pub depth: f64,
+}
+
+impl Default for CraterParams {
+    fn default() -> Self {
+        Self {
+            density: 1.0,
+            depth: 1.0,
+        }
+    }
+}
+
+impl CraterParams {
+    /// Parses the reserved recipe area. Never fails; anything unrecognized
+    /// yields the default for that key.
+    pub fn from_value(v: &serde_json::Value) -> Self {
+        let get = |key: &str| {
+            v.get(key)
+                .and_then(|x| x.as_f64())
+                .map(|x| x.clamp(0.0, 4.0))
+        };
+        Self {
+            density: get("density").unwrap_or(1.0),
+            depth: get("depth").unwrap_or(1.0),
+        }
+    }
+}
 
 /// A deterministic surface field for one body, derived from its seed and radius.
 #[derive(Clone, Copy, Debug)]
@@ -45,10 +140,8 @@ pub struct SurfaceField {
     amplitude: f64,
     /// Base terrain noise frequency (feature count across the sphere).
     base_freq: f64,
-    /// Crater lattice frequency (cells across the direction sphere).
-    crater_freq: f64,
-    /// Crater depth scale, metres.
-    crater_amp: f64,
+    /// Per-body crater multipliers over [`CRATER_OCTAVES`] (WI 782).
+    crater: CraterParams,
 }
 
 /// A surface sample: elevation (metres, relative to the reference radius) and the
@@ -62,21 +155,31 @@ pub struct SurfaceSample {
 }
 
 impl SurfaceField {
-    /// Builds the field for `asset` from its `surface.seed` and `radius`.
+    /// Builds the field for `asset` from its `surface.seed`, `radius`, and the
+    /// (reserved-area) crater parameters (WI 782).
     pub fn from_asset(asset: &BodyAsset) -> Self {
-        Self::new(asset.surface.seed, asset.radius)
+        Self::with_crater_params(
+            asset.surface.seed,
+            asset.radius,
+            CraterParams::from_value(&asset.surface.crater),
+        )
     }
 
-    /// Builds a field from an explicit seed and reference radius (metres).
+    /// Builds a field from an explicit seed and reference radius (metres), with
+    /// the default crater configuration.
     pub fn new(seed: u64, radius: f64) -> Self {
+        Self::with_crater_params(seed, radius, CraterParams::default())
+    }
+
+    /// Builds a field with explicit per-body crater multipliers (WI 782).
+    pub fn with_crater_params(seed: u64, radius: f64, crater: CraterParams) -> Self {
         let amplitude = (radius.abs() * 0.015).clamp(300.0, 9_000.0);
         Self {
             seed,
             radius: radius.abs().max(1.0),
             amplitude,
             base_freq: 2.5,
-            crater_freq: 14.0,
-            crater_amp: amplitude * 0.7,
+            crater,
         }
     }
 
@@ -86,10 +189,11 @@ impl SurfaceField {
     }
 
     /// A conservative bound on `|elevation|` anywhere on the body, metres — the sum
-    /// of the terrain and crater amplitude scales. Lets distance tests bracket the
+    /// of the terrain amplitude and the crater relief budget (every octave's depth
+    /// scale, times the per-body depth multiplier). Lets distance tests bracket the
     /// surface without sampling the field (used by the LOD split pre-test, WI 795).
     pub fn relief_bound(&self) -> f64 {
-        self.amplitude + self.crater_amp
+        self.amplitude * (1.0 + CRATER_TOTAL_DEPTH_FRAC * self.crater.depth)
     }
 
     /// Elevation (metres, relative to the reference radius) at a direction from the
@@ -166,25 +270,39 @@ impl SurfaceField {
         }
     }
 
-    /// The crater-population elevation delta at a direction (usually a depression).
-    /// Sums only craters in the 3×3×3 cell neighbourhood of the query — a fixed,
-    /// bounded amount of work regardless of the total crater count.
-    ///
-    /// Continuity (WI 866): the whole per-crater profile is exactly zero at and
-    /// beyond its reach, and influence is measured **in lattice space against the
-    /// unnormalized centre** — a crater's reach (< 1 cell per axis) plus its centre
-    /// lying inside its own cell means every crater that can influence `q` has its
-    /// cell within `floor(q) ± 1`, so the 27-cell window is exact by construction
-    /// and nothing can pop when the query crosses a lattice plane. (Projecting
-    /// centres onto the sphere — the pre-866 behaviour — displaced them radially by
-    /// up to ~1.7 cells and broke exactly that argument.)
+    /// The crater-population elevation delta at a direction (usually a depression):
+    /// the sum of the [`CRATER_OCTAVES`] populations (WI 782). Per-sample cost is a
+    /// constant — octave count × 27 cells — independent of the total crater count.
     fn crater_delta(&self, d: DVec3) -> f64 {
-        let cf = self.crater_freq;
-        let q = d * cf;
+        let mut delta = 0.0;
+        for (i, o) in CRATER_OCTAVES.iter().enumerate() {
+            delta += self.octave_delta(d, i as u64, o);
+        }
+        delta
+    }
+
+    /// One octave's crater delta — the WI 866 mechanism at the octave's own
+    /// lattice frequency with an octave-salted hash stream.
+    ///
+    /// Continuity (WI 866, held per octave): the whole per-crater profile is
+    /// exactly zero at and beyond its reach, and influence is measured **in
+    /// lattice space against the unnormalized centre** — a crater's reach
+    /// (< 1 cell per axis) plus its centre lying inside its own cell means every
+    /// crater that can influence `q` has its cell within `floor(q) ± 1`, so the
+    /// 27-cell window is exact by construction and nothing can pop when the query
+    /// crosses a lattice plane. (Projecting centres onto the sphere — the pre-866
+    /// behaviour — displaced them radially by up to ~1.7 cells and broke exactly
+    /// that argument.)
+    fn octave_delta(&self, d: DVec3, index: u64, o: &CraterOctave) -> f64 {
+        // Independent population per octave: salt the seed before the existing
+        // per-purpose XORs so octave hash streams don't correlate.
+        let oseed = self
+            .seed
+            .wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(index + 1));
+        let q = d * o.freq;
         let base = q.floor();
-        // Reach in lattice units, strictly below one cell per axis (see above).
-        let ar_max = 0.9;
-        let ar_min = 0.3;
+        let density = (o.density * self.crater.density).min(1.0);
+        let amp = self.amplitude * o.depth_frac * self.crater.depth;
         // The rim Gaussian's value at reach (t = 1); subtracted so the rim term is
         // exactly zero where the crater's influence ends. The coefficient below is
         // rescaled (0.25 → 0.3163) so the rim's peak height at t ≈ 0.85 is
@@ -196,28 +314,29 @@ impl SurfaceField {
                 for dz in -1..=1 {
                     let c = base + DVec3::new(dx as f64, dy as f64, dz as f64);
                     let (cx, cy, cz) = (c.x as i64, c.y as i64, c.z as i64);
-                    if hash_unit(cx, cy, cz, self.seed ^ 0x00C0_FFEE) >= CRATER_DENSITY {
+                    if hash_unit(cx, cy, cz, oseed ^ 0x00C0_FFEE) >= density {
                         continue;
                     }
                     let jitter = DVec3::new(
-                        hash_unit(cx, cy, cz, self.seed ^ 0x11),
-                        hash_unit(cx, cy, cz, self.seed ^ 0x22),
-                        hash_unit(cx, cy, cz, self.seed ^ 0x33),
+                        hash_unit(cx, cy, cz, oseed ^ 0x11),
+                        hash_unit(cx, cy, cz, oseed ^ 0x22),
+                        hash_unit(cx, cy, cz, oseed ^ 0x33),
                     );
                     // Lattice-space centre, inside cell `c`. Never projected onto
                     // the sphere: the crater is a lattice-space ball and the
-                    // surface trace is its intersection with the |q| = cf shell
+                    // surface trace is its intersection with the |q| = freq shell
                     // (cells whose ball misses the shell contribute nowhere).
                     let center = c + jitter;
                     let chord = (q - center).length();
-                    let ar = ar_min + (ar_max - ar_min) * hash_unit(cx, cy, cz, self.seed ^ 0x44);
+                    let ar = o.reach_min
+                        + (o.reach_max - o.reach_min) * hash_unit(cx, cy, cz, oseed ^ 0x44);
                     if chord >= ar {
                         continue;
                     }
                     let t = chord / ar;
-                    let depth = self.crater_amp
-                        * (0.3 + 0.7 * hash_unit(cx, cy, cz, self.seed ^ 0x55))
-                        * (ar / ar_max);
+                    let depth = amp
+                        * (0.3 + 0.7 * hash_unit(cx, cy, cz, oseed ^ 0x55))
+                        * (ar / o.reach_max);
                     // Bowl: −depth at the centre rising to exactly 0 at reach; plus
                     // a raised rim bump near t ≈ 0.85, windowed to exactly 0 at
                     // reach (the `.max(0.0)` also clips the Gaussian's inner tail,
@@ -409,6 +528,9 @@ mod tests {
         fn rotate(v: DVec3, axis: DVec3, ang: f64) -> DVec3 {
             v * ang.cos() + axis.cross(v) * ang.sin() + axis * axis.dot(v) * (1.0 - ang.cos())
         }
+        // Count lattice-plane crossings against the finest octave (most planes);
+        // any octave's planes are the pop habitat the fix must keep closed.
+        let finest = CRATER_OCTAVES[CRATER_OCTAVES.len() - 1].freq;
         for seed in [7u64, 11] {
             let f = SurfaceField::new(seed, 730_000.0);
             let start = DVec3::new(0.3, -0.9, 0.2).normalize();
@@ -430,8 +552,8 @@ mod tests {
                     "relief_bound violated: |{e}| > {} (seed {seed})",
                     f.relief_bound()
                 );
-                let cell_a = (prev_d * f.crater_freq).floor();
-                let cell_b = (d * f.crater_freq).floor();
+                let cell_a = (prev_d * finest).floor();
+                let cell_b = (d * finest).floor();
                 if cell_a != cell_b {
                     planes_crossed += 1;
                 }
@@ -476,39 +598,54 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_crater_profile_has_no_step_at_its_perimeter() {
-        // WI 866 fix B: the rim term is windowed to exactly zero at reach, so
-        // marching out of a crater must show no step — only smooth slope. Find a
-        // crater (same search as the bowl test), then march a tangent ray from its
-        // centre through the perimeter at ~7 cm arc steps; the crater term may not
-        // change faster than a smooth-slope bound per step. Pre-866 the truncated
-        // rim Gaussian left an ~5%-of-depth cliff exactly at the perimeter.
-        let f = SurfaceField::new(77, 2_000_000.0);
-        let mut center = None;
-        'search: for ix in 10..18 {
+    /// Finds (near +X) the projected centre of a crater from octave `index` whose
+    /// lattice ball reaches the sphere shell — the shared search for the
+    /// perimeter/bowl tests, re-anchored from the single-lattice WI 866 form to
+    /// the octave table (WI 782). The scan range covers the octave's shell radius.
+    fn find_octave_crater(f: &SurfaceField, index: usize) -> Option<DVec3> {
+        let o = &CRATER_OCTAVES[index];
+        let oseed = f
+            .seed
+            .wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(index as u64 + 1));
+        let shell = o.freq.round() as i64;
+        for ix in (shell - 4)..(shell + 4) {
             for iy in -3..=3 {
                 for iz in -3..=3 {
-                    if hash_unit(ix, iy, iz, f.seed ^ 0x00C0_FFEE) >= CRATER_DENSITY {
+                    if hash_unit(ix, iy, iz, oseed ^ 0x00C0_FFEE)
+                        >= (o.density * f.crater.density).min(1.0)
+                    {
                         continue;
                     }
                     let jitter = DVec3::new(
-                        hash_unit(ix, iy, iz, f.seed ^ 0x11),
-                        hash_unit(ix, iy, iz, f.seed ^ 0x22),
-                        hash_unit(ix, iy, iz, f.seed ^ 0x33),
+                        hash_unit(ix, iy, iz, oseed ^ 0x11),
+                        hash_unit(ix, iy, iz, oseed ^ 0x22),
+                        hash_unit(ix, iy, iz, oseed ^ 0x33),
                     );
                     let c = normalize_or_x(DVec3::new(ix as f64, iy as f64, iz as f64) + jitter);
-                    if c.x > 0.5 && f.crater_delta(c) < 0.0 {
-                        center = Some(c);
-                        break 'search;
+                    if c.x > 0.5 && f.octave_delta(c, index as u64, o) < 0.0 {
+                        return Some(c);
                     }
                 }
             }
         }
-        let center = center.expect("expected to find a crater near +X for this seed");
+        None
+    }
+
+    #[test]
+    fn a_crater_profile_has_no_step_at_its_perimeter() {
+        // WI 866 fix B: the rim term is windowed to exactly zero at reach, so
+        // marching out of a crater must show no step — only smooth slope. Find a
+        // medium-octave crater, then march a tangent ray from its centre through
+        // the perimeter at ~7 cm arc steps; the whole crater term (all octaves —
+        // the march inevitably crosses other octaves' perimeters too) may not
+        // change faster than a smooth-slope bound per step. Pre-866 the truncated
+        // rim Gaussian left an ~5%-of-depth cliff exactly at the perimeter.
+        let f = SurfaceField::new(77, 2_000_000.0);
+        let center = find_octave_crater(&f, 1).expect("expected to find a medium crater near +X");
         let (t1, _) = tangent_basis(center);
-        // 0.1 rad ≫ the maximum possible reach (0.9 lattice units / cf ≈ 0.064 rad),
-        // so the march provably crosses the perimeter.
+        // 0.1 rad ≫ the medium octave's maximum reach (0.9 lattice units / 14
+        // ≈ 0.064 rad), so the march provably crosses that crater's perimeter
+        // (and, incidentally, other octaves' perimeters along the way).
         let step = 1.0e-6;
         let mut prev = f.crater_delta(center);
         let mut max_step = 0.0_f64;
@@ -535,57 +672,147 @@ mod tests {
         }
         // Sparse + local: some directions sit in a crater (delta < 0), others sit
         // in none (delta == 0). If every sample summed all craters this couldn't
-        // hold — it demonstrates the bounded local query.
-        let has_crater = dirs().iter().any(|&d| f.crater_delta(d) < 0.0);
-        let no_crater = dirs().iter().any(|&d| f.crater_delta(d) == 0.0);
-        assert!(has_crater, "expected at least one crater among the samples");
+        // hold — it demonstrates the bounded local query. Checked per octave since
+        // WI 782: three overlapping populations legitimately leave few *totally*
+        // crater-free directions, but each octave must still be sparse and local.
+        for (i, o) in CRATER_OCTAVES.iter().enumerate() {
+            let has_crater = dirs().iter().any(|&d| f.octave_delta(d, i as u64, o) < 0.0);
+            let no_crater = dirs()
+                .iter()
+                .any(|&d| f.octave_delta(d, i as u64, o) == 0.0);
+            assert!(
+                has_crater,
+                "octave {i}: expected at least one crater among the samples"
+            );
+            assert!(
+                no_crater,
+                "octave {i}: expected at least one crater-free sample (locality)"
+            );
+        }
+    }
+
+    #[test]
+    fn octave_table_upholds_the_bounded_cost_and_exactness_invariants() {
+        // WI 782 config-validity guard: the numeric preconditions of the WI 866
+        // exactness argument (reach < 1 cell per axis; centres in-cell comes from
+        // hash_unit ∈ [0,1)) and the R3 bounded cost (small fixed octave count)
+        // must hold for the octave table, or the lattice-plane pops return.
         assert!(
-            no_crater,
-            "expected at least one crater-free sample (locality)"
+            (1..=4).contains(&CRATER_OCTAVES.len()),
+            "octave count must stay small and fixed (R3)"
         );
+        let mut depth_total = 0.0;
+        for o in &CRATER_OCTAVES {
+            assert!(o.reach_max < 1.0, "reach must stay under one lattice cell");
+            assert!(0.0 < o.reach_min && o.reach_min < o.reach_max);
+            assert!(0.0 < o.density && o.density <= 1.0);
+            assert!(o.depth_frac > 0.0);
+            depth_total += o.depth_frac;
+        }
+        assert!(
+            (depth_total - CRATER_TOTAL_DEPTH_FRAC).abs() < 1e-12,
+            "relief budget constant must match the table"
+        );
+        // Anti-grid: frequencies pairwise incommensurate (no near-integer ratio),
+        // and the finest octave's craters stay km-scale (rim ≫ render grid — the
+        // WI 781 faceting-regression floor).
+        for (i, a) in CRATER_OCTAVES.iter().enumerate() {
+            for (j, b) in CRATER_OCTAVES.iter().enumerate().skip(i + 1) {
+                let r = b.freq / a.freq;
+                assert!(
+                    (r - r.round()).abs() > 0.05,
+                    "octave frequencies {i}/{j} must have a non-integer ratio (got {r})"
+                );
+            }
+        }
+        assert!(CRATER_OCTAVES[CRATER_OCTAVES.len() - 1].freq <= 32.0);
+    }
+
+    #[test]
+    fn crater_params_parse_leniently_and_apply() {
+        // Parse: defaults for anything absent/null/garbage; clamped multipliers.
+        assert_eq!(
+            CraterParams::from_value(&serde_json::Value::Null),
+            CraterParams::default()
+        );
+        assert_eq!(
+            CraterParams::from_value(&serde_json::json!({"bogus": 3, "density": "x"})),
+            CraterParams::default()
+        );
+        assert_eq!(
+            CraterParams::from_value(&serde_json::json!({"density": 0.5, "depth": 2.0})),
+            CraterParams {
+                density: 0.5,
+                depth: 2.0
+            }
+        );
+        assert_eq!(
+            CraterParams::from_value(&serde_json::json!({"density": -5.0, "depth": 99.0})),
+            CraterParams {
+                density: 0.0,
+                depth: 4.0
+            }
+        );
+
+        // An asset with an untouched (reserved/empty) crater area builds a field
+        // identical to the default constructor.
+        let mut asset = BodyAsset::earthlike();
+        asset.surface.seed = 42;
+        asset.radius = 1_500_000.0;
+        let from_asset = SurfaceField::from_asset(&asset);
+        let plain = SurfaceField::new(42, 1_500_000.0);
+        for d in dirs() {
+            assert_eq!(from_asset.elevation(d), plain.elevation(d));
+        }
+
+        // Density multiplier 0 ⇒ a craterless (but still continuous) body.
+        asset.surface.crater = serde_json::json!({"density": 0.0});
+        let craterless = SurfaceField::from_asset(&asset);
+        for d in dirs() {
+            assert_eq!(craterless.crater_delta(d), 0.0);
+        }
+
+        // Depth multiplier scales the crater term linearly where it is nonzero.
+        asset.surface.crater = serde_json::json!({"depth": 2.0});
+        let deep = SurfaceField::from_asset(&asset);
+        let mut checked = 0;
+        for d in dirs() {
+            let base = plain.crater_delta(d);
+            if base != 0.0 {
+                let scaled = deep.crater_delta(d);
+                assert!(
+                    (scaled - 2.0 * base).abs() <= 1e-9 * base.abs(),
+                    "depth multiplier must scale the crater term ({base} -> {scaled})"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 0,
+            "expected in-crater samples for the depth check"
+        );
+        // And the relief bound follows the depth multiplier.
+        assert!(deep.relief_bound() > plain.relief_bound());
     }
 
     #[test]
     fn a_crater_centre_is_depressed_below_its_rim() {
-        // Find a cell with a crater near +X, take its centre, and confirm the centre
-        // is lower than a point out near the rim (a bowl).
+        // Find a medium-octave crater near +X and confirm its centre is lower than
+        // a point out near the rim (a bowl). Compared on the octave's own delta so
+        // another octave's overlapping slope can't mask the shape (WI 782
+        // re-anchor of the single-lattice original).
         let f = SurfaceField::new(77, 2_000_000.0);
-        let cf = f.crater_freq;
-        let mut found = false;
-        'search: for ix in 10..18 {
-            for iy in -3..=3 {
-                for iz in -3..=3 {
-                    if hash_unit(ix, iy, iz, f.seed ^ 0x00C0_FFEE) >= CRATER_DENSITY {
-                        continue;
-                    }
-                    let jitter = DVec3::new(
-                        hash_unit(ix, iy, iz, f.seed ^ 0x11),
-                        hash_unit(ix, iy, iz, f.seed ^ 0x22),
-                        hash_unit(ix, iy, iz, f.seed ^ 0x33),
-                    );
-                    let center =
-                        normalize_or_x(DVec3::new(ix as f64, iy as f64, iz as f64) + jitter);
-                    // Only accept centres actually near +X so `cf` scaling lines up.
-                    if center.x < 0.5 {
-                        continue;
-                    }
-                    let center_delta = f.crater_delta(center);
-                    if center_delta < 0.0 {
-                        // A ring point ~0.6 of the max radius away, along a tangent.
-                        let (t1, _) = tangent_basis(center);
-                        let ring = normalize_or_x(center + t1 * (0.6 * 0.9 / cf));
-                        assert!(
-                            center_delta < f.crater_delta(ring),
-                            "centre {center_delta} must be below ring {}",
-                            f.crater_delta(ring)
-                        );
-                        found = true;
-                        break 'search;
-                    }
-                }
-            }
-        }
-        assert!(found, "expected to find a crater near +X for this seed");
+        let o = &CRATER_OCTAVES[1];
+        let center = find_octave_crater(&f, 1).expect("expected to find a medium crater near +X");
+        let center_delta = f.octave_delta(center, 1, o);
+        // A ring point ~0.6 of the max radius away, along a tangent.
+        let (t1, _) = tangent_basis(center);
+        let ring = normalize_or_x(center + t1 * (0.6 * o.reach_max / o.freq));
+        assert!(
+            center_delta < f.octave_delta(ring, 1, o),
+            "centre {center_delta} must be below ring {}",
+            f.octave_delta(ring, 1, o)
+        );
     }
 
     #[test]
