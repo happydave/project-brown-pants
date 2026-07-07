@@ -72,13 +72,11 @@ pub fn stream(
     anchor_body: DVec3,
     material: &Handle<StandardMaterial>,
 ) {
-    let radius = field.radius();
-
     let desired: HashSet<QuadNode> = {
         let mut leaves = Vec::new();
         let mut stack: Vec<QuadNode> = QuadNode::roots().to_vec();
         while let Some(node) = stack.pop() {
-            if should_split(node, anchor_body, radius, DEFAULT_MAX_LEVEL) {
+            if should_split(field, node, anchor_body, DEFAULT_MAX_LEVEL) {
                 stack.extend_from_slice(&node.children());
             } else {
                 leaves.push(node);

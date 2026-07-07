@@ -324,7 +324,6 @@ fn stream_surface(
     mat: Res<SurfaceMat>,
     mut streamer: ResMut<ChunkStreamer>,
 ) {
-    let radius = world.field.radius();
     // Camera-of-interest for LOD = the rover, in body-centred coordinates.
     let rover_body = world.patch.local_to_world(world.rover.body.position);
 
@@ -332,7 +331,7 @@ fn stream_surface(
         let mut leaves = Vec::new();
         let mut stack: Vec<QuadNode> = QuadNode::roots().to_vec();
         while let Some(node) = stack.pop() {
-            if should_split(node, rover_body, radius, DEFAULT_MAX_LEVEL) {
+            if should_split(&world.field, node, rover_body, DEFAULT_MAX_LEVEL) {
                 stack.extend_from_slice(&node.children());
             } else {
                 leaves.push(node);

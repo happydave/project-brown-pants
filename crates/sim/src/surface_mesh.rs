@@ -254,14 +254,66 @@ pub struct ChunkMesh {
 /// The `LOD` split decision: split `node` (subdivide) when the camera is close
 /// enough that the node's world edge subtends more than the range factor allows,
 /// bounded by `max_level`. Pure function of node + camera world position.
-pub fn should_split(node: QuadNode, camera_world: DVec3, radius: f64, max_level: u32) -> bool {
+///
+/// Two WI 795 properties make the LOD boundaries land inside the CDLOD morph
+/// windows (the "zippering" fix — see the module doc of `surface_scan` and the
+/// WI 795 record):
+///
+/// 1. **Surface-consistent distances.** Distances are measured to points **on the
+///    surface** (`radius + elevation`, the same anchor `build_chunk` places vertices
+///    at) — not to the bare sphere. The morph factor is a per-vertex function of
+///    camera-to-surface-vertex distance; measuring selection against the sphere let
+///    the two metrics diverge by the local elevation (kilometres at low altitude
+///    over a −5.6 km basin at the WI 791 known-bad pose), realizing boundaries far
+///    outside every morph window.
+/// 2. **Nearest-point ranging.** The distance is the *minimum* over the node's
+///    surface centre and four surface corners — a node's shared boundary can sit
+///    ~0.7–0.8 edge lengths nearer than its centre (plus intra-node elevation
+///    variation), and the per-level morph anchors (`morph_range`) require realized
+///    fine/coarse boundaries no nearer than `(SPLIT_RANGE_FACTOR − EDGE_OFFSET) ·
+///    min_edge_len(level)`; ranging on the centre alone let a kept coarse node
+///    expose a boundary *inside* the finer neighbour's ramp (measured 634 m /
+///    174 px at the known-bad pose).
+///
+/// A conservative pre-test (bounding the surface between `±relief_bound`) resolves
+/// clearly-far and clearly-near nodes without sampling the field, so the five
+/// elevation samples are paid only near the split threshold.
+pub fn should_split(
+    field: &SurfaceField,
+    node: QuadNode,
+    camera_world: DVec3,
+    max_level: u32,
+) -> bool {
     if node.level >= max_level {
         return false;
     }
-    let center_world = node.center_dir() * radius;
-    let dist = (camera_world - center_world).length();
+    let radius = field.radius();
     let size = node.edge_len(radius);
-    dist < size * SPLIT_RANGE_FACTOR
+    let threshold = size * SPLIT_RANGE_FACTOR;
+
+    // Conservative pre-test on the sphere-distance to the node centre: the nearest
+    // surface point of the node is at least `center_sphere_dist − reach` and at most
+    // `center_sphere_dist + reach`, with `reach` = half-diagonal + relief bound.
+    let cdir = node.center_dir();
+    let center_sphere = cdir * radius;
+    let center_dist = (camera_world - center_sphere).length();
+    let reach = 0.75 * size + field.relief_bound();
+    if center_dist - reach >= threshold {
+        return false; // even the nearest possible surface point is beyond range
+    }
+    if center_dist + reach < threshold {
+        return true; // even the farthest possible surface point is within range
+    }
+
+    // Near the threshold: exact nearest-point test over centre + corners on the
+    // actual surface.
+    let mut nearest = f64::INFINITY;
+    let corner_dirs = node.corner_dirs();
+    for dir in std::iter::once(cdir).chain(corner_dirs) {
+        let p = dir * (radius + field.elevation(dir));
+        nearest = nearest.min((camera_world - p).length());
+    }
+    nearest < threshold
 }
 
 /// How far a chunk's shared boundary can sit from its node **centre**, as a fraction of
@@ -355,6 +407,80 @@ pub fn morph_range(level: u32, radius: f64) -> (f32, f32) {
     (start as f32, end as f32)
 }
 
+/// Rows over which an edge-weld forcing fades back to the distance-driven morph
+/// factor (WI 795). Wide enough that a forced edge does not fold against its
+/// interior rows (the per-vertex morph displacement can be hundreds of metres in
+/// craters), narrow enough that the falloff rarely reaches the opposite edge.
+pub const WELD_BAND_ROWS: f64 = 6.0;
+
+/// The per-vertex CDLOD morph factor with the WI 795 **edge weld** applied — the
+/// single formula the render shader (WGSL) and the headless oracle both implement;
+/// keep them in lockstep.
+///
+/// Per-level global morph ramps cannot make cross-level boundaries seamless on this
+/// body: a node splits for its *near* side, so far-side children realize boundaries
+/// up to `(SPLIT_RANGE_FACTOR + diagonal)·edge` plus intra-node relief away — past
+/// the level's ramp start — while widening the ramp start beyond the next level's
+/// ramp end inverts the window (relief ~15 km bound, ~1.3× cube-distortion spread).
+/// So the realized neighbour relation is welded in directly, per edge:
+///
+/// - On an edge bordering a **coarser** neighbour the factor forces to **1**: a
+///   fully-morphed boundary vertex lies on the parent grid, which for a one-level
+///   jump *is* the coarser chunk's un-morphed surface chord (odd verts land on the
+///   chord midpoint between two of the coarser chunk's own vertices, bit-near-exact).
+/// - On an edge bordering a **finer** neighbour the factor forces to **0**: the
+///   finer side's welded (fully-morphed) vertices equal this chunk's surface grid.
+///
+/// Each forcing fades inward over [`WELD_BAND_ROWS`] so the edge never folds against
+/// the chunk interior. Masks carry **8 relations**: bits 0–3 the four edges (v0, u1,
+/// v1, u0), bits 4–7 the four **diagonal corners** (c00, c10, c11, c01). Corner bits
+/// exist for cross-chunk consistency: when a coarser region touches a chunk only at
+/// a corner, the two same-level chunks flanking that corner must still render their
+/// shared edge identically, so the corner-adjacent chunk applies the same falloff
+/// profile (by Chebyshev distance to the corner) that its neighbour applies from its
+/// flagged edge. The per-source falloffs combine by **max** (order-independent,
+/// idempotent — an edge and its corner never double-apply), then finer forcings pull
+/// toward 0 and coarser forcings toward 1, coarser last (a vertex constrained by
+/// both welds to the coarser side, the one that cannot move). Both sides of a
+/// cross-level edge therefore render the **coarser level's surface grid**, and
+/// same-level edges match exactly (verified by `scan_same_level_exact`, WI 795).
+pub fn weld_factor(
+    dist_factor: f64,
+    a: u32,
+    b: u32,
+    res: u32,
+    mask_coarser: u8,
+    mask_finer: u8,
+) -> f64 {
+    // Rows from each edge, in edge order 0 = v0 (b = 0), 1 = u1 (a = res),
+    // 2 = v1 (b = res), 3 = u0 (a = 0), then Chebyshev distance to each corner
+    // (c00, c10, c11, c01).
+    let dist = [
+        b,
+        res - a,
+        res - b,
+        a,
+        a.max(b),
+        (res - a).max(b),
+        (res - a).max(res - b),
+        a.max(res - b),
+    ];
+    let falloff = |r: u32| (1.0 - r as f64 / WELD_BAND_ROWS).clamp(0.0, 1.0);
+    let weight = |mask: u8| {
+        let mut w = 0.0f64;
+        for (k, &r) in dist.iter().enumerate() {
+            if mask & (1 << k) != 0 {
+                w = w.max(falloff(r));
+            }
+        }
+        w
+    };
+    let w_finer = weight(mask_finer);
+    let w_coarser = weight(mask_coarser);
+    let f = dist_factor + (0.0 - dist_factor) * w_finer;
+    f + (1.0 - f) * w_coarser
+}
+
 /// A representative world edge length (metres) for all chunks at `level`, sampled at a
 /// mid-face node — a per-level scale roughly midway between [`min_edge_len`] and
 /// [`max_edge_len`]. (The morph ramp is anchored on the min/max extremes, not this; kept
@@ -416,6 +542,18 @@ pub fn chunk_relief(field: &SurfaceField, node: QuadNode, res: u32) -> f64 {
 /// grid to sample every other vertex, so the border indices (0 and `res`) must be
 /// even and each interior odd vertex must sit between two even neighbours.
 pub fn build_chunk(field: &SurfaceField, node: QuadNode, res: u32) -> ChunkMesh {
+    build_chunk_with(field, node, res, true)
+}
+
+/// [`build_chunk`] with the skirt optional. `with_skirt: false` is the WI 795
+/// diagnostic build (the `SOUNDING_NO_SKIRT=1` visual cross-check: with skirts off,
+/// any remaining dark boundary geometry is the LOD step itself, not skirt walls).
+pub fn build_chunk_with(
+    field: &SurfaceField,
+    node: QuadNode,
+    res: u32,
+    with_skirt: bool,
+) -> ChunkMesh {
     let res = res.max(1);
     let res = res + (res & 1); // even: parent grid uses every other vertex
     let (u0, u1, v0, v1) = node.uv_rect();
@@ -495,22 +633,24 @@ pub fn build_chunk(field: &SurfaceField, node: QuadNode, res: u32) -> ChunkMesh 
     // (bounded by this chunk's relief) *and* its curvature sagitta (the chord of a
     // coarse edge sinks ~4× this chunk's sagitta below the true surface) — but no
     // deeper, so it stays buried instead of standing up as a wall.
-    let relief = (max_elev - min_elev).max(0.0);
-    let skirt_depth = skirt_depth_for(relief, node.edge_len(radius), radius);
-    add_skirt(
-        res,
-        &world_of,
-        center,
-        skirt_depth,
-        &mut positions,
-        &mut normals,
-        &mut uvs,
-        &mut indices,
-    );
+    if with_skirt {
+        let relief = (max_elev - min_elev).max(0.0);
+        let skirt_depth = skirt_depth_for(relief, node.edge_len(radius), radius);
+        add_skirt(
+            res,
+            &world_of,
+            center,
+            skirt_depth,
+            &mut positions,
+            &mut normals,
+            &mut uvs,
+            &mut indices,
+        );
 
-    // Skirt vertices do not morph: their target is their own position, so the morph
-    // blend is a no-op on the skirt regardless of the chunk's morph factor.
-    morph_targets.extend_from_slice(&positions[vert_count..]);
+        // Skirt vertices do not morph: their target is their own position, so the
+        // morph blend is a no-op on the skirt regardless of the chunk's morph factor.
+        morph_targets.extend_from_slice(&positions[vert_count..]);
+    }
 
     ChunkMesh {
         center,
@@ -1098,13 +1238,14 @@ mod tests {
 
     #[test]
     fn split_near_camera_true_far_camera_false() {
+        let f = field();
         let root = QuadNode::root(CubeFace::PosX);
         // Camera hovering just above the node centre → split.
         let near = root.center_dir() * (R + 1_000.0);
-        assert!(should_split(root, near, R, DEFAULT_MAX_LEVEL));
+        assert!(should_split(&f, root, near, DEFAULT_MAX_LEVEL));
         // Camera far out in orbit → keep (root).
         let far = root.center_dir() * (R * 20.0);
-        assert!(!should_split(root, far, R, DEFAULT_MAX_LEVEL));
+        assert!(!should_split(&f, root, far, DEFAULT_MAX_LEVEL));
         // At the max level, never split.
         let leaf = QuadNode {
             face: CubeFace::PosX,
@@ -1112,7 +1253,46 @@ mod tests {
             i: 1,
             j: 1,
         };
-        assert!(!should_split(leaf, leaf.center_dir() * (R + 1.0), R, 2));
+        assert!(!should_split(&f, leaf, leaf.center_dir() * (R + 1.0), 2));
+    }
+
+    #[test]
+    fn weld_factor_forces_edges_and_fades_over_the_band() {
+        let res = 24u32;
+        // No masks: the distance factor passes through untouched.
+        assert_eq!(weld_factor(0.37, 5, 7, res, 0, 0), 0.37);
+        // A coarser edge (bit 0 = v0, b = 0) forces its boundary vertices to 1
+        // regardless of the distance factor, fading out over the band.
+        assert_eq!(weld_factor(0.37, 5, 0, res, 1, 0), 1.0);
+        let mid = weld_factor(0.0, 5, 3, res, 1, 0);
+        assert!(mid > 0.0 && mid < 1.0, "inside the band: partial ({mid})");
+        assert_eq!(
+            weld_factor(0.37, 5, WELD_BAND_ROWS as u32 + 1, res, 1, 0),
+            0.37,
+            "beyond the band: untouched"
+        );
+        // A finer edge forces to 0 on the boundary.
+        assert_eq!(weld_factor(0.83, 5, 0, res, 0, 1), 0.0);
+        // Coarser wins where both constrain the same vertex.
+        assert_eq!(weld_factor(0.5, 0, 0, res, 0b1000, 0b0001), 1.0);
+    }
+
+    #[test]
+    fn weld_corner_profile_matches_the_edge_profile_on_a_shared_edge() {
+        // The cross-chunk consistency property behind the corner bits: for vertices
+        // on the v0 edge (b = 0), a chunk whose u0 edge (bit 3) is flagged and its
+        // same-level neighbour whose only knowledge is the diagonal corner c00
+        // (bit 4) must compute identical factors — otherwise the weld would break
+        // the shared edge it exists to protect.
+        let res = 24u32;
+        for a in 0..=res {
+            let via_edge = weld_factor(0.42, a, 0, res, 0b0000_1000, 0);
+            let via_corner = weld_factor(0.42, a, 0, res, 0b0001_0000, 0);
+            assert!(
+                (via_edge - via_corner).abs() < 1e-12,
+                "a={a}: edge profile {via_edge} != corner profile {via_corner}"
+            );
+        }
     }
 
     #[test]

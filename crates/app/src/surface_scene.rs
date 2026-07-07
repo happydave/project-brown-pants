@@ -47,10 +47,10 @@ use sounding_sim::bodygen::{generate, Archetype};
 use sounding_sim::frame::{FrameId, WorldPos};
 use sounding_sim::surface_field::SurfaceField;
 use sounding_sim::surface_mesh::{
-    build_chunk, morph_range, AtmosphereParams, ChunkMesh, QuadNode, DEFAULT_MAX_LEVEL,
-    DEFAULT_RESOLUTION,
+    build_chunk_with, morph_range, AtmosphereParams, ChunkMesh, QuadNode, DEFAULT_MAX_LEVEL,
+    DEFAULT_RESOLUTION, WELD_BAND_ROWS,
 };
-use sounding_sim::surface_scan::resident_leaves;
+use sounding_sim::surface_scan::{boundary_config, resident_leaves};
 
 use crate::debug_control::{DebugCameraContext, DebugControllable, DebugOverlayState};
 use crate::floating_origin::{
@@ -77,6 +77,12 @@ struct GeomorphExt {
     // Vertex-visible: the geomorph ramp is read in the vertex shader.
     #[uniform(100, visibility(vertex))]
     morph_range: Vec4,
+    // WI 795 edge weld: (coarser-edge bitmask, finer-edge bitmask, grid res,
+    // falloff band in rows). Per-chunk — updated when the realized neighbour
+    // relation changes; see `weld_factor` in `sounding_sim::surface_mesh` for the
+    // formula this must mirror.
+    #[uniform(101, visibility(vertex))]
+    weld: Vec4,
 }
 
 impl MaterialExtension for GeomorphExt {
@@ -137,15 +143,39 @@ struct SurfaceBody {
     /// the approached surface is near the world origin with +Y up (Bevy's
     /// atmosphere convention): centre at `(0, -radius, 0)`.
     center_world: DVec3,
+    /// `SOUNDING_NO_SKIRT=1` diagnostic build (WI 795): chunks are built without
+    /// skirts, so any remaining dark boundary geometry is the LOD step itself.
+    no_skirt: bool,
 }
 
-/// The surface material: a base `StandardMaterial` config plus one geomorph material
-/// per LOD level (cached), so every chunk of a level shares an identical morph ramp
-/// (same-level shared edges stay matched) and streaming does not leak material assets.
+/// The weld uniform for a chunk's neighbour config — mirrors
+/// `sounding_sim::surface_mesh::weld_factor`'s inputs: (coarser mask, finer mask,
+/// grid resolution, falloff band rows).
+fn weld_uniform((coarser, finer): (u8, u8)) -> Vec4 {
+    Vec4::new(
+        coarser as f32,
+        finer as f32,
+        DEFAULT_RESOLUTION as f32,
+        WELD_BAND_ROWS as f32,
+    )
+}
+
+/// The surface material config. Each chunk gets its **own** geomorph material
+/// instance (WI 795): the weld uniform carries the chunk's realized neighbour-edge
+/// relation, which is per-chunk state. The distance-driven part of the morph stays
+/// a pure function of level + world position, so same-level shared edges still
+/// match exactly.
 #[derive(Resource)]
 struct SurfaceMat {
     base: StandardMaterial,
-    by_level: HashMap<u32, Handle<SurfaceGeomorph>>,
+}
+
+/// A live chunk: its entity, its material (mutated in place when the weld config
+/// changes), and the last weld config applied.
+struct LiveChunk {
+    entity: Entity,
+    material: Handle<SurfaceGeomorph>,
+    config: (u8, u8),
 }
 
 /// Live (uploaded), in-flight (meshing), and built-but-not-yet-uploaded (ready)
@@ -153,7 +183,7 @@ struct SurfaceMat {
 /// awaiting the per-frame upload budget, so finished work is never discarded.
 #[derive(Resource, Default)]
 struct ChunkStreamer {
-    live: HashMap<QuadNode, Entity>,
+    live: HashMap<QuadNode, LiveChunk>,
     meshing: HashMap<QuadNode, Task<ChunkMesh>>,
     ready: Vec<(QuadNode, ChunkMesh)>,
 }
@@ -408,10 +438,10 @@ fn setup(mut commands: Commands, mut scattering: ResMut<Assets<ScatteringMedium>
         asset,
         field,
         center_world,
+        no_skirt: std::env::var("SOUNDING_NO_SKIRT").is_ok_and(|v| v == "1"),
     });
     commands.insert_resource(SurfaceMat {
         base: base_material,
-        by_level: HashMap::new(),
     });
     commands.insert_resource(ChunkStreamer::default());
     // Body frame for bus-driven debug camera placement (WI 784): body-relative poses
@@ -468,9 +498,9 @@ fn update_telemetry(
 
 /// The desired resident **leaf** set: traverse the six face roots, splitting where
 /// the camera is close, and collect the leaves.
-fn desired_leaves(camera_body: DVec3, radius: f64) -> Vec<QuadNode> {
+fn desired_leaves(field: &SurfaceField, camera_body: DVec3) -> Vec<QuadNode> {
     // Single source of truth with the headless seam scan (WI 785).
-    resident_leaves(camera_body, radius, DEFAULT_MAX_LEVEL)
+    resident_leaves(field, camera_body, DEFAULT_MAX_LEVEL)
 }
 
 /// The CDLOD streaming step: compute desired leaves, enqueue new chunk builds
@@ -479,7 +509,7 @@ fn desired_leaves(camera_body: DVec3, radius: f64) -> Vec<QuadNode> {
 fn stream_surface(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut mat: ResMut<SurfaceMat>,
+    mat: Res<SurfaceMat>,
     mut geomorph_materials: ResMut<Assets<SurfaceGeomorph>>,
     body: Res<SurfaceBody>,
     mut streamer: ResMut<ChunkStreamer>,
@@ -492,8 +522,24 @@ fn stream_surface(
     let camera_body = cam.0.pos - body.center_world;
     let radius = body.field.radius();
 
-    let desired: std::collections::HashSet<QuadNode> =
-        desired_leaves(camera_body, radius).into_iter().collect();
+    let desired: std::collections::HashSet<QuadNode> = desired_leaves(&body.field, camera_body)
+        .into_iter()
+        .collect();
+
+    // WI 795 edge weld: a chunk's weld config is its realized neighbour relation
+    // against the *desired* leaf set (selection, not upload timing — deterministic
+    // and identical to the headless scans; skirts cover transient live-set gaps).
+    // Refresh live chunks whose relation changed by mutating their material's weld
+    // uniform in place.
+    for (node, live) in streamer.live.iter_mut() {
+        let config = boundary_config(*node, &desired, DEFAULT_MAX_LEVEL);
+        if config != live.config {
+            if let Some(m) = geomorph_materials.get_mut(&live.material) {
+                m.extension.weld = weld_uniform(config);
+                live.config = config;
+            }
+        }
+    }
 
     // 1. Poll in-flight builds once; move completed ones to the ready queue. Each
     //    task is polled to completion exactly once (its output is captured here).
@@ -524,29 +570,33 @@ fn stream_surface(
         }
         let mesh = to_bevy_mesh(&mut meshes, &chunk);
         let world = body.center_world + chunk.center;
-        // Per-level geomorph material (built once per level, shared by all its chunks).
-        let level = node.level;
-        if !mat.by_level.contains_key(&level) {
-            let (start, end) = morph_range(level, radius);
-            let handle = geomorph_materials.add(SurfaceGeomorph {
-                base: mat.base.clone(),
-                extension: GeomorphExt {
-                    morph_range: Vec4::new(start, end, 0.0, 0.0),
-                },
-            });
-            mat.by_level.insert(level, handle);
-        }
-        let material = mat.by_level[&level].clone();
+        // Per-chunk geomorph material (WI 795): the weld uniform is per-chunk state.
+        let (start, end) = morph_range(node.level, radius);
+        let config = boundary_config(node, &desired, DEFAULT_MAX_LEVEL);
+        let material = geomorph_materials.add(SurfaceGeomorph {
+            base: mat.base.clone(),
+            extension: GeomorphExt {
+                morph_range: Vec4::new(start, end, 0.0, 0.0),
+                weld: weld_uniform(config),
+            },
+        });
         let entity = commands
             .spawn((
                 Mesh3d(mesh),
-                MeshMaterial3d(material),
+                MeshMaterial3d(material.clone()),
                 Transform::default(),
                 WorldPlacement(WorldPos::new(FrameId::CENTRAL_BODY, world)),
                 SurfaceChunk,
             ))
             .id();
-        streamer.live.insert(node, entity);
+        streamer.live.insert(
+            node,
+            LiveChunk {
+                entity,
+                material,
+                config,
+            },
+        );
         uploaded += 1;
     }
     streamer.ready = keep;
@@ -565,7 +615,9 @@ fn stream_surface(
             continue;
         }
         let field = body.field; // Copy
-        let task = pool.spawn(async move { build_chunk(&field, node, DEFAULT_RESOLUTION) });
+        let with_skirt = !body.no_skirt;
+        let task = pool
+            .spawn(async move { build_chunk_with(&field, node, DEFAULT_RESOLUTION, with_skirt) });
         streamer.meshing.insert(node, task);
         spawned += 1;
     }
@@ -590,8 +642,8 @@ fn stream_surface(
         })
         .collect();
     for node in stale {
-        if let Some(entity) = streamer.live.remove(&node) {
-            commands.entity(entity).despawn();
+        if let Some(live) = streamer.live.remove(&node) {
+            commands.entity(live.entity).despawn();
         }
     }
 

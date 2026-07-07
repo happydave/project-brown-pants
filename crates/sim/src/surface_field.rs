@@ -81,6 +81,13 @@ impl SurfaceField {
         self.radius
     }
 
+    /// A conservative bound on `|elevation|` anywhere on the body, metres — the sum
+    /// of the terrain and crater amplitude scales. Lets distance tests bracket the
+    /// surface without sampling the field (used by the LOD split pre-test, WI 795).
+    pub fn relief_bound(&self) -> f64 {
+        self.amplitude + self.crater_amp
+    }
+
     /// Elevation (metres, relative to the reference radius) at a direction from the
     /// body centre. `dir` need not be normalized; a zero vector falls back to +X.
     pub fn elevation(&self, dir: DVec3) -> f64 {
