@@ -41,8 +41,58 @@ pub enum BiomeFamily {
     Airless,
 }
 
+/// Per-body biome/climate knobs (WI 870), read from the **reserved**
+/// `SurfaceRecipe.material` area — the WI 782 `CraterParams` pattern verbatim
+/// (a defaulted `serde_json::Value`, so no persistence-format change; lenient:
+/// absent / null / non-object values and missing or non-numeric keys all fall
+/// back to defaults). Recognized keys:
+/// - `"temperature"` — additive offset (Kelvin) on the **classifier's** base
+///   temperature, clamped to ±100. The physics medium is untouched (WI 875
+///   owns that side).
+/// - `"moisture"` — additive offset on the moisture field's midpoint,
+///   clamped to ±1.
+/// - `"moisture_scale"` — multiplier on the moisture field's deviation from
+///   its (shifted) midpoint — widens/narrows the wet–dry contrast — clamped
+///   to [0, 4].
+///
+/// A palette/variant selector key stays **reserved** (unread) for the render
+/// work items. Constant per body, so every derived field stays continuous.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BiomeParams {
+    /// Classifier base-temperature offset, Kelvin (default 0).
+    pub temperature: f64,
+    /// Moisture midpoint offset (default 0).
+    pub moisture: f64,
+    /// Moisture deviation multiplier (default 1).
+    pub moisture_scale: f64,
+}
+
+impl Default for BiomeParams {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            moisture: 0.0,
+            moisture_scale: 1.0,
+        }
+    }
+}
+
+impl BiomeParams {
+    /// Parses the reserved recipe area. Never fails; anything unrecognized
+    /// yields the default for that key.
+    pub fn from_value(v: &serde_json::Value) -> Self {
+        let get = |key: &str| v.get(key).and_then(|x| x.as_f64());
+        Self {
+            temperature: get("temperature").map_or(0.0, |x| x.clamp(-100.0, 100.0)),
+            moisture: get("moisture").map_or(0.0, |x| x.clamp(-1.0, 1.0)),
+            moisture_scale: get("moisture_scale").map_or(1.0, |x| x.clamp(0.0, 4.0)),
+        }
+    }
+}
+
 /// The per-body climate inputs the biome layer needs — all read from fields
-/// [`BodyAsset`] already has, so the layer adds **no persistence change**.
+/// [`BodyAsset`] already has (plus the [`BiomeParams`] knobs on the reserved
+/// recipe area), so the layer adds **no persistence change**.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BodyClimate {
     /// The classifier family (atmosphere present or not).
@@ -58,6 +108,8 @@ pub struct BodyClimate {
     /// a hardcoded coordinate (bodygen rotates about +Z; the pre-868
     /// `material()` used `d.y`, an acknowledged quirk this fixes).
     pub axis: DVec3,
+    /// Per-body biome knobs from the reserved recipe area (WI 870).
+    pub params: BiomeParams,
 }
 
 impl Default for BodyClimate {
@@ -69,6 +121,11 @@ impl Default for BodyClimate {
             base_temperature: 200.0,
             sea_level: None,
             axis: DVec3::Z,
+            params: BiomeParams {
+                temperature: 0.0,
+                moisture: 0.0,
+                moisture_scale: 1.0,
+            },
         }
     }
 }
@@ -76,7 +133,8 @@ impl Default for BodyClimate {
 impl BodyClimate {
     /// Reads the climate inputs from an asset: family from atmosphere presence,
     /// sea level from ocean presence, latitude axis from the rotation axis
-    /// (normalized; a degenerate axis falls back to +Z).
+    /// (normalized; a degenerate axis falls back to +Z), biome knobs from the
+    /// reserved `surface.material` area (WI 870).
     pub fn from_asset(asset: &BodyAsset) -> Self {
         let m = &asset.fluid_medium;
         let axis = asset.rotation.axis.normalize_or_zero();
@@ -89,6 +147,7 @@ impl BodyClimate {
             base_temperature: m.atmosphere_temperature,
             sea_level: (m.ocean_surface_density > 0.0).then_some(0.0),
             axis: if axis == DVec3::ZERO { DVec3::Z } else { axis },
+            params: BiomeParams::from_value(&asset.surface.material),
         }
     }
 }
@@ -1024,6 +1083,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn biome_params_parse_leniently_and_clamp() {
+        // The CraterParams contract (WI 782/870): absent / null / garbage /
+        // partial all yield per-key defaults; recognized keys clamp.
+        assert_eq!(
+            BiomeParams::from_value(&serde_json::Value::Null),
+            BiomeParams::default()
+        );
+        assert_eq!(
+            BiomeParams::from_value(&serde_json::json!("weather")),
+            BiomeParams::default()
+        );
+        assert_eq!(
+            BiomeParams::from_value(&serde_json::json!({"bogus": 1, "temperature": "x"})),
+            BiomeParams::default()
+        );
+        assert_eq!(
+            BiomeParams::from_value(&serde_json::json!({"temperature": 38.15})),
+            BiomeParams {
+                temperature: 38.15,
+                ..BiomeParams::default()
+            }
+        );
+        assert_eq!(
+            BiomeParams::from_value(&serde_json::json!({
+                "temperature": 500.0, "moisture": -9.0, "moisture_scale": 99.0
+            })),
+            BiomeParams {
+                temperature: 100.0,
+                moisture: -1.0,
+                moisture_scale: 4.0,
+            }
+        );
+        // Unknown keys coexist with known ones (the reserved palette selector).
+        assert_eq!(
+            BiomeParams::from_value(&serde_json::json!({"palette": "lush", "moisture": 0.2})),
+            BiomeParams {
+                moisture: 0.2,
+                ..BiomeParams::default()
+            }
+        );
     }
 
     #[test]

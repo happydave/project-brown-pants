@@ -317,7 +317,10 @@ impl SurfaceField {
     /// elevation is itself a function of direction).
     fn temperature_at_elevation(&self, d: DVec3, elevation: f64) -> f64 {
         let lat = self.warped_latitude(d);
-        let mut t = self.climate.base_temperature - LATITUDE_TEMPERATURE_DROP * lat * lat;
+        // The WI 870 per-body offset shifts the classifier's base only — the
+        // physics medium keeps its own temperature (WI 875 owns that side).
+        let base = self.climate.base_temperature + self.climate.params.temperature;
+        let mut t = base - LATITUDE_TEMPERATURE_DROP * lat * lat;
         if self.climate.family == BiomeFamily::Atmospheric {
             let sea = self.climate.sea_level.unwrap_or(0.0);
             t -= LAPSE_PER_M * (elevation - sea).max(0.0);
@@ -337,7 +340,12 @@ impl SurfaceField {
             fbm(p + DVec3::splat(41.9), self.seed ^ 0x30B6, 2),
             fbm(p + DVec3::splat(83.7), self.seed ^ 0x30B7, 2),
         ) * 0.5;
-        (0.5 + 0.8 * fbm(p + warp, self.seed ^ 0x30B0, 3)).clamp(0.0, 1.0)
+        // WI 870 knobs: `moisture` shifts the midpoint, `moisture_scale`
+        // widens/narrows the deviation around the shifted midpoint — both
+        // constant per body (continuity preserved), result still in [0, 1].
+        let deviation = 0.8 * fbm(p + warp, self.seed ^ 0x30B0, 3);
+        (0.5 + self.climate.params.moisture + self.climate.params.moisture_scale * deviation)
+            .clamp(0.0, 1.0)
     }
 
     /// Warped absolute latitude in `[0, 1]` against the rotation axis: the raw
@@ -568,6 +576,7 @@ fn ridged(p: DVec3, seed: u64, octaves: u32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::biome::BiomeParams;
 
     fn dirs() -> Vec<DVec3> {
         let mut v = Vec::new();
@@ -959,6 +968,7 @@ mod tests {
             base_temperature: 288.0,
             sea_level: Some(0.0),
             axis: DVec3::Z,
+            params: BiomeParams::default(),
         }
     }
 
@@ -1119,6 +1129,103 @@ mod tests {
             moon_names.insert(moon.biome_weights(d).dominant().name);
         }
         assert!(moon_names.len() >= 2, "airless variety: {moon_names:?}");
+    }
+
+    #[test]
+    fn biome_params_apply_and_defaults_are_equivalent() {
+        // WI 870: the per-body knobs shift the classifier exactly as documented,
+        // and an untouched recipe is bit-identical to the default constructor.
+        let base =
+            SurfaceField::with_params(9, 2_000_000.0, CraterParams::default(), temperate_climate());
+        let mut warm_climate = temperate_climate();
+        warm_climate.params.temperature = 20.0;
+        let warm = SurfaceField::with_params(9, 2_000_000.0, CraterParams::default(), warm_climate);
+        let mut wet_climate = temperate_climate();
+        wet_climate.params.moisture = 0.25;
+        wet_climate.params.moisture_scale = 2.0;
+        let wet = SurfaceField::with_params(9, 2_000_000.0, CraterParams::default(), wet_climate);
+
+        for d in dirs() {
+            // Temperature: the offset moves the seam by exactly its value.
+            let dt = warm.temperature_at_elevation(d, 0.0) - base.temperature_at_elevation(d, 0.0);
+            assert!((dt - 20.0).abs() < 1e-12, "offset must apply exactly: {dt}");
+            // Moisture: midpoint + scaled deviation, still clamped to [0, 1].
+            let m0 = base.moisture(d);
+            let m1 = wet.moisture(d);
+            assert!((0.0..=1.0).contains(&m1));
+            let expected = (0.5 + 0.25 + 2.0 * (m0 - 0.5)).clamp(0.0, 1.0);
+            assert!(
+                (m1 - expected).abs() < 1e-12,
+                "moisture knobs must follow the documented formula ({m0} -> {m1})"
+            );
+        }
+        // The warm body is consumer-visibly warmer at the pole.
+        let pole = DVec3::Z;
+        assert!(warm.temperature(pole) > base.temperature(pole));
+
+        // Default-equivalence: an asset with an untouched material area
+        // classifies bit-identically to the explicit-defaults constructor.
+        let mut asset = BodyAsset::earthlike_ice_age();
+        asset.surface.seed = 9;
+        asset.radius = 2_000_000.0;
+        let from_asset = SurfaceField::from_asset(&asset);
+        let explicit = SurfaceField::with_params(
+            9,
+            2_000_000.0,
+            CraterParams::default(),
+            crate::biome::BodyClimate::from_asset(&asset),
+        );
+        let table = crate::biome::biome_table(from_asset.biome_weights(DVec3::X).family());
+        for d in dirs() {
+            let a = from_asset.biome_weights(d);
+            let b = explicit.biome_weights(d);
+            for i in 0..table.len() {
+                assert_eq!(a.weight_of(i), b.weight_of(i));
+            }
+        }
+    }
+
+    #[test]
+    fn earthlike_reads_temperate_and_its_ice_age_sibling_reads_cold() {
+        // WI 870 route 2: the canonical earthlike carries the ISA-anchored
+        // classifier offset (temperate surface, unchanged physics); the
+        // ice-age sibling is the same body without it.
+        use crate::body_asset::{EARTHLIKE_TEMPERATE_OFFSET, ISA_SEA_LEVEL_TEMPERATURE};
+        let temperate = SurfaceField::from_asset(&BodyAsset::earthlike());
+        let ice_age = SurfaceField::from_asset(&BodyAsset::earthlike_ice_age());
+
+        // The offset is derived, not magic: ISA − the medium's own value.
+        let medium_t = BodyAsset::earthlike().fluid_medium.atmosphere_temperature;
+        assert!(
+            (EARTHLIKE_TEMPERATE_OFFSET - (ISA_SEA_LEVEL_TEMPERATURE - medium_t)).abs() < 1e-12
+        );
+
+        // Body-equatorial sea level reads ≈ ISA on the temperate asset and the
+        // medium's own value on the sibling (± the small latitude warp).
+        for equator in [DVec3::X, DVec3::Y, DVec3::new(0.7, -0.7, 0.0).normalize()] {
+            let t = temperate.temperature_at_elevation(equator, 0.0);
+            assert!(
+                (t - ISA_SEA_LEVEL_TEMPERATURE).abs() < 0.5,
+                "temperate equator should read ≈ ISA, got {t}"
+            );
+            let t = ice_age.temperature_at_elevation(equator, 0.0);
+            assert!(
+                (t - medium_t).abs() < 0.5,
+                "ice-age equator should read the medium's value, got {t}"
+            );
+        }
+        // The temperate world keeps polar ice but is not ice at the equator;
+        // the ice-age world is ice cap even at the equator.
+        assert_eq!(temperate.biome_weights(DVec3::Z).dominant().name, "ice cap");
+        assert_ne!(temperate.biome_weights(DVec3::X).dominant().name, "ice cap");
+        assert_eq!(ice_age.biome_weights(DVec3::X).dominant().name, "ice cap");
+
+        // Same physics: identical derived central body and medium.
+        let (a, b) = (BodyAsset::earthlike(), BodyAsset::earthlike_ice_age());
+        assert_eq!(a.central_body().mu, b.central_body().mu);
+        assert_eq!(a.central_body().radius, b.central_body().radius);
+        assert_eq!(a.fluid_medium(), b.fluid_medium());
+        assert_ne!(a.id, b.id);
     }
 
     #[test]

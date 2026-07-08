@@ -59,7 +59,8 @@ impl Rotation {
 /// parameter areas were **reserved** (opaque, defaulted on load), following the
 /// reserved-container idiom of [`crate::persist`], so surface work items could
 /// populate them without a format-version bump. WI 782 defined the `crater` area
-/// (see its field doc); `terrain` and `material` remain reserved.
+/// and WI 870 the `material` area (see the field docs); `terrain` remains
+/// reserved.
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub struct SurfaceRecipe {
     /// Master seed — the deterministic source of the whole surface (same seed ⇒
@@ -75,7 +76,14 @@ pub struct SurfaceRecipe {
     /// defaults, so pre-782 assets read unchanged (no format bump).
     #[serde(default)]
     pub crater: serde_json::Value,
-    /// Reserved: surface-material field parameters (WI 763).
+    /// Biome/climate parameters (defined by WI 870; reserved since WI 763).
+    /// Read leniently by `biome::BiomeParams::from_value` — recognized keys are
+    /// `"temperature"` (classifier base-temperature offset, Kelvin, clamped
+    /// ±100; the physics medium is untouched — WI 875), `"moisture"` (midpoint
+    /// offset, clamped ±1), and `"moisture_scale"` (deviation multiplier,
+    /// clamped [0, 4]); a palette/variant selector stays reserved. Anything
+    /// absent or malformed means defaults, so pre-870 assets read unchanged
+    /// (no format bump).
     #[serde(default)]
     pub material: serde_json::Value,
 }
@@ -114,11 +122,28 @@ pub struct BodyAsset {
     pub render: serde_json::Value,
 }
 
+/// ISA sea-level standard temperature (288.15 K) — the named physical anchor
+/// for "an Earth-like surface reads temperate" (WI 870). The classifier offset
+/// below is *derived* from it, never a bare number; WI 875 continues the
+/// un-magic-the-temperature thread on the physics side.
+pub const ISA_SEA_LEVEL_TEMPERATURE: f64 = 288.15;
+
+/// The classifier temperature offset the canonical Earth-like asset carries
+/// (WI 870): ISA sea-level minus the medium's own `atmosphere_temperature`
+/// (a representative *atmospheric* value the physics keeps reading, WI 875).
+/// Derived, so a future change to the medium constant keeps the classifier
+/// read anchored at ISA.
+pub const EARTHLIKE_TEMPERATE_OFFSET: f64 =
+    ISA_SEA_LEVEL_TEMPERATURE - FluidMedium::EARTHLIKE.atmosphere_temperature;
+
 impl BodyAsset {
     /// The canonical Earth-like body, expressed as an asset. Its derived
     /// [`CentralBody`] equals [`CentralBody::EARTHLIKE`] and its fluid medium
     /// equals [`FluidMedium::EARTHLIKE`], so behaviour that reads those constants
-    /// is unchanged when sourced from this asset.
+    /// is unchanged when sourced from this asset. Since WI 870 its recipe
+    /// carries the ISA-anchored classifier temperature offset, so the surface
+    /// **reads temperate** to the biome layer (the ice-age look lives on in
+    /// [`Self::earthlike_ice_age`]); physics is untouched.
     pub fn earthlike() -> Self {
         Self {
             id: "earthlike".to_string(),
@@ -127,8 +152,24 @@ impl BodyAsset {
             radius: CentralBody::EARTHLIKE.radius,
             rotation: Rotation::EARTHLIKE,
             fluid_medium: FluidMedium::EARTHLIKE,
-            surface: SurfaceRecipe::from_seed(0),
+            surface: SurfaceRecipe {
+                material: serde_json::json!({ "temperature": EARTHLIKE_TEMPERATE_OFFSET }),
+                ..SurfaceRecipe::from_seed(0)
+            },
             render: serde_json::Value::Null,
+        }
+    }
+
+    /// The ice-age sibling of [`Self::earthlike`] (WI 870): the identical body
+    /// — same physics, same terrain seed — without the temperate classifier
+    /// offset, so the biome layer reads the medium's own temperature and the
+    /// surface classifies as an ice-age world (the pre-870 canonical look).
+    pub fn earthlike_ice_age() -> Self {
+        Self {
+            id: "earthlike-ice-age".to_string(),
+            name: "Earth-like (Ice Age)".to_string(),
+            surface: SurfaceRecipe::from_seed(0),
+            ..Self::earthlike()
         }
     }
 

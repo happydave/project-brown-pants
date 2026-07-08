@@ -964,7 +964,7 @@ pub fn to_vec3(p: [f32; 3]) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::biome::{BiomeFamily, BodyClimate};
+    use crate::biome::{BiomeFamily, BiomeParams, BodyClimate};
     use crate::body_asset::BodyAsset;
     use crate::surface_field::CraterParams;
 
@@ -986,6 +986,7 @@ mod tests {
                 base_temperature: 288.0,
                 sea_level: Some(0.0),
                 axis: DVec3::Z,
+                params: BiomeParams::default(),
             },
         )
     }
