@@ -46,6 +46,12 @@ struct Vertex {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
+#ifdef VERTEX_COLORS
+    // Per-vertex biome tint (WI 869) — computed headless in sounding_sim and
+    // passed through untouched (no color math on the shader side: the WI 795
+    // one-side-only lockstep rule). The standard PBR fragment multiplies it.
+    @location(5) color: vec4<f32>,
+#endif
     @location(8) morph_target: vec3<f32>,
 };
 
@@ -117,6 +123,10 @@ fn vertex(vertex: Vertex) -> VertexOutput {
 
 #ifdef VERTEX_UVS_A
     out.uv = vertex.uv;
+#endif
+
+#ifdef VERTEX_COLORS
+    out.color = vertex.color;
 #endif
 
 #ifdef VERTEX_OUTPUT_INSTANCE_INDEX

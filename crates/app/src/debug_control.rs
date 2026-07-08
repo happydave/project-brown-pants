@@ -19,6 +19,7 @@ use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::floating_origin::WorldPlacement;
+use sounding_sim::surface_mesh::SurfaceView;
 
 /// How a placed camera should aim.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
@@ -71,6 +72,11 @@ pub enum DebugCommand {
     SetOverlay {
         #[serde(default)]
         lod: Option<bool>,
+        /// Surface color view (WI 869): `"biome"` (the shipping tint),
+        /// `"dominant"`, `"temperature"`, or `"moisture"`. Unknown names are
+        /// ignored (lenient like the rest of this surface).
+        #[serde(default)]
+        biome_view: Option<String>,
     },
 }
 
@@ -83,6 +89,13 @@ pub struct DebugCameraContext(pub Option<(DVec3, f64)>);
 /// `DebugCommand::SetOverlay`.
 #[derive(Resource, Default)]
 pub struct DebugOverlayState(pub bool);
+
+/// The surface color-view state (WI 869): which [`SurfaceView`] streamed chunks are
+/// built with. Cycled by `F6` in `-- surface` and settable over the bus via
+/// `DebugCommand::SetOverlay { biome_view }`; the streamer rebuilds chunks when it
+/// changes. Default = the shipping biome tint.
+#[derive(Resource, Default)]
+pub struct BiomeViewState(pub SurfaceView);
 
 /// The current debug-camera pose, published each frame and served by `GET /camera` so an
 /// agent can read where it framed. `available` is false when no controllable camera exists.
@@ -175,15 +188,20 @@ pub fn apply_debug_commands(
     mut reader: MessageReader<DebugCommand>,
     ctx: Res<DebugCameraContext>,
     mut overlay: ResMut<DebugOverlayState>,
+    mut view: ResMut<BiomeViewState>,
     mut q: Query<(&mut Transform, &mut WorldPlacement), With<DebugControllable>>,
 ) {
     let mut camera = q.single_mut().ok();
     let frame = ctx.0; // Copy (DVec3, f64)
     for cmd in reader.read() {
         // Overlay commands apply regardless of camera availability.
-        if let DebugCommand::SetOverlay { lod } = cmd {
+        if let DebugCommand::SetOverlay { lod, biome_view } = cmd {
             if let Some(v) = lod {
                 overlay.0 = *v;
+            }
+            // Lenient: unknown view names are ignored, never an error.
+            if let Some(v) = biome_view.as_deref().and_then(SurfaceView::parse) {
+                view.0 = v;
             }
             continue;
         }
@@ -262,6 +280,7 @@ impl Plugin for DebugControlPlugin {
         app.add_message::<DebugCommand>()
             .init_resource::<DebugCameraContext>()
             .init_resource::<DebugOverlayState>()
+            .init_resource::<BiomeViewState>()
             .init_resource::<DebugCameraState>()
             .add_systems(Update, (apply_debug_commands, publish_camera_pose).chain());
     }
@@ -295,7 +314,10 @@ mod tests {
                 pitch_deg: -2.0,
             },
             DebugCommand::NamedPose("nadir_200km".into()),
-            DebugCommand::SetOverlay { lod: Some(true) },
+            DebugCommand::SetOverlay {
+                lod: Some(true),
+                biome_view: Some("dominant".into()),
+            },
         ];
         for c in cmds {
             let j = serde_json::to_string(&c).unwrap();
@@ -305,11 +327,39 @@ mod tests {
 
     #[test]
     fn overlay_command_parses_from_partial_json() {
-        // `lod` defaults to None when omitted; present values parse.
+        // Fields default to None when omitted (additive/backward-compatible —
+        // pre-869 clients send only `lod`); present values parse.
         let c: DebugCommand = serde_json::from_str(r#"{"set_overlay":{"lod":true}}"#).unwrap();
-        assert_eq!(c, DebugCommand::SetOverlay { lod: Some(true) });
+        assert_eq!(
+            c,
+            DebugCommand::SetOverlay {
+                lod: Some(true),
+                biome_view: None
+            }
+        );
         let c: DebugCommand = serde_json::from_str(r#"{"set_overlay":{}}"#).unwrap();
-        assert_eq!(c, DebugCommand::SetOverlay { lod: None });
+        assert_eq!(
+            c,
+            DebugCommand::SetOverlay {
+                lod: None,
+                biome_view: None
+            }
+        );
+        let c: DebugCommand =
+            serde_json::from_str(r#"{"set_overlay":{"biome_view":"temperature"}}"#).unwrap();
+        assert_eq!(
+            c,
+            DebugCommand::SetOverlay {
+                lod: None,
+                biome_view: Some("temperature".into())
+            }
+        );
+        // Unknown view names parse as data and are ignored at apply time.
+        assert_eq!(SurfaceView::parse("bogus"), None);
+        assert_eq!(
+            SurfaceView::parse("dominant"),
+            Some(SurfaceView::DominantBiome)
+        );
     }
 
     #[test]

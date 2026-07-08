@@ -168,7 +168,9 @@ pub struct BiomeRow {
     /// fallback whose kernel is also ~1. A constant multiplier of a continuous
     /// kernel — continuity unaffected.
     pub gain: f64,
-    /// Base tint, linear RGB in `[0, 1]` (plain data; consumed by render B2).
+    /// Base tint, **sRGB** in `[0, 1]` (plain data, authored perceptually like
+    /// every `Color::srgb` in the app; the mesh builder converts to linear for
+    /// the GPU — WI 869). Consumed by render B2.
     pub tint: [f64; 3],
     /// Terrain texture-set name under `assets/materials/` (reserved for
     /// splatting, B5); `None` ⇒ tint-only.

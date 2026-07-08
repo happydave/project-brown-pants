@@ -28,6 +28,146 @@
 use crate::surface_field::SurfaceField;
 use glam::{DVec3, Vec2, Vec3};
 
+/// What a chunk's per-vertex colors show (WI 869). `Biome` is the shipping
+/// look — the weight-blended biome tint. The other views are the **debug
+/// overlay family**: the discrete dominant-biome view (the one visual consumer
+/// allowed the dominant accessor — its job is to show the classification,
+/// artifacts and all) and the raw climate-field ramps. All color math lives
+/// here, headless — the render shader only passes the attribute through (the
+/// WI 795 one-side-only lockstep rule).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SurfaceView {
+    /// Weight-blended biome tint (the shipping phase-1 look).
+    #[default]
+    Biome,
+    /// Discrete dominant-biome coloring on a categorical palette.
+    DominantBiome,
+    /// Temperature-field ramp (cold blue → temperate pale → hot red).
+    Temperature,
+    /// Moisture-field ramp (dry ochre → wet blue).
+    Moisture,
+}
+
+impl SurfaceView {
+    /// Cycle order for the debug key / HUD.
+    pub const ALL: [SurfaceView; 4] = [
+        SurfaceView::Biome,
+        SurfaceView::DominantBiome,
+        SurfaceView::Temperature,
+        SurfaceView::Moisture,
+    ];
+
+    /// The next view in the cycle (wraps).
+    pub fn next(self) -> SurfaceView {
+        let i = Self::ALL.iter().position(|&v| v == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    /// A short HUD/debug label.
+    pub fn label(self) -> &'static str {
+        match self {
+            SurfaceView::Biome => "biome tint",
+            SurfaceView::DominantBiome => "dominant biome",
+            SurfaceView::Temperature => "temperature",
+            SurfaceView::Moisture => "moisture",
+        }
+    }
+
+    /// Parses a bus/debug-command name (lenient; unknown ⇒ `None`).
+    pub fn parse(name: &str) -> Option<SurfaceView> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "biome" | "tint" => SurfaceView::Biome,
+            "dominant" | "dominant_biome" => SurfaceView::DominantBiome,
+            "temperature" | "temp" => SurfaceView::Temperature,
+            "moisture" => SurfaceView::Moisture,
+            _ => return None,
+        })
+    }
+}
+
+/// The categorical color for dominant-biome debug row `index`: golden-ratio hue
+/// stepping so adjacent indices land far apart on the wheel (deliberately
+/// discrete — this view exists to show the classification boundaries).
+pub fn dominant_palette(index: usize) -> [f32; 4] {
+    let h = (index as f64 * 0.618_033_988_75).fract();
+    let (r, g, b) = hsv_to_rgb(h, 0.65, 0.95);
+    [r as f32, g as f32, b as f32, 1.0]
+}
+
+/// Temperature debug ramp: ≤180 K deep blue → 250 K pale → ≥320 K red.
+/// Bounded for any input; monotone in hue position over the physical range.
+pub fn temperature_ramp(kelvin: f64) -> [f32; 4] {
+    let t = ((kelvin - 180.0) / (320.0 - 180.0)).clamp(0.0, 1.0);
+    // Stops are per-channel monotone (red rises, blue falls) so the ramp is an
+    // honest single-variable read, not just a pretty gradient.
+    ramp3(
+        t,
+        [0.10, 0.25, 0.85],
+        [0.90, 0.90, 0.70],
+        [0.95, 0.15, 0.10],
+    )
+}
+
+/// Moisture debug ramp: 0 dry ochre → 0.5 sage → 1 wet blue. Bounded, monotone.
+pub fn moisture_ramp(moisture: f64) -> [f32; 4] {
+    let t = moisture.clamp(0.0, 1.0);
+    ramp3(
+        t,
+        [0.60, 0.45, 0.22],
+        [0.45, 0.60, 0.35],
+        [0.10, 0.35, 0.80],
+    )
+}
+
+/// sRGB → linear conversion (exact piecewise curve). Biome-table tints and the
+/// debug ramps/palette are **authored as sRGB** (perceptual values, like every
+/// `Color::srgb` in the app); the GPU consumes vertex colors linearly, so the
+/// conversion happens here — the one place color math lives (WI 795 lockstep
+/// rule). Feeding authored values straight through as linear washed the whole
+/// body out toward white (linear 0.5 displays like sRGB ~0.74).
+fn srgb_to_linear(c: [f32; 4]) -> [f32; 4] {
+    let conv = |v: f32| {
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    [conv(c[0]), conv(c[1]), conv(c[2]), c[3]]
+}
+
+/// Piecewise-linear 3-stop color ramp over `t ∈ [0, 1]`.
+fn ramp3(t: f64, a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> [f32; 4] {
+    let lerp = |x: [f64; 3], y: [f64; 3], s: f64| {
+        [
+            x[0] + (y[0] - x[0]) * s,
+            x[1] + (y[1] - x[1]) * s,
+            x[2] + (y[2] - x[2]) * s,
+        ]
+    };
+    let rgb = if t < 0.5 {
+        lerp(a, b, t * 2.0)
+    } else {
+        lerp(b, c, (t - 0.5) * 2.0)
+    };
+    [rgb[0] as f32, rgb[1] as f32, rgb[2] as f32, 1.0]
+}
+
+/// HSV → RGB (h, s, v ∈ [0, 1]).
+fn hsv_to_rgb(h: f64, s: f64, v: f64) -> (f64, f64, f64) {
+    let i = (h * 6.0).floor();
+    let f = h * 6.0 - i;
+    let (p, q, t) = (v * (1.0 - s), v * (1.0 - s * f), v * (1.0 - s * (1.0 - f)));
+    match (i as i64).rem_euclid(6) {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    }
+}
+
 /// Skirt depth as a multiple of a chunk's own **relief** (max−min elevation). The
 /// terrain gap against a finer/coarser neighbour is bounded by the relief the chunks
 /// span, so a relief-sized skirt covers the *terrain* part of the gap. (Sizing the
@@ -247,6 +387,14 @@ pub struct ChunkMesh {
     /// changes are continuous (no pop). Skirt vertices carry their own position
     /// (skirts do not morph).
     pub morph_targets: Vec<[f32; 3]>,
+    /// Per-vertex colors (linear RGBA, alpha 1) — the biome-blended tint, or a
+    /// debug view's color, per the [`SurfaceView`] the chunk was built with
+    /// (WI 869). Skirt vertices inherit their source border vertex's color
+    /// (the WI 786 pattern). Colors are an *additional* buffer: geometry is
+    /// identical across views, and colors do not morph (positions do) — the
+    /// biome fields are low-frequency relative to vertex spacing, which the
+    /// LOD-agreement tests verify rather than assume.
+    pub colors: Vec<[f32; 4]>,
     /// Triangle indices (three per triangle).
     pub indices: Vec<u32>,
 }
@@ -554,6 +702,18 @@ pub fn build_chunk_with(
     res: u32,
     with_skirt: bool,
 ) -> ChunkMesh {
+    build_chunk_view(field, node, res, with_skirt, SurfaceView::Biome)
+}
+
+/// [`build_chunk_with`] with an explicit color view (WI 869): geometry is
+/// identical for every view; only the `colors` buffer differs.
+pub fn build_chunk_view(
+    field: &SurfaceField,
+    node: QuadNode,
+    res: u32,
+    with_skirt: bool,
+    view: SurfaceView,
+) -> ChunkMesh {
     let res = res.max(1);
     let res = res + (res & 1); // even: parent grid uses every other vertex
     let (u0, u1, v0, v1) = node.uv_rect();
@@ -568,6 +728,7 @@ pub fn build_chunk_with(
     let mut positions = Vec::with_capacity(vert_count);
     let mut normals = Vec::with_capacity(vert_count);
     let mut uvs = Vec::with_capacity(vert_count);
+    let mut colors = Vec::with_capacity(vert_count);
 
     // Surface grid: sample the field at each (u, v) direction. Track the elevation
     // range so the skirt can be sized to this chunk's relief.
@@ -587,8 +748,10 @@ pub fn build_chunk_with(
             let world = dir * (radius + elev);
             world_of.push((dir, world));
             positions.push((world - center).as_vec3().to_array());
-            normals.push(field.normal(dir).as_vec3().to_array());
+            let normal = field.normal(dir);
+            normals.push(normal.as_vec3().to_array());
             uvs.push(Vec2::new(tu as f32, tv as f32).to_array());
+            colors.push(vertex_color(field, dir, elev, normal, view));
         }
     }
 
@@ -644,6 +807,7 @@ pub fn build_chunk_with(
             &mut positions,
             &mut normals,
             &mut uvs,
+            &mut colors,
             &mut indices,
         );
 
@@ -658,8 +822,33 @@ pub fn build_chunk_with(
         normals,
         uvs,
         morph_targets,
+        colors,
         indices,
     }
+}
+
+/// The per-vertex color for `view` (WI 869). `elev`/`normal` are the grid
+/// pass's already-computed samples at `dir` — the `biome_weights_at` seam, so
+/// the biome query here costs the climate fields + classification only.
+fn vertex_color(
+    field: &SurfaceField,
+    dir: DVec3,
+    elev: f64,
+    normal: DVec3,
+    view: SurfaceView,
+) -> [f32; 4] {
+    let srgb = match view {
+        SurfaceView::Biome => {
+            let t = field.biome_weights_at(dir, elev, normal).tint();
+            [t[0] as f32, t[1] as f32, t[2] as f32, 1.0]
+        }
+        SurfaceView::DominantBiome => {
+            dominant_palette(field.biome_weights_at(dir, elev, normal).dominant_index())
+        }
+        SurfaceView::Temperature => temperature_ramp(field.temperature(dir)),
+        SurfaceView::Moisture => moisture_ramp(field.moisture(dir)),
+    };
+    srgb_to_linear(srgb)
 }
 
 /// Appends the border skirt: for each border grid vertex, a duplicate pushed
@@ -679,6 +868,7 @@ fn add_skirt(
     positions: &mut Vec<[f32; 3]>,
     normals: &mut Vec<[f32; 3]>,
     uvs: &mut Vec<[f32; 2]>,
+    colors: &mut Vec<[f32; 4]>,
     indices: &mut Vec<u32>,
 ) {
     let grid_idx = |a: u32, b: u32| (b * (res + 1) + a) as usize;
@@ -707,9 +897,11 @@ fn add_skirt(
         let dropped = world - dir * skirt_depth;
         let border_normal = normals[gi];
         let border_uv = uvs[gi];
+        let border_color = colors[gi];
         positions.push((dropped - center).as_vec3().to_array());
         normals.push(border_normal);
         uvs.push(border_uv);
+        colors.push(border_color);
     }
 
     // Walls: quad (top_k, top_k+1, skirt_k+1, skirt_k) as two triangles.
@@ -772,12 +964,258 @@ pub fn to_vec3(p: [f32; 3]) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::biome::{BiomeFamily, BodyClimate};
     use crate::body_asset::BodyAsset;
+    use crate::surface_field::CraterParams;
 
     const R: f64 = 1_000_000.0;
 
     fn field() -> SurfaceField {
         SurfaceField::new(1234, R)
+    }
+
+    /// A temperate ocean-bearing atmospheric body — real tint variation for the
+    /// color tests (the default airless climate is mostly regolith-grey).
+    fn temperate_field() -> SurfaceField {
+        SurfaceField::with_params(
+            21,
+            2_000_000.0,
+            CraterParams::default(),
+            BodyClimate {
+                family: BiomeFamily::Atmospheric,
+                base_temperature: 288.0,
+                sea_level: Some(0.0),
+                axis: DVec3::Z,
+            },
+        )
+    }
+
+    #[test]
+    fn chunk_colors_match_the_field_tint_and_skirts_inherit() {
+        // WI 869: the Biome view's per-vertex color is exactly the field's
+        // blended tint at that vertex's direction (all color math lives here,
+        // headless — the shader only passes it through), and skirt duplicates
+        // inherit their source border vertex's color (the WI 786 pattern).
+        for f in [field(), temperate_field()] {
+            let node = QuadNode {
+                face: CubeFace::PosX,
+                level: 3,
+                i: 3,
+                j: 5,
+            };
+            let res = 8u32;
+            let chunk = build_chunk(&f, node, res);
+            assert_eq!(chunk.colors.len(), chunk.positions.len());
+            let n = (res + 1) as usize;
+            let (u0, u1, v0, v1) = node.uv_rect();
+            let lerp = |a: f64, b: f64, t: f64| a + (b - a) * t;
+            for b in 0..=res {
+                for a in 0..=res {
+                    let dir = direction(
+                        node.face,
+                        lerp(u0, u1, a as f64 / res as f64),
+                        lerp(v0, v1, b as f64 / res as f64),
+                    );
+                    let t = f.biome_weights(dir).tint();
+                    let expected = srgb_to_linear([t[0] as f32, t[1] as f32, t[2] as f32, 1.0]);
+                    let c = chunk.colors[b as usize * n + a as usize];
+                    for k in 0..3 {
+                        assert_eq!(
+                            c[k], expected[k],
+                            "grid color ≠ linearized field tint at ({a},{b})"
+                        );
+                        assert!((0.0..=1.0).contains(&c[k]));
+                    }
+                    assert_eq!(c[3], 1.0);
+                }
+            }
+            // Skirt ring duplicates (same ring order as add_skirt).
+            let grid_idx = |a: u32, b: u32| (b * (res + 1) + a) as usize;
+            let mut ring: Vec<usize> = Vec::new();
+            for a in 0..=res {
+                ring.push(grid_idx(a, 0));
+            }
+            for b in 1..=res {
+                ring.push(grid_idx(res, b));
+            }
+            for a in (0..res).rev() {
+                ring.push(grid_idx(a, res));
+            }
+            for b in (1..res).rev() {
+                ring.push(grid_idx(0, b));
+            }
+            let skirt_base = n * n;
+            assert_eq!(chunk.colors.len(), skirt_base + ring.len());
+            for (k, &gi) in ring.iter().enumerate() {
+                assert_eq!(
+                    chunk.colors[skirt_base + k],
+                    chunk.colors[gi],
+                    "skirt vertex {k} must inherit its border color"
+                );
+            }
+            // Purity: a rebuild is bit-identical.
+            let again = build_chunk(&f, node, res);
+            assert_eq!(chunk.colors, again.colors);
+        }
+    }
+
+    #[test]
+    fn geometry_is_identical_across_color_views() {
+        // WI 869 invariant: colors are an additional buffer — the view changes
+        // nothing about positions/normals/uvs/morph targets/indices, so the
+        // WI 795 seam/weld guarantees are untouched by construction.
+        let f = temperate_field();
+        let node = QuadNode {
+            face: CubeFace::NegZ,
+            level: 2,
+            i: 1,
+            j: 2,
+        };
+        let base = build_chunk_with(&f, node, 8, true);
+        for view in SurfaceView::ALL {
+            let c = build_chunk_view(&f, node, 8, true, view);
+            assert_eq!(c.positions, base.positions, "{view:?}");
+            assert_eq!(c.normals, base.normals, "{view:?}");
+            assert_eq!(c.uvs, base.uvs, "{view:?}");
+            assert_eq!(c.morph_targets, base.morph_targets, "{view:?}");
+            assert_eq!(c.indices, base.indices, "{view:?}");
+            assert_eq!(c.colors.len(), base.colors.len(), "{view:?}");
+        }
+        // And the default build (build_chunk_with) is the Biome view.
+        let biome = build_chunk_view(&f, node, 8, true, SurfaceView::Biome);
+        assert_eq!(base.colors, biome.colors);
+    }
+
+    #[test]
+    fn debug_ramps_are_bounded_monotone_and_palette_distinct() {
+        // Temperature: bounded for any input, red rises / blue falls with heat.
+        let mut prev = temperature_ramp(100.0);
+        for k in 0..=60 {
+            let t = 100.0 + k as f64 * 5.0; // 100 → 400 K
+            let c = temperature_ramp(t);
+            for v in c {
+                assert!((0.0..=1.0).contains(&v));
+            }
+            assert!(c[0] >= prev[0] - 1e-6, "red must not decrease with heat");
+            assert!(c[2] <= prev[2] + 1e-6, "blue must not increase with heat");
+            prev = c;
+        }
+        // Moisture: bounded, blue rises with wetness.
+        let mut prev = moisture_ramp(-1.0);
+        for k in 0..=40 {
+            let m = -1.0 + k as f64 * 0.1; // clamps outside [0,1]
+            let c = moisture_ramp(m);
+            for v in c {
+                assert!((0.0..=1.0).contains(&v));
+            }
+            assert!(
+                c[2] >= prev[2] - 1e-6,
+                "blue must not decrease with moisture"
+            );
+            prev = c;
+        }
+        // Dominant palette: distinct colors across any table-sized index range.
+        for i in 0..16 {
+            for j in (i + 1)..16 {
+                let (a, b) = (dominant_palette(i), dominant_palette(j));
+                let d: f32 = (0..3).map(|k| (a[k] - b[k]).abs()).sum();
+                assert!(d > 0.05, "palette indices {i}/{j} too similar");
+            }
+        }
+        // View cycle covers all views and wraps.
+        let mut v = SurfaceView::Biome;
+        for _ in 0..SurfaceView::ALL.len() {
+            v = v.next();
+        }
+        assert_eq!(v, SurfaceView::Biome);
+    }
+
+    #[test]
+    fn lod_vertex_colors_agree_across_levels() {
+        // WI 869 §LOD: verify the design's claim instead of assuming it. A
+        // parent chunk and its child sample coincident directions at the
+        // child's even grid points — colors there must agree to float-path
+        // tolerance. At the child's odd points the parent's triangles show the
+        // linear interpolation of its adjacent vertex colors; the biome fields
+        // are low-frequency relative to vertex spacing, so the deviation is
+        // small — measured: even = 0.0 (bit-identical), odd max ≈ 0.018 on a
+        // chunk whose own tint spread is 0.13; asserted at 0.05 (≈3× headroom,
+        // still far below the spread a vertex-scale tint field would show).
+        let f = temperate_field();
+        let parent = QuadNode {
+            face: CubeFace::PosX,
+            level: 4,
+            i: 5,
+            j: 9,
+        };
+        let child = parent.children()[0]; // low-u/low-v quadrant
+        let res = DEFAULT_RESOLUTION;
+        let n = (res + 1) as usize;
+        let p = build_chunk_view(&f, parent, res, false, SurfaceView::Biome);
+        let c = build_chunk_view(&f, child, res, false, SurfaceView::Biome);
+
+        // Coverage guard: the probed chunk must actually span tint variation,
+        // or the agreement asserts are vacuous.
+        let mut spread = 0.0_f32;
+        for k in 0..3 {
+            let lo = c.colors.iter().map(|v| v[k]).fold(f32::MAX, f32::min);
+            let hi = c.colors.iter().map(|v| v[k]).fold(f32::MIN, f32::max);
+            spread = spread.max(hi - lo);
+        }
+        assert!(
+            spread > 0.05,
+            "probe chunk shows no tint variation ({spread}) — re-site it"
+        );
+
+        let mut max_even = 0.0_f32;
+        let mut max_odd = 0.0_f32;
+        let pc = |a: usize, b: usize| p.colors[b * n + a];
+        for b in 0..=res as usize {
+            for a in 0..=res as usize {
+                let cc = c.colors[b * n + a];
+                let expected = match (a % 2, b % 2) {
+                    (0, 0) => pc(a / 2, b / 2),
+                    (1, 0) => avg2(pc(a / 2, b / 2), pc(a / 2 + 1, b / 2)),
+                    (0, 1) => avg2(pc(a / 2, b / 2), pc(a / 2, b / 2 + 1)),
+                    _ => avg4(
+                        pc(a / 2, b / 2),
+                        pc(a / 2 + 1, b / 2),
+                        pc(a / 2, b / 2 + 1),
+                        pc(a / 2 + 1, b / 2 + 1),
+                    ),
+                };
+                let d = (0..3)
+                    .map(|k| (cc[k] - expected[k]).abs())
+                    .fold(0.0, f32::max);
+                if a % 2 == 0 && b % 2 == 0 {
+                    max_even = max_even.max(d);
+                } else {
+                    max_odd = max_odd.max(d);
+                }
+            }
+        }
+        // Even (coincident-direction) vertices: identical up to the uv float
+        // path (the parent lerps its own rect).
+        assert!(
+            max_even < 1e-4,
+            "coincident LOD vertices disagree on tint: {max_even}"
+        );
+        // Odd vertices vs the parent's on-screen interpolation: the level-pop
+        // bound. Calibrated: measured max recorded below; a tint field varying
+        // at vertex scale (the claim's failure mode) would push this toward the
+        // chunk's own spread (>0.05).
+        assert!(
+            max_odd < 0.05,
+            "LOD tint deviation at odd vertices too large: {max_odd}"
+        );
+    }
+
+    fn avg2(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+        std::array::from_fn(|k| 0.5 * (a[k] + b[k]))
+    }
+
+    fn avg4(a: [f32; 4], b: [f32; 4], c: [f32; 4], d: [f32; 4]) -> [f32; 4] {
+        std::array::from_fn(|k| 0.25 * (a[k] + b[k] + c[k] + d[k]))
     }
 
     #[test]

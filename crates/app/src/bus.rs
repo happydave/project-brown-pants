@@ -650,7 +650,10 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(
             drx.try_recv().unwrap(),
-            DebugCommand::SetOverlay { lod: Some(true) }
+            DebugCommand::SetOverlay {
+                lod: Some(true),
+                biome_view: None
+            }
         );
         // GET /camera returns the published pose JSON.
         let (status, body) = handle_request(

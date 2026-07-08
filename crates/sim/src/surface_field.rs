@@ -251,7 +251,19 @@ impl SurfaceField {
     pub fn biome_weights(&self, dir: DVec3) -> BiomeWeights {
         let d = normalize_or_x(dir);
         let (n, elevation) = self.normal_and_elevation(d);
-        let slope = 1.0 - n.dot(d).clamp(-1.0, 1.0);
+        self.biome_weights_at(d, elevation, n)
+    }
+
+    /// [`Self::biome_weights`] with the elevation and normal supplied by the
+    /// caller — the mesh builder's seam (WI 869): chunk generation already
+    /// samples both per vertex, so its per-vertex biome query pays only the
+    /// climate fields + classification, not a second finite-difference normal.
+    /// `elevation`/`normal` **must** come from this same field at `dir`
+    /// (`elevation(dir)` / `normal(dir)`), or the classification is
+    /// inconsistent with the terrain.
+    pub fn biome_weights_at(&self, dir: DVec3, elevation: f64, normal: DVec3) -> BiomeWeights {
+        let d = normalize_or_x(dir);
+        let slope = 1.0 - normal.dot(d).clamp(-1.0, 1.0);
         let sea = self.climate.sea_level.unwrap_or(0.0);
         // Family-irrelevant channels stay neutral and unevaluated (their rows
         // mark them "don't care"): the atmospheric path never pays for the
@@ -265,10 +277,21 @@ impl SurfaceField {
                 self.bowl(d),
             ),
         };
+        // A dry world has no marine biomes (WI 869 finding): without an ocean,
+        // the elevation channel floors just above the marine bands (ocean /
+        // shallows / beach all close by 0.03), so basins read as low plains and
+        // classify by climate instead. `max` keeps the channel continuous; the
+        // floored region is constant, so no new frontier appears.
+        let e = (elevation - sea) / self.amplitude;
+        let elevation_channel = if self.climate.sea_level.is_some() {
+            e
+        } else {
+            e.max(0.03)
+        };
         let sample = ClimateSample {
             temperature: self.temperature_at_elevation(d, elevation),
             moisture,
-            elevation: (elevation - sea) / self.amplitude,
+            elevation: elevation_channel,
             slope,
             latitude: self.warped_latitude(d),
             albedo,
@@ -1096,6 +1119,49 @@ mod tests {
             moon_names.insert(moon.biome_weights(d).dominant().name);
         }
         assert!(moon_names.len() >= 2, "airless variety: {moon_names:?}");
+    }
+
+    #[test]
+    fn dry_worlds_have_no_marine_biomes() {
+        // WI 869 finding: a rocky planet (atmosphere, no ocean) classified its
+        // basins as "ocean" — the marine rows fire on the raw elevation channel.
+        // Without a sea level the channel floors above the marine bands, so dry
+        // basins read as low plains (climate decides), never ocean/shallows/beach.
+        let mut climate = temperate_climate();
+        climate.sea_level = None;
+        let f = SurfaceField::with_params(12, 6_588_000.0, CraterParams::default(), climate);
+        let mut deep = 0;
+        for i in 0..800 {
+            let a = i as f64 * 0.618_033_988_75 * std::f64::consts::TAU;
+            let z = -1.0 + 2.0 * (i as f64 + 0.5) / 800.0;
+            let r = (1.0 - z * z).max(0.0).sqrt();
+            let d = DVec3::new(r * a.cos(), r * a.sin(), z);
+            if f.elevation(d) < -900.0 {
+                deep += 1; // the marine rows' old habitat — must be exercised
+            }
+            let name = f.biome_weights(d).dominant().name;
+            assert!(
+                name != "ocean" && name != "shallows" && name != "beach",
+                "dry world classified {name} at a basin"
+            );
+        }
+        assert!(deep > 0, "no deep basins sampled — re-site the scan");
+        // And an ocean-bearing body still gets its ocean (the flooring is
+        // strictly a no-ocean behavior).
+        let wet = SurfaceField::with_params(
+            12,
+            6_588_000.0,
+            CraterParams::default(),
+            temperate_climate(),
+        );
+        let has_ocean = (0..800).any(|i| {
+            let a = i as f64 * 0.618_033_988_75 * std::f64::consts::TAU;
+            let z = -1.0 + 2.0 * (i as f64 + 0.5) / 800.0;
+            let r = (1.0 - z * z).max(0.0).sqrt();
+            let d = DVec3::new(r * a.cos(), r * a.sin(), z);
+            wet.biome_weights(d).dominant().name == "ocean"
+        });
+        assert!(has_ocean, "ocean-bearing body lost its ocean biome");
     }
 
     #[test]

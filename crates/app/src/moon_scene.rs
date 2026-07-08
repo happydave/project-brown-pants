@@ -180,8 +180,10 @@ fn setup(
     let asm = assemble_rover(&craft, DVec3::new(0.0, ground + 3.0 * CELL, 0.0), g)
         .expect("buggy has four complete wheel stations");
 
+    // White since WI 869: the per-vertex biome tint (maria/highlands/boulder/
+    // cold-trap two-tone on an airless body) carries the surface's look.
     let material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.52, 0.52, 0.55),
+        base_color: Color::WHITE,
         perceptual_roughness: 1.0,
         ..default()
     });
@@ -431,6 +433,9 @@ fn to_bevy_mesh(meshes: &mut Assets<Mesh>, chunk: &ChunkMesh) -> Handle<Mesh> {
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, chunk.positions.clone());
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, chunk.normals.clone());
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, chunk.uvs.clone());
+    // Per-vertex biome tint (WI 869); StandardMaterial consumes it natively
+    // (the base color is white so the tint carries the look).
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, chunk.colors.clone());
     mesh.insert_indices(Indices::U32(chunk.indices.clone()));
     meshes.add(mesh)
 }

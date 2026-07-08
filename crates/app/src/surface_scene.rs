@@ -47,12 +47,14 @@ use sounding_sim::bodygen::{generate, Archetype};
 use sounding_sim::frame::{FrameId, WorldPos};
 use sounding_sim::surface_field::SurfaceField;
 use sounding_sim::surface_mesh::{
-    build_chunk_with, morph_range, AtmosphereParams, ChunkMesh, QuadNode, DEFAULT_MAX_LEVEL,
+    build_chunk_view, morph_range, AtmosphereParams, ChunkMesh, QuadNode, DEFAULT_MAX_LEVEL,
     DEFAULT_RESOLUTION, WELD_BAND_ROWS,
 };
 use sounding_sim::surface_scan::{boundary_config, resident_leaves};
 
-use crate::debug_control::{DebugCameraContext, DebugControllable, DebugOverlayState};
+use crate::debug_control::{
+    BiomeViewState, DebugCameraContext, DebugControllable, DebugOverlayState,
+};
 use crate::floating_origin::{
     render_translation, AnchorCamera, FloatingOrigin, FloatingOriginPlugin, WorldPlacement,
 };
@@ -96,12 +98,14 @@ impl MaterialExtension for GeomorphExt {
         layout: &MeshVertexBufferLayoutRef,
         _key: MaterialExtensionKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
-        // Add the morph-target attribute (@location 8) alongside the standard ones so
+        // Add the morph-target attribute (@location 8) and the biome vertex color
+        // (@location 5, the standard slot — WI 869) alongside the standard ones so
         // the custom vertex shader's input matches the uploaded mesh layout.
         let vertex_layout = layout.0.get_layout(&[
             Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
             Mesh::ATTRIBUTE_NORMAL.at_shader_location(1),
             Mesh::ATTRIBUTE_UV_0.at_shader_location(2),
+            Mesh::ATTRIBUTE_COLOR.at_shader_location(5),
             ATTRIBUTE_MORPH_TARGET.at_shader_location(8),
         ])?;
         descriptor.vertex.buffers = vec![vertex_layout];
@@ -311,17 +315,6 @@ fn parse_args() -> (u64, Archetype) {
     (seed, archetype)
 }
 
-fn body_tint(asset: &BodyAsset) -> Color {
-    let m = &asset.fluid_medium;
-    if m.ocean_surface_density > 0.0 {
-        Color::srgb(0.35, 0.40, 0.45)
-    } else if m.atmosphere_surface_density > 0.0 {
-        Color::srgb(0.60, 0.50, 0.38)
-    } else {
-        Color::srgb(0.52, 0.52, 0.55)
-    }
-}
-
 fn setup(mut commands: Commands, mut scattering: ResMut<Assets<ScatteringMedium>>) {
     let (seed, archetype) = parse_args();
     let asset = generate(seed, archetype);
@@ -330,8 +323,10 @@ fn setup(mut commands: Commands, mut scattering: ResMut<Assets<ScatteringMedium>
     let center_world = DVec3::new(0.0, -radius, 0.0);
 
     // Base surface material config; per-level geomorph materials are built on demand.
+    // White since WI 869: the per-vertex biome tint carries the body's look (the
+    // old flat `body_tint` survives only as the atmosphere's ground albedo hint).
     let base_material = StandardMaterial {
-        base_color: body_tint(&asset),
+        base_color: Color::WHITE,
         perceptual_roughness: 1.0,
         ..default()
     };
@@ -512,6 +507,7 @@ fn stream_surface(
     mat: Res<SurfaceMat>,
     mut geomorph_materials: ResMut<Assets<SurfaceGeomorph>>,
     body: Res<SurfaceBody>,
+    view: Res<BiomeViewState>,
     mut streamer: ResMut<ChunkStreamer>,
     mut stats: ResMut<StreamStats>,
     camera: Query<&WorldPlacement, With<AnchorCamera>>,
@@ -521,6 +517,17 @@ fn stream_surface(
     };
     let camera_body = cam.0.pos - body.center_world;
     let radius = body.field.radius();
+
+    // Color-view change (WI 869): drop everything and restream — chunks are
+    // rebuilt with the new view's colors. A brief re-stream is fine for a debug
+    // toggle; in-flight tasks are simply dropped (their output would be stale).
+    if view.is_changed() && !view.is_added() {
+        for (_, live) in streamer.live.drain() {
+            commands.entity(live.entity).despawn();
+        }
+        streamer.meshing.clear();
+        streamer.ready.clear();
+    }
 
     let desired: std::collections::HashSet<QuadNode> = desired_leaves(&body.field, camera_body)
         .into_iter()
@@ -616,8 +623,10 @@ fn stream_surface(
         }
         let field = body.field; // Copy
         let with_skirt = !body.no_skirt;
-        let task = pool
-            .spawn(async move { build_chunk_with(&field, node, DEFAULT_RESOLUTION, with_skirt) });
+        let color_view = view.0;
+        let task = pool.spawn(async move {
+            build_chunk_view(&field, node, DEFAULT_RESOLUTION, with_skirt, color_view)
+        });
         streamer.meshing.insert(node, task);
         spawned += 1;
     }
@@ -667,6 +676,9 @@ fn to_bevy_mesh(meshes: &mut Assets<Mesh>, chunk: &ChunkMesh) -> Handle<Mesh> {
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, chunk.positions.clone());
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, chunk.normals.clone());
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, chunk.uvs.clone());
+    // Per-vertex biome tint (WI 869); the base color is white so this carries
+    // the body's look (a body_tint multiply would double-tint).
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, chunk.colors.clone());
     mesh.insert_attribute(ATTRIBUTE_MORPH_TARGET, chunk.morph_targets.clone());
     mesh.insert_indices(Indices::U32(chunk.indices.clone()));
     meshes.add(mesh)
@@ -725,10 +737,18 @@ fn fly_camera(
     }
 }
 
-/// Toggles the debug overlay with `F3`.
-fn toggle_overlay(keys: Res<ButtonInput<KeyCode>>, mut overlay: ResMut<DebugOverlayState>) {
+/// Toggles the debug overlay with `F3`; cycles the surface color view (biome
+/// tint → dominant biome → temperature → moisture) with `F6` (WI 869).
+fn toggle_overlay(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut overlay: ResMut<DebugOverlayState>,
+    mut view: ResMut<BiomeViewState>,
+) {
     if keys.just_pressed(KeyCode::F3) {
         overlay.0 = !overlay.0;
+    }
+    if keys.just_pressed(KeyCode::F6) {
+        view.0 = view.0.next();
     }
 }
 
@@ -793,6 +813,7 @@ fn lod_color(level: u32) -> Color {
 fn hud(
     body: Res<SurfaceBody>,
     overlay: Res<DebugOverlayState>,
+    view: Res<BiomeViewState>,
     streamer: Res<ChunkStreamer>,
     camera: Query<&WorldPlacement, With<AnchorCamera>>,
     mut text: Query<&mut Text, With<HudText>>,
@@ -813,7 +834,7 @@ fn hud(
         "SURFACE (-- surface)  v{ver}\n\
          body: {name}\nradius: {rkm:.0} km\naltitude: {akm:.1} km\n\
          chunks: {live} live, {pend} meshing\natmosphere: {atmo}\n\n\
-         W/A/S/D move \u{b7} R/F up/down \u{b7} arrows look \u{b7} F3 overlay [{ov}]",
+         W/A/S/D move \u{b7} R/F up/down \u{b7} arrows look \u{b7} F3 overlay [{ov}] \u{b7} F6 view [{view}]",
         ver = env!("CARGO_PKG_VERSION"),
         name = body.asset.name,
         rkm = body.field.radius() / 1000.0,
@@ -822,5 +843,6 @@ fn hud(
         pend = streamer.meshing.len(),
         atmo = atmo,
         ov = if overlay.0 { "on" } else { "off" },
+        view = view.0.label(),
     );
 }
