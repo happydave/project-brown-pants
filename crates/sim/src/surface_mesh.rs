@@ -1409,6 +1409,107 @@ mod tests {
         );
     }
 
+    /// WI 873: the LOD tint-agreement contract holds *over an ejecta ray
+    /// system* — the highest-angular-frequency biome input. Self-siting: scan
+    /// level-4 nodes on the (airless) default body for one whose chunk actually
+    /// contains strong ejecta, then run the same even/odd analysis and bounds
+    /// as [`lod_vertex_colors_agree_across_levels`]. This is the check that ray
+    /// frequency content stays legible under vertex sampling; if tuning ever
+    /// pushes it over, widen the streak core / lower ray counts / soften the
+    /// ejecta band — not the bound. (Calibration at authoring: even = 0.0
+    /// bit-identical; odd ≈ 0.025 after the WI 873 tune — the first-cut
+    /// 6–12-ray, 0.15-core shape measured 0.18 here and was retuned.)
+    #[test]
+    fn lod_vertex_colors_agree_over_ejecta_rays() {
+        let f = field();
+        let res = DEFAULT_RESOLUTION;
+        let n = (res + 1) as usize;
+        let mut sited = None;
+        let mut best = 0.0_f64;
+        for face in CubeFace::ALL {
+            for i in 0..16 {
+                for j in 0..16 {
+                    let node = QuadNode {
+                        face,
+                        level: 4,
+                        i,
+                        j,
+                    };
+                    let (u0, u1, v0, v1) = node.uv_rect();
+                    // Peak ejecta over the node's centre + quarter points.
+                    let peak = [
+                        (0.5, 0.5),
+                        (0.25, 0.25),
+                        (0.75, 0.25),
+                        (0.25, 0.75),
+                        (0.75, 0.75),
+                    ]
+                    .iter()
+                    .map(|&(a, b)| {
+                        f.ejecta(direction(face, u0 + a * (u1 - u0), v0 + b * (v1 - v0)))
+                    })
+                    .fold(0.0, f64::max);
+                    if peak > best {
+                        best = peak;
+                        sited = Some(node);
+                    }
+                }
+            }
+        }
+        let parent = sited.expect("no level-4 node sees ejecta — re-seed the probe");
+        assert!(
+            best > 0.35,
+            "strongest sited ejecta is only {best} — re-seed the probe"
+        );
+        // The child quadrant that sees the rays strongest.
+        let child = *parent
+            .children()
+            .iter()
+            .max_by(|a, b| {
+                let peak = |q: &QuadNode| {
+                    let (u0, u1, v0, v1) = q.uv_rect();
+                    f.ejecta(direction(q.face, 0.5 * (u0 + u1), 0.5 * (v0 + v1)))
+                };
+                peak(a).total_cmp(&peak(b))
+            })
+            .unwrap();
+        let p = build_chunk_view(&f, parent, res, false, SurfaceView::Biome);
+        let c = build_chunk_view(&f, child, res, false, SurfaceView::Biome);
+        let pc = |a: usize, b: usize| {
+            let (ci, cj) = (child.i as usize % 2, child.j as usize % 2);
+            p.colors[(b / 2 + cj * (res as usize / 2)) * n + (a / 2 + ci * (res as usize / 2))]
+        };
+        let mut max_even = 0.0_f32;
+        let mut max_odd = 0.0_f32;
+        for b in 0..=res as usize {
+            for a in 0..=res as usize {
+                let cc = c.colors[b * n + a];
+                let expected = match (a % 2, b % 2) {
+                    (0, 0) => pc(a, b),
+                    (1, 0) => avg2(pc(a, b), pc(a + 2, b)),
+                    (0, 1) => avg2(pc(a, b), pc(a, b + 2)),
+                    _ => avg4(pc(a, b), pc(a + 2, b), pc(a, b + 2), pc(a + 2, b + 2)),
+                };
+                let d = (0..3)
+                    .map(|k| (cc[k] - expected[k]).abs())
+                    .fold(0.0, f32::max);
+                if a % 2 == 0 && b % 2 == 0 {
+                    max_even = max_even.max(d);
+                } else {
+                    max_odd = max_odd.max(d);
+                }
+            }
+        }
+        assert!(
+            max_even < 1e-4,
+            "coincident LOD vertices disagree over rays: {max_even}"
+        );
+        assert!(
+            max_odd < 0.05,
+            "LOD tint deviation over rays too large: {max_odd}"
+        );
+    }
+
     fn avg2(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
         std::array::from_fn(|k| 0.5 * (a[k] + b[k]))
     }

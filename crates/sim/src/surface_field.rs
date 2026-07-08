@@ -92,6 +92,34 @@ const CRATER_OCTAVES: [CraterOctave; 3] = [
 /// Σ `depth_frac` over [`CRATER_OCTAVES`] — the crater relief budget.
 const CRATER_TOTAL_DEPTH_FRAC: f64 = 0.50 + 0.40 + 0.15;
 
+/// How many leading [`CRATER_OCTAVES`] carry ejecta rays (WI 873): the large
+/// and medium populations only — the small octave's craters are sub-visible at
+/// the orbital altitudes rays are for, and skipping it bounds the query cost.
+const EJECTA_OCTAVES: usize = 2;
+
+/// Fraction of craters that are "young" (carry a ray system): a fresh per-cell
+/// hash against this, so ray systems are a clear minority of craters.
+const EJECTA_YOUNG_FRACTION: f64 = 0.2;
+
+/// Ejecta extent as a multiple of the crater's own reach…
+const EJECTA_EXTENT_FACTOR: f64 = 2.5;
+
+/// …capped **strictly below one lattice cell**, so the WI 866 exactness
+/// argument (influence reach < 1 cell per axis + centre inside its own cell ⇒
+/// the 27-cell window is exact) holds for the ejecta reach verbatim.
+const EJECTA_EXTENT_MAX: f64 = 0.95;
+
+/// Tangent-plane radius (lattice units) over which the angular streak
+/// modulation fades in. Inside it the profile is halo-only — which is what
+/// keeps the field continuous where the azimuth is ill-defined (the crater
+/// centre, and the radially-aligned surface point of an off-shell centre).
+/// Sized (with the ray-count cap below) so the narrowest streak lobe stays
+/// wider than parent-level chunk vertex spacing — the LOD tint-agreement
+/// bound (`surface_mesh::lod_vertex_colors_agree_over_ejecta_rays`) is the
+/// check; at 0.15 with 6–12 rays the lobes aliased (odd-vertex deviation
+/// 0.18 > the 0.05 bound).
+const EJECTA_STREAK_CORE: f64 = 0.45;
+
 /// Per-body crater parameters (WI 782), read from the **reserved**
 /// `SurfaceRecipe.crater` area (a defaulted `serde_json::Value`, so no
 /// persistence-format change). Lenient: absent / null / non-object values and
@@ -267,14 +295,16 @@ impl SurfaceField {
         let sea = self.climate.sea_level.unwrap_or(0.0);
         // Family-irrelevant channels stay neutral and unevaluated (their rows
         // mark them "don't care"): the atmospheric path never pays for the
-        // crater-bowl query and the airless path never pays for moisture.
-        let (moisture, albedo, roughness, bowl) = match self.climate.family {
-            BiomeFamily::Atmospheric => (self.moisture(d), 0.5, 0.5, 0.0),
+        // crater-bowl or ejecta queries and the airless path never pays for
+        // moisture.
+        let (moisture, albedo, roughness, bowl, ejecta) = match self.climate.family {
+            BiomeFamily::Atmospheric => (self.moisture(d), 0.5, 0.5, 0.0, 0.0),
             BiomeFamily::Airless => (
                 0.5,
                 self.albedo_field(d),
                 self.roughness_field(d),
                 self.bowl(d),
+                self.ejecta(d),
             ),
         };
         // A dry world has no marine biomes (WI 869 finding): without an ocean,
@@ -297,6 +327,7 @@ impl SurfaceField {
             albedo,
             roughness,
             bowl,
+            ejecta,
         };
         classify(self.climate.family, &sample)
     }
@@ -491,6 +522,100 @@ impl SurfaceField {
             }
         }
         delta
+    }
+
+    /// Ejecta-ray intensity in `[0, 1]` at a direction (WI 873): bright halos +
+    /// radial streaks around the deterministic "young" subset of the large and
+    /// medium crater populations, feeding the airless classifier's `ejecta`
+    /// channel — **albedo only**, never elevation. The pass reuses each
+    /// octave's own occupancy/jitter/reach hash streams, so every ray system
+    /// sits on a real crater of that octave; overlapping systems combine by a
+    /// saturating product, so the result stays bounded and continuous.
+    ///
+    /// Continuity (the WI 866 rules, applied to the new reach): each system's
+    /// profile is exactly zero at and beyond its extent; the extent is measured
+    /// in lattice space against the unnormalized centre and stays strictly
+    /// below one cell ([`EJECTA_EXTENT_MAX`]), so the 27-cell window is exact
+    /// and nothing pops at lattice planes; the streak modulation fades to a
+    /// pure halo below a tangent-plane radius ([`EJECTA_STREAK_CORE`]), so the
+    /// azimuth singularity contributes nothing where it is ill-defined; and the
+    /// ray count is an exact integer, so the angular term has no branch-cut
+    /// step at ±π.
+    pub fn ejecta(&self, dir: DVec3) -> f64 {
+        let d = normalize_or_x(dir);
+        // Product of (1 − contribution): saturating combine of overlaps.
+        let mut clear = 1.0;
+        for (i, o) in CRATER_OCTAVES.iter().take(EJECTA_OCTAVES).enumerate() {
+            let oseed = self
+                .seed
+                .wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i as u64 + 1));
+            let q = d * o.freq;
+            let base = q.floor();
+            let density = (o.density * self.crater.density).min(1.0);
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        let c = base + DVec3::new(dx as f64, dy as f64, dz as f64);
+                        let (cx, cy, cz) = (c.x as i64, c.y as i64, c.z as i64);
+                        // Same occupancy gate as the crater term — a ray system
+                        // exists only where its crater does (and the per-body
+                        // density multiplier zeroes both together).
+                        if hash_unit(cx, cy, cz, oseed ^ 0x00C0_FFEE) >= density {
+                            continue;
+                        }
+                        if hash_unit(cx, cy, cz, oseed ^ 0x66) >= EJECTA_YOUNG_FRACTION {
+                            continue;
+                        }
+                        let jitter = DVec3::new(
+                            hash_unit(cx, cy, cz, oseed ^ 0x11),
+                            hash_unit(cx, cy, cz, oseed ^ 0x22),
+                            hash_unit(cx, cy, cz, oseed ^ 0x33),
+                        );
+                        let center = c + jitter;
+                        let ar = o.reach_min
+                            + (o.reach_max - o.reach_min) * hash_unit(cx, cy, cz, oseed ^ 0x44);
+                        let er = (EJECTA_EXTENT_FACTOR * ar).min(EJECTA_EXTENT_MAX);
+                        let off = q - center;
+                        let chord = off.length();
+                        if chord >= er {
+                            continue;
+                        }
+                        let t = chord / er;
+                        // Radial envelope: 1 at the centre, smoothly exactly 0
+                        // at the extent (zero slope there — no perimeter ring).
+                        let envelope = {
+                            let u = 1.0 - t * t;
+                            u * u
+                        };
+                        // Angular streaks: an integer ray count over the azimuth
+                        // in the crater's tangent frame, sharpened; blended in by
+                        // the tangent-plane radius so the core stays a halo.
+                        let cdir = normalize_or_x(center);
+                        let (t1, t2) = tangent_basis(cdir);
+                        let (u, v) = (off.dot(t1), off.dot(t2));
+                        let planar = (u * u + v * v).sqrt();
+                        let mix = {
+                            let s = (planar / EJECTA_STREAK_CORE).clamp(0.0, 1.0);
+                            s * s * (3.0 - 2.0 * s)
+                        };
+                        // Few, fat rays: the count cap and the mild sharpening
+                        // keep the narrowest lobe wider than parent-LOD vertex
+                        // spacing (see EJECTA_STREAK_CORE) — real ray systems
+                        // read as a handful of dominant rays anyway.
+                        let rays = (3.0 + 4.0 * hash_unit(cx, cy, cz, oseed ^ 0x77)).floor();
+                        let phase = std::f64::consts::TAU * hash_unit(cx, cy, cz, oseed ^ 0x88);
+                        let streak = {
+                            let s = 0.5 + 0.5 * (rays * v.atan2(u) + phase).cos();
+                            s * s
+                        };
+                        let angular = 1.0 - mix + mix * streak;
+                        let intensity = 0.55 + 0.45 * hash_unit(cx, cy, cz, oseed ^ 0x99);
+                        clear *= 1.0 - (intensity * envelope * angular).clamp(0.0, 1.0);
+                    }
+                }
+            }
+        }
+        1.0 - clear
     }
 }
 
@@ -954,6 +1079,185 @@ mod tests {
             center_delta < f.octave_delta(ring, 1, o),
             "centre {center_delta} must be below ring {}",
             f.octave_delta(ring, 1, o)
+        );
+    }
+
+    /// Finds a "young" (ray-carrying) crater of octave `index` near +X whose
+    /// projected centre sits well inside its own ejecta extent (so the halo
+    /// core is guaranteed sampled on the sphere). Returns the projected centre
+    /// direction and the extent in radians — the WI 873 sibling of
+    /// [`find_octave_crater`], selecting on the same hash streams plus the
+    /// young gate.
+    fn find_young_crater(f: &SurfaceField, index: usize) -> Option<(DVec3, f64)> {
+        let o = &CRATER_OCTAVES[index];
+        let oseed = f
+            .seed
+            .wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(index as u64 + 1));
+        let shell = o.freq.round() as i64;
+        for ix in (shell - 4)..(shell + 4) {
+            for iy in -3..=3 {
+                for iz in -3..=3 {
+                    if hash_unit(ix, iy, iz, oseed ^ 0x00C0_FFEE)
+                        >= (o.density * f.crater.density).min(1.0)
+                    {
+                        continue;
+                    }
+                    if hash_unit(ix, iy, iz, oseed ^ 0x66) >= EJECTA_YOUNG_FRACTION {
+                        continue;
+                    }
+                    let jitter = DVec3::new(
+                        hash_unit(ix, iy, iz, oseed ^ 0x11),
+                        hash_unit(ix, iy, iz, oseed ^ 0x22),
+                        hash_unit(ix, iy, iz, oseed ^ 0x33),
+                    );
+                    let center = DVec3::new(ix as f64, iy as f64, iz as f64) + jitter;
+                    let ar = o.reach_min
+                        + (o.reach_max - o.reach_min) * hash_unit(ix, iy, iz, oseed ^ 0x44);
+                    let er = (EJECTA_EXTENT_FACTOR * ar).min(EJECTA_EXTENT_MAX);
+                    let chord_at_centre = (center.length() - o.freq).abs();
+                    let c = normalize_or_x(center);
+                    if c.x > 0.5 && chord_at_centre < 0.5 * er {
+                        return Some((c, er / o.freq));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn ejecta_is_pure_bounded_local_young_minority_and_density_gated() {
+        let f = SurfaceField::new(2024, 1_000_000.0);
+        // Purity + bounds on the standard direction set.
+        for d in dirs() {
+            let e = f.ejecta(d);
+            assert!(e.is_finite() && (0.0..=1.0).contains(&e));
+            assert_eq!(e, f.ejecta(d), "ejecta must be pure");
+        }
+        assert!(f.ejecta(DVec3::ZERO).is_finite(), "zero dir → finite");
+        // Locality: on a dense scan, rayed and exactly-ray-free directions both
+        // exist — each per-crater profile is exactly zero at and beyond its
+        // extent, so the field has genuine zero support away from young craters.
+        let (mut rayed, mut clear) = (0u32, 0u32);
+        for i in 0..4_000 {
+            let a = i as f64 * 0.618_033_988_75 * std::f64::consts::TAU;
+            let z = -1.0 + 2.0 * (i as f64 + 0.5) / 4_000.0;
+            let r = (1.0 - z * z).max(0.0).sqrt();
+            let e = f.ejecta(DVec3::new(r * a.cos(), z, r * a.sin()));
+            if e > 0.05 {
+                rayed += 1;
+            }
+            if e == 0.0 {
+                clear += 1;
+            }
+        }
+        assert!(rayed > 0, "no rayed directions found — field inert");
+        assert!(clear > rayed, "ejecta must be sparse (local support)");
+
+        // Young craters are a deterministic minority: scan octave 1's occupied
+        // cells near the +X shell and count the young gate.
+        let o = &CRATER_OCTAVES[1];
+        let oseed = f
+            .seed
+            .wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(2));
+        let shell = o.freq.round() as i64;
+        let (mut craters, mut young) = (0u32, 0u32);
+        for ix in (shell - 4)..(shell + 4) {
+            for iy in -4..=4 {
+                for iz in -4..=4 {
+                    if hash_unit(ix, iy, iz, oseed ^ 0x00C0_FFEE) >= o.density {
+                        continue;
+                    }
+                    craters += 1;
+                    if hash_unit(ix, iy, iz, oseed ^ 0x66) < EJECTA_YOUNG_FRACTION {
+                        young += 1;
+                    }
+                }
+            }
+        }
+        assert!(craters > 20, "scan window too small to judge the fraction");
+        assert!(young > 0, "expected some young craters");
+        assert!(
+            (young as f64) < 0.5 * craters as f64,
+            "young craters must be a minority ({young}/{craters})"
+        );
+
+        // Per-body density multiplier gates ejecta exactly as it gates craters…
+        let mut asset = BodyAsset::earthlike();
+        asset.surface.seed = 2024;
+        asset.radius = 1_000_000.0;
+        asset.surface.crater = serde_json::json!({"density": 0.0});
+        let craterless = SurfaceField::from_asset(&asset);
+        for d in dirs() {
+            assert_eq!(craterless.ejecta(d), 0.0, "no craters ⇒ no rays");
+        }
+        // …while the depth multiplier does not apply (rays are albedo, not
+        // relief).
+        asset.surface.crater = serde_json::json!({"depth": 2.0});
+        let deep = SurfaceField::from_asset(&asset);
+        for d in dirs() {
+            assert_eq!(deep.ejecta(d), f.ejecta(d));
+        }
+    }
+
+    #[test]
+    fn ejecta_is_continuous_and_locally_supported_along_an_arc() {
+        // The WI 866 arc-march pattern on the new field: march straight through
+        // a young crater's ray system at ~1.5 m steps; the intensity and the
+        // blended tint must move at a smooth rate everywhere — across the
+        // system's extent, its streak lobes, its halo core, and the lattice
+        // planes the arc crosses (the membership-pop habitat).
+        fn rotate(v: DVec3, axis: DVec3, ang: f64) -> DVec3 {
+            v * ang.cos() + axis.cross(v) * ang.sin() + axis * axis.dot(v) * (1.0 - ang.cos())
+        }
+        let f = SurfaceField::new(2024, 1_000_000.0);
+        let (center, ext) = find_young_crater(&f, 1)
+            .or_else(|| find_young_crater(&f, 0))
+            .expect("no young crater near +X — re-seed the probe");
+        let (t1, _) = tangent_basis(center);
+        let axis = center.cross(t1).normalize();
+        let half = 1.6 * ext; // start/end outside the system
+        let step = 2.0e-6;
+        let n = (2.0 * half / step) as usize;
+        let finest = CRATER_OCTAVES[EJECTA_OCTAVES - 1].freq;
+        let mut prev_d = rotate(center, axis, -half);
+        let mut prev_e = f.ejecta(prev_d);
+        let mut prev_t = f.biome_weights(prev_d).tint();
+        let (mut max_de, mut max_dt) = (0.0_f64, 0.0_f64);
+        let (mut peak, mut zeros, mut planes) = (0.0_f64, 0u32, 0u32);
+        for i in 1..=n {
+            let d = rotate(center, axis, -half + i as f64 * step);
+            let e = f.ejecta(d);
+            let t = f.biome_weights(d).tint();
+            max_de = max_de.max((e - prev_e).abs());
+            for (a, b) in t.iter().zip(prev_t) {
+                max_dt = max_dt.max((a - b).abs());
+            }
+            peak = peak.max(e);
+            if e == 0.0 {
+                zeros += 1;
+            }
+            if (prev_d * finest).floor() != (d * finest).floor() {
+                planes += 1;
+            }
+            (prev_d, prev_e, prev_t) = (d, e, t);
+        }
+        // Coverage guards: the march must actually cross the system, exit it,
+        // and cross lattice planes, or the rate asserts go vacuous.
+        assert!(peak > 0.2, "arc never entered a ray system (peak {peak})");
+        assert!(zeros > 0, "arc never left the system — extend it");
+        assert!(planes >= 2, "arc crossed only {planes} lattice planes");
+        // Smooth-rate bounds, calibrated: measured smooth maxima are
+        // max_de ≈ 8e-5 and max_dt ≈ 1.3e-4 per step — >100× headroom below
+        // the bounds, while a pop (whole-profile step, ≥ ~0.5 intensity) or an
+        // extent cliff would exceed them by orders of magnitude.
+        assert!(
+            max_de < 0.02,
+            "ejecta stepped {max_de} in one ~1.5 m sample — discontinuity"
+        );
+        assert!(
+            max_dt < 0.02,
+            "blended tint stepped {max_dt} in one ~1.5 m sample"
         );
     }
 

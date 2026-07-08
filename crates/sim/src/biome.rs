@@ -24,7 +24,7 @@
 //! (`surface_field`) is the check on this whole argument.
 //!
 //! The other half — evaluating the climate fields themselves (temperature,
-//! moisture, albedo/roughness, crater-bowl) — lives in
+//! moisture, albedo/roughness, crater-bowl, ejecta) — lives in
 //! [`crate::surface_field`], which owns the seed and the noise internals.
 
 use crate::body_asset::BodyAsset;
@@ -174,11 +174,15 @@ pub struct ClimateSample {
     /// Crater-interior factor in `[0, 1]` (0 outside craters, →1 in deep bowls);
     /// a smooth ramp of the continuous crater term (airless family).
     pub bowl: f64,
+    /// Ejecta-ray intensity in `[0, 1]` (0 away from young craters, →1 on
+    /// bright rays); the continuous crater-lattice-derived field of WI 873
+    /// (airless family; neutral 0 otherwise).
+    pub ejecta: f64,
 }
 
 /// Channel count/order for [`BiomeRow::bands`]. Order: temperature, moisture,
-/// elevation, slope, latitude, albedo, roughness, bowl.
-pub const CHANNELS: usize = 8;
+/// elevation, slope, latitude, albedo, roughness, bowl, ejecta.
+pub const CHANNELS: usize = 9;
 
 /// A smooth membership band over one channel: kernel 0 at/below `lo` and
 /// at/above `hi`, 1 on the plateau `[lo + ramp, hi − ramp]`, smoothstep ramps
@@ -254,10 +258,9 @@ const SLOPE_OPEN: Band = Band {
     ramp: 0.02,
 };
 
-/// Shorthand for a row's band vector:
-/// `[temperature, moisture, elevation, slope, latitude, albedo, roughness, bowl]`.
-/// One positional argument per channel is the point — the table rows read as
-/// aligned columns.
+/// Shorthand for a row's band vector: `[temperature, moisture, elevation,
+/// slope, latitude, albedo, roughness, bowl, ejecta]`. One positional argument
+/// per channel is the point — the table rows read as aligned columns.
 #[expect(clippy::too_many_arguments)]
 const fn bands(
     t: Band,
@@ -268,8 +271,9 @@ const fn bands(
     a: Band,
     r: Band,
     b: Band,
+    j: Band,
 ) -> [Band; CHANNELS] {
-    [t, m, e, s, l, a, r, b]
+    [t, m, e, s, l, a, r, b, j]
 }
 
 const fn band(lo: f64, hi: f64, ramp: f64) -> Band {
@@ -305,6 +309,7 @@ pub const ATMOSPHERIC_BIOMES: &[BiomeRow] = &[
             Band::ANY,
             Band::ANY,
             Band::ANY,
+            Band::ANY,
         ),
         floor: 0.0,
         gain: 1.0,
@@ -319,6 +324,7 @@ pub const ATMOSPHERIC_BIOMES: &[BiomeRow] = &[
             Band::ANY,
             band(-0.09, -0.005, 0.03),
             SLOPE_CAP,
+            Band::ANY,
             Band::ANY,
             Band::ANY,
             Band::ANY,
@@ -341,6 +347,7 @@ pub const ATMOSPHERIC_BIOMES: &[BiomeRow] = &[
             Band::ANY,
             Band::ANY,
             Band::ANY,
+            Band::ANY,
         ),
         floor: 0.0,
         gain: 1.0,
@@ -355,6 +362,7 @@ pub const ATMOSPHERIC_BIOMES: &[BiomeRow] = &[
             band(0.6, 1.0e9, 0.12),
             band(-0.01, 0.07, 0.03),
             SLOPE_CAP,
+            Band::ANY,
             Band::ANY,
             Band::ANY,
             Band::ANY,
@@ -379,6 +387,7 @@ pub const ATMOSPHERIC_BIOMES: &[BiomeRow] = &[
             Band::ANY,
             Band::ANY,
             Band::ANY,
+            Band::ANY,
         ),
         floor: 0.01,
         gain: 1.0,
@@ -393,6 +402,7 @@ pub const ATMOSPHERIC_BIOMES: &[BiomeRow] = &[
             band(0.15, 0.55, 0.12),
             band(-0.01, 0.7, 0.05),
             SLOPE_CAP,
+            Band::ANY,
             Band::ANY,
             Band::ANY,
             Band::ANY,
@@ -415,6 +425,7 @@ pub const ATMOSPHERIC_BIOMES: &[BiomeRow] = &[
             Band::ANY,
             Band::ANY,
             Band::ANY,
+            Band::ANY,
         ),
         floor: 0.0,
         gain: 1.0,
@@ -429,6 +440,7 @@ pub const ATMOSPHERIC_BIOMES: &[BiomeRow] = &[
             band(0.55, 1.0e9, 0.12),
             band(-0.01, 0.5, 0.04),
             SLOPE_CAP,
+            Band::ANY,
             Band::ANY,
             Band::ANY,
             Band::ANY,
@@ -454,6 +466,7 @@ pub const ATMOSPHERIC_BIOMES: &[BiomeRow] = &[
             Band::ANY,
             Band::ANY,
             Band::ANY,
+            Band::ANY,
         ),
         floor: 0.0,
         gain: 1.0,
@@ -471,6 +484,7 @@ pub const ATMOSPHERIC_BIOMES: &[BiomeRow] = &[
             Band::ANY,
             band(-0.01, 0.7, 0.05),
             SLOPE_CAP,
+            Band::ANY,
             Band::ANY,
             Band::ANY,
             Band::ANY,
@@ -496,6 +510,7 @@ pub const ATMOSPHERIC_BIOMES: &[BiomeRow] = &[
             Band::ANY,
             Band::ANY,
             Band::ANY,
+            Band::ANY,
         ),
         floor: 0.0,
         gain: 1.0,
@@ -513,6 +528,7 @@ pub const ATMOSPHERIC_BIOMES: &[BiomeRow] = &[
             Band::ANY,
             band(0.70, 1.0e9, 0.10),
             SLOPE_CAP,
+            Band::ANY,
             Band::ANY,
             Band::ANY,
             Band::ANY,
@@ -538,6 +554,7 @@ pub const ATMOSPHERIC_BIOMES: &[BiomeRow] = &[
             Band::ANY,
             Band::ANY,
             Band::ANY,
+            Band::ANY,
         ),
         floor: 0.0,
         gain: 1.0,
@@ -556,6 +573,7 @@ pub const ATMOSPHERIC_BIOMES: &[BiomeRow] = &[
             Band::ANY,
             Band::ANY,
             Band::ANY,
+            Band::ANY,
         ),
         floor: 0.0,
         gain: 1.0,
@@ -566,8 +584,8 @@ pub const ATMOSPHERIC_BIOMES: &[BiomeRow] = &[
 ];
 
 /// The airless-family table. Classification runs on albedo/roughness noise,
-/// elevation, slope, and the polar cold trap (latitude ∧ crater interior) —
-/// no moisture. Ejecta rays are deferred (WI 873/B6).
+/// elevation, slope, the polar cold trap (latitude ∧ crater interior), and
+/// young-crater ejecta rays (WI 873) — no moisture.
 pub const AIRLESS_BIOMES: &[BiomeRow] = &[
     BiomeRow {
         // The airless fallback row (floor: see the grassland note).
@@ -579,6 +597,7 @@ pub const AIRLESS_BIOMES: &[BiomeRow] = &[
             SLOPE_CAP,
             Band::ANY,
             band(0.30, 0.75, 0.10),
+            Band::ANY,
             Band::ANY,
             Band::ANY,
         ),
@@ -597,6 +616,7 @@ pub const AIRLESS_BIOMES: &[BiomeRow] = &[
             SLOPE_CAP,
             Band::ANY,
             band(-1.0e9, 0.38, 0.08),
+            Band::ANY,
             Band::ANY,
             Band::ANY,
         ),
@@ -620,6 +640,7 @@ pub const AIRLESS_BIOMES: &[BiomeRow] = &[
             band(0.62, 1.0e9, 0.08),
             Band::ANY,
             Band::ANY,
+            Band::ANY,
         ),
         floor: 0.0,
         gain: 1.0,
@@ -640,6 +661,7 @@ pub const AIRLESS_BIOMES: &[BiomeRow] = &[
             Band::ANY,
             Band::ANY,
             band(0.68, 1.0e9, 0.08),
+            Band::ANY,
             Band::ANY,
         ),
         floor: 0.0,
@@ -662,6 +684,7 @@ pub const AIRLESS_BIOMES: &[BiomeRow] = &[
             Band::ANY,
             Band::ANY,
             band(0.45, 1.0e9, 0.20), // …∧ inside a crater bowl
+            Band::ANY,
         ),
         floor: 0.0,
         // A fully-fired cold trap must outweigh the always-on plains fallback
@@ -672,12 +695,45 @@ pub const AIRLESS_BIOMES: &[BiomeRow] = &[
         material: SurfaceMaterial::ICE,
     },
     BiomeRow {
+        name: "ejecta blanket",
+        bands: bands(
+            Band::ANY,
+            Band::ANY,
+            Band::ANY,
+            SLOPE_CAP,
+            Band::ANY,
+            Band::ANY,
+            Band::ANY,
+            Band::ANY,
+            // Fires on ray crests + the halo core, NOT the whole ejecta
+            // disc: a lower lo saturated every system's interior into a flat
+            // bright blob at orbital view (Test-phase finding) — the radial
+            // streak structure only reads if between-ray ground stays plains.
+            band(0.25, 1.0e9, 0.4), // on a young crater's rays/halo (WI 873)
+        ),
+        floor: 0.0,
+        // Like the cold trap: a fully-fired ray must outweigh the always-on
+        // plains fallback — fresh ejecta is the notable feature where it lies.
+        gain: 2.5,
+        // Brighter than "bright highlands": fresh rays are the brightest
+        // surface on an airless body.
+        tint: [0.72, 0.71, 0.69],
+        // Reuses the airless family's existing regolith_fine slot (WI 872), so
+        // the splat machinery, KTX2 arrays, and shader are untouched.
+        texture_set: Some("regolith_fine"),
+        material: SurfaceMaterial {
+            friction: 0.6,
+            rolling_resistance: 0.08,
+        },
+    },
+    BiomeRow {
         name: "bedrock outcrop",
         bands: bands(
             Band::ANY,
             Band::ANY,
             Band::ANY,
             SLOPE_OPEN,
+            Band::ANY,
             Band::ANY,
             Band::ANY,
             Band::ANY,
@@ -897,6 +953,7 @@ pub fn classify(family: BiomeFamily, sample: &ClimateSample) -> BiomeWeights {
         sample.albedo,
         sample.roughness,
         sample.bowl,
+        sample.ejecta,
     ];
     // Top-k selection by insertion (tables are ≤ ~14 rows; k = 4).
     let mut top: [(usize, f64); BIOME_BLEND_K] = [(0, -1.0); BIOME_BLEND_K];
@@ -949,6 +1006,7 @@ mod tests {
             albedo: 0.5,
             roughness: 0.5,
             bowl: 0.0,
+            ejecta: 0.0,
         }
     }
 
@@ -1097,6 +1155,7 @@ mod tests {
             albedo: 0.5,
             roughness: 0.5,
             bowl: 0.0,
+            ejecta: 0.0,
         };
         for family in [BiomeFamily::Atmospheric, BiomeFamily::Airless] {
             let w = classify(family, &sample);
@@ -1122,6 +1181,7 @@ mod tests {
             albedo: 0.5,
             roughness: 0.5,
             bowl: 0.0,
+            ejecta: 0.0,
         };
         let w = classify(BiomeFamily::Atmospheric, &deep);
         let slot_sum: f32 = w.slot_weights().iter().sum();
@@ -1151,6 +1211,7 @@ mod tests {
                                 albedo: 0.5,
                                 roughness: 0.5,
                                 bowl: 0.0,
+                                ejecta: 0.0,
                             };
                             let w = classify(family, &sample);
                             let mut sum = 0.0;
@@ -1257,6 +1318,53 @@ mod tests {
             classify(BiomeFamily::Airless, &maria).dominant().name,
             "maria"
         );
+    }
+
+    /// WI 873: a fired ejecta channel classifies "ejecta blanket" dominant on
+    /// the airless family; zero (or sub-band) ejecta never does; and the
+    /// atmospheric family is structurally indifferent to the channel (every
+    /// row "don't care"), so its classifications cannot have changed.
+    #[test]
+    fn ejecta_channel_fires_the_blanket_and_atmospheric_rows_ignore_it() {
+        let cold = ClimateSample {
+            temperature: 200.0,
+            ..neutral()
+        };
+        let rayed = ClimateSample {
+            ejecta: 0.8,
+            ..cold
+        };
+        assert_eq!(
+            classify(BiomeFamily::Airless, &rayed).dominant().name,
+            "ejecta blanket"
+        );
+        for e in [0.0, 0.1] {
+            let faint = ClimateSample { ejecta: e, ..cold };
+            assert_ne!(
+                classify(BiomeFamily::Airless, &faint).dominant().name,
+                "ejecta blanket",
+                "sub-band ejecta {e} must not fire the blanket"
+            );
+        }
+        // The ejecta channel is the last in the vector (CHANNELS − 1).
+        for row in ATMOSPHERIC_BIOMES {
+            let b = row.bands[CHANNELS - 1];
+            assert!(
+                b.lo <= Band::ANY.lo && b.hi >= Band::ANY.hi,
+                "{}: atmospheric rows must be don't-care on ejecta",
+                row.name
+            );
+        }
+        // Data intent guard: fresh rays are the brightest airless surface
+        // short of ice — brighter than the highlands they overlay.
+        let tint_of = |name: &str| {
+            AIRLESS_BIOMES
+                .iter()
+                .find(|r| r.name == name)
+                .map(|r| r.tint.iter().sum::<f64>())
+                .expect("row present")
+        };
+        assert!(tint_of("ejecta blanket") > tint_of("bright highlands"));
     }
 
     #[test]
