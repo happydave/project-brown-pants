@@ -125,7 +125,7 @@ pub fn moisture_ramp(moisture: f64) -> [f32; 4] {
 /// conversion happens here — the one place color math lives (WI 795 lockstep
 /// rule). Feeding authored values straight through as linear washed the whole
 /// body out toward white (linear 0.5 displays like sRGB ~0.74).
-fn srgb_to_linear(c: [f32; 4]) -> [f32; 4] {
+pub fn srgb_to_linear(c: [f32; 4]) -> [f32; 4] {
     let conv = |v: f32| {
         if v <= 0.04045 {
             v / 12.92
@@ -395,9 +395,37 @@ pub struct ChunkMesh {
     /// biome fields are low-frequency relative to vertex spacing, which the
     /// LOD-agreement tests verify rather than assume.
     pub colors: Vec<[f32; 4]>,
+    /// Terrain-texture coordinates (WI 872), in **tile units**: the vertex's
+    /// cube-face world UV (face parameter × face arc length ÷
+    /// [`TERRAIN_TILE_METRES`]) minus this chunk's [`TERRAIN_UV_PERIOD`]-aligned
+    /// anchor, computed in f64 so the value is f32-safe at planetary radius.
+    /// Adjacent chunks' values differ by exact multiples of the period, and the
+    /// shader's detiling pattern is period-exact, so sampling is continuous
+    /// across every chunk/LOD border. Skirts inherit the border vertex's value.
+    pub terrain_uvs: Vec<[f32; 2]>,
+    /// Splat slot weights, slots 0–3 (WI 872): the biome weights folded onto
+    /// the body family's texture slots ([`crate::biome::texture_slot_names`],
+    /// body-wide fixed semantics — interpolation is well-defined across any
+    /// two chunks). The slot sum is 1 minus the untextured (marine) weight;
+    /// the fragment mixes toward the pure tint by the deficit. Skirts inherit.
+    pub splat_a: Vec<[f32; 4]>,
+    /// Splat slot weights, slots 4–7 (see [`Self::splat_a`]).
+    pub splat_b: Vec<[f32; 4]>,
     /// Triangle indices (three per triangle).
     pub indices: Vec<u32>,
 }
+
+/// One terrain-texture tile's ground coverage, metres (WI 872). Applied at mesh
+/// build (the terrain UV is generated in tile units), so render and sim agree by
+/// construction.
+pub const TERRAIN_TILE_METRES: f64 = 24.0;
+
+/// The terrain-UV anchor/pattern period, in tiles (WI 872). Chunk UV anchors
+/// snap to multiples of this, so adjacent chunks' terrain UVs differ by exact
+/// multiples of it; the shader's stochastic detiling hashes cells **modulo this
+/// period**, making the anti-tiling pattern world-consistent across chunks. A
+/// power of two ≤ 2^11 keeps f32 ULP within the attribute ≤ ~1/4 texel.
+pub const TERRAIN_UV_PERIOD: f64 = 2048.0;
 
 /// The `LOD` split decision: split `node` (subdivide) when the camera is close
 /// enough that the node's world edge subtends more than the range factor allows,
@@ -729,6 +757,17 @@ pub fn build_chunk_view(
     let mut normals = Vec::with_capacity(vert_count);
     let mut uvs = Vec::with_capacity(vert_count);
     let mut colors = Vec::with_capacity(vert_count);
+    let mut terrain_uvs = Vec::with_capacity(vert_count);
+    let mut splat_a = Vec::with_capacity(vert_count);
+    let mut splat_b = Vec::with_capacity(vert_count);
+
+    // Terrain UV (WI 872): face parameter → world tile units, anchored per chunk
+    // to a period multiple so the f32 attribute stays precise at planetary radius
+    // while cross-chunk differences are exact period multiples (invisible to both
+    // the repeat sampler and the period-exact detiling hash).
+    let tiles_per_face = radius * std::f64::consts::FRAC_PI_2 / TERRAIN_TILE_METRES;
+    let anchor_u = TERRAIN_UV_PERIOD * (u0 * tiles_per_face / TERRAIN_UV_PERIOD).floor();
+    let anchor_v = TERRAIN_UV_PERIOD * (v0 * tiles_per_face / TERRAIN_UV_PERIOD).floor();
 
     // Surface grid: sample the field at each (u, v) direction. Track the elevation
     // range so the skirt can be sized to this chunk's relief.
@@ -751,7 +790,15 @@ pub fn build_chunk_view(
             let normal = field.normal(dir);
             normals.push(normal.as_vec3().to_array());
             uvs.push(Vec2::new(tu as f32, tv as f32).to_array());
-            colors.push(vertex_color(field, dir, elev, normal, view));
+            let weights = field.biome_weights_at(dir, elev, normal);
+            colors.push(vertex_color(field, dir, &weights, view));
+            terrain_uvs.push([
+                (uu * tiles_per_face - anchor_u) as f32,
+                (vv * tiles_per_face - anchor_v) as f32,
+            ]);
+            let slots = weights.slot_weights();
+            splat_a.push([slots[0], slots[1], slots[2], slots[3]]);
+            splat_b.push([slots[4], slots[5], slots[6], slots[7]]);
         }
     }
 
@@ -808,6 +855,9 @@ pub fn build_chunk_view(
             &mut normals,
             &mut uvs,
             &mut colors,
+            &mut terrain_uvs,
+            &mut splat_a,
+            &mut splat_b,
             &mut indices,
         );
 
@@ -823,28 +873,28 @@ pub fn build_chunk_view(
         uvs,
         morph_targets,
         colors,
+        terrain_uvs,
+        splat_a,
+        splat_b,
         indices,
     }
 }
 
-/// The per-vertex color for `view` (WI 869). `elev`/`normal` are the grid
-/// pass's already-computed samples at `dir` — the `biome_weights_at` seam, so
-/// the biome query here costs the climate fields + classification only.
+/// The per-vertex color for `view` (WI 869). `weights` is the grid pass's
+/// already-computed classification at `dir` (shared with the WI 872 splat
+/// fold), so the biome query is paid once per vertex.
 fn vertex_color(
     field: &SurfaceField,
     dir: DVec3,
-    elev: f64,
-    normal: DVec3,
+    weights: &crate::biome::BiomeWeights,
     view: SurfaceView,
 ) -> [f32; 4] {
     let srgb = match view {
         SurfaceView::Biome => {
-            let t = field.biome_weights_at(dir, elev, normal).tint();
+            let t = weights.tint();
             [t[0] as f32, t[1] as f32, t[2] as f32, 1.0]
         }
-        SurfaceView::DominantBiome => {
-            dominant_palette(field.biome_weights_at(dir, elev, normal).dominant_index())
-        }
+        SurfaceView::DominantBiome => dominant_palette(weights.dominant_index()),
         SurfaceView::Temperature => temperature_ramp(field.temperature(dir)),
         SurfaceView::Moisture => moisture_ramp(field.moisture(dir)),
     };
@@ -869,6 +919,9 @@ fn add_skirt(
     normals: &mut Vec<[f32; 3]>,
     uvs: &mut Vec<[f32; 2]>,
     colors: &mut Vec<[f32; 4]>,
+    terrain_uvs: &mut Vec<[f32; 2]>,
+    splat_a: &mut Vec<[f32; 4]>,
+    splat_b: &mut Vec<[f32; 4]>,
     indices: &mut Vec<u32>,
 ) {
     let grid_idx = |a: u32, b: u32| (b * (res + 1) + a) as usize;
@@ -898,10 +951,15 @@ fn add_skirt(
         let border_normal = normals[gi];
         let border_uv = uvs[gi];
         let border_color = colors[gi];
+        let border_terrain_uv = terrain_uvs[gi];
+        let border_splat = (splat_a[gi], splat_b[gi]);
         positions.push((dropped - center).as_vec3().to_array());
         normals.push(border_normal);
         uvs.push(border_uv);
         colors.push(border_color);
+        terrain_uvs.push(border_terrain_uv);
+        splat_a.push(border_splat.0);
+        splat_b.push(border_splat.1);
     }
 
     // Walls: quad (top_k, top_k+1, skirt_k+1, skirt_k) as two triangles.
@@ -989,6 +1047,146 @@ mod tests {
                 params: BiomeParams::default(),
             },
         )
+    }
+
+    /// WI 872: the splat vertex data holds the same continuity contract the
+    /// tint does. (a) Coincident parent/child vertices carry near-identical
+    /// slot weights; (b) two same-level adjacent chunks reconstruct the same
+    /// world terrain UV along the shared border (attributes differ by exact
+    /// [`TERRAIN_UV_PERIOD`] multiples at most) and identical slot weights;
+    /// (c) skirt duplicates inherit their border vertex's splat data verbatim.
+    #[test]
+    fn splat_attributes_are_lod_and_border_consistent_and_skirts_inherit() {
+        let f = temperate_field();
+        let radius = f.radius();
+        let res = DEFAULT_RESOLUTION;
+        let n = (res + 1) as usize;
+
+        // World terrain-UV reconstruction: attribute + the builder's anchor.
+        let tiles_per_face = radius * std::f64::consts::FRAC_PI_2 / TERRAIN_TILE_METRES;
+        let anchor =
+            |t0: f64| TERRAIN_UV_PERIOD * (t0 * tiles_per_face / TERRAIN_UV_PERIOD).floor();
+        let world_uv = |node: QuadNode, m: &ChunkMesh, k: usize| {
+            let (u0, _, v0, _) = node.uv_rect();
+            [
+                m.terrain_uvs[k][0] as f64 + anchor(u0),
+                m.terrain_uvs[k][1] as f64 + anchor(v0),
+            ]
+        };
+
+        // (a) Parent/child even vertices: coincident directions ⇒ same weights.
+        // Self-siting probe: scan candidate nodes for one whose child actually
+        // spans splat variation (a frontier), so the agreement asserts are
+        // never vacuous however the tables are tuned.
+        let splat_spread = |m: &ChunkMesh| {
+            (0..4)
+                .map(|k| {
+                    let lo = m
+                        .splat_a
+                        .iter()
+                        .chain(m.splat_b.iter())
+                        .map(|v| v[k])
+                        .fold(f32::MAX, f32::min);
+                    let hi = m
+                        .splat_a
+                        .iter()
+                        .chain(m.splat_b.iter())
+                        .map(|v| v[k])
+                        .fold(f32::MIN, f32::max);
+                    hi - lo
+                })
+                .fold(0.0, f32::max)
+        };
+        let mut sited = None;
+        'site: for face in [CubeFace::PosX, CubeFace::NegZ, CubeFace::PosY] {
+            for (i, j) in [(5, 9), (3, 4), (9, 2), (12, 12), (7, 14)] {
+                let parent = QuadNode {
+                    face,
+                    level: 4,
+                    i,
+                    j,
+                };
+                let child = parent.children()[0];
+                let c = build_chunk_view(&f, child, res, false, SurfaceView::Biome);
+                if splat_spread(&c) > 0.05 {
+                    sited = Some((parent, child, c));
+                    break 'site;
+                }
+            }
+        }
+        let (parent, _child, c) =
+            sited.expect("no candidate chunk spans a biome frontier — re-site the probe list");
+        let p = build_chunk_view(&f, parent, res, false, SurfaceView::Biome);
+        let mut max_even = 0.0_f32;
+        for b in (0..=res as usize).step_by(2) {
+            for a in (0..=res as usize).step_by(2) {
+                let ci = b * n + a;
+                let pi = (b / 2) * n + (a / 2);
+                for k in 0..4 {
+                    max_even = max_even
+                        .max((c.splat_a[ci][k] - p.splat_a[pi][k]).abs())
+                        .max((c.splat_b[ci][k] - p.splat_b[pi][k]).abs());
+                }
+            }
+        }
+        assert!(
+            max_even < 1e-4,
+            "coincident LOD splat weights disagree: {max_even}"
+        );
+
+        // (b) Same-level neighbours: the shared border column carries the same
+        // world UV and weights on both sides.
+        let right = QuadNode {
+            i: parent.i + 1,
+            ..parent
+        };
+        let r = build_chunk_view(&f, right, res, false, SurfaceView::Biome);
+        let mut max_uv = 0.0_f64;
+        let mut max_w = 0.0_f32;
+        for b in 0..=res as usize {
+            let left_k = b * n + res as usize; // parent's u = 1 column
+            let right_k = b * n; // neighbour's u = 0 column
+            let wu_l = world_uv(parent, &p, left_k);
+            let wu_r = world_uv(right, &r, right_k);
+            max_uv = max_uv
+                .max((wu_l[0] - wu_r[0]).abs())
+                .max((wu_l[1] - wu_r[1]).abs());
+            for k in 0..4 {
+                max_w = max_w
+                    .max((p.splat_a[left_k][k] - r.splat_a[right_k][k]).abs())
+                    .max((p.splat_b[left_k][k] - r.splat_b[right_k][k]).abs());
+            }
+        }
+        // f32 attribute ULP at ≤ period+span is ~2.4e-4 tiles (≤ 1/4 texel).
+        assert!(
+            max_uv < 1e-3,
+            "border world-UV reconstruction differs: {max_uv}"
+        );
+        assert!(max_w < 1e-4, "border splat weights differ: {max_w}");
+
+        // (c) Skirts inherit splat data (the WI 786 pattern).
+        let s = build_chunk_view(&f, parent, res, true, SurfaceView::Biome);
+        let surface_count = n * n;
+        assert_eq!(s.splat_a.len(), s.positions.len());
+        assert_eq!(s.terrain_uvs.len(), s.positions.len());
+        let ring: Vec<usize> = {
+            let gi = |a: usize, b: usize| b * n + a;
+            let r = res as usize;
+            let mut v: Vec<usize> = (0..=r).map(|a| gi(a, 0)).collect();
+            v.extend((1..=r).map(|b| gi(r, b)));
+            v.extend((0..r).rev().map(|a| gi(a, r)));
+            v.extend((1..r).rev().map(|b| gi(0, b)));
+            v
+        };
+        for (k, &gi) in ring.iter().enumerate() {
+            let sk = surface_count + k;
+            assert_eq!(s.splat_a[sk], s.splat_a[gi], "skirt splat_a not inherited");
+            assert_eq!(s.splat_b[sk], s.splat_b[gi], "skirt splat_b not inherited");
+            assert_eq!(
+                s.terrain_uvs[sk], s.terrain_uvs[gi],
+                "skirt terrain_uv not inherited"
+            );
+        }
     }
 
     #[test]

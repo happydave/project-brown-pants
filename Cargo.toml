@@ -3,13 +3,13 @@ resolver = "2"
 members = ["crates/sim", "crates/app", "crates/companion", "crates/server", "crates/netclient"]
 
 [workspace.package]
-version = "0.1.189"
+version = "0.1.190"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Dave <projectbrownpants@scienceranch.com>"]
 
 [workspace.dependencies]
-bevy = "0.18.1"
+bevy = { version = "0.18.1", features = ["basis-universal"] }
 bevy_app = "0.18.1"
 bevy_ecs = "0.18.1"
 bevy_time = "0.18.1"

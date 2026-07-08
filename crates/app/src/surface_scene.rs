@@ -36,24 +36,25 @@ use bevy::pbr::{
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::render::render_resource::{
-    AsBindGroup, RenderPipelineDescriptor, SpecializedMeshPipelineError,
+    AsBindGroup, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError,
 };
 use bevy::shader::ShaderRef;
 use bevy::tasks::{block_on, futures_lite::future, AsyncComputeTaskPool, Task};
 use std::collections::HashMap;
 
+use sounding_sim::biome::{slot_anchor_tints, slot_layer_indices, BodyClimate};
 use sounding_sim::body_asset::BodyAsset;
 use sounding_sim::bodygen::{generate, Archetype};
 use sounding_sim::frame::{FrameId, WorldPos};
 use sounding_sim::surface_field::SurfaceField;
 use sounding_sim::surface_mesh::{
-    build_chunk_view, morph_range, AtmosphereParams, ChunkMesh, QuadNode, DEFAULT_MAX_LEVEL,
-    DEFAULT_RESOLUTION, WELD_BAND_ROWS,
+    build_chunk_view, morph_range, srgb_to_linear, AtmosphereParams, ChunkMesh, QuadNode,
+    DEFAULT_MAX_LEVEL, DEFAULT_RESOLUTION, WELD_BAND_ROWS,
 };
 use sounding_sim::surface_scan::{boundary_config, resident_leaves};
 
 use crate::debug_control::{
-    BiomeViewState, DebugCameraContext, DebugControllable, DebugOverlayState,
+    BiomeViewState, DebugCameraContext, DebugControllable, DebugOverlayState, SplatState,
 };
 use crate::floating_origin::{
     render_translation, AnchorCamera, FloatingOrigin, FloatingOriginPlugin, WorldPlacement,
@@ -70,9 +71,41 @@ const SPAWN_BUDGET: usize = 12;
 const ATTRIBUTE_MORPH_TARGET: MeshVertexAttribute =
     MeshVertexAttribute::new("MorphTarget", 0x4d4f_5250_5447, VertexFormat::Float32x3);
 
+/// WI 872 splat attributes: terrain UV (tile units, chunk-anchored — see
+/// `surface_mesh::TERRAIN_UV_PERIOD`) and the 8 slot weights split across two
+/// vec4s (`@location(9)`/`(10)`/`(11)` in the geomorph shader).
+const ATTRIBUTE_TERRAIN_UV: MeshVertexAttribute =
+    MeshVertexAttribute::new("TerrainUv", 0x5445_5252_5556, VertexFormat::Float32x2);
+const ATTRIBUTE_SPLAT_A: MeshVertexAttribute =
+    MeshVertexAttribute::new("SplatA", 0x5350_4c41_5441, VertexFormat::Float32x4);
+const ATTRIBUTE_SPLAT_B: MeshVertexAttribute =
+    MeshVertexAttribute::new("SplatB", 0x5350_4c41_5442, VertexFormat::Float32x4);
+
+/// Camera-distance band over which textures fade to the pure tint look (WI 872):
+/// start far beyond the texel-density-1 distance (the crossfade blends an
+/// already-mip-blurred texture into the tint — invisible), end = 3× start.
+/// Sized against real bodies: relief spans ±kilometres, so a sub-km band is
+/// unreachable over depressed terrain in normal flight; mips + anisotropy own
+/// shimmer inside the band. Everything the splat drives (albedo, normal,
+/// roughness, AO) converges under the same factor. Tunables — owner gate.
+const SPLAT_FADE_START_M: f32 = 2_000.0;
+const SPLAT_FADE_END_M: f32 = 6_000.0;
+
 /// StandardMaterial extended with a CDLOD geomorph vertex shader. The extension uniform
 /// carries the per-level morph ramp `(start, end, _, _)` (camera-distance metres).
 type SurfaceGeomorph = ExtendedMaterial<StandardMaterial, GeomorphExt>;
+
+/// WI 872 splat config (shader `SplatUniform`): per-body slot→array-layer
+/// indices, per-slot anchor tints (linear — the mean tint of the rows consuming
+/// each slot's texture, from the biome table), and
+/// `params = (fade_start_m, fade_end_m, enabled, _)`.
+#[derive(ShaderType, Reflect, Debug, Clone, Default)]
+struct SplatUniform {
+    layers_a: UVec4,
+    layers_b: UVec4,
+    anchors: [Vec4; 8],
+    params: Vec4,
+}
 
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default)]
 struct GeomorphExt {
@@ -85,10 +118,29 @@ struct GeomorphExt {
     // formula this must mirror.
     #[uniform(101, visibility(vertex))]
     weld: Vec4,
+    // WI 872 terrain splat: config uniform + the three global KTX2 texture
+    // arrays (albedo sRGB; normal + packed rough/AO/height linear), one shared
+    // repeat/aniso sampler. `None` handles bind Bevy's fallback images — safe
+    // because `params.z` (enabled) is only raised once all three are loaded.
+    #[uniform(102)]
+    splat: SplatUniform,
+    #[texture(103, dimension = "2d_array")]
+    #[sampler(104)]
+    albedo_array: Option<Handle<Image>>,
+    #[texture(105, dimension = "2d_array")]
+    normal_array: Option<Handle<Image>>,
+    #[texture(106, dimension = "2d_array")]
+    surface_array: Option<Handle<Image>>,
 }
 
 impl MaterialExtension for GeomorphExt {
     fn vertex_shader() -> ShaderRef {
+        "shaders/surface_geomorph.wgsl".into()
+    }
+
+    fn fragment_shader() -> ShaderRef {
+        // WI 872: the splat blend lives fragment-side in the same file; the
+        // untouched path reproduces the standard PBR pipeline exactly.
         "shaders/surface_geomorph.wgsl".into()
     }
 
@@ -98,18 +150,61 @@ impl MaterialExtension for GeomorphExt {
         layout: &MeshVertexBufferLayoutRef,
         _key: MaterialExtensionKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
-        // Add the morph-target attribute (@location 8) and the biome vertex color
-        // (@location 5, the standard slot — WI 869) alongside the standard ones so
-        // the custom vertex shader's input matches the uploaded mesh layout.
+        // Add the morph-target attribute (@location 8), the biome vertex color
+        // (@location 5, the standard slot — WI 869) and the splat attributes
+        // (@locations 9-11, WI 872) alongside the standard ones so the custom
+        // vertex shader's input matches the uploaded mesh layout.
         let vertex_layout = layout.0.get_layout(&[
             Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
             Mesh::ATTRIBUTE_NORMAL.at_shader_location(1),
             Mesh::ATTRIBUTE_UV_0.at_shader_location(2),
             Mesh::ATTRIBUTE_COLOR.at_shader_location(5),
             ATTRIBUTE_MORPH_TARGET.at_shader_location(8),
+            ATTRIBUTE_TERRAIN_UV.at_shader_location(9),
+            ATTRIBUTE_SPLAT_A.at_shader_location(10),
+            ATTRIBUTE_SPLAT_B.at_shader_location(11),
         ])?;
         descriptor.vertex.buffers = vec![vertex_layout];
         Ok(())
+    }
+}
+
+/// WI 872: the three terrain texture arrays + the per-body slot mapping, built
+/// once at setup. `enabled()` gates the shader flag on the toggle AND the load
+/// state, so a missing/renamed KTX2 set (or the first frames before load) is
+/// exactly the tint path.
+#[derive(Resource)]
+struct SplatAssets {
+    albedo: Option<Handle<Image>>,
+    normal: Option<Handle<Image>>,
+    surface: Option<Handle<Image>>,
+    layers_a: UVec4,
+    layers_b: UVec4,
+    anchors: [Vec4; 8],
+    loaded: bool,
+}
+
+impl SplatAssets {
+    fn enabled(&self, toggle: bool) -> f32 {
+        if toggle && self.loaded && self.albedo.is_some() {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    fn uniform(&self, toggle: bool) -> SplatUniform {
+        SplatUniform {
+            layers_a: self.layers_a,
+            layers_b: self.layers_b,
+            anchors: self.anchors,
+            params: Vec4::new(
+                SPLAT_FADE_START_M,
+                SPLAT_FADE_END_M,
+                self.enabled(toggle),
+                0.0,
+            ),
+        }
     }
 }
 
@@ -128,6 +223,7 @@ impl Plugin for SurfaceScenePlugin {
                 (
                     fly_camera,
                     stream_surface,
+                    sync_splat_state,
                     toggle_overlay,
                     draw_overlay,
                     update_telemetry,
@@ -315,12 +411,57 @@ fn parse_args() -> (u64, Archetype) {
     (seed, archetype)
 }
 
-fn setup(mut commands: Commands, mut scattering: ResMut<Assets<ScatteringMedium>>) {
+fn setup(
+    mut commands: Commands,
+    mut scattering: ResMut<Assets<ScatteringMedium>>,
+    asset_server: Res<AssetServer>,
+) {
     let (seed, archetype) = parse_args();
     let asset = generate(seed, archetype);
     let field = SurfaceField::from_asset(&asset);
     let radius = asset.radius;
     let center_world = DVec3::new(0.0, -radius, 0.0);
+
+    // WI 872: terrain texture arrays + the body's slot mapping. Missing files ⇒
+    // `None` handles and a permanent tint-only path (the asset-optional
+    // invariant); the per-body family decides which biome table's slots apply.
+    let family = BodyClimate::from_asset(&asset).family;
+    let anchors_srgb = slot_anchor_tints(family);
+    let mut anchors = [Vec4::ZERO; 8];
+    for (i, a) in anchors_srgb.iter().enumerate() {
+        let l = srgb_to_linear([a[0] as f32, a[1] as f32, a[2] as f32, 1.0]);
+        anchors[i] = Vec4::new(l[0], l[1], l[2], 1.0);
+    }
+    let layers = slot_layer_indices(family);
+    let assets_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+    let load_array = |name: &str| -> Option<Handle<Image>> {
+        if !assets_dir.join("materials").join(name).exists() {
+            warn!("terrain array {name} missing — splatting disabled (tint fallback)");
+            return None;
+        }
+        Some(asset_server.load_with_settings(
+            format!("materials/{name}"),
+            |s: &mut bevy::image::ImageLoaderSettings| {
+                // KTX2 carries its own transfer function; only the sampler is
+                // ours: repeat wrap (tiling), trilinear + anisotropy (terrain
+                // is mostly seen at grazing angles).
+                let mut desc = bevy::image::ImageSamplerDescriptor::linear();
+                desc.address_mode_u = bevy::image::ImageAddressMode::Repeat;
+                desc.address_mode_v = bevy::image::ImageAddressMode::Repeat;
+                desc.anisotropy_clamp = 8;
+                s.sampler = bevy::image::ImageSampler::Descriptor(desc);
+            },
+        ))
+    };
+    commands.insert_resource(SplatAssets {
+        albedo: load_array("terrain_albedo.ktx2"),
+        normal: load_array("terrain_normal.ktx2"),
+        surface: load_array("terrain_surface.ktx2"),
+        layers_a: UVec4::new(layers[0], layers[1], layers[2], layers[3]),
+        layers_b: UVec4::new(layers[4], layers[5], layers[6], layers[7]),
+        anchors,
+        loaded: false,
+    });
 
     // Base surface material config; per-level geomorph materials are built on demand.
     // White since WI 869: the per-vertex biome tint carries the body's look (the
@@ -508,6 +649,8 @@ fn stream_surface(
     mut geomorph_materials: ResMut<Assets<SurfaceGeomorph>>,
     body: Res<SurfaceBody>,
     view: Res<BiomeViewState>,
+    splat_assets: Res<SplatAssets>,
+    splat_state: Res<SplatState>,
     mut streamer: ResMut<ChunkStreamer>,
     mut stats: ResMut<StreamStats>,
     camera: Query<&WorldPlacement, With<AnchorCamera>>,
@@ -585,6 +728,10 @@ fn stream_surface(
             extension: GeomorphExt {
                 morph_range: Vec4::new(start, end, 0.0, 0.0),
                 weld: weld_uniform(config),
+                splat: splat_assets.uniform(splat_state.0),
+                albedo_array: splat_assets.albedo.clone(),
+                normal_array: splat_assets.normal.clone(),
+                surface_array: splat_assets.surface.clone(),
             },
         });
         let entity = commands
@@ -680,8 +827,47 @@ fn to_bevy_mesh(meshes: &mut Assets<Mesh>, chunk: &ChunkMesh) -> Handle<Mesh> {
     // the body's look (a body_tint multiply would double-tint).
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, chunk.colors.clone());
     mesh.insert_attribute(ATTRIBUTE_MORPH_TARGET, chunk.morph_targets.clone());
+    // WI 872 splat inputs (terrain UV + 8 slot weights), sim-computed.
+    mesh.insert_attribute(ATTRIBUTE_TERRAIN_UV, chunk.terrain_uvs.clone());
+    mesh.insert_attribute(ATTRIBUTE_SPLAT_A, chunk.splat_a.clone());
+    mesh.insert_attribute(ATTRIBUTE_SPLAT_B, chunk.splat_b.clone());
     mesh.insert_indices(Indices::U32(chunk.indices.clone()));
     meshes.add(mesh)
+}
+
+/// WI 872: raise `SplatAssets.loaded` once all three arrays are in `Assets<Image>`,
+/// and push the combined enable flag (+ config) into every live chunk material
+/// whenever the load state or the `F7`/bus toggle changes. Mutating uniforms in
+/// place (the WI 795 weld pattern) makes the A/B toggle instant — no restream.
+fn sync_splat_state(
+    images: Res<Assets<Image>>,
+    mut splat_assets: ResMut<SplatAssets>,
+    splat_state: Res<SplatState>,
+    mut geomorph_materials: ResMut<Assets<SurfaceGeomorph>>,
+) {
+    let all_loaded = match (
+        &splat_assets.albedo,
+        &splat_assets.normal,
+        &splat_assets.surface,
+    ) {
+        (Some(a), Some(n), Some(s)) => {
+            images.contains(a) && images.contains(n) && images.contains(s)
+        }
+        _ => false,
+    };
+    let load_flipped = all_loaded != splat_assets.loaded;
+    if load_flipped {
+        splat_assets.loaded = all_loaded;
+        if all_loaded {
+            info!("terrain texture arrays loaded — splatting active");
+        }
+    }
+    if load_flipped || splat_state.is_changed() {
+        let uniform = splat_assets.uniform(splat_state.0);
+        for (_, m) in geomorph_materials.iter_mut() {
+            m.extension.splat = uniform.clone();
+        }
+    }
 }
 
 /// Free-fly camera editing the f64 world placement (movement) and f32 rotation
@@ -738,17 +924,22 @@ fn fly_camera(
 }
 
 /// Toggles the debug overlay with `F3`; cycles the surface color view (biome
-/// tint → dominant biome → temperature → moisture) with `F6` (WI 869).
+/// tint → dominant biome → temperature → moisture) with `F6` (WI 869);
+/// toggles terrain texture splatting with `F7` (WI 872, instant A/B).
 fn toggle_overlay(
     keys: Res<ButtonInput<KeyCode>>,
     mut overlay: ResMut<DebugOverlayState>,
     mut view: ResMut<BiomeViewState>,
+    mut splat: ResMut<SplatState>,
 ) {
     if keys.just_pressed(KeyCode::F3) {
         overlay.0 = !overlay.0;
     }
     if keys.just_pressed(KeyCode::F6) {
         view.0 = view.0.next();
+    }
+    if keys.just_pressed(KeyCode::F7) {
+        splat.0 = !splat.0;
     }
 }
 
@@ -810,10 +1001,13 @@ fn lod_color(level: u32) -> Color {
 }
 
 /// Updates the HUD each frame.
+#[allow(clippy::too_many_arguments)]
 fn hud(
     body: Res<SurfaceBody>,
     overlay: Res<DebugOverlayState>,
     view: Res<BiomeViewState>,
+    splat: Res<SplatState>,
+    splat_assets: Res<SplatAssets>,
     streamer: Res<ChunkStreamer>,
     camera: Query<&WorldPlacement, With<AnchorCamera>>,
     mut text: Query<&mut Text, With<HudText>>,
@@ -834,7 +1028,7 @@ fn hud(
         "SURFACE (-- surface)  v{ver}\n\
          body: {name}\nradius: {rkm:.0} km\naltitude: {akm:.1} km\n\
          chunks: {live} live, {pend} meshing\natmosphere: {atmo}\n\n\
-         W/A/S/D move \u{b7} R/F up/down \u{b7} arrows look \u{b7} F3 overlay [{ov}] \u{b7} F6 view [{view}]",
+         W/A/S/D move \u{b7} R/F up/down \u{b7} arrows look \u{b7} F3 overlay [{ov}] \u{b7} F6 view [{view}] \u{b7} F7 splat [{splat}]",
         ver = env!("CARGO_PKG_VERSION"),
         name = body.asset.name,
         rkm = body.field.radius() / 1000.0,
@@ -844,5 +1038,12 @@ fn hud(
         atmo = atmo,
         ov = if overlay.0 { "on" } else { "off" },
         view = view.0.label(),
+        splat = if splat_assets.enabled(splat.0) > 0.5 {
+            "on"
+        } else if splat.0 {
+            "loading/absent"
+        } else {
+            "off"
+        },
     );
 }

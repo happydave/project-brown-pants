@@ -77,6 +77,10 @@ pub enum DebugCommand {
         /// ignored (lenient like the rest of this surface).
         #[serde(default)]
         biome_view: Option<String>,
+        /// Terrain texture splatting on/off (WI 872): the `F7` A/B toggle,
+        /// exposed for scripted before/after captures. Absent ⇒ unchanged.
+        #[serde(default)]
+        splat: Option<bool>,
     },
 }
 
@@ -96,6 +100,19 @@ pub struct DebugOverlayState(pub bool);
 /// changes. Default = the shipping biome tint.
 #[derive(Resource, Default)]
 pub struct BiomeViewState(pub SurfaceView);
+
+/// Terrain texture splatting toggle (WI 872): `F7` in `-- surface` and the bus's
+/// `SetOverlay { splat }`. The material's enable flag combines this with the
+/// KTX2 arrays' load state, so it is safe to enable before assets finish
+/// loading. On by default (assets present ⇒ the textured look ships).
+#[derive(Resource)]
+pub struct SplatState(pub bool);
+
+impl Default for SplatState {
+    fn default() -> Self {
+        Self(true)
+    }
+}
 
 /// The current debug-camera pose, published each frame and served by `GET /camera` so an
 /// agent can read where it framed. `available` is false when no controllable camera exists.
@@ -189,19 +206,28 @@ pub fn apply_debug_commands(
     ctx: Res<DebugCameraContext>,
     mut overlay: ResMut<DebugOverlayState>,
     mut view: ResMut<BiomeViewState>,
+    mut splat_state: ResMut<SplatState>,
     mut q: Query<(&mut Transform, &mut WorldPlacement), With<DebugControllable>>,
 ) {
     let mut camera = q.single_mut().ok();
     let frame = ctx.0; // Copy (DVec3, f64)
     for cmd in reader.read() {
         // Overlay commands apply regardless of camera availability.
-        if let DebugCommand::SetOverlay { lod, biome_view } = cmd {
+        if let DebugCommand::SetOverlay {
+            lod,
+            biome_view,
+            splat,
+        } = cmd
+        {
             if let Some(v) = lod {
                 overlay.0 = *v;
             }
             // Lenient: unknown view names are ignored, never an error.
             if let Some(v) = biome_view.as_deref().and_then(SurfaceView::parse) {
                 view.0 = v;
+            }
+            if let Some(v) = splat {
+                splat_state.0 = *v;
             }
             continue;
         }
@@ -281,6 +307,7 @@ impl Plugin for DebugControlPlugin {
             .init_resource::<DebugCameraContext>()
             .init_resource::<DebugOverlayState>()
             .init_resource::<BiomeViewState>()
+            .init_resource::<SplatState>()
             .init_resource::<DebugCameraState>()
             .add_systems(Update, (apply_debug_commands, publish_camera_pose).chain());
     }
@@ -317,6 +344,7 @@ mod tests {
             DebugCommand::SetOverlay {
                 lod: Some(true),
                 biome_view: Some("dominant".into()),
+                splat: None,
             },
         ];
         for c in cmds {
@@ -334,7 +362,8 @@ mod tests {
             c,
             DebugCommand::SetOverlay {
                 lod: Some(true),
-                biome_view: None
+                biome_view: None,
+                splat: None
             }
         );
         let c: DebugCommand = serde_json::from_str(r#"{"set_overlay":{}}"#).unwrap();
@@ -342,7 +371,8 @@ mod tests {
             c,
             DebugCommand::SetOverlay {
                 lod: None,
-                biome_view: None
+                biome_view: None,
+                splat: None
             }
         );
         let c: DebugCommand =
@@ -351,7 +381,8 @@ mod tests {
             c,
             DebugCommand::SetOverlay {
                 lod: None,
-                biome_view: Some("temperature".into())
+                biome_view: Some("temperature".into()),
+                splat: None
             }
         );
         // Unknown view names parse as data and are ignored at apply time.

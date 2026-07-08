@@ -699,6 +699,89 @@ pub fn biome_table(family: BiomeFamily) -> &'static [BiomeRow] {
     }
 }
 
+/// Canonical terrain-texture array layer order (WI 872): the union of both
+/// families' `texture_set` names, **alphabetical**. The asset-harness KTX2
+/// packer derives the identical order independently (a plain sort), so no
+/// manifest is shared between the repos; a test pins this list against the
+/// tables.
+pub const TERRAIN_TEXTURE_LAYERS: [&str; 10] = [
+    "basalt",
+    "forest_floor",
+    "grass",
+    "mud",
+    "regolith_coarse",
+    "regolith_fine",
+    "rock",
+    "sand",
+    "snow",
+    "steppe",
+];
+
+/// Splat slot budget (WI 872): per-vertex weights ride two vec4 attributes, so a
+/// family may use at most 8 distinct textured sets. Body-wide fixed slot
+/// semantics (not per-chunk palettes) is what makes weight interpolation
+/// well-defined everywhere and removes the chunk-border palette-mismatch seam
+/// class — see the WI 872 plan. Guarded by a table test, not runtime logic.
+pub const MAX_TEXTURE_SLOTS: usize = 8;
+
+/// A family's texture slots: its distinct `texture_set` names in
+/// first-appearance (table) order. Const so the query path stays
+/// allocation-free; a test derives the same lists from the tables.
+pub fn texture_slot_names(family: BiomeFamily) -> &'static [&'static str] {
+    match family {
+        BiomeFamily::Atmospheric => &[
+            "sand",
+            "mud",
+            "grass",
+            "steppe",
+            "forest_floor",
+            "rock",
+            "snow",
+        ],
+        BiomeFamily::Airless => &["regolith_fine", "basalt", "regolith_coarse", "snow", "rock"],
+    }
+}
+
+/// Each slot's layer index in the [`TERRAIN_TEXTURE_LAYERS`] arrays (unused
+/// slots report 0 — harmless: their weight is always exactly 0).
+pub fn slot_layer_indices(family: BiomeFamily) -> [u32; MAX_TEXTURE_SLOTS] {
+    let mut out = [0u32; MAX_TEXTURE_SLOTS];
+    for (slot, name) in texture_slot_names(family).iter().enumerate() {
+        let layer = TERRAIN_TEXTURE_LAYERS
+            .iter()
+            .position(|l| l == name)
+            .expect("slot set present in the canonical layer list (table-tested)");
+        out[slot] = layer as u32;
+    }
+    out
+}
+
+/// Each slot's anchor tint (sRGB, like row tints): the mean tint of the family
+/// rows consuming that slot's texture set — the same derivation that produced
+/// the harness textures' tone anchors, so the shader's macro modulation
+/// (`vertex tint / Σ w·anchor`) is ≈ 1 where the texture already matches the
+/// biome look and re-expresses the tint difference where several rows share one
+/// texture (highland vs alpine rock). Computed from the table: no second copy
+/// of the harness constants to drift.
+pub fn slot_anchor_tints(family: BiomeFamily) -> [[f64; 3]; MAX_TEXTURE_SLOTS] {
+    let mut out = [[0.0; 3]; MAX_TEXTURE_SLOTS];
+    for (slot, name) in texture_slot_names(family).iter().enumerate() {
+        let (mut sum, mut count) = ([0.0; 3], 0.0);
+        for row in biome_table(family) {
+            if row.texture_set == Some(*name) {
+                for (acc, c) in sum.iter_mut().zip(row.tint) {
+                    *acc += c;
+                }
+                count += 1.0;
+            }
+        }
+        if count > 0.0 {
+            out[slot] = sum.map(|c| c / count);
+        }
+    }
+    out
+}
+
 /// How many rows a blend keeps (the design's k ≈ 4).
 pub const BIOME_BLEND_K: usize = 4;
 
@@ -764,6 +847,28 @@ impl BiomeWeights {
             friction,
             rolling_resistance: rolling,
         }
+    }
+
+    /// The weights folded onto the family's texture slots (WI 872): each kept
+    /// row's weight accumulates into its `texture_set`'s slot; rows without a
+    /// texture (marine) contribute nothing, so the slot sum is 1 minus the
+    /// untextured weight — the shader mixes toward the pure tint by exactly
+    /// that deficit, which is what renders seabeds tint-only and feathers a
+    /// beach→ocean frontier. Continuous wherever the weights are (a fixed
+    /// linear fold).
+    pub fn slot_weights(&self) -> [f32; MAX_TEXTURE_SLOTS] {
+        let slots = texture_slot_names(self.family);
+        let mut out = [0.0f32; MAX_TEXTURE_SLOTS];
+        for (row, w) in self.iter() {
+            if let Some(set) = row.texture_set {
+                let slot = slots
+                    .iter()
+                    .position(|s| *s == set)
+                    .expect("every table texture_set has a slot (table-tested)");
+                out[slot] += w as f32;
+            }
+        }
+        out
     }
 
     /// The weight-blended tint (linear RGB) — the render work item's phase-1
@@ -921,6 +1026,109 @@ mod tests {
         assert!(AIRLESS_BIOMES
             .iter()
             .any(|r| r.material == SurfaceMaterial::REGOLITH));
+    }
+
+    /// WI 872: the texture-slot machinery is table-derived and budget-bound.
+    /// The canonical layer list is exactly the alphabetically-sorted union of
+    /// both families' `texture_set` names (the KTX2 packer derives the same
+    /// order by sorting — this test is the cross-repo contract's Rust half);
+    /// each family's slot list is its table's first-appearance order, fits the
+    /// two-attribute budget, and maps into the canonical list; anchors are
+    /// means of in-range tints, so they are in range.
+    #[test]
+    fn texture_slots_match_the_tables_and_fit_the_budget() {
+        let mut union: Vec<&str> = [BiomeFamily::Atmospheric, BiomeFamily::Airless]
+            .iter()
+            .flat_map(|&f| biome_table(f).iter().filter_map(|r| r.texture_set))
+            .collect();
+        union.sort_unstable();
+        union.dedup();
+        assert_eq!(union, TERRAIN_TEXTURE_LAYERS, "canonical layer list drift");
+
+        for family in [BiomeFamily::Atmospheric, BiomeFamily::Airless] {
+            let mut first_appearance: Vec<&str> = Vec::new();
+            for row in biome_table(family) {
+                if let Some(set) = row.texture_set {
+                    if !first_appearance.contains(&set) {
+                        first_appearance.push(set);
+                    }
+                }
+            }
+            assert_eq!(
+                first_appearance,
+                texture_slot_names(family),
+                "{family:?}: slot list drift"
+            );
+            assert!(
+                first_appearance.len() <= MAX_TEXTURE_SLOTS,
+                "{family:?}: more textured sets than slot budget"
+            );
+            let layers = slot_layer_indices(family);
+            for (slot, name) in texture_slot_names(family).iter().enumerate() {
+                assert_eq!(
+                    TERRAIN_TEXTURE_LAYERS[layers[slot] as usize], *name,
+                    "{family:?}: slot {slot} layer mapping"
+                );
+            }
+            let anchors = slot_anchor_tints(family);
+            for (slot, _) in texture_slot_names(family).iter().enumerate() {
+                for c in anchors[slot] {
+                    assert!((0.0..=1.0).contains(&c), "{family:?}: anchor out of range");
+                }
+                assert!(
+                    anchors[slot].iter().any(|&c| c > 0.0),
+                    "{family:?}: slot {slot} anchor is black (no consuming row?)"
+                );
+            }
+        }
+    }
+
+    /// WI 872: the slot fold is a fixed linear map of the kept weights — the
+    /// slot sum equals 1 minus the untextured-row weight, and a marine-only
+    /// blend folds to all-zero slots (the shader's pure-tint case).
+    #[test]
+    fn slot_weights_fold_conserves_textured_weight() {
+        let sample = ClimateSample {
+            temperature: 288.0,
+            moisture: 0.6,
+            elevation: 0.1,
+            slope: 0.005,
+            latitude: 0.3,
+            albedo: 0.5,
+            roughness: 0.5,
+            bowl: 0.0,
+        };
+        for family in [BiomeFamily::Atmospheric, BiomeFamily::Airless] {
+            let w = classify(family, &sample);
+            let untextured: f64 = w
+                .iter()
+                .filter(|(row, _)| row.texture_set.is_none())
+                .map(|(_, wt)| wt)
+                .sum();
+            let slot_sum: f32 = w.slot_weights().iter().sum();
+            assert!(
+                (slot_sum as f64 - (1.0 - untextured)).abs() < 1e-6,
+                "{family:?}: slot sum {slot_sum} vs textured weight {}",
+                1.0 - untextured
+            );
+        }
+        // Deep ocean: the marine rows dominate and carry no texture.
+        let deep = ClimateSample {
+            temperature: 290.0,
+            moisture: 0.7,
+            elevation: -0.5,
+            slope: 0.001,
+            latitude: 0.1,
+            albedo: 0.5,
+            roughness: 0.5,
+            bowl: 0.0,
+        };
+        let w = classify(BiomeFamily::Atmospheric, &deep);
+        let slot_sum: f32 = w.slot_weights().iter().sum();
+        assert!(
+            slot_sum < 0.15,
+            "deep ocean should be nearly untextured (got {slot_sum})"
+        );
     }
 
     #[test]

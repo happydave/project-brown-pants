@@ -652,7 +652,8 @@ mod tests {
             drx.try_recv().unwrap(),
             DebugCommand::SetOverlay {
                 lod: Some(true),
-                biome_view: None
+                biome_view: None,
+                splat: None
             }
         );
         // GET /camera returns the published pose JSON.
