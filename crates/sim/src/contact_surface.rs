@@ -173,11 +173,12 @@ mod tests {
         let up = patch.up();
         // Height at the origin equals the field elevation along `up`.
         assert!((patch.height(0.0, 0.0) - field.elevation(up)).abs() < 1e-6);
-        // Material at the origin equals the field material along `up`.
-        assert_eq!(
-            patch.material_at(0.0, 0.0).friction,
-            field.material(up).friction
-        );
+        // Material at the origin equals the field material along `up` (within
+        // float tolerance: the patch renormalizes `up · radius`, which can move
+        // the direction by an ulp, and the WI 868 blended material is
+        // value-continuous rather than piecewise-constant, so bit-equality no
+        // longer holds by construction).
+        assert!((patch.material_at(0.0, 0.0).friction - field.material(up).friction).abs() < 1e-9);
         // Local normal at the origin is ~+Y (radial), tilted only by local slope.
         let n = patch.normal(0.0, 0.0);
         assert!(n.y > 0.9, "origin normal should be near local up: {n:?}");

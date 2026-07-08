@@ -12,6 +12,7 @@ pub mod afloat;
 pub mod attitude;
 pub mod autopilot;
 pub mod ballast;
+pub mod biome;
 pub mod body_asset;
 pub mod body_library;
 pub mod bodygen;

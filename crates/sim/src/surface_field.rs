@@ -34,6 +34,7 @@
 //! `SurfaceRecipe.crater` area (lenient parse, defaults on anything absent or
 //! malformed — no persistence-format change).
 
+use crate::biome::{classify, BiomeFamily, BiomeWeights, BodyClimate, ClimateSample};
 use crate::body_asset::BodyAsset;
 use crate::surface::SurfaceMaterial;
 use glam::DVec3;
@@ -142,7 +143,15 @@ pub struct SurfaceField {
     base_freq: f64,
     /// Per-body crater multipliers over [`CRATER_OCTAVES`] (WI 782).
     crater: CraterParams,
+    /// Per-body climate inputs for the biome layer (WI 868).
+    climate: BodyClimate,
 }
+
+/// Equator-to-pole temperature drop, Kelvin (applied as `drop · lat²`).
+const LATITUDE_TEMPERATURE_DROP: f64 = 75.0;
+
+/// Atmospheric lapse rate, Kelvin per metre above sea level.
+const LAPSE_PER_M: f64 = 6.5e-3;
 
 /// A surface sample: elevation (metres, relative to the reference radius) and the
 /// surface material at a direction.
@@ -155,24 +164,32 @@ pub struct SurfaceSample {
 }
 
 impl SurfaceField {
-    /// Builds the field for `asset` from its `surface.seed`, `radius`, and the
-    /// (reserved-area) crater parameters (WI 782).
+    /// Builds the field for `asset` from its `surface.seed`, `radius`, the
+    /// (reserved-area) crater parameters (WI 782), and the climate inputs the
+    /// biome layer reads from the asset's existing fields (WI 868).
     pub fn from_asset(asset: &BodyAsset) -> Self {
-        Self::with_crater_params(
+        Self::with_params(
             asset.surface.seed,
             asset.radius,
             CraterParams::from_value(&asset.surface.crater),
+            BodyClimate::from_asset(asset),
         )
     }
 
     /// Builds a field from an explicit seed and reference radius (metres), with
-    /// the default crater configuration.
+    /// the default crater configuration and climate (an airless 200 K body).
     pub fn new(seed: u64, radius: f64) -> Self {
         Self::with_crater_params(seed, radius, CraterParams::default())
     }
 
-    /// Builds a field with explicit per-body crater multipliers (WI 782).
+    /// Builds a field with explicit per-body crater multipliers (WI 782) and
+    /// the default climate.
     pub fn with_crater_params(seed: u64, radius: f64, crater: CraterParams) -> Self {
+        Self::with_params(seed, radius, crater, BodyClimate::default())
+    }
+
+    /// Builds a field with explicit crater and climate configuration (WI 868).
+    pub fn with_params(seed: u64, radius: f64, crater: CraterParams, climate: BodyClimate) -> Self {
         let amplitude = (radius.abs() * 0.015).clamp(300.0, 9_000.0);
         Self {
             seed,
@@ -180,6 +197,7 @@ impl SurfaceField {
             amplitude,
             base_freq: 2.5,
             crater,
+            climate,
         }
     }
 
@@ -217,22 +235,111 @@ impl SurfaceField {
         relief * self.amplitude + self.crater_delta(d)
     }
 
-    /// Surface material at a direction: steep slopes read as bedrock, cold/high
-    /// (polar or noise-masked) bands as ice, otherwise regolith.
+    /// Surface material at a direction: since WI 868 the **weight-blended**
+    /// friction/rolling of the biome table (see [`Self::biome_weights`]) — same
+    /// signature and query pattern as before, blended in value, so a consumer
+    /// crossing a biome frontier sees a ramp, never a step. The pre-868 rules
+    /// (steep → bedrock, polar/cold → ice, else regolith) survive as table rows.
     pub fn material(&self, dir: DVec3) -> SurfaceMaterial {
+        self.biome_weights(dir).material()
+    }
+
+    /// The biome blend at a direction (WI 868): climate-field evaluation +
+    /// weight-blended classification against the body family's biome table.
+    /// Pure and deterministic; no allocation. See `crate::biome` for the
+    /// weights-not-ids contract and the continuity argument.
+    pub fn biome_weights(&self, dir: DVec3) -> BiomeWeights {
         let d = normalize_or_x(dir);
-        let n = self.normal(d);
-        // On flat ground the normal is ~radial (n·d ≈ 1); a slope tilts it away.
+        let (n, elevation) = self.normal_and_elevation(d);
         let slope = 1.0 - n.dot(d).clamp(-1.0, 1.0);
-        if slope > 0.03 {
-            return SurfaceMaterial::BEDROCK;
+        let sea = self.climate.sea_level.unwrap_or(0.0);
+        // Family-irrelevant channels stay neutral and unevaluated (their rows
+        // mark them "don't care"): the atmospheric path never pays for the
+        // crater-bowl query and the airless path never pays for moisture.
+        let (moisture, albedo, roughness, bowl) = match self.climate.family {
+            BiomeFamily::Atmospheric => (self.moisture(d), 0.5, 0.5, 0.0),
+            BiomeFamily::Airless => (
+                0.5,
+                self.albedo_field(d),
+                self.roughness_field(d),
+                self.bowl(d),
+            ),
+        };
+        let sample = ClimateSample {
+            temperature: self.temperature_at_elevation(d, elevation),
+            moisture,
+            elevation: (elevation - sea) / self.amplitude,
+            slope,
+            latitude: self.warped_latitude(d),
+            albedo,
+            roughness,
+            bowl,
+        };
+        classify(self.climate.family, &sample)
+    }
+
+    /// Temperature (Kelvin-anchored classifier scale) at a direction: body base
+    /// temperature − latitude gradient − altitude lapse (WI 868). Latitude is
+    /// measured against the body's **rotation axis**; the lapse applies above
+    /// sea level on atmospheric bodies only (airless bodies have no atmosphere
+    /// to cool through).
+    pub fn temperature(&self, dir: DVec3) -> f64 {
+        let d = normalize_or_x(dir);
+        self.temperature_at_elevation(d, self.elevation(d))
+    }
+
+    /// The temperature model with elevation as an explicit input — the internal
+    /// seam `temperature` composes with `elevation`, and the tests exercise
+    /// directly (the lapse is unobservable from directions alone because
+    /// elevation is itself a function of direction).
+    fn temperature_at_elevation(&self, d: DVec3, elevation: f64) -> f64 {
+        let lat = self.warped_latitude(d);
+        let mut t = self.climate.base_temperature - LATITUDE_TEMPERATURE_DROP * lat * lat;
+        if self.climate.family == BiomeFamily::Atmospheric {
+            let sea = self.climate.sea_level.unwrap_or(0.0);
+            t -= LAPSE_PER_M * (elevation - sea).max(0.0);
         }
-        let polar = d.y.abs();
-        let ice_mask = fbm(d * 4.0, self.seed ^ 0x1CE, 3);
-        if polar > 0.85 || ice_mask > 0.6 {
-            return SurfaceMaterial::ICE;
-        }
-        SurfaceMaterial::REGOLITH
+        t
+    }
+
+    /// Moisture in `[0, 1]` at a direction: an independent low-frequency
+    /// domain-warped fbm (WI 868). A real hydrology model is explicitly out of
+    /// scope; ocean-adjacent wetness emerges from the classifier's elevation
+    /// gates instead.
+    pub fn moisture(&self, dir: DVec3) -> f64 {
+        let d = normalize_or_x(dir);
+        let p = d * 1.4;
+        let warp = DVec3::new(
+            fbm(p + DVec3::splat(7.3), self.seed ^ 0x30B5, 2),
+            fbm(p + DVec3::splat(41.9), self.seed ^ 0x30B6, 2),
+            fbm(p + DVec3::splat(83.7), self.seed ^ 0x30B7, 2),
+        ) * 0.5;
+        (0.5 + 0.8 * fbm(p + warp, self.seed ^ 0x30B0, 3)).clamp(0.0, 1.0)
+    }
+
+    /// Warped absolute latitude in `[0, 1]` against the rotation axis: the raw
+    /// `|d·axis|` plus a low-frequency wander so no biome edge traces a perfect
+    /// parallel (the design's domain-warped-inputs rule).
+    fn warped_latitude(&self, d: DVec3) -> f64 {
+        let raw = d.dot(self.climate.axis).abs();
+        (raw + 0.06 * fbm(d * 2.5, self.seed ^ 0x1A71, 2)).clamp(0.0, 1.0)
+    }
+
+    /// Airless-family albedo field in `[0, 1]` (maria vs bright highlands).
+    fn albedo_field(&self, d: DVec3) -> f64 {
+        (0.5 + 0.85 * fbm(d * 1.8, self.seed ^ 0xA1BED0, 3)).clamp(0.0, 1.0)
+    }
+
+    /// Airless-family roughness field in `[0, 1]` (boulder fields).
+    fn roughness_field(&self, d: DVec3) -> f64 {
+        (0.5 + 0.85 * fbm(d * 5.0, self.seed ^ 0x40C4, 2)).clamp(0.0, 1.0)
+    }
+
+    /// Crater-interior factor in `[0, 1]`: a smooth ramp over the (continuous,
+    /// WI 866) crater term, →1 in deep bowls — the cold-trap gate input.
+    fn bowl(&self, d: DVec3) -> f64 {
+        let t = (-self.crater_delta(d) / (0.08 * self.amplitude)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
     }
 
     /// Elevation + material at a direction.
@@ -247,14 +354,21 @@ impl SurfaceField {
     /// finite difference of three nearby surface points. Deterministic; used by the
     /// renderer (764) and contact (765).
     pub fn normal(&self, dir: DVec3) -> DVec3 {
-        let d = normalize_or_x(dir);
+        self.normal_and_elevation(normalize_or_x(dir)).0
+    }
+
+    /// The normal plus the centre elevation from the same three-point finite
+    /// difference — shared so the biome query pays exactly the pre-868
+    /// `material()` cost (three elevation evaluations), not a fourth.
+    fn normal_and_elevation(&self, d: DVec3) -> (DVec3, f64) {
         let (t1, t2) = tangent_basis(d);
         let eps = 1e-3;
         let point = |u: DVec3| {
             let un = normalize_or_x(u);
             un * (self.radius + self.elevation(un))
         };
-        let pc = point(d);
+        let e0 = self.elevation(d);
+        let pc = d * (self.radius + e0);
         let pu = point(d + t1 * eps);
         let pv = point(d + t2 * eps);
         let n = (pu - pc).cross(pv - pc);
@@ -263,11 +377,7 @@ impl SurfaceField {
         } else {
             d
         };
-        if n.dot(d) < 0.0 {
-            -n
-        } else {
-            n
-        }
+        (if n.dot(d) < 0.0 { -n } else { n }, e0)
     }
 
     /// The crater-population elevation delta at a direction (usually a depression):
@@ -813,6 +923,296 @@ mod tests {
             "centre {center_delta} must be below ring {}",
             f.octave_delta(ring, 1, o)
         );
+    }
+
+    /// A temperate (288 K) ocean-bearing atmospheric climate rotating about +Z —
+    /// the classifier-scale "earthlike" the biome tests probe. (The canonical
+    /// `FluidMedium::EARTHLIKE` carries a representative *atmospheric* 250 K,
+    /// which classifies as an ice-age world — fine physically, but the variety
+    /// scenarios need the temperate regime.)
+    fn temperate_climate() -> BodyClimate {
+        BodyClimate {
+            family: BiomeFamily::Atmospheric,
+            base_temperature: 288.0,
+            sea_level: Some(0.0),
+            axis: DVec3::Z,
+        }
+    }
+
+    #[test]
+    fn climate_fields_are_pure_finite_and_bounded() {
+        let fields = [
+            SurfaceField::with_params(5, 2_000_000.0, CraterParams::default(), temperate_climate()),
+            SurfaceField::new(5, 2_000_000.0), // default airless climate
+        ];
+        for f in fields {
+            for d in dirs() {
+                let t = f.temperature(d);
+                assert!(t.is_finite());
+                assert_eq!(t, f.temperature(d), "temperature must be pure");
+                let m = f.moisture(d);
+                assert!((0.0..=1.0).contains(&m));
+                assert_eq!(m, f.moisture(d), "moisture must be pure");
+                let w = f.biome_weights(d);
+                let table = crate::biome::biome_table(w.family());
+                let mut sum = 0.0;
+                for (_, wi) in w.iter() {
+                    assert!(wi.is_finite() && wi >= 0.0);
+                    sum += wi;
+                }
+                assert!((sum - 1.0).abs() < 1e-12, "weights must normalize: {sum}");
+                // Bit-identical on a second evaluation (purity of the whole query).
+                let w2 = f.biome_weights(d);
+                assert_eq!(w.dominant_index(), w2.dominant_index());
+                for i in 0..table.len() {
+                    assert_eq!(w.weight_of(i), w2.weight_of(i));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_latitude_gradient_and_lapse_cool_temperature() {
+        let f =
+            SurfaceField::with_params(9, 3_000_000.0, CraterParams::default(), temperate_climate());
+        let d = DVec3::new(0.8, 0.5, 0.1).normalize();
+        // The lapse is exact on the internal seam: 6.5 K per km above sea level,
+        // nothing below it.
+        let drop = f.temperature_at_elevation(d, 0.0) - f.temperature_at_elevation(d, 5_000.0);
+        assert!((drop - 32.5).abs() < 1e-9, "lapse drop {drop} ≠ 32.5");
+        assert_eq!(
+            f.temperature_at_elevation(d, -3_000.0),
+            f.temperature_at_elevation(d, 0.0),
+            "no lapse below sea level"
+        );
+        // Airless bodies skip the lapse entirely.
+        let moon = SurfaceField::new(9, 700_000.0);
+        assert_eq!(
+            moon.temperature_at_elevation(d, 0.0),
+            moon.temperature_at_elevation(d, 5_000.0)
+        );
+        // Latitude cools: polar directions are far colder than equatorial ones
+        // (75 K gradient dwarfs the ±few-K latitude warp).
+        for f in [f, moon] {
+            let polar = f.temperature_at_elevation(DVec3::Z, 0.0);
+            let equatorial = f.temperature_at_elevation(DVec3::X, 0.0);
+            assert!(
+                equatorial - polar > 40.0,
+                "expected a strong equator→pole drop, got {equatorial} → {polar}"
+            );
+        }
+    }
+
+    #[test]
+    fn polar_cold_sits_on_the_rotation_axis_not_y() {
+        // The WI 868 polar-axis fix, characterized: bodygen rotates about +Z and
+        // the pre-868 material() iced ±Y. Cold must follow the axis.
+        let z_axis =
+            SurfaceField::with_params(3, 2_000_000.0, CraterParams::default(), temperate_climate());
+        for f in [z_axis] {
+            let pole = f.temperature_at_elevation(DVec3::Z, 0.0);
+            for equatorial in [DVec3::X, DVec3::Y, DVec3::NEG_Y] {
+                assert!(
+                    f.temperature_at_elevation(equatorial, 0.0) > pole + 40.0,
+                    "±Y must be equatorial (warm) on a Z-rotator"
+                );
+            }
+        }
+        // And the axis is respected when it is not +Z.
+        let mut tilted_climate = temperate_climate();
+        tilted_climate.axis = DVec3::X;
+        let x_axis =
+            SurfaceField::with_params(3, 2_000_000.0, CraterParams::default(), tilted_climate);
+        assert!(
+            x_axis.temperature_at_elevation(DVec3::Z, 0.0)
+                > x_axis.temperature_at_elevation(DVec3::X, 0.0) + 40.0,
+            "cold pole must follow the rotation axis"
+        );
+    }
+
+    #[test]
+    fn families_follow_the_medium_and_biomes_vary() {
+        // Atmospheric family via the asset path (BodyAsset::earthlike has an
+        // atmosphere), airless via bodygen's Moon.
+        let mut asset = BodyAsset::earthlike();
+        asset.surface.seed = 21;
+        assert_eq!(
+            SurfaceField::from_asset(&asset)
+                .biome_weights(DVec3::X)
+                .family(),
+            BiomeFamily::Atmospheric
+        );
+        let moon_asset = crate::bodygen::generate(918_273_645, crate::bodygen::Archetype::Moon);
+        let moon = SurfaceField::from_asset(&moon_asset);
+        assert_eq!(moon.biome_weights(DVec3::X).family(), BiomeFamily::Airless);
+
+        // A temperate world shows a real taxonomy: several distinct dominant
+        // biomes, ice caps at the rotation poles, ocean-family rows on deep
+        // low-latitude seafloor. (Dominant use here is the discrete debug view —
+        // asserting the classification, not consuming it physically.)
+        let f = SurfaceField::with_params(
+            21,
+            2_000_000.0,
+            CraterParams::default(),
+            temperate_climate(),
+        );
+        let mut names = std::collections::HashSet::new();
+        for d in dirs() {
+            names.insert(f.biome_weights(d).dominant().name);
+        }
+        assert!(
+            names.len() >= 4,
+            "a temperate world should show ≥ 4 dominant biomes, got {names:?}"
+        );
+        assert_eq!(f.biome_weights(DVec3::Z).dominant().name, "ice cap");
+        // Deep + equatorial + gentle ⇒ ocean family. Scan a denser direction set
+        // for qualifying sites (coverage-guarded so the scenario can't hollow).
+        let mut checked = 0;
+        for i in 0..1_500 {
+            let a = i as f64 * 0.618_033_988_75 * std::f64::consts::TAU;
+            let z = -0.4 + 0.8 * (i as f64 + 0.5) / 1_500.0; // low latitudes only
+            let r = (1.0 - z * z).max(0.0).sqrt();
+            let d = DVec3::new(r * a.cos(), r * a.sin(), z); // z is the axis
+            if f.elevation(d) < -0.08 * f.amplitude {
+                let n = f.normal(d);
+                if 1.0 - n.dot(d) < 0.015 {
+                    let name = f.biome_weights(d).dominant().name;
+                    assert!(
+                        name == "ocean" || name == "shallows",
+                        "deep gentle low-latitude floor should be ocean-family, got {name}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked > 0,
+            "no qualifying seafloor sites — re-site the scan"
+        );
+
+        // The moon varies too (albedo/roughness classes), entirely airless-table.
+        let mut moon_names = std::collections::HashSet::new();
+        for d in dirs() {
+            moon_names.insert(moon.biome_weights(d).dominant().name);
+        }
+        assert!(moon_names.len() >= 2, "airless variety: {moon_names:?}");
+    }
+
+    #[test]
+    fn blended_material_lies_in_the_family_hull() {
+        for f in [
+            SurfaceField::with_params(
+                11,
+                1_500_000.0,
+                CraterParams::default(),
+                temperate_climate(),
+            ),
+            SurfaceField::new(11, 700_000.0),
+        ] {
+            let table = crate::biome::biome_table(f.biome_weights(DVec3::X).family());
+            let fmin = table
+                .iter()
+                .map(|r| r.material.friction)
+                .fold(f64::MAX, f64::min);
+            let fmax = table
+                .iter()
+                .map(|r| r.material.friction)
+                .fold(f64::MIN, f64::max);
+            let rmin = table
+                .iter()
+                .map(|r| r.material.rolling_resistance)
+                .fold(f64::MAX, f64::min);
+            let rmax = table
+                .iter()
+                .map(|r| r.material.rolling_resistance)
+                .fold(f64::MIN, f64::max);
+            for d in dirs() {
+                let m = f.material(d);
+                assert!(m.friction >= fmin - 1e-12 && m.friction <= fmax + 1e-12);
+                assert!(
+                    m.rolling_resistance >= rmin - 1e-12 && m.rolling_resistance <= rmax + 1e-12
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn biome_frontiers_are_continuous() {
+        // The WI 866 continuity pattern one layer up: march great-circle arcs at
+        // ~3 m steps and assert every per-id biome weight and the blended
+        // material move smoothly — this is the check on the whole layered
+        // continuity argument (smooth kernels of continuous inputs; equal raw
+        // weights at any top-k ranking swap; constant floor). A hard cut
+        // anywhere (a box edge, an override threshold, the truncation) shows as
+        // an O(0.1..1) jump in one step, orders above the smooth rate.
+        fn rotate(v: DVec3, axis: DVec3, ang: f64) -> DVec3 {
+            v * ang.cos() + axis.cross(v) * ang.sin() + axis * axis.dot(v) * (1.0 - ang.cos())
+        }
+        let bodies = [
+            (
+                "atmospheric",
+                SurfaceField::with_params(
+                    7,
+                    730_000.0,
+                    CraterParams::default(),
+                    temperate_climate(),
+                ),
+            ),
+            ("airless", SurfaceField::new(7, 730_000.0)),
+        ];
+        for (label, f) in bodies {
+            let table = crate::biome::biome_table(f.biome_weights(DVec3::X).family());
+            let start = DVec3::new(0.3, -0.9, 0.2).normalize();
+            let axis = start.cross(DVec3::Y).normalize();
+            let step = 4.0e-6; // rad ≈ 3 m of arc on this body
+            let (a0, a1) = (0.35_f64, 0.60_f64);
+            let n = ((a1 - a0) / step) as usize;
+            let weights_at = |d: DVec3| {
+                let w = f.biome_weights(d);
+                let mut v = [0.0_f64; 16];
+                for (i, slot) in v.iter_mut().enumerate().take(table.len()) {
+                    *slot = w.weight_of(i);
+                }
+                (v, w.dominant_index(), w.material())
+            };
+            let (mut prev_w, mut prev_dom, mut prev_m) = weights_at(rotate(start, axis, a0));
+            let mut dom_changes = 0u32;
+            let mut max_dw = 0.0_f64;
+            let mut max_df = 0.0_f64;
+            for i in 1..=n {
+                let d = rotate(start, axis, a0 + i as f64 * step);
+                let (w, dom, m) = weights_at(d);
+                for (a, b) in w.iter().zip(prev_w) {
+                    max_dw = max_dw.max((a - b).abs());
+                }
+                max_df = max_df
+                    .max((m.friction - prev_m.friction).abs())
+                    .max((m.rolling_resistance - prev_m.rolling_resistance).abs());
+                if dom != prev_dom {
+                    dom_changes += 1;
+                }
+                (prev_w, prev_dom, prev_m) = (w, dom, m);
+            }
+            // Coverage guard: the arc must actually cross biome frontiers, or
+            // the assertions above stop exercising anything.
+            assert!(
+                dom_changes >= 3,
+                "{label}: arc crossed only {dom_changes} frontiers — re-site it"
+            );
+            // Smooth-rate bounds, calibrated: measured smooth maxima are
+            // max_dw ≈ 0.0032 / max_df ≈ 0.0018 (atmospheric) and 0.0018 /
+            // 0.0005 (airless) — >10× headroom below the bounds, while a hard
+            // cut anywhere (verified by temporarily making Band::kernel a step)
+            // exceeds them by an order of magnitude.
+            assert!(
+                max_dw < 0.05,
+                "{label}: a biome weight stepped {max_dw} in one ~3 m sample"
+            );
+            assert!(
+                max_df < 0.02,
+                "{label}: blended material stepped {max_df} in one ~3 m sample"
+            );
+        }
     }
 
     #[test]
