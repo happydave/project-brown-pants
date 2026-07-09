@@ -294,6 +294,18 @@ const MUD: SurfaceMaterial = SurfaceMaterial {
     rolling_resistance: 0.25,
 };
 
+/// Lower temperature edge of the ocean family, K: open water (ocean, shallows)
+/// requires a surface at least this warm. The single source of truth for the
+/// threshold — the ocean/shallows rows below and the ice-age body's cold anchor
+/// (`body_asset::EARTHLIKE_ICE_AGE_OFFSET`, WI 875) both derive from it.
+pub const OCEAN_FREEZE_THRESHOLD_K: f64 = 254.0;
+
+/// Ramp width, K, on the ocean-family temperature band. At or below
+/// `OCEAN_FREEZE_THRESHOLD_K − OCEAN_FREEZE_RAMP_K` the ocean kernel contributes
+/// zero weight, so liquid water — hence any non-frozen surface class — is
+/// impossible and the surface is guaranteed to classify as ice.
+pub const OCEAN_FREEZE_RAMP_K: f64 = 6.0;
+
 /// The atmospheric-family table. Boxes overlap by at least a ramp width between
 /// climatic neighbours so (with the fallback floor) coverage has no holes.
 /// All numbers are tunable data; the tests pin structural properties only.
@@ -301,7 +313,7 @@ pub const ATMOSPHERIC_BIOMES: &[BiomeRow] = &[
     BiomeRow {
         name: "ocean",
         bands: bands(
-            band(254.0, 1.0e9, 6.0), // warm enough not to be ice-capped
+            band(OCEAN_FREEZE_THRESHOLD_K, 1.0e9, OCEAN_FREEZE_RAMP_K), // warm enough not to be ice-capped
             Band::ANY,
             band(-1.0e9, -0.04, 0.04), // well below sea level
             SLOPE_CAP,
@@ -320,7 +332,7 @@ pub const ATMOSPHERIC_BIOMES: &[BiomeRow] = &[
     BiomeRow {
         name: "shallows",
         bands: bands(
-            band(254.0, 1.0e9, 6.0),
+            band(OCEAN_FREEZE_THRESHOLD_K, 1.0e9, OCEAN_FREEZE_RAMP_K),
             Band::ANY,
             band(-0.09, -0.005, 0.03),
             SLOPE_CAP,

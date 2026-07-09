@@ -75,8 +75,15 @@ pub struct FluidMedium {
     pub ocean_density_gradient: f64,
     /// Gravitational acceleration used for ocean hydrostatic pressure, m/s². `>= 0`.
     pub gravity: f64,
-    /// Atmosphere temperature, K (WI 694) — the convective-exchange target above the
-    /// surface. Defaulted on load.
+    /// Atmosphere temperature, K — the **surface (sea-level) ambient** temperature
+    /// of this body. The medium is *isothermal* (`sample_altitude` returns this at
+    /// every altitude above the surface), so this is a single quantity, not a
+    /// separate "surface" vs "bulk/effective" pair: a lapse-aware vertical profile
+    /// is a possible future physics item, not modelled here. Two consumers read it,
+    /// both wanting a surface ambient — the re-entry recovery/quench target in
+    /// `thermal.rs` (WI 694; at rest the skin cools toward this) and the biome
+    /// classifier's base temperature (`biome::BodyClimate::from_asset`, WI 868/870).
+    /// Defaulted on load.
     #[serde(default)]
     pub atmosphere_temperature: f64,
     /// Ocean temperature, K (WI 694) — the convective-exchange target below the
@@ -84,6 +91,13 @@ pub struct FluidMedium {
     #[serde(default)]
     pub ocean_temperature: f64,
 }
+
+/// ISA sea-level standard temperature: **288.15 K = exactly 15 °C**, the
+/// sea-level datum of the International Standard Atmosphere (ISO 2533). The named
+/// physical anchor for "an Earth-like surface is temperate" — used as the
+/// canonical [`FluidMedium::EARTHLIKE`] surface ambient so no bare number stands
+/// in for it (WI 875; the anchor itself was introduced by WI 870).
+pub const ISA_SEA_LEVEL_TEMPERATURE: f64 = 288.15;
 
 impl FluidMedium {
     /// Empty space: zero density and pressure at every altitude.
@@ -111,8 +125,8 @@ impl FluidMedium {
         ocean_surface_pressure: 101_325.0,      // continuous with the atmosphere
         ocean_density_gradient: 0.0,            // near-incompressible: constant density
         gravity: 9.81,                          // m/s²
-        atmosphere_temperature: 250.0,          // K — a representative atmospheric temp
-        ocean_temperature: 290.0,               // K — surface seawater
+        atmosphere_temperature: ISA_SEA_LEVEL_TEMPERATURE, // surface ambient, 15 °C
+        ocean_temperature: 290.0,               // K — surface seawater (~17 °C, ISA-consistent)
     };
 
     /// Samples the medium at signed altitude `h` (metres): `h > 0` above the

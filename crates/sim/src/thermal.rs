@@ -664,6 +664,52 @@ mod tests {
         );
     }
 
+    // WI 875: the at-rest quench floor is the medium's own surface-ambient
+    // temperature. Moving the earthlike anchor 250 K → ISA sea-level (288.15 K)
+    // raises this floor by ~38 K — measured here and accepted: it is a correct
+    // ~15 °C surface ambient, is negligible against re-entry recovery
+    // temperatures (the kinetic `v²/(2·c_p)` head at entry speed dwarfs it), and
+    // sits far below any material maximum, so no voxel-failure behaviour changes.
+    #[test]
+    fn rest_quench_floor_is_the_medium_surface_ambient() {
+        let craft = box_craft(2, 2, 2, 1.0, alu());
+        let medium = dense_air(); // EARTHLIKE at the surface
+        let floor = medium.temperature;
+        // The floor is the ISA anchor now, and strictly above the old 250 K magic.
+        assert!((floor - crate::fluid::ISA_SEA_LEVEL_TEMPERATURE).abs() < 1e-9);
+        assert!(
+            floor > 250.0,
+            "WI 875 raised the rest floor above 250 K: {floor}"
+        );
+
+        // The floor is a **fixed point**: a craft already at the medium
+        // temperature, at rest, with the radiative sink also at the medium
+        // temperature, has zero convective and radiative gradient — it neither
+        // heats nor cools, so the steady state is exactly the medium ambient.
+        let mut at_floor = ThermalState::new(&craft, floor);
+        for _ in 0..200 {
+            at_floor.step(&craft, &medium, DVec3::ZERO, DQuat::IDENTITY, floor, 1.0);
+        }
+        assert!(
+            (at_floor.max_skin_temp() - floor).abs() < 1e-6,
+            "the medium ambient is a rest fixed point, got {}",
+            at_floor.max_skin_temp()
+        );
+
+        // And it is an *attracting* floor: a hotter craft at rest only cools, and
+        // never overshoots below the medium ambient.
+        let mut hot = ThermalState::new(&craft, 500.0);
+        let start = hot.max_skin_temp();
+        for _ in 0..200 {
+            hot.step(&craft, &medium, DVec3::ZERO, DQuat::IDENTITY, floor, 1.0);
+        }
+        let cooled = hot.max_skin_temp();
+        assert!(
+            cooled < start && cooled >= floor - 1e-6,
+            "at rest a hot craft cools toward the floor {floor} without overshoot: {start} → {cooled}"
+        );
+    }
+
     // Heating rises with density and speed.
     #[test]
     fn faster_denser_descent_is_hotter() {

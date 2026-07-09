@@ -19,6 +19,7 @@
 //! (WI 764) are *reserved, extensible* areas here — defaulted on load — so those
 //! work items fill them without a format-version change.
 
+use crate::biome::{OCEAN_FREEZE_RAMP_K, OCEAN_FREEZE_THRESHOLD_K};
 use crate::fluid::FluidMedium;
 use crate::sim::CentralBody;
 use glam::DVec3;
@@ -122,28 +123,32 @@ pub struct BodyAsset {
     pub render: serde_json::Value,
 }
 
-/// ISA sea-level standard temperature (288.15 K) — the named physical anchor
-/// for "an Earth-like surface reads temperate" (WI 870). The classifier offset
-/// below is *derived* from it, never a bare number; WI 875 continues the
-/// un-magic-the-temperature thread on the physics side.
-pub const ISA_SEA_LEVEL_TEMPERATURE: f64 = 288.15;
+/// The ice-age sibling's target surface temperature, K (WI 875): at/below the
+/// point where the ocean kernel contributes zero weight, so open water — hence
+/// any non-frozen surface class — is impossible and the surface is guaranteed to
+/// classify as ice. Derived from the classifier's own ocean-freeze band, never a
+/// bare number.
+const EARTHLIKE_ICE_AGE_SURFACE_TEMPERATURE: f64 = OCEAN_FREEZE_THRESHOLD_K - OCEAN_FREEZE_RAMP_K;
 
-/// The classifier temperature offset the canonical Earth-like asset carries
-/// (WI 870): ISA sea-level minus the medium's own `atmosphere_temperature`
-/// (a representative *atmospheric* value the physics keeps reading, WI 875).
-/// Derived, so a future change to the medium constant keeps the classifier
-/// read anchored at ISA.
-pub const EARTHLIKE_TEMPERATE_OFFSET: f64 =
-    ISA_SEA_LEVEL_TEMPERATURE - FluidMedium::EARTHLIKE.atmosphere_temperature;
+/// The classifier temperature offset the ice-age Earth-like sibling carries
+/// (WI 875): its guaranteed-frozen target minus the medium's own
+/// `atmosphere_temperature` (now [`crate::fluid::ISA_SEA_LEVEL_TEMPERATURE`]). Derived,
+/// so it tracks any future change to the medium constant. The *temperate*
+/// earthlike needs no offset — its medium already equals the ISA surface anchor,
+/// so it reads temperate with no per-asset override (WI 875 un-magicked the
+/// physics constant that WI 870 had to bridge with a +38 K classifier offset).
+pub const EARTHLIKE_ICE_AGE_OFFSET: f64 =
+    EARTHLIKE_ICE_AGE_SURFACE_TEMPERATURE - FluidMedium::EARTHLIKE.atmosphere_temperature;
 
 impl BodyAsset {
     /// The canonical Earth-like body, expressed as an asset. Its derived
     /// [`CentralBody`] equals [`CentralBody::EARTHLIKE`] and its fluid medium
     /// equals [`FluidMedium::EARTHLIKE`], so behaviour that reads those constants
-    /// is unchanged when sourced from this asset. Since WI 870 its recipe
-    /// carries the ISA-anchored classifier temperature offset, so the surface
-    /// **reads temperate** to the biome layer (the ice-age look lives on in
-    /// [`Self::earthlike_ice_age`]); physics is untouched.
+    /// is unchanged when sourced from this asset. Since WI 875 its medium's own
+    /// surface ambient equals the ISA sea-level anchor, so the surface **reads
+    /// temperate** to the biome layer with **no per-asset override** (the ice-age
+    /// look lives on in [`Self::earthlike_ice_age`], now via an explicit cold
+    /// offset). Physics is untouched by the temperate look.
     pub fn earthlike() -> Self {
         Self {
             id: "earthlike".to_string(),
@@ -152,23 +157,25 @@ impl BodyAsset {
             radius: CentralBody::EARTHLIKE.radius,
             rotation: Rotation::EARTHLIKE,
             fluid_medium: FluidMedium::EARTHLIKE,
-            surface: SurfaceRecipe {
-                material: serde_json::json!({ "temperature": EARTHLIKE_TEMPERATE_OFFSET }),
-                ..SurfaceRecipe::from_seed(0)
-            },
+            surface: SurfaceRecipe::from_seed(0),
             render: serde_json::Value::Null,
         }
     }
 
-    /// The ice-age sibling of [`Self::earthlike`] (WI 870): the identical body
-    /// — same physics, same terrain seed — without the temperate classifier
-    /// offset, so the biome layer reads the medium's own temperature and the
-    /// surface classifies as an ice-age world (the pre-870 canonical look).
+    /// The ice-age sibling of [`Self::earthlike`]: the identical body — same
+    /// physics, same terrain seed — carrying an explicit **cold** classifier
+    /// offset ([`EARTHLIKE_ICE_AGE_OFFSET`], WI 875) that pushes its surface below
+    /// the ocean-freeze point, so the biome layer classifies it as an ice-age
+    /// world (the pre-870 canonical look) while physics stays identical to its
+    /// temperate twin.
     pub fn earthlike_ice_age() -> Self {
         Self {
             id: "earthlike-ice-age".to_string(),
             name: "Earth-like (Ice Age)".to_string(),
-            surface: SurfaceRecipe::from_seed(0),
+            surface: SurfaceRecipe {
+                material: serde_json::json!({ "temperature": EARTHLIKE_ICE_AGE_OFFSET }),
+                ..SurfaceRecipe::from_seed(0)
+            },
             ..Self::earthlike()
         }
     }

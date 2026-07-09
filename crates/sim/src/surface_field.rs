@@ -1660,21 +1660,27 @@ mod tests {
 
     #[test]
     fn earthlike_reads_temperate_and_its_ice_age_sibling_reads_cold() {
-        // WI 870 route 2: the canonical earthlike carries the ISA-anchored
-        // classifier offset (temperate surface, unchanged physics); the
-        // ice-age sibling is the same body without it.
-        use crate::body_asset::{EARTHLIKE_TEMPERATE_OFFSET, ISA_SEA_LEVEL_TEMPERATURE};
+        // WI 875: the earthlike medium's own surface ambient now equals the ISA
+        // sea-level anchor, so the canonical earthlike reads temperate with **no**
+        // per-asset offset; the ice-age sibling carries an explicit cold offset
+        // derived from the ocean-freeze band, pushing its surface below freezing.
+        // Physics (the shared medium) is identical between the two.
+        use crate::biome::{OCEAN_FREEZE_RAMP_K, OCEAN_FREEZE_THRESHOLD_K};
+        use crate::body_asset::EARTHLIKE_ICE_AGE_OFFSET;
+        use crate::fluid::ISA_SEA_LEVEL_TEMPERATURE;
         let temperate = SurfaceField::from_asset(&BodyAsset::earthlike());
         let ice_age = SurfaceField::from_asset(&BodyAsset::earthlike_ice_age());
 
-        // The offset is derived, not magic: ISA − the medium's own value.
+        // The temperate asset reads its medium's own value; the medium equals ISA.
         let medium_t = BodyAsset::earthlike().fluid_medium.atmosphere_temperature;
-        assert!(
-            (EARTHLIKE_TEMPERATE_OFFSET - (ISA_SEA_LEVEL_TEMPERATURE - medium_t)).abs() < 1e-12
-        );
+        assert!((medium_t - ISA_SEA_LEVEL_TEMPERATURE).abs() < 1e-12);
+        // The ice-age surface sits at/below the point where the ocean kernel is
+        // zero (guaranteed frozen), derived from the classifier's own band.
+        let ice_age_surface = ISA_SEA_LEVEL_TEMPERATURE + EARTHLIKE_ICE_AGE_OFFSET;
+        assert!(ice_age_surface <= OCEAN_FREEZE_THRESHOLD_K - OCEAN_FREEZE_RAMP_K + 1e-9);
 
         // Body-equatorial sea level reads ≈ ISA on the temperate asset and the
-        // medium's own value on the sibling (± the small latitude warp).
+        // derived frozen target on the sibling (± the small latitude warp).
         for equator in [DVec3::X, DVec3::Y, DVec3::new(0.7, -0.7, 0.0).normalize()] {
             let t = temperate.temperature_at_elevation(equator, 0.0);
             assert!(
@@ -1683,8 +1689,8 @@ mod tests {
             );
             let t = ice_age.temperature_at_elevation(equator, 0.0);
             assert!(
-                (t - medium_t).abs() < 0.5,
-                "ice-age equator should read the medium's value, got {t}"
+                (t - ice_age_surface).abs() < 0.5,
+                "ice-age equator should read the derived frozen target, got {t}"
             );
         }
         // The temperate world keeps polar ice but is not ice at the equator;
