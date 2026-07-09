@@ -107,12 +107,12 @@ impl Rng {
 /// derivations) stays in `sample` as the deterministic spine. Fields a shape
 /// never draws are left at their [`Default`] (`(0.0, 0.0)`) and ignored.
 ///
-/// These bands are the numbers that move into the authored body **recipes**
-/// (WI 883): a `BodyRecipe` carrying a `shape` supplies its bands as
-/// ladder-tunable fields, and content resolution samples them exactly as
-/// [`generate`] samples [`default_bands`]. [`generate`]'s in-code defaults are
-/// the transitional copy of the bands; WI 884 collapses the two onto the RON
-/// recipes.
+/// The band **numbers** live in authored body **recipes** (WI 883/884): a
+/// `BodyRecipe` carrying a `shape` supplies its bands as ladder-tunable fields,
+/// and the canonical archetype bands ship in the embedded bodies pack
+/// (`crates/sim/content/bodies.ron`) — the single source since WI 884 deleted
+/// the in-code defaults. [`generate`] reads them back through
+/// `content::canonical_bands`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct ArchetypeBands {
     pub radius: (f64, f64),
@@ -124,43 +124,6 @@ pub(crate) struct ArchetypeBands {
     pub atmosphere_temperature: (f64, f64),
     pub ocean_surface_density: (f64, f64),
     pub ocean_temperature: (f64, f64),
-}
-
-/// The canonical bands for an archetype — the ranges the generator has always
-/// used, now named. `sample(seed, arch, &default_bands(arch))` reproduces the
-/// historical [`generate`] output exactly.
-pub(crate) fn default_bands(archetype: Archetype) -> ArchetypeBands {
-    // A sidereal period drawn from one broad range for every archetype.
-    let sidereal_period = (20_000.0, 200_000.0);
-    match archetype {
-        Archetype::Moon => ArchetypeBands {
-            radius: (2.0e5, 2.0e6),
-            gravity: (0.5, 3.0),
-            sidereal_period,
-            ..ArchetypeBands::default()
-        },
-        Archetype::RockyPlanet => ArchetypeBands {
-            radius: (2.5e6, 8.0e6),
-            gravity: (3.0, 12.0),
-            sidereal_period,
-            atmosphere_surface_pressure: (50_000.0, 150_000.0),
-            atmosphere_surface_density: (0.2, 2.0),
-            atmosphere_scale_height: (5_000.0, 12_000.0),
-            atmosphere_temperature: (220.0, 300.0),
-            ..ArchetypeBands::default()
-        },
-        Archetype::OceanWorld => ArchetypeBands {
-            radius: (3.0e6, 9.0e6),
-            gravity: (5.0, 12.0),
-            sidereal_period,
-            atmosphere_surface_pressure: (80_000.0, 180_000.0),
-            atmosphere_surface_density: (0.5, 2.5),
-            atmosphere_scale_height: (6_000.0, 12_000.0),
-            atmosphere_temperature: (250.0, 300.0),
-            ocean_surface_density: (950.0, 1_100.0),
-            ocean_temperature: (275.0, 300.0),
-        },
-    }
 }
 
 /// Samples a [`BodyAsset`] deterministically from `seed`, an `archetype`
@@ -271,14 +234,17 @@ pub(crate) fn sample(seed: u64, archetype: Archetype, bands: &ArchetypeBands) ->
 
 /// Generates a [`BodyAsset`] deterministically from `seed` and `archetype`.
 ///
-/// Pure: the same inputs always produce a bit-identical body. Delegates to
-/// [`sample`] with the archetype's [`default_bands`], so the single sampler owns
-/// the draw structure and this function's output is unchanged by construction.
+/// Deterministic: the same inputs always produce a bit-identical body. Since
+/// WI 884 the archetype's parameter bands come from the **shipped canonical
+/// recipes** (the embedded bodies pack, via `content::canonical_bands`) — the
+/// single authored source — and are fed to [`sample`], which owns the draw
+/// structure. The historical output is pinned by the golden-stream test below
+/// plus the content-side characterization against independent literal fixtures.
 /// The body's `mu` is derived as `g · radius²` and its medium's `gravity` set to
 /// the same `g`, so it is internally consistent. Detailed surface/render
 /// parameters stay reserved (WI 763/764); only `surface.seed` is set (to `seed`).
 pub fn generate(seed: u64, archetype: Archetype) -> BodyAsset {
-    sample(seed, archetype, &default_bands(archetype))
+    sample(seed, archetype, &crate::content::canonical_bands(archetype))
 }
 
 #[cfg(test)]
@@ -364,5 +330,51 @@ mod tests {
         assert_eq!(back.fluid_medium, asset.fluid_medium);
         assert_eq!(back.surface.seed, asset.surface.seed);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// Golden pin of the draw stream (WI 884). Once `generate` and the recipe
+    /// path share the shipped RON bands, they can no longer characterize each
+    /// other against a stream change — this test is the independent oracle that
+    /// keeps every previously kept/saved body reproducible. Values captured from
+    /// the pre-migration generator at seed 42; they must never change without a
+    /// deliberate `output_version`-style decision.
+    #[test]
+    fn golden_stream_values_are_pinned() {
+        let cases = [
+            // (archetype, radius, mu, sidereal period, atmosphere temperature)
+            (
+                Archetype::Moon,
+                1_358_435.777_484_764_3,
+                3_428_264_859_485.727,
+                130_298.459_131_767_84,
+                200.0,
+            ),
+            (
+                Archetype::RockyPlanet,
+                4_081_792.695_450_728_8,
+                189_890_998_055_418.75,
+                49_797.502_630_290_735,
+                250.011_675_428_911_3,
+            ),
+            (
+                Archetype::OceanWorld,
+                8_149_405.480_361_776,
+                445_294_168_988_460.94,
+                174_079.664_849_490_7,
+                269.558_074_707_842_1,
+            ),
+        ];
+        for (arch, radius, mu, period, atm_t) in cases {
+            let b = generate(42, arch);
+            assert_eq!(b.radius, radius, "{arch:?} radius drifted");
+            assert_eq!(b.mu, mu, "{arch:?} mu drifted");
+            assert_eq!(
+                b.rotation.sidereal_period, period,
+                "{arch:?} period drifted"
+            );
+            assert_eq!(
+                b.fluid_medium.atmosphere_temperature, atm_t,
+                "{arch:?} atmosphere temperature drifted"
+            );
+        }
     }
 }

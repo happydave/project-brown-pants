@@ -80,6 +80,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
+use std::sync::OnceLock;
 
 /// Version of the authored content-document *format* (packs and override
 /// sets; not of any pack's content). Rejected loudly when a document declares
@@ -1006,11 +1007,21 @@ pub struct BodyRefRecord {
 /// A resolved body-recipe record (WI 881): the intrinsic body definition,
 /// reassembled from the flattened recipe fields into a [`BodyAsset`] the sim
 /// reads. Contrast [`BodyRefRecord`], which only links to a library slug.
+///
+/// A **shaped** record (WI 883/884) additionally retains its archetype `shape`
+/// and its ladder-resolved parameter bands, so a consumer can re-sample the
+/// family at arbitrary seeds (`bodygen::generate` reads the canonical archetype
+/// records' bands this way); `body` is then the record's own-`surface_seed`
+/// sample. Fixed records carry `None` for both.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BodyRecipeRecord {
     pub id: String,
     /// The resolved intrinsic body.
     pub body: BodyAsset,
+    /// The archetype shape, for sampled records (WI 883); `None` = fixed.
+    pub shape: Option<Archetype>,
+    /// The ladder-resolved bands a shaped record was sampled from (WI 884).
+    pub(crate) bands: Option<ArchetypeBands>,
     /// Inert metadata tags.
     pub tags: Vec<String>,
 }
@@ -1941,6 +1952,97 @@ fn validate(m: &RawRecord) -> Result<Record, ContentError> {
         })),
         RawRecord::BodyRecipe(b) => {
             let req = |v: Option<f64>, field: &'static str| v.ok_or_else(|| missing(&b.id, field));
+            // WI 884: a recipe is either **sampled** (`shape` + band fields) or
+            // **fixed** (scalar fields) — authoring the other mode's fields is a
+            // loud error, mirroring `device_spec`'s class-dependent rejection
+            // (previously the off-mode fields were silently ignored). Inheritance
+            // cannot mix the modes indirectly: `shape` inherits together with the
+            // bands, so a child of a shaped parent is itself shaped.
+            let inapplicable = |field: &'static str| ContentError::InapplicableField {
+                id: b.id.clone(),
+                field,
+            };
+            let fixed_scalars = [
+                (b.mu.is_some(), "mu"),
+                (b.radius.is_some(), "radius"),
+                (b.rotation_period.is_some(), "rotation_period"),
+                (
+                    b.atmosphere_surface_density.is_some(),
+                    "atmosphere_surface_density",
+                ),
+                (
+                    b.atmosphere_surface_pressure.is_some(),
+                    "atmosphere_surface_pressure",
+                ),
+                (
+                    b.atmosphere_scale_height.is_some(),
+                    "atmosphere_scale_height",
+                ),
+                (b.ocean_surface_density.is_some(), "ocean_surface_density"),
+                (b.ocean_surface_pressure.is_some(), "ocean_surface_pressure"),
+                (b.ocean_density_gradient.is_some(), "ocean_density_gradient"),
+                (b.gravity.is_some(), "gravity"),
+                (b.atmosphere_temperature.is_some(), "atmosphere_temperature"),
+                (b.ocean_temperature.is_some(), "ocean_temperature"),
+            ];
+            let band_fields = [
+                (b.radius_min.is_some(), "radius_min"),
+                (b.radius_max.is_some(), "radius_max"),
+                (b.gravity_min.is_some(), "gravity_min"),
+                (b.gravity_max.is_some(), "gravity_max"),
+                (b.rotation_period_min.is_some(), "rotation_period_min"),
+                (b.rotation_period_max.is_some(), "rotation_period_max"),
+                (
+                    b.atmosphere_surface_pressure_min.is_some(),
+                    "atmosphere_surface_pressure_min",
+                ),
+                (
+                    b.atmosphere_surface_pressure_max.is_some(),
+                    "atmosphere_surface_pressure_max",
+                ),
+                (
+                    b.atmosphere_surface_density_min.is_some(),
+                    "atmosphere_surface_density_min",
+                ),
+                (
+                    b.atmosphere_surface_density_max.is_some(),
+                    "atmosphere_surface_density_max",
+                ),
+                (
+                    b.atmosphere_scale_height_min.is_some(),
+                    "atmosphere_scale_height_min",
+                ),
+                (
+                    b.atmosphere_scale_height_max.is_some(),
+                    "atmosphere_scale_height_max",
+                ),
+                (
+                    b.atmosphere_temperature_min.is_some(),
+                    "atmosphere_temperature_min",
+                ),
+                (
+                    b.atmosphere_temperature_max.is_some(),
+                    "atmosphere_temperature_max",
+                ),
+                (
+                    b.ocean_surface_density_min.is_some(),
+                    "ocean_surface_density_min",
+                ),
+                (
+                    b.ocean_surface_density_max.is_some(),
+                    "ocean_surface_density_max",
+                ),
+                (b.ocean_temperature_min.is_some(), "ocean_temperature_min"),
+                (b.ocean_temperature_max.is_some(), "ocean_temperature_max"),
+            ];
+            let off_mode = if b.shape.is_some() {
+                &fixed_scalars[..]
+            } else {
+                &band_fields[..]
+            };
+            if let Some((_, field)) = off_mode.iter().find(|(present, _)| *present) {
+                return Err(inapplicable(field));
+            }
             // Absent offset ⇒ no per-asset override (material `null`), matching a
             // body that reads its medium directly (WI 875); present ⇒ the JSON the
             // biome classifier reads.
@@ -1948,7 +2050,7 @@ fn validate(m: &RawRecord) -> Result<Record, ContentError> {
                 Some(offset) => serde_json::json!({ "temperature": offset }),
                 None => serde_json::Value::Null,
             };
-            let body = match b.shape {
+            let (body, bands) = match b.shape {
                 // Sampled (WI 883): an archetype. Draw the shape's bands at the
                 // seed via the shared sampler, reproducing `bodygen::generate`.
                 // The scalar fields are unused here; identity + classifier offset
@@ -2076,60 +2178,67 @@ fn validate(m: &RawRecord) -> Result<Record, ContentError> {
                     body.id = b.id.clone();
                     body.name = b.name.clone().ok_or_else(|| missing(&b.id, "name"))?;
                     body.surface.material = material;
-                    body
+                    // Retain the resolved bands (WI 884) so consumers can
+                    // re-sample the family at other seeds.
+                    (body, Some(bands))
                 }
                 // Fixed (WI 881): the scalar fields are the body directly.
-                None => BodyAsset {
-                    id: b.id.clone(),
-                    name: b.name.clone().ok_or_else(|| missing(&b.id, "name"))?,
-                    mu: req(b.mu, "mu")?,
-                    radius: req(b.radius, "radius")?,
-                    rotation: Rotation {
-                        axis: DVec3::Z,
-                        sidereal_period: req(b.rotation_period, "rotation_period")?,
+                None => (
+                    BodyAsset {
+                        id: b.id.clone(),
+                        name: b.name.clone().ok_or_else(|| missing(&b.id, "name"))?,
+                        mu: req(b.mu, "mu")?,
+                        radius: req(b.radius, "radius")?,
+                        rotation: Rotation {
+                            axis: DVec3::Z,
+                            sidereal_period: req(b.rotation_period, "rotation_period")?,
+                        },
+                        fluid_medium: FluidMedium {
+                            atmosphere_surface_density: req(
+                                b.atmosphere_surface_density,
+                                "atmosphere_surface_density",
+                            )?,
+                            atmosphere_surface_pressure: req(
+                                b.atmosphere_surface_pressure,
+                                "atmosphere_surface_pressure",
+                            )?,
+                            atmosphere_scale_height: req(
+                                b.atmosphere_scale_height,
+                                "atmosphere_scale_height",
+                            )?,
+                            ocean_surface_density: req(
+                                b.ocean_surface_density,
+                                "ocean_surface_density",
+                            )?,
+                            ocean_surface_pressure: req(
+                                b.ocean_surface_pressure,
+                                "ocean_surface_pressure",
+                            )?,
+                            ocean_density_gradient: req(
+                                b.ocean_density_gradient,
+                                "ocean_density_gradient",
+                            )?,
+                            gravity: req(b.gravity, "gravity")?,
+                            atmosphere_temperature: req(
+                                b.atmosphere_temperature,
+                                "atmosphere_temperature",
+                            )?,
+                            ocean_temperature: req(b.ocean_temperature, "ocean_temperature")?,
+                        },
+                        surface: SurfaceRecipe {
+                            material,
+                            ..SurfaceRecipe::from_seed(req(b.surface_seed, "surface_seed")? as u64)
+                        },
+                        render: serde_json::Value::Null,
                     },
-                    fluid_medium: FluidMedium {
-                        atmosphere_surface_density: req(
-                            b.atmosphere_surface_density,
-                            "atmosphere_surface_density",
-                        )?,
-                        atmosphere_surface_pressure: req(
-                            b.atmosphere_surface_pressure,
-                            "atmosphere_surface_pressure",
-                        )?,
-                        atmosphere_scale_height: req(
-                            b.atmosphere_scale_height,
-                            "atmosphere_scale_height",
-                        )?,
-                        ocean_surface_density: req(
-                            b.ocean_surface_density,
-                            "ocean_surface_density",
-                        )?,
-                        ocean_surface_pressure: req(
-                            b.ocean_surface_pressure,
-                            "ocean_surface_pressure",
-                        )?,
-                        ocean_density_gradient: req(
-                            b.ocean_density_gradient,
-                            "ocean_density_gradient",
-                        )?,
-                        gravity: req(b.gravity, "gravity")?,
-                        atmosphere_temperature: req(
-                            b.atmosphere_temperature,
-                            "atmosphere_temperature",
-                        )?,
-                        ocean_temperature: req(b.ocean_temperature, "ocean_temperature")?,
-                    },
-                    surface: SurfaceRecipe {
-                        material,
-                        ..SurfaceRecipe::from_seed(req(b.surface_seed, "surface_seed")? as u64)
-                    },
-                    render: serde_json::Value::Null,
-                },
+                    None,
+                ),
             };
             Ok(Record::BodyRecipe(Box::new(BodyRecipeRecord {
                 id: b.id.clone(),
                 body,
+                shape: b.shape,
+                bands,
                 tags: b.tags.clone().unwrap_or_default(),
             })))
         }
@@ -2191,6 +2300,59 @@ fn device_spec(d: &RawDevice, class: DeviceClass) -> Result<DeviceSpec, ContentE
             draw: d.draw.ok_or_else(|| missing("draw"))?,
         },
     })
+}
+
+// ---------------------------------------------------------------------------
+// The canonical bodies (WI 884) — the embedded recipe pack.
+// ---------------------------------------------------------------------------
+
+/// The canonical bodies pack, embedded at compile time (WI 884): the single
+/// authored source of the canonical fixed bodies (`earthlike`,
+/// `earthlike-ice-age`) and the archetype band records (`moon`, `rocky`,
+/// `ocean`). `BodyAsset::earthlike`/`earthlike_ice_age` and `bodygen::generate`
+/// resolve from here — the hardcoded constructor assemblies and generator band
+/// literals they replaced are gone.
+const CANONICAL_BODIES_RON: &str = include_str!("../content/bodies.ron");
+
+/// The resolved canonical-bodies catalog, parsed once per process. The embedded
+/// pack is a compile-time asset gated by a unit test, so the `expect`s here are
+/// build-integrity assertions, never reachable input failures.
+fn canonical_catalog() -> &'static Catalog {
+    static CATALOG: OnceLock<Catalog> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        Catalog::from_ron_str(CANONICAL_BODIES_RON)
+            .expect("embedded canonical bodies pack (crates/sim/content/bodies.ron) must resolve")
+    })
+}
+
+/// Resolve a canonical body by record id from the embedded pack (WI 884).
+/// Panics if the id is absent or not a body recipe — a build-integrity error
+/// (the embedded pack is fixed at compile time and covered by a unit test).
+pub(crate) fn canonical_body(id: &str) -> BodyAsset {
+    let entry = canonical_catalog()
+        .get(id)
+        .unwrap_or_else(|| panic!("canonical body `{id}` missing from the embedded bodies pack"));
+    match &entry.record {
+        Record::BodyRecipe(r) => r.body.clone(),
+        other => panic!("canonical record `{id}` is not a body recipe: {other:?}"),
+    }
+}
+
+/// The ladder-resolved parameter bands of the canonical archetype record for
+/// `archetype` (record id = its slug), from the embedded pack (WI 884). Drives
+/// [`crate::bodygen::generate`]. Same build-integrity panic contract as
+/// [`canonical_body`].
+pub(crate) fn canonical_bands(archetype: Archetype) -> ArchetypeBands {
+    let id = archetype.slug();
+    let entry = canonical_catalog().get(id).unwrap_or_else(|| {
+        panic!("canonical archetype `{id}` missing from the embedded bodies pack")
+    });
+    match &entry.record {
+        Record::BodyRecipe(r) => r
+            .bands
+            .unwrap_or_else(|| panic!("canonical archetype `{id}` retains no bands (not shaped?)")),
+        other => panic!("canonical record `{id}` is not a body recipe: {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2799,9 +2961,12 @@ mod tests {
     }
 
     // WI 881: BodyRecipe as a content record kind — the canonical bodies authored
-    // as composable RON, characterization-equal to the constructors.
+    // as composable RON, characterization-equal to the constructors. Since WI 884
+    // the constructors *resolve the shipped pack*, so these inline fixtures are
+    // the **independent literal pins**: they no longer share a source with the
+    // constructors, and a drift in the shipped bodies.ron fails here.
 
-    /// The earthlike body as a recipe record (values mirror the constructors).
+    /// The earthlike body as a recipe record — independent literal pin (WI 884).
     fn earthlike_recipe() -> &'static str {
         r#"BodyRecipe((
             id: "earthlike", name: "Earth-like",
@@ -2962,10 +3127,14 @@ mod tests {
 
     // WI 883: archetypes as sampled recipes — an abstract base carrying a `shape`
     // + parameter bands, a concrete child supplying a seed; resolving samples the
-    // bands and reproduces `bodygen::generate` for that shape.
+    // bands and reproduces `bodygen::generate` for that shape. Since WI 884
+    // `generate` reads the *shipped* bands, so these inline literal fixtures are
+    // the independent pin welding shipped bands to the historical values (the
+    // stream itself is pinned by bodygen's golden test).
 
-    /// The three archetype base recipes (abstract), bands = today's generator
-    /// literals, paired with the `Archetype` the oracle `generate` uses.
+    /// The three archetype base recipes (abstract), bands = the historic
+    /// generator literals (independent pin, WI 884), paired with the
+    /// `Archetype` the oracle `generate` uses.
     fn archetype_bases() -> [(&'static str, &'static str, Archetype); 3] {
         [
             (
@@ -3111,6 +3280,104 @@ mod tests {
                 );
             }
             other => panic!("expected MissingField, got {other:?}"),
+        }
+    }
+
+    // WI 884: the shipped canonical bodies — the embedded pack is the single
+    // authored source; these tests weld it to the engine physics constants and
+    // gate the build-integrity `expect`s in the canonical accessors.
+
+    #[test]
+    fn embedded_canonical_pack_welds_to_the_physics_consts() {
+        use crate::body_asset::EARTHLIKE_ICE_AGE_OFFSET;
+        use crate::sim::CentralBody;
+
+        // The temperate earthlike: recipe values must equal the engine physics
+        // constants **exactly** (the RON transcribes the same digit strings, and
+        // decimal→f64 parsing is correctly rounded on both sides).
+        let e = canonical_body("earthlike");
+        assert_eq!(e.id, "earthlike");
+        assert_eq!(e.mu, CentralBody::EARTHLIKE.mu);
+        assert_eq!(e.radius, CentralBody::EARTHLIKE.radius);
+        assert_eq!(e.rotation, Rotation::EARTHLIKE);
+        assert_eq!(e.fluid_medium, FluidMedium::EARTHLIKE);
+        assert_eq!(e.surface.seed, 0);
+        assert!(e.surface.material.is_null());
+
+        // The ice-age sibling: inherited physics identical to the twin; its
+        // authored offset pins to the WI-875 derived constant (tolerance covers
+        // the authored `-40.15` vs the computed `248 - 288.15` — ≲1e-13 apart).
+        let i = canonical_body("earthlike-ice-age");
+        assert_eq!(i.fluid_medium, e.fluid_medium);
+        assert_eq!(i.mu, e.mu);
+        assert_eq!(i.radius, e.radius);
+        assert_eq!(i.rotation, e.rotation);
+        let offset = i.surface.material["temperature"].as_f64().unwrap();
+        assert!(
+            (offset - EARTHLIKE_ICE_AGE_OFFSET).abs() < 1e-9,
+            "shipped ice-age offset {offset} drifted from the derived constant \
+             {EARTHLIKE_ICE_AGE_OFFSET} — update bodies.ron"
+        );
+
+        // Every archetype record retains ladder-resolved bands (spot-check the
+        // moon's historic radius band exactly).
+        for arch in Archetype::ALL {
+            let _ = canonical_bands(arch); // panics if missing/not shaped
+        }
+        assert_eq!(canonical_bands(Archetype::Moon).radius, (2.0e5, 2.0e6));
+    }
+
+    #[test]
+    fn shaped_recipe_rejects_authored_fixed_scalars() {
+        // A shaped recipe authoring a fixed scalar is a loud authoring error
+        // (WI 884) — the sampled body's fields come from the draw, not scalars.
+        let p = pack(
+            r#"BodyRecipe(( id: "r1", name: "R1", shape: moon, surface_seed: 1, mu: 1.0e12,
+                radius_min: 2.0e5, radius_max: 2.0e6, gravity_min: 0.5, gravity_max: 3.0,
+                rotation_period_min: 20000.0, rotation_period_max: 200000.0 )),"#,
+        );
+        match Catalog::merge(&[&p], &[]) {
+            Err(ContentError::InapplicableField { id, field }) => {
+                assert_eq!(id, "r1");
+                assert_eq!(field, "mu");
+            }
+            other => panic!("expected InapplicableField, got {other:?}"),
+        }
+
+        // …and the same rejection fires when an override writes the scalar onto
+        // a shaped record (validation runs after the ladder).
+        let p = pack(standalone_rocky());
+        let ov = override_set(
+            "bad",
+            "Scenario",
+            "",
+            r#"( target: Id("r1"), field: "mu", op: Set(Number(1.0e12)) ),"#,
+        );
+        assert!(matches!(
+            Catalog::merge(&[&p], &[&ov]),
+            Err(ContentError::InapplicableField { .. })
+        ));
+    }
+
+    #[test]
+    fn fixed_recipe_rejects_authored_band_fields() {
+        // Bands are meaningless without a sampler: a fixed (shapeless) recipe
+        // authoring a band bound is rejected symmetrically (WI 884).
+        let p = pack(
+            r#"BodyRecipe(( id: "b1", name: "B1", radius_min: 1.0,
+                mu: 3.986e14, radius: 6360000.0, rotation_period: 86164.0905,
+                atmosphere_surface_density: 1.225, atmosphere_surface_pressure: 101325.0,
+                atmosphere_scale_height: 8500.0, ocean_surface_density: 1025.0,
+                ocean_surface_pressure: 101325.0, ocean_density_gradient: 0.0,
+                gravity: 9.81, atmosphere_temperature: 288.15, ocean_temperature: 290.0,
+                surface_seed: 0 )),"#,
+        );
+        match Catalog::merge(&[&p], &[]) {
+            Err(ContentError::InapplicableField { id, field }) => {
+                assert_eq!(id, "b1");
+                assert_eq!(field, "radius_min");
+            }
+            other => panic!("expected InapplicableField, got {other:?}"),
         }
     }
 

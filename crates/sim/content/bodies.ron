@@ -1,0 +1,90 @@
+// The canonical bodies, authored as recipes (WI 884) — the single authored
+// source of canonical body configuration. Embedded in the sim crate at compile
+// time and resolved through the ordinary content merge-ladder; the old
+// `BodyAsset::earthlike`/`earthlike_ice_age` constructors and the
+// `bodygen::default_bands` literals resolve from here.
+//
+// Values mirror the engine physics constants digit-for-digit
+// (`CentralBody::EARTHLIKE`, `Rotation::EARTHLIKE`, `FluidMedium::EARTHLIKE`);
+// a drift-guard test pins the two forever. The ice-age offset is the WI-875
+// derivation (guaranteed-frozen 248 K minus the ISA surface ambient 288.15 K),
+// authored as its value; a test pins it to `EARTHLIKE_ICE_AGE_OFFSET`.
+//
+// The shaped records (moon / rocky / ocean) carry the archetype parameter
+// bands that used to live in `bodygen::generate`'s match arms (WI 883 lifted
+// them to data; this pack is now their only source). They are concrete (seed 0)
+// so they resolve into the catalog, where their retained bands drive
+// `bodygen::generate` at arbitrary seeds — and they are legal parents for
+// future authored children.
+#![enable(implicit_some)]
+(
+    format: 1,
+    id: "sim-canonical-bodies",
+    version: "1",
+    records: [
+        BodyRecipe((
+            id: "earthlike",
+            name: "Earth-like",
+            mu: 3.986e14,
+            radius: 6360000.0,
+            rotation_period: 86164.0905,
+            atmosphere_surface_density: 1.225,
+            atmosphere_surface_pressure: 101325.0,
+            atmosphere_scale_height: 8500.0,
+            ocean_surface_density: 1025.0,
+            ocean_surface_pressure: 101325.0,
+            ocean_density_gradient: 0.0,
+            gravity: 9.81,
+            atmosphere_temperature: 288.15,
+            ocean_temperature: 290.0,
+            surface_seed: 0,
+        )),
+        // The identical body — same physics, same terrain seed — carrying the
+        // explicit cold classifier offset (248 - 288.15; WI 875) that pushes its
+        // surface below the ocean-freeze point.
+        BodyRecipe((
+            id: "earthlike-ice-age",
+            name: "Earth-like (Ice Age)",
+            parent: "earthlike",
+            surface_temperature_offset: -40.15,
+        )),
+        // Archetypes: the historic generator bands (WI 762 literals), as data.
+        BodyRecipe((
+            id: "moon",
+            name: "Moon",
+            shape: moon,
+            surface_seed: 0,
+            radius_min: 2.0e5, radius_max: 2.0e6,
+            gravity_min: 0.5, gravity_max: 3.0,
+            rotation_period_min: 20000.0, rotation_period_max: 200000.0,
+        )),
+        BodyRecipe((
+            id: "rocky",
+            name: "Rocky Planet",
+            shape: rocky_planet,
+            surface_seed: 0,
+            radius_min: 2.5e6, radius_max: 8.0e6,
+            gravity_min: 3.0, gravity_max: 12.0,
+            rotation_period_min: 20000.0, rotation_period_max: 200000.0,
+            atmosphere_surface_pressure_min: 50000.0, atmosphere_surface_pressure_max: 150000.0,
+            atmosphere_surface_density_min: 0.2, atmosphere_surface_density_max: 2.0,
+            atmosphere_scale_height_min: 5000.0, atmosphere_scale_height_max: 12000.0,
+            atmosphere_temperature_min: 220.0, atmosphere_temperature_max: 300.0,
+        )),
+        BodyRecipe((
+            id: "ocean",
+            name: "Ocean World",
+            shape: ocean_world,
+            surface_seed: 0,
+            radius_min: 3.0e6, radius_max: 9.0e6,
+            gravity_min: 5.0, gravity_max: 12.0,
+            rotation_period_min: 20000.0, rotation_period_max: 200000.0,
+            atmosphere_surface_pressure_min: 80000.0, atmosphere_surface_pressure_max: 180000.0,
+            atmosphere_surface_density_min: 0.5, atmosphere_surface_density_max: 2.5,
+            atmosphere_scale_height_min: 6000.0, atmosphere_scale_height_max: 12000.0,
+            atmosphere_temperature_min: 250.0, atmosphere_temperature_max: 300.0,
+            ocean_surface_density_min: 950.0, ocean_surface_density_max: 1100.0,
+            ocean_temperature_min: 275.0, ocean_temperature_max: 300.0,
+        )),
+    ],
+)

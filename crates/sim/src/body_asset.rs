@@ -141,43 +141,30 @@ pub const EARTHLIKE_ICE_AGE_OFFSET: f64 =
     EARTHLIKE_ICE_AGE_SURFACE_TEMPERATURE - FluidMedium::EARTHLIKE.atmosphere_temperature;
 
 impl BodyAsset {
-    /// The canonical Earth-like body, expressed as an asset. Its derived
-    /// [`CentralBody`] equals [`CentralBody::EARTHLIKE`] and its fluid medium
-    /// equals [`FluidMedium::EARTHLIKE`], so behaviour that reads those constants
-    /// is unchanged when sourced from this asset. Since WI 875 its medium's own
-    /// surface ambient equals the ISA sea-level anchor, so the surface **reads
-    /// temperate** to the biome layer with **no per-asset override** (the ice-age
-    /// look lives on in [`Self::earthlike_ice_age`], now via an explicit cold
-    /// offset). Physics is untouched by the temperate look.
+    /// The canonical Earth-like body. Since WI 884 this **resolves the shipped
+    /// recipe** (the embedded canonical-bodies pack, `content::canonical_body`)
+    /// rather than assembling constants in code — the recipe is the single
+    /// authored source of body configuration. Its derived [`CentralBody`] still
+    /// equals [`CentralBody::EARTHLIKE`] and its fluid medium still equals
+    /// [`FluidMedium::EARTHLIKE`] — now guaranteed by drift-guard tests welding
+    /// the recipe to the physics constants, rather than by construction. Since
+    /// WI 875 its medium's own surface ambient equals the ISA sea-level anchor,
+    /// so the surface **reads temperate** to the biome layer with **no per-asset
+    /// override** (the ice-age look lives on in [`Self::earthlike_ice_age`]).
     pub fn earthlike() -> Self {
-        Self {
-            id: "earthlike".to_string(),
-            name: "Earth-like".to_string(),
-            mu: CentralBody::EARTHLIKE.mu,
-            radius: CentralBody::EARTHLIKE.radius,
-            rotation: Rotation::EARTHLIKE,
-            fluid_medium: FluidMedium::EARTHLIKE,
-            surface: SurfaceRecipe::from_seed(0),
-            render: serde_json::Value::Null,
-        }
+        crate::content::canonical_body("earthlike")
     }
 
     /// The ice-age sibling of [`Self::earthlike`]: the identical body — same
     /// physics, same terrain seed — carrying an explicit **cold** classifier
-    /// offset ([`EARTHLIKE_ICE_AGE_OFFSET`], WI 875) that pushes its surface below
-    /// the ocean-freeze point, so the biome layer classifies it as an ice-age
-    /// world (the pre-870 canonical look) while physics stays identical to its
-    /// temperate twin.
+    /// offset (the WI-875 derivation, authored in the shipped recipe and pinned
+    /// to [`EARTHLIKE_ICE_AGE_OFFSET`] by a drift-guard test) that pushes its
+    /// surface below the ocean-freeze point, so the biome layer classifies it as
+    /// an ice-age world while physics stays identical to its temperate twin.
+    /// Resolves the shipped recipe (WI 884), where it is authored as
+    /// `parent: earthlike` + the one cold override.
     pub fn earthlike_ice_age() -> Self {
-        Self {
-            id: "earthlike-ice-age".to_string(),
-            name: "Earth-like (Ice Age)".to_string(),
-            surface: SurfaceRecipe {
-                material: serde_json::json!({ "temperature": EARTHLIKE_ICE_AGE_OFFSET }),
-                ..SurfaceRecipe::from_seed(0)
-            },
-            ..Self::earthlike()
-        }
+        crate::content::canonical_body("earthlike-ice-age")
     }
 
     /// The [`CentralBody`] this asset defines (gravity + radius) — the intrinsic
