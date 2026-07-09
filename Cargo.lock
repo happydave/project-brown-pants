@@ -1957,7 +1957,7 @@ dependencies = [
 
 [[package]]
 name = "companion"
-version = "0.1.194"
+version = "0.1.195"
 dependencies = [
  "glam 0.30.10",
  "serde_json",
@@ -4780,7 +4780,7 @@ dependencies = [
 
 [[package]]
 name = "sounding"
-version = "0.1.194"
+version = "0.1.195"
 dependencies = [
  "bevy",
  "serde",
@@ -4792,7 +4792,7 @@ dependencies = [
 
 [[package]]
 name = "sounding_netclient"
-version = "0.1.194"
+version = "0.1.195"
 dependencies = [
  "glam 0.30.10",
  "serde",
@@ -4804,7 +4804,7 @@ dependencies = [
 
 [[package]]
 name = "sounding_server"
-version = "0.1.194"
+version = "0.1.195"
 dependencies = [
  "glam 0.30.10",
  "serde",
@@ -4817,7 +4817,7 @@ dependencies = [
 
 [[package]]
 name = "sounding_sim"
-version = "0.1.194"
+version = "0.1.195"
 dependencies = [
  "bevy_app",
  "bevy_diagnostic",

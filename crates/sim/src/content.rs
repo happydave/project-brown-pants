@@ -580,13 +580,27 @@ impl Target {
     }
 }
 
-/// The four field operations. `Set` operands are explicitly typed (RON-safe).
+/// The field operations. `Set` operands are explicitly typed (RON-safe). List
+/// fields carry ordered, **id-keyed** ops (WI 879): `Extend` appends, `Delete`
+/// removes by id, and `InsertAfter`/`Replace` splice relative to a named element
+/// so an ordered list (e.g. a body's surface-layer stack) composes across the
+/// ladder by element identity, never by index.
 #[derive(Debug, Deserialize)]
 enum Op {
     Set(SetValue),
     Multiply(f64),
     Extend(Vec<String>),
     Delete(String),
+    /// Insert `items` immediately after the first element equal to `anchor`.
+    InsertAfter {
+        anchor: String,
+        items: Vec<String>,
+    },
+    /// Replace the first element equal to `target` with `items` (splice in place).
+    Replace {
+        target: String,
+        items: Vec<String>,
+    },
 }
 
 /// A typed `set` operand.
@@ -1183,6 +1197,63 @@ fn apply_op(
             }
         }
         (_, Op::Delete(_)) => return Err(mismatch("delete")),
+        (Slot::List(v), Op::InsertAfter { anchor, items }) => {
+            let list = match v {
+                Some(list) => list,
+                None if parentless => {
+                    return Err(ContentError::AbsentElement {
+                        record: record_id,
+                        field: field.to_string(),
+                        element: anchor.clone(),
+                    })
+                }
+                None => return Err(unset()),
+            };
+            match list.iter().position(|e| e == anchor) {
+                Some(i) => {
+                    for (k, item) in items.iter().enumerate() {
+                        list.insert(i + 1 + k, item.clone());
+                    }
+                }
+                None => {
+                    return Err(ContentError::AbsentElement {
+                        record: record_id,
+                        field: field.to_string(),
+                        element: anchor.clone(),
+                    })
+                }
+            }
+        }
+        (_, Op::InsertAfter { .. }) => return Err(mismatch("insert_after")),
+        (Slot::List(v), Op::Replace { target, items }) => {
+            let list = match v {
+                Some(list) => list,
+                None if parentless => {
+                    return Err(ContentError::AbsentElement {
+                        record: record_id,
+                        field: field.to_string(),
+                        element: target.clone(),
+                    })
+                }
+                None => return Err(unset()),
+            };
+            match list.iter().position(|e| e == target) {
+                Some(i) => {
+                    list.remove(i);
+                    for (k, item) in items.iter().enumerate() {
+                        list.insert(i + k, item.clone());
+                    }
+                }
+                None => {
+                    return Err(ContentError::AbsentElement {
+                        record: record_id,
+                        field: field.to_string(),
+                        element: target.clone(),
+                    })
+                }
+            }
+        }
+        (_, Op::Replace { .. }) => return Err(mismatch("replace")),
     }
     // Provenance: the displaced value's source is whoever last wrote it (or
     // the defining pack for an authored/unset original).
@@ -2126,6 +2197,111 @@ mod tests {
         match Catalog::merge(&[&p], &[&s1, &s3]) {
             Err(ContentError::AbsentElement { element, .. }) => assert_eq!(element, "missing"),
             other => panic!("expected AbsentElement, got {other:?}"),
+        }
+    }
+
+    // WI 879: ordered, id-keyed list ops compose across the ladder without index
+    // dependence — insert-after and replace splice relative to a named element.
+    fn tags_of(cat: &Catalog, id: &str) -> Vec<String> {
+        match &cat.get(id).unwrap().record {
+            Record::Resource(r) => r.tags.clone(),
+            other => panic!("expected resource, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_after_and_replace_are_id_keyed() {
+        let p = pack(r#"Resource(( id: "fuel", density: 800.0 )),"#);
+        // Seed an ordered list [a, b, c].
+        let seed = override_set(
+            "seed",
+            "Patch",
+            "",
+            r#"( target: Id("fuel"), field: "tags", op: Set(List(["a", "b", "c"])) ),"#,
+        );
+        // Insert after `a`, then replace `b` with two elements — id-keyed, so the
+        // earlier insert shifting positions must not affect the later target.
+        let ins = override_set(
+            "ins",
+            "Scenario",
+            "",
+            r#"( target: Id("fuel"), field: "tags", op: InsertAfter(anchor: "a", items: ["x"]) ),"#,
+        );
+        let rep = override_set(
+            "rep",
+            "Local",
+            "",
+            r#"( target: Id("fuel"), field: "tags", op: Replace(target: "b", items: ["y", "z"]) ),"#,
+        );
+        let cat = Catalog::merge(&[&p], &[&seed, &ins, &rep]).unwrap();
+        assert_eq!(tags_of(&cat, "fuel"), vec!["a", "x", "y", "z", "c"]);
+        // Determinism: an independent merge of the same inputs resolves identically.
+        let cat_again = Catalog::merge(&[&p], &[&seed, &ins, &rep]).unwrap();
+        assert_eq!(tags_of(&cat, "fuel"), tags_of(&cat_again, "fuel"));
+
+        // Insert after the last element appends at the tail.
+        let tail = override_set(
+            "tail",
+            "Local",
+            "",
+            r#"( target: Id("fuel"), field: "tags", op: InsertAfter(anchor: "c", items: ["end"]) ),"#,
+        );
+        let cat = Catalog::merge(&[&p], &[&seed, &tail]).unwrap();
+        assert_eq!(tags_of(&cat, "fuel"), vec!["a", "b", "c", "end"]);
+
+        // Provenance: the list op records the displaced whole list.
+        let cat = Catalog::merge(&[&p], &[&seed, &ins]).unwrap();
+        let fp = &cat.get("fuel").unwrap().field_provenance["tags"];
+        assert_eq!(
+            fp.shadows[0].value,
+            ProvValue::List(vec!["a".into(), "b".into(), "c".into()])
+        );
+    }
+
+    #[test]
+    fn insert_after_and_replace_absent_anchor_is_loud() {
+        let p = pack(r#"Resource(( id: "fuel", density: 800.0 )),"#);
+        let seed = override_set(
+            "seed",
+            "Patch",
+            "",
+            r#"( target: Id("fuel"), field: "tags", op: Set(List(["a"])) ),"#,
+        );
+        let ins = override_set(
+            "ins",
+            "Scenario",
+            "",
+            r#"( target: Id("fuel"), field: "tags", op: InsertAfter(anchor: "nope", items: ["x"]) ),"#,
+        );
+        match Catalog::merge(&[&p], &[&seed, &ins]) {
+            Err(ContentError::AbsentElement { element, .. }) => assert_eq!(element, "nope"),
+            other => panic!("expected AbsentElement, got {other:?}"),
+        }
+        let rep = override_set(
+            "rep",
+            "Scenario",
+            "",
+            r#"( target: Id("fuel"), field: "tags", op: Replace(target: "nope", items: ["x"]) ),"#,
+        );
+        match Catalog::merge(&[&p], &[&seed, &rep]) {
+            Err(ContentError::AbsentElement { element, .. }) => assert_eq!(element, "nope"),
+            other => panic!("expected AbsentElement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_after_on_wrong_slot_type_is_loud() {
+        // `density` is a numeric slot, not a list.
+        let p = pack(r#"Resource(( id: "fuel", density: 800.0 )),"#);
+        let bad = override_set(
+            "bad",
+            "Patch",
+            "",
+            r#"( target: Id("fuel"), field: "density", op: InsertAfter(anchor: "a", items: ["x"]) ),"#,
+        );
+        match Catalog::merge(&[&p], &[&bad]) {
+            Err(ContentError::TypeMismatch { op, .. }) => assert_eq!(op, "insert_after"),
+            other => panic!("expected TypeMismatch, got {other:?}"),
         }
     }
 
