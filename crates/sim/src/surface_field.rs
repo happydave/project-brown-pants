@@ -98,10 +98,14 @@ const CRATER_TOTAL_DEPTH_FRAC: f64 = 0.50 + 0.40 + 0.15;
 const EJECTA_OCTAVES: usize = 2;
 
 /// Fraction of craters that are "young" (carry a ray system): a fresh per-cell
-/// hash against this, so ray systems are a clear minority of craters.
-const EJECTA_YOUNG_FRACTION: f64 = 0.2;
+/// hash against this, so ray systems are a clear minority of craters. (Gate
+/// iteration: 0.2 → 0.12 — the real Moon shows a handful of prominent systems
+/// per hemisphere, and per-pixel ray cost scales with how many systems overlap
+/// a pixel.)
+const EJECTA_YOUNG_FRACTION: f64 = 0.12;
 
-/// Ejecta extent as a multiple of the crater's own reach…
+/// Full ray extent as a multiple of the crater's own reach (the shader draws
+/// rays out to this)…
 const EJECTA_EXTENT_FACTOR: f64 = 2.5;
 
 /// …capped **strictly below one lattice cell**, so the WI 866 exactness
@@ -109,16 +113,40 @@ const EJECTA_EXTENT_FACTOR: f64 = 2.5;
 /// the 27-cell window is exact) holds for the ejecta reach verbatim.
 const EJECTA_EXTENT_MAX: f64 = 0.95;
 
-/// Tangent-plane radius (lattice units) over which the angular streak
-/// modulation fades in. Inside it the profile is halo-only — which is what
-/// keeps the field continuous where the azimuth is ill-defined (the crater
-/// centre, and the radially-aligned surface point of an off-shell centre).
-/// Sized (with the ray-count cap below) so the narrowest streak lobe stays
-/// wider than parent-level chunk vertex spacing — the LOD tint-agreement
-/// bound (`surface_mesh::lod_vertex_colors_agree_over_ejecta_rays`) is the
-/// check; at 0.15 with 6–12 rays the lobes aliased (odd-vertex deviation
-/// 0.18 > the 0.05 bound).
-const EJECTA_STREAK_CORE: f64 = 0.45;
+/// The classifier halo's extent as a fraction of the full ray extent (gate
+/// iteration): the sim field carries only the **round bright blanket** hugging
+/// the crater — thin rays run much farther, per-pixel, in the render shader
+/// (`ejecta_systems` is that seam). Splitting them this way removed the
+/// vertex-resolution constraint that forced the rejected few-fat-straight-arm
+/// look.
+const EJECTA_HALO_FRACTION: f64 = 0.55;
+
+/// Per-chunk budget of ray systems passed to the render shader — the gather
+/// ranks by visual contribution (intensity × extent²) and truncates; typical
+/// coarse-chunk overlap is ~3, and anything truncated is the faintest and
+/// resolves in as chunks split.
+pub const MAX_EJECTA_SYSTEMS: usize = 8;
+
+/// One young crater's ray system, as the render shader consumes it (WI 873
+/// gate iteration): where the system is and its per-crater hash parameters.
+/// The shader owns the ray *pattern*; this owns the ray *placement* — derived
+/// from the same occupancy/jitter/reach hash streams as the crater bowls and
+/// the halo, so all three always coincide.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EjectaSystem {
+    /// Unit direction of the crater centre (body frame).
+    pub center_dir: DVec3,
+    /// First tangent of the centre's frame (the second is
+    /// `center_dir × tangent`) — precomputed so the shader pays no per-pixel
+    /// frame construction.
+    pub tangent: DVec3,
+    /// Full ray extent, radians of arc from the centre.
+    pub extent: f64,
+    /// Per-crater ray-pattern seed in `[0, 1)`.
+    pub ray_seed: f64,
+    /// Per-crater brightness in `[0.55, 1.0)` (the halo's intensity hash).
+    pub intensity: f64,
+}
 
 /// Per-body crater parameters (WI 782), read from the **reserved**
 /// `SurfaceRecipe.crater` area (a defaulted `serde_json::Value`, so no
@@ -524,23 +552,24 @@ impl SurfaceField {
         delta
     }
 
-    /// Ejecta-ray intensity in `[0, 1]` at a direction (WI 873): bright halos +
-    /// radial streaks around the deterministic "young" subset of the large and
-    /// medium crater populations, feeding the airless classifier's `ejecta`
-    /// channel — **albedo only**, never elevation. The pass reuses each
-    /// octave's own occupancy/jitter/reach hash streams, so every ray system
-    /// sits on a real crater of that octave; overlapping systems combine by a
-    /// saturating product, so the result stays bounded and continuous.
+    /// Ejecta **halo** intensity in `[0, 1]` at a direction (WI 873, gate
+    /// iteration): the round bright blanket around the deterministic "young"
+    /// subset of the large and medium crater populations, feeding the airless
+    /// classifier's `ejecta` channel — **albedo only**, never elevation. The
+    /// pass reuses each octave's own occupancy/jitter/reach hash streams, so
+    /// every halo sits on a real crater; overlapping halos combine by a
+    /// saturating product, so the result stays bounded and continuous. The
+    /// thin ray streaks are **not here**: they are drawn per-pixel by the
+    /// render shader from [`Self::ejecta_systems`] (same hashes, same centres),
+    /// because ray-width detail is below vertex-tint resolution at orbital LOD.
     ///
-    /// Continuity (the WI 866 rules, applied to the new reach): each system's
-    /// profile is exactly zero at and beyond its extent; the extent is measured
-    /// in lattice space against the unnormalized centre and stays strictly
-    /// below one cell ([`EJECTA_EXTENT_MAX`]), so the 27-cell window is exact
-    /// and nothing pops at lattice planes; the streak modulation fades to a
-    /// pure halo below a tangent-plane radius ([`EJECTA_STREAK_CORE`]), so the
-    /// azimuth singularity contributes nothing where it is ill-defined; and the
-    /// ray count is an exact integer, so the angular term has no branch-cut
-    /// step at ±π.
+    /// Continuity (the WI 866 rules, applied to the new reach): each halo is
+    /// exactly zero at and beyond its extent (zero slope there — no perimeter
+    /// ring); influence is measured in lattice space against the unnormalized
+    /// centre and stays strictly below one cell ([`EJECTA_EXTENT_MAX`]), so
+    /// the 27-cell window is exact and nothing pops at lattice planes. A pure
+    /// radial profile has no angular term at all, so the pre-iteration azimuth
+    /// hazards are gone by construction.
     pub fn ejecta(&self, dir: DVec3) -> f64 {
         let d = normalize_or_x(dir);
         // Product of (1 − contribution): saturating combine of overlaps.
@@ -575,47 +604,112 @@ impl SurfaceField {
                         let ar = o.reach_min
                             + (o.reach_max - o.reach_min) * hash_unit(cx, cy, cz, oseed ^ 0x44);
                         let er = (EJECTA_EXTENT_FACTOR * ar).min(EJECTA_EXTENT_MAX);
-                        let off = q - center;
-                        let chord = off.length();
-                        if chord >= er {
+                        let eh = EJECTA_HALO_FRACTION * er;
+                        let chord = (q - center).length();
+                        if chord >= eh {
                             continue;
                         }
-                        let t = chord / er;
-                        // Radial envelope: 1 at the centre, smoothly exactly 0
-                        // at the extent (zero slope there — no perimeter ring).
+                        let t = chord / eh;
+                        // Radial halo: 1 at the centre, smoothly exactly 0 at
+                        // the halo extent (zero slope there — no perimeter
+                        // ring). Round on purpose: small/distant real ray
+                        // systems read as round bright splotches.
                         let envelope = {
                             let u = 1.0 - t * t;
                             u * u
                         };
-                        // Angular streaks: an integer ray count over the azimuth
-                        // in the crater's tangent frame, sharpened; blended in by
-                        // the tangent-plane radius so the core stays a halo.
-                        let cdir = normalize_or_x(center);
-                        let (t1, t2) = tangent_basis(cdir);
-                        let (u, v) = (off.dot(t1), off.dot(t2));
-                        let planar = (u * u + v * v).sqrt();
-                        let mix = {
-                            let s = (planar / EJECTA_STREAK_CORE).clamp(0.0, 1.0);
-                            s * s * (3.0 - 2.0 * s)
-                        };
-                        // Few, fat rays: the count cap and the mild sharpening
-                        // keep the narrowest lobe wider than parent-LOD vertex
-                        // spacing (see EJECTA_STREAK_CORE) — real ray systems
-                        // read as a handful of dominant rays anyway.
-                        let rays = (3.0 + 4.0 * hash_unit(cx, cy, cz, oseed ^ 0x77)).floor();
-                        let phase = std::f64::consts::TAU * hash_unit(cx, cy, cz, oseed ^ 0x88);
-                        let streak = {
-                            let s = 0.5 + 0.5 * (rays * v.atan2(u) + phase).cos();
-                            s * s
-                        };
-                        let angular = 1.0 - mix + mix * streak;
                         let intensity = 0.55 + 0.45 * hash_unit(cx, cy, cz, oseed ^ 0x99);
-                        clear *= 1.0 - (intensity * envelope * angular).clamp(0.0, 1.0);
+                        clear *= 1.0 - (intensity * envelope).clamp(0.0, 1.0);
                     }
                 }
             }
         }
         1.0 - clear
+    }
+
+    /// The young-crater ray systems overlapping a query cone (WI 873 gate
+    /// iteration) — the render shader's placement seam. `dir` is the cone axis
+    /// (a chunk's centre direction), `angular_radius` its half-angle; a system
+    /// overlaps when its centre is within `angular_radius + extent` of the
+    /// axis. Systems come from the same occupancy/jitter/reach hash streams as
+    /// the crater bowls and the halo (invariant: all three coincide), are
+    /// ranked by visual contribution (intensity × extent²), and truncate to
+    /// [`MAX_EJECTA_SYSTEMS`] — anything cut is the faintest overlap and
+    /// resolves in as chunks split. Pure and deterministic; returns the array
+    /// plus the valid count. Atmospheric bodies have no ray systems (same
+    /// family rule as the classifier's ejecta channel).
+    pub fn ejecta_systems(
+        &self,
+        dir: DVec3,
+        angular_radius: f64,
+    ) -> ([EjectaSystem; MAX_EJECTA_SYSTEMS], usize) {
+        let mut out = [EjectaSystem::default(); MAX_EJECTA_SYSTEMS];
+        if self.climate.family == BiomeFamily::Atmospheric {
+            return (out, 0);
+        }
+        let d = normalize_or_x(dir);
+        // (system, ranking key); kept sorted descending by key, ties broken by
+        // the deterministic iteration order (octave, then cell scan order).
+        let mut found: Vec<(EjectaSystem, f64)> = Vec::new();
+        for (i, o) in CRATER_OCTAVES.iter().take(EJECTA_OCTAVES).enumerate() {
+            let oseed = self
+                .seed
+                .wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i as u64 + 1));
+            let q = d * o.freq;
+            let density = (o.density * self.crater.density).min(1.0);
+            // Lattice-space window covering the cone plus the maximum reach
+            // (+1 for centre-in-cell), clamped to the lattice's shell range so
+            // a whole-face cone degrades to a bounded full scan.
+            let w = angular_radius * o.freq + EJECTA_EXTENT_MAX + 1.0;
+            let lo = |x: f64| ((x - w).floor().max(-o.freq - 2.0)) as i64;
+            let hi = |x: f64| ((x + w).floor().min(o.freq + 2.0)) as i64;
+            for cx in lo(q.x)..=hi(q.x) {
+                for cy in lo(q.y)..=hi(q.y) {
+                    for cz in lo(q.z)..=hi(q.z) {
+                        if hash_unit(cx, cy, cz, oseed ^ 0x00C0_FFEE) >= density {
+                            continue;
+                        }
+                        if hash_unit(cx, cy, cz, oseed ^ 0x66) >= EJECTA_YOUNG_FRACTION {
+                            continue;
+                        }
+                        let jitter = DVec3::new(
+                            hash_unit(cx, cy, cz, oseed ^ 0x11),
+                            hash_unit(cx, cy, cz, oseed ^ 0x22),
+                            hash_unit(cx, cy, cz, oseed ^ 0x33),
+                        );
+                        let center = DVec3::new(cx as f64, cy as f64, cz as f64) + jitter;
+                        let ar = o.reach_min
+                            + (o.reach_max - o.reach_min) * hash_unit(cx, cy, cz, oseed ^ 0x44);
+                        let er = (EJECTA_EXTENT_FACTOR * ar).min(EJECTA_EXTENT_MAX);
+                        // A lattice ball only traces onto the sphere if it
+                        // reaches the |q| = freq shell.
+                        if (center.length() - o.freq).abs() >= er {
+                            continue;
+                        }
+                        let cdir = normalize_or_x(center);
+                        let extent = er / o.freq;
+                        let sep = cdir.dot(d).clamp(-1.0, 1.0).acos();
+                        if sep >= angular_radius + extent {
+                            continue;
+                        }
+                        let sys = EjectaSystem {
+                            center_dir: cdir,
+                            tangent: tangent_basis(cdir).0,
+                            extent,
+                            ray_seed: hash_unit(cx, cy, cz, oseed ^ 0x77),
+                            intensity: 0.55 + 0.45 * hash_unit(cx, cy, cz, oseed ^ 0x99),
+                        };
+                        found.push((sys, sys.intensity * extent * extent));
+                    }
+                }
+            }
+        }
+        found.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let n = found.len().min(MAX_EJECTA_SYSTEMS);
+        for (slot, (sys, _)) in out.iter_mut().zip(found.into_iter().take(n)) {
+            *slot = sys;
+        }
+        (out, n)
     }
 }
 
@@ -1116,7 +1210,9 @@ mod tests {
                     let er = (EJECTA_EXTENT_FACTOR * ar).min(EJECTA_EXTENT_MAX);
                     let chord_at_centre = (center.length() - o.freq).abs();
                     let c = normalize_or_x(center);
-                    if c.x > 0.5 && chord_at_centre < 0.5 * er {
+                    // Near-shell so the (tighter, halo-fraction) core is
+                    // guaranteed sampled on the sphere trace.
+                    if c.x > 0.5 && chord_at_centre < 0.25 * er {
                         return Some((c, er / o.freq));
                     }
                 }
@@ -1203,10 +1299,11 @@ mod tests {
     #[test]
     fn ejecta_is_continuous_and_locally_supported_along_an_arc() {
         // The WI 866 arc-march pattern on the new field: march straight through
-        // a young crater's ray system at ~1.5 m steps; the intensity and the
-        // blended tint must move at a smooth rate everywhere — across the
-        // system's extent, its streak lobes, its halo core, and the lattice
-        // planes the arc crosses (the membership-pop habitat).
+        // a young crater's halo at ~1.5 m steps; the intensity and the blended
+        // tint must move at a smooth rate everywhere — across the halo's
+        // extent, its core, and the lattice planes the arc crosses (the
+        // membership-pop habitat). (Gate iteration: the field is halo-only;
+        // the thin rays are per-pixel shader work with no field footprint.)
         fn rotate(v: DVec3, axis: DVec3, ang: f64) -> DVec3 {
             v * ang.cos() + axis.cross(v) * ang.sin() + axis * axis.dot(v) * (1.0 - ang.cos())
         }
@@ -1259,6 +1356,78 @@ mod tests {
             max_dt < 0.02,
             "blended tint stepped {max_dt} in one ~1.5 m sample"
         );
+    }
+
+    #[test]
+    fn ejecta_systems_gather_is_deterministic_covering_and_bounded() {
+        let f = SurfaceField::new(2024, 1_000_000.0);
+        // Site the probe cone on a known young crater (same hash streams).
+        let (center, ext) = find_young_crater(&f, 1)
+            .or_else(|| find_young_crater(&f, 0))
+            .expect("no young crater near +X — re-seed the probe");
+        let radius = 3.0 * ext;
+        let (systems, n) = f.ejecta_systems(center, radius);
+        // Deterministic: bit-identical on re-query.
+        let (systems2, n2) = f.ejecta_systems(center, radius);
+        assert_eq!(n, n2);
+        assert_eq!(systems[..n], systems2[..n2]);
+        assert!(n >= 1, "the sited young crater must be gathered");
+        assert!(n <= MAX_EJECTA_SYSTEMS);
+        // The sited crater itself is in the list (a system centred within its
+        // own extent of the probe centre), parameters in range, and the
+        // ranking key is descending.
+        assert!(
+            systems[..n]
+                .iter()
+                .any(|s| s.center_dir.dot(center).clamp(-1.0, 1.0).acos() < s.extent),
+            "gathered systems miss the sited crater"
+        );
+        let mut prev = f64::INFINITY;
+        for s in &systems[..n] {
+            assert!((s.center_dir.length() - 1.0).abs() < 1e-9);
+            assert!(s.extent > 0.0 && s.extent < 1.0);
+            assert!((0.0..1.0).contains(&s.ray_seed));
+            assert!((0.55..1.0).contains(&s.intensity));
+            let key = s.intensity * s.extent * s.extent;
+            assert!(key <= prev + 1e-15, "ranking must be descending");
+            prev = key;
+        }
+        // Coverage: every direction with positive halo inside the cone lies
+        // within some gathered system's extent (the halo is a subset of the
+        // ray extent, and the gather over-reaches the cone) — unless the list
+        // truncated, which this probe must not (guarded above by n ≤ MAX).
+        if n < MAX_EJECTA_SYSTEMS {
+            let (t1, t2) = tangent_basis(center);
+            for i in 0..500 {
+                let a = i as f64 * 0.618_033_988_75 * std::f64::consts::TAU;
+                let r = radius * ((i as f64 + 0.5) / 500.0).sqrt();
+                let d = normalize_or_x(center + (t1 * a.cos() + t2 * a.sin()) * r);
+                if f.ejecta(d) > 0.0 {
+                    let covered = systems[..n]
+                        .iter()
+                        .any(|s| s.center_dir.dot(d).clamp(-1.0, 1.0).acos() < s.extent);
+                    assert!(covered, "halo-positive direction not covered by any system");
+                }
+            }
+        }
+        // Family rule: atmospheric bodies gather nothing.
+        let atm = SurfaceField::with_params(
+            2024,
+            1_000_000.0,
+            CraterParams::default(),
+            temperate_climate(),
+        );
+        assert_eq!(atm.ejecta_systems(center, radius).1, 0);
+        // Density 0 ⇒ no systems anywhere.
+        let quiet = SurfaceField::with_crater_params(
+            2024,
+            1_000_000.0,
+            CraterParams {
+                density: 0.0,
+                depth: 1.0,
+            },
+        );
+        assert_eq!(quiet.ejecta_systems(center, radius).1, 0);
     }
 
     /// A temperate (288 K) ocean-bearing atmospheric climate rotating about +Z —

@@ -25,7 +25,7 @@
 //! centre world point** (returned separately as `f64`), so per-vertex values stay
 //! small regardless of body radius; absolute placement is the floating origin's job.
 
-use crate::surface_field::SurfaceField;
+use crate::surface_field::{EjectaSystem, SurfaceField, MAX_EJECTA_SYSTEMS};
 use glam::{DVec3, Vec2, Vec3};
 
 /// What a chunk's per-vertex colors show (WI 869). `Biome` is the shipping
@@ -411,6 +411,12 @@ pub struct ChunkMesh {
     pub splat_a: Vec<[f32; 4]>,
     /// Splat slot weights, slots 4–7 (see [`Self::splat_a`]).
     pub splat_b: Vec<[f32; 4]>,
+    /// The young-crater ejecta ray systems overlapping this chunk (WI 873 gate
+    /// iteration): the fixed-size array plus the valid count, gathered from
+    /// [`SurfaceField::ejecta_systems`] over the chunk's bounding cone. The
+    /// render shader draws the per-pixel ray streaks from these (the vertex
+    /// tint carries only the round halo); empty on atmospheric bodies.
+    pub ejecta: ([EjectaSystem; MAX_EJECTA_SYSTEMS], usize),
     /// Triangle indices (three per triangle).
     pub indices: Vec<u32>,
 }
@@ -866,6 +872,18 @@ pub fn build_chunk_view(
         morph_targets.extend_from_slice(&positions[vert_count..]);
     }
 
+    // Ejecta ray systems overlapping this chunk (WI 873 gate iteration): the
+    // bounding cone is the max centre→corner angle plus a small pad against
+    // the in-edge bulge of a spherified face cell.
+    let cone = node
+        .corner_dirs()
+        .iter()
+        .map(|c| cdir.dot(*c).clamp(-1.0, 1.0).acos())
+        .fold(0.0_f64, f64::max)
+        * 1.1
+        + 1e-4;
+    let ejecta = field.ejecta_systems(cdir, cone);
+
     ChunkMesh {
         center,
         positions,
@@ -876,6 +894,7 @@ pub fn build_chunk_view(
         terrain_uvs,
         splat_a,
         splat_b,
+        ejecta,
         indices,
     }
 }
@@ -1500,6 +1519,13 @@ mod tests {
                 }
             }
         }
+        // The sited chunk must also carry its ray system(s) for the shader
+        // (WI 873 gate iteration): the strongest-halo chunk overlaps at least
+        // one young crater by construction.
+        assert!(
+            c.ejecta.1 >= 1 && c.ejecta.1 <= c.ejecta.0.len(),
+            "sited chunk gathered no ejecta systems"
+        );
         assert!(
             max_even < 1e-4,
             "coincident LOD vertices disagree over rays: {max_even}"

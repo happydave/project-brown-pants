@@ -107,6 +107,38 @@ struct SplatUniform {
     params: Vec4,
 }
 
+/// WI 873 (gate iteration) per-chunk ejecta ray systems for the per-pixel ray
+/// pass (shader `EjectaUniform`): `origin` = (chunk anchor in the body frame,
+/// metres | system count), `sys_a[i]` = (crater centre unit direction | ray
+/// extent in radians), `sys_b[i]` = (ray-pattern seed | intensity | reserved).
+/// Data comes straight off `ChunkMesh.ejecta` (the sim gather — same hash
+/// streams as the crater bowls and the vertex-tint halo, so all three
+/// coincide); the shader owns the ray *pattern*.
+#[derive(ShaderType, Reflect, Debug, Clone, Default)]
+struct EjectaUniform {
+    origin: Vec4,
+    sys_a: [Vec4; 8],
+    sys_b: [Vec4; 8],
+    // Precomputed first tangent of each system's frame (w unused) — saves the
+    // shader a per-pixel frame construction.
+    sys_t: [Vec4; 8],
+}
+
+/// Packs a chunk's gathered ray systems for the shader.
+fn ejecta_uniform(chunk: &ChunkMesh) -> EjectaUniform {
+    let (systems, n) = chunk.ejecta;
+    let mut u = EjectaUniform {
+        origin: chunk.center.as_vec3().extend(n as f32),
+        ..Default::default()
+    };
+    for (i, sys) in systems.iter().take(n).enumerate() {
+        u.sys_a[i] = sys.center_dir.as_vec3().extend(sys.extent as f32);
+        u.sys_b[i] = Vec4::new(sys.ray_seed as f32, sys.intensity as f32, 0.0, 0.0);
+        u.sys_t[i] = sys.tangent.as_vec3().extend(0.0);
+    }
+    u
+}
+
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default)]
 struct GeomorphExt {
     // Vertex-visible: the geomorph ramp is read in the vertex shader.
@@ -131,6 +163,9 @@ struct GeomorphExt {
     normal_array: Option<Handle<Image>>,
     #[texture(106, dimension = "2d_array")]
     surface_array: Option<Handle<Image>>,
+    // WI 873: per-chunk young-crater ray systems (fragment-side per-pixel rays).
+    #[uniform(107)]
+    ejecta: EjectaUniform,
 }
 
 impl MaterialExtension for GeomorphExt {
@@ -732,6 +767,7 @@ fn stream_surface(
                 albedo_array: splat_assets.albedo.clone(),
                 normal_array: splat_assets.normal.clone(),
                 surface_array: splat_assets.surface.clone(),
+                ejecta: ejecta_uniform(&chunk),
             },
         });
         let entity = commands

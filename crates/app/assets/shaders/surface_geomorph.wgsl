@@ -59,6 +59,21 @@ var<uniform> geomorph: GeomorphExt;
 var<uniform> geomorph_weld: GeomorphWeld;
 @group(#{MATERIAL_BIND_GROUP}) @binding(102)
 var<uniform> splat: SplatUniform;
+// WI 873 (gate iteration): the chunk's young-crater ray systems for the
+// per-pixel ray pass. origin = (chunk anchor, body frame, metres | count);
+// sys_a[i] = (crater centre unit dir | ray extent, radians);
+// sys_b[i] = (ray-pattern seed | intensity | reserved). The shader owns the
+// ray PATTERN (thin wispy streaks — below vertex-tint resolution at orbital
+// LOD); the sim owns placement (same hash streams as bowls + halo).
+struct EjectaUniform {
+    origin: vec4<f32>,
+    sys_a: array<vec4<f32>, 8>,
+    sys_b: array<vec4<f32>, 8>,
+    sys_t: array<vec4<f32>, 8>,
+}
+@group(#{MATERIAL_BIND_GROUP}) @binding(107)
+var<uniform> ejecta: EjectaUniform;
+
 @group(#{MATERIAL_BIND_GROUP}) @binding(103)
 var terrain_albedo: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(104)
@@ -116,6 +131,10 @@ struct SplatVertexOutput {
     @location(9) terrain_uv: vec2<f32>,
     @location(10) splat_a: vec4<f32>,
     @location(11) splat_b: vec4<f32>,
+    // WI 873: the morphed chunk-local position — with the chunk anchor
+    // (ejecta.origin.xyz) this reconstructs a body-frame direction per pixel,
+    // immune to floating-origin/world-space semantics.
+    @location(12) local_position: vec3<f32>,
 }
 
 @vertex
@@ -199,6 +218,7 @@ fn vertex(vertex: Vertex) -> SplatVertexOutput {
     out.terrain_uv = vertex.terrain_uv;
     out.splat_a = vertex.splat_a;
     out.splat_b = vertex.splat_b;
+    out.local_position = local;
 
     return out;
 }
@@ -251,6 +271,106 @@ fn detiled_albedo(layer: u32, uv: vec2<f32>, ddx_uv: vec2<f32>, ddy_uv: vec2<f32
         color += (sharp[k] / wsum) * s.rgb;
     }
     return color;
+}
+
+// --- WI 873 per-pixel ejecta rays ---------------------------------------
+// Small hash + 3D value noise (f32; quality needs are low — organic streak
+// modulation). Periodicity around each ray system's azimuth comes from
+// sampling on the circle's 2D embedding (no ±pi seam by construction).
+
+fn hash31(p: vec3<f32>) -> f32 {
+    var q = fract(p * vec3<f32>(0.1031, 0.1030, 0.0973));
+    q += dot(q, q.yzx + 33.33);
+    return fract((q.x + q.y) * q.z);
+}
+
+fn vnoise3(p: vec3<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let w = f * f * (3.0 - 2.0 * f);
+    let n000 = hash31(i + vec3<f32>(0.0, 0.0, 0.0));
+    let n100 = hash31(i + vec3<f32>(1.0, 0.0, 0.0));
+    let n010 = hash31(i + vec3<f32>(0.0, 1.0, 0.0));
+    let n110 = hash31(i + vec3<f32>(1.0, 1.0, 0.0));
+    let n001 = hash31(i + vec3<f32>(0.0, 0.0, 1.0));
+    let n101 = hash31(i + vec3<f32>(1.0, 0.0, 1.0));
+    let n011 = hash31(i + vec3<f32>(0.0, 1.0, 1.0));
+    let n111 = hash31(i + vec3<f32>(1.0, 1.0, 1.0));
+    let x00 = mix(n000, n100, w.x);
+    let x10 = mix(n010, n110, w.x);
+    let x01 = mix(n001, n101, w.x);
+    let x11 = mix(n011, n111, w.x);
+    return mix(mix(x00, x10, w.y), mix(x01, x11, w.y), w.z);
+}
+
+// Ray color (linear) and overall strength — tunables, owner gate.
+const EJECTA_RAY_RGB: vec3<f32> = vec3<f32>(0.55, 0.535, 0.52);
+const EJECTA_RAY_STRENGTH: f32 = 0.85;
+
+// Combined ray brightness in [0, 1] at a chunk-local point. Per system:
+// a radial envelope exactly zero at the extent (continuity — no ring), a
+// fade-in window that leaves the crater core to the vertex-tint halo (and
+// masks the azimuth singularity at the centre, the only place the tangent
+// projection degenerates in direction space), and a streak field = two scales
+// of circle-embedded value noise (dozens of thin rays), coupled to radius so
+// individual rays break up and vary in length, with a radius-driven rotation
+// so they curve rather than run ruler-straight.
+fn ejecta_brightness(local: vec3<f32>) -> f32 {
+    let n = u32(ejecta.origin.w);
+    if n == 0u {
+        return 0.0;
+    }
+    let dir = normalize(ejecta.origin.xyz + local);
+    var total = 0.0;
+    for (var i = 0u; i < 8u; i += 1u) {
+        if i >= n {
+            break;
+        }
+        let cdir = ejecta.sys_a[i].xyz;
+        let extent = ejecta.sys_a[i].w;
+        // Chord length ≈ angle for the small extents in play (precision-safe
+        // for small angles, unlike acos of a near-1 dot).
+        let t = length(dir - cdir) / extent;
+        if t >= 1.0 {
+            continue;
+        }
+        let seed = ejecta.sys_b[i].x;
+        let intensity = ejecta.sys_b[i].y;
+        // Envelope first: exactly zero at the extent, fading in past the halo
+        // core — skip the streak math wherever it cannot contribute.
+        // Slow radial decay (rays stay legible into the outer half) but still
+        // exactly zero at the extent.
+        let env = smoothstep(0.05, 0.14, t) * pow(max(1.0 - t * t, 0.0), 1.4);
+        if env * intensity < 0.004 {
+            continue;
+        }
+        // Tangent frame: precomputed CPU-side (constant per system).
+        let t1 = ejecta.sys_t[i].xyz;
+        let t2 = cross(cdir, t1);
+        let off = dir - cdir;
+        let uv_t = vec2<f32>(dot(off, t1), dot(off, t2));
+        let planar = max(length(uv_t), 1e-9);
+        var e = uv_t / planar;
+        // Gentle analytic curvature only (the first-cut noise wander spiralled;
+        // real rays are near-radial with slight bends).
+        let wan = 0.18 * t * sin(t * (2.0 + 4.0 * seed) + seed * 40.0);
+        let cw = cos(wan);
+        let sw = sin(wan);
+        e = vec2<f32>(e.x * cw - e.y * sw, e.x * sw + e.y * cw);
+        // Straight-ray construction: the streak PEAK positions come from
+        // radius-independent noise over the circle embedding (two scales:
+        // broad arms + fine streaks), so rays run radially; a separate
+        // radius-coupled breakup term modulates brightness ALONG each ray
+        // (varying lengths, gaps) without moving the peaks in azimuth.
+        let n1 = vnoise3(vec3<f32>(e * 5.0, seed * 89.0));
+        let n2 = vnoise3(vec3<f32>(e * 14.0, seed * 47.0));
+        let arms = pow(clamp(n1 * 1.7 - 0.55, 0.0, 1.0), 2.0);
+        let streaks = pow(clamp(n2 * 2.1 - 0.9, 0.0, 1.0), 2.0);
+        let breakup = 0.3 + 0.7 * vnoise3(vec3<f32>(e * 9.0, t * 2.4 + seed * 31.0));
+        let ray = clamp(arms * 0.5 + streaks * 0.6 + 1.5 * arms * streaks, 0.0, 1.0) * breakup;
+        total += intensity * env * ray;
+    }
+    return clamp(total, 0.0, 1.0);
 }
 
 @fragment
@@ -390,6 +510,19 @@ fn fragment(
             pbr_input.N = normalize(tbn * n_flat);
         }
         }
+    }
+
+    // WI 873: per-pixel ejecta rays, after the albedo composition (they ride
+    // both the textured near regime and the tint far regime identically) and
+    // before lighting — a translucent mix toward bright ray regolith, so the
+    // underlying terrain stays visible through the streaks.
+    let ray_b = ejecta_brightness(in.local_position);
+    if ray_b > 0.0015 {
+        let base = pbr_input.material.base_color;
+        pbr_input.material.base_color = vec4<f32>(
+            mix(base.rgb, EJECTA_RAY_RGB, ray_b * EJECTA_RAY_STRENGTH),
+            base.a,
+        );
     }
 
     var out: FragmentOutput;
