@@ -350,13 +350,10 @@ fn ejecta_brightness(local: vec3<f32>) -> f32 {
         let off = dir - cdir;
         let uv_t = vec2<f32>(dot(off, t1), dot(off, t2));
         let planar = max(length(uv_t), 1e-9);
-        var e = uv_t / planar;
-        // Gentle analytic curvature only (the first-cut noise wander spiralled;
-        // real rays are near-radial with slight bends).
-        let wan = 0.18 * t * sin(t * (2.0 + 4.0 * seed) + seed * 40.0);
-        let cw = cos(wan);
-        let sw = sin(wan);
-        e = vec2<f32>(e.x * cw - e.y * sw, e.x * sw + e.y * cw);
+        let e = uv_t / planar;
+        // No wander at all: any azimuth rotation that grows with radius reads
+        // as spiralling (owner gate, twice) — rays are exactly radial; all the
+        // organic character comes from the breakup term below.
         // Straight-ray construction: the streak PEAK positions come from
         // radius-independent noise over the circle embedding (two scales:
         // broad arms + fine streaks), so rays run radially; a separate
