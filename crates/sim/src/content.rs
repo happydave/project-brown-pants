@@ -72,6 +72,7 @@
 //! (WI 550's scope).
 
 use crate::body_asset::{BodyAsset, Rotation, SurfaceRecipe};
+use crate::bodygen::{self, Archetype, ArchetypeBands};
 use crate::fluid::FluidMedium;
 use crate::voxel::{Material, Thermal};
 use glam::DVec3;
@@ -87,7 +88,7 @@ pub const CONTENT_FORMAT_VERSION: u32 = 1;
 
 /// Field names that overrides may never target: record identity and
 /// inheritance topology are definitions, not tunables.
-const STRUCTURAL_FIELDS: [&str; 4] = ["id", "parent", "abstract", "class"];
+const STRUCTURAL_FIELDS: [&str; 5] = ["id", "parent", "abstract", "class", "shape"];
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -270,7 +271,10 @@ enum RawRecord {
     Material(RawMaterial),
     Resource(RawResource),
     Body(RawBody),
-    BodyRecipe(RawBodyRecipe),
+    /// Boxed — the flattened body recipe carries many more fields than the other
+    /// raw records (fixed scalars + WI 883 archetype bands), so an unboxed variant
+    /// would bloat every `RawRecord`.
+    BodyRecipe(Box<RawBodyRecipe>),
 }
 
 /// A record kind — the override target-selector vocabulary.
@@ -334,7 +338,7 @@ impl RawRecord {
             }
             (RawRecord::Body(c), RawRecord::Body(p)) => Ok(RawRecord::Body(c.merge_over(p))),
             (RawRecord::BodyRecipe(c), RawRecord::BodyRecipe(p)) => {
-                Ok(RawRecord::BodyRecipe(c.merge_over(p)))
+                Ok(RawRecord::BodyRecipe(Box::new(c.merge_over(p))))
             }
             (c, p) => Err(ContentError::KindMismatch {
                 child: c.id().to_string(),
@@ -535,6 +539,17 @@ impl RawBody {
 /// inherit/override each field; `validate` reassembles a `BodyAsset`. Axis is
 /// fixed to +Z this slice (both `bodygen` and `earthlike` rotate about +Z);
 /// axial tilt, moisture, and the ordered surface-layer stack are later slices.
+///
+/// Two resolve modes, discriminated by `shape` (WI 883):
+/// - **Fixed** (no `shape`): the scalar fields below are the body directly (the
+///   WI-881 path — `earthlike`, `earthlike_ice_age`).
+/// - **Sampled** (`shape` set): an archetype. The `*_min`/`*_max` **band** fields
+///   carry the parameter ranges; `validate` samples them at `surface_seed` via
+///   [`bodygen::sample`], reproducing `bodygen::generate` for that shape. The
+///   scalar fields are unused in this mode; only `name`, `surface_seed`, and the
+///   shape's drawn bands are required. `shape` is structural (not an override
+///   target) and inherits — so a concrete body `parent`-ing an archetype base
+///   inherits its shape + bands and adds a seed.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawBodyRecipe {
@@ -543,6 +558,11 @@ struct RawBodyRecipe {
     parent: Option<String>,
     #[serde(default, rename = "abstract")]
     is_abstract: bool,
+    /// Archetype shape (WI 883). Absent ⇒ fixed body (scalar fields); present ⇒
+    /// sampled body (band fields). Structural: selects the sampler branch and is
+    /// never an override target.
+    #[serde(default)]
+    shape: Option<Archetype>,
     /// Human-facing display name.
     #[serde(default)]
     name: Option<String>,
@@ -583,6 +603,46 @@ struct RawBodyRecipe {
     /// with no per-asset offset; present ⇒ `{"temperature": offset}`.
     #[serde(default)]
     surface_temperature_offset: Option<f64>,
+    // Archetype bands (WI 883) — the `[min, max)` ranges the sampler draws when
+    // `shape` is set. Each bound is an independent, ladder-tunable field; a shape
+    // requires only the bounds it draws (Moon: radius/gravity/rotation; Rocky adds
+    // the four atmosphere bands; Ocean adds the two ocean bands).
+    #[serde(default)]
+    radius_min: Option<f64>,
+    #[serde(default)]
+    radius_max: Option<f64>,
+    #[serde(default)]
+    gravity_min: Option<f64>,
+    #[serde(default)]
+    gravity_max: Option<f64>,
+    #[serde(default)]
+    rotation_period_min: Option<f64>,
+    #[serde(default)]
+    rotation_period_max: Option<f64>,
+    #[serde(default)]
+    atmosphere_surface_pressure_min: Option<f64>,
+    #[serde(default)]
+    atmosphere_surface_pressure_max: Option<f64>,
+    #[serde(default)]
+    atmosphere_surface_density_min: Option<f64>,
+    #[serde(default)]
+    atmosphere_surface_density_max: Option<f64>,
+    #[serde(default)]
+    atmosphere_scale_height_min: Option<f64>,
+    #[serde(default)]
+    atmosphere_scale_height_max: Option<f64>,
+    #[serde(default)]
+    atmosphere_temperature_min: Option<f64>,
+    #[serde(default)]
+    atmosphere_temperature_max: Option<f64>,
+    #[serde(default)]
+    ocean_surface_density_min: Option<f64>,
+    #[serde(default)]
+    ocean_surface_density_max: Option<f64>,
+    #[serde(default)]
+    ocean_temperature_min: Option<f64>,
+    #[serde(default)]
+    ocean_temperature_max: Option<f64>,
     /// Inert metadata tags.
     #[serde(default)]
     tags: Option<Vec<String>>,
@@ -594,6 +654,7 @@ impl RawBodyRecipe {
             id: self.id,
             parent: self.parent,
             is_abstract: self.is_abstract,
+            shape: self.shape.or(p.shape),
             name: self.name.or_else(|| p.name.clone()),
             mu: self.mu.or(p.mu),
             radius: self.radius.or(p.radius),
@@ -615,6 +676,44 @@ impl RawBodyRecipe {
             surface_temperature_offset: self
                 .surface_temperature_offset
                 .or(p.surface_temperature_offset),
+            radius_min: self.radius_min.or(p.radius_min),
+            radius_max: self.radius_max.or(p.radius_max),
+            gravity_min: self.gravity_min.or(p.gravity_min),
+            gravity_max: self.gravity_max.or(p.gravity_max),
+            rotation_period_min: self.rotation_period_min.or(p.rotation_period_min),
+            rotation_period_max: self.rotation_period_max.or(p.rotation_period_max),
+            atmosphere_surface_pressure_min: self
+                .atmosphere_surface_pressure_min
+                .or(p.atmosphere_surface_pressure_min),
+            atmosphere_surface_pressure_max: self
+                .atmosphere_surface_pressure_max
+                .or(p.atmosphere_surface_pressure_max),
+            atmosphere_surface_density_min: self
+                .atmosphere_surface_density_min
+                .or(p.atmosphere_surface_density_min),
+            atmosphere_surface_density_max: self
+                .atmosphere_surface_density_max
+                .or(p.atmosphere_surface_density_max),
+            atmosphere_scale_height_min: self
+                .atmosphere_scale_height_min
+                .or(p.atmosphere_scale_height_min),
+            atmosphere_scale_height_max: self
+                .atmosphere_scale_height_max
+                .or(p.atmosphere_scale_height_max),
+            atmosphere_temperature_min: self
+                .atmosphere_temperature_min
+                .or(p.atmosphere_temperature_min),
+            atmosphere_temperature_max: self
+                .atmosphere_temperature_max
+                .or(p.atmosphere_temperature_max),
+            ocean_surface_density_min: self
+                .ocean_surface_density_min
+                .or(p.ocean_surface_density_min),
+            ocean_surface_density_max: self
+                .ocean_surface_density_max
+                .or(p.ocean_surface_density_max),
+            ocean_temperature_min: self.ocean_temperature_min.or(p.ocean_temperature_min),
+            ocean_temperature_max: self.ocean_temperature_max.or(p.ocean_temperature_max),
             tags: self.tags.or_else(|| p.tags.clone()),
         }
     }
@@ -1117,6 +1216,32 @@ fn slot<'a>(rec: &'a mut RawRecord, field: &str) -> Option<Slot<'a>> {
             "ocean_temperature" => Some(Slot::Num(&mut b.ocean_temperature)),
             "surface_seed" => Some(Slot::Num(&mut b.surface_seed)),
             "surface_temperature_offset" => Some(Slot::Num(&mut b.surface_temperature_offset)),
+            "radius_min" => Some(Slot::Num(&mut b.radius_min)),
+            "radius_max" => Some(Slot::Num(&mut b.radius_max)),
+            "gravity_min" => Some(Slot::Num(&mut b.gravity_min)),
+            "gravity_max" => Some(Slot::Num(&mut b.gravity_max)),
+            "rotation_period_min" => Some(Slot::Num(&mut b.rotation_period_min)),
+            "rotation_period_max" => Some(Slot::Num(&mut b.rotation_period_max)),
+            "atmosphere_surface_pressure_min" => {
+                Some(Slot::Num(&mut b.atmosphere_surface_pressure_min))
+            }
+            "atmosphere_surface_pressure_max" => {
+                Some(Slot::Num(&mut b.atmosphere_surface_pressure_max))
+            }
+            "atmosphere_surface_density_min" => {
+                Some(Slot::Num(&mut b.atmosphere_surface_density_min))
+            }
+            "atmosphere_surface_density_max" => {
+                Some(Slot::Num(&mut b.atmosphere_surface_density_max))
+            }
+            "atmosphere_scale_height_min" => Some(Slot::Num(&mut b.atmosphere_scale_height_min)),
+            "atmosphere_scale_height_max" => Some(Slot::Num(&mut b.atmosphere_scale_height_max)),
+            "atmosphere_temperature_min" => Some(Slot::Num(&mut b.atmosphere_temperature_min)),
+            "atmosphere_temperature_max" => Some(Slot::Num(&mut b.atmosphere_temperature_max)),
+            "ocean_surface_density_min" => Some(Slot::Num(&mut b.ocean_surface_density_min)),
+            "ocean_surface_density_max" => Some(Slot::Num(&mut b.ocean_surface_density_max)),
+            "ocean_temperature_min" => Some(Slot::Num(&mut b.ocean_temperature_min)),
+            "ocean_temperature_max" => Some(Slot::Num(&mut b.ocean_temperature_max)),
             "tags" => Some(Slot::List(&mut b.tags)),
             _ => None,
         },
@@ -1167,6 +1292,24 @@ fn field_names(kind: RecordKind) -> &'static [&'static str] {
             "ocean_temperature",
             "surface_seed",
             "surface_temperature_offset",
+            "radius_min",
+            "radius_max",
+            "gravity_min",
+            "gravity_max",
+            "rotation_period_min",
+            "rotation_period_max",
+            "atmosphere_surface_pressure_min",
+            "atmosphere_surface_pressure_max",
+            "atmosphere_surface_density_min",
+            "atmosphere_surface_density_max",
+            "atmosphere_scale_height_min",
+            "atmosphere_scale_height_max",
+            "atmosphere_temperature_min",
+            "atmosphere_temperature_max",
+            "ocean_surface_density_min",
+            "ocean_surface_density_max",
+            "ocean_temperature_min",
+            "ocean_temperature_max",
             "tags",
         ],
     }
@@ -1805,49 +1948,184 @@ fn validate(m: &RawRecord) -> Result<Record, ContentError> {
                 Some(offset) => serde_json::json!({ "temperature": offset }),
                 None => serde_json::Value::Null,
             };
-            let body = BodyAsset {
-                id: b.id.clone(),
-                name: b.name.clone().ok_or_else(|| missing(&b.id, "name"))?,
-                mu: req(b.mu, "mu")?,
-                radius: req(b.radius, "radius")?,
-                rotation: Rotation {
-                    axis: DVec3::Z,
-                    sidereal_period: req(b.rotation_period, "rotation_period")?,
+            let body = match b.shape {
+                // Sampled (WI 883): an archetype. Draw the shape's bands at the
+                // seed via the shared sampler, reproducing `bodygen::generate`.
+                // The scalar fields are unused here; identity + classifier offset
+                // come from the recipe, everything else from the seeded draw.
+                Some(shape) => {
+                    let band = |lo: Option<f64>,
+                                hi: Option<f64>,
+                                fmin: &'static str,
+                                fmax: &'static str| {
+                        Ok::<(f64, f64), ContentError>((req(lo, fmin)?, req(hi, fmax)?))
+                    };
+                    let bands = match shape {
+                        Archetype::Moon => ArchetypeBands {
+                            radius: band(b.radius_min, b.radius_max, "radius_min", "radius_max")?,
+                            gravity: band(
+                                b.gravity_min,
+                                b.gravity_max,
+                                "gravity_min",
+                                "gravity_max",
+                            )?,
+                            sidereal_period: band(
+                                b.rotation_period_min,
+                                b.rotation_period_max,
+                                "rotation_period_min",
+                                "rotation_period_max",
+                            )?,
+                            ..ArchetypeBands::default()
+                        },
+                        Archetype::RockyPlanet => ArchetypeBands {
+                            radius: band(b.radius_min, b.radius_max, "radius_min", "radius_max")?,
+                            gravity: band(
+                                b.gravity_min,
+                                b.gravity_max,
+                                "gravity_min",
+                                "gravity_max",
+                            )?,
+                            sidereal_period: band(
+                                b.rotation_period_min,
+                                b.rotation_period_max,
+                                "rotation_period_min",
+                                "rotation_period_max",
+                            )?,
+                            atmosphere_surface_pressure: band(
+                                b.atmosphere_surface_pressure_min,
+                                b.atmosphere_surface_pressure_max,
+                                "atmosphere_surface_pressure_min",
+                                "atmosphere_surface_pressure_max",
+                            )?,
+                            atmosphere_surface_density: band(
+                                b.atmosphere_surface_density_min,
+                                b.atmosphere_surface_density_max,
+                                "atmosphere_surface_density_min",
+                                "atmosphere_surface_density_max",
+                            )?,
+                            atmosphere_scale_height: band(
+                                b.atmosphere_scale_height_min,
+                                b.atmosphere_scale_height_max,
+                                "atmosphere_scale_height_min",
+                                "atmosphere_scale_height_max",
+                            )?,
+                            atmosphere_temperature: band(
+                                b.atmosphere_temperature_min,
+                                b.atmosphere_temperature_max,
+                                "atmosphere_temperature_min",
+                                "atmosphere_temperature_max",
+                            )?,
+                            ..ArchetypeBands::default()
+                        },
+                        Archetype::OceanWorld => ArchetypeBands {
+                            radius: band(b.radius_min, b.radius_max, "radius_min", "radius_max")?,
+                            gravity: band(
+                                b.gravity_min,
+                                b.gravity_max,
+                                "gravity_min",
+                                "gravity_max",
+                            )?,
+                            sidereal_period: band(
+                                b.rotation_period_min,
+                                b.rotation_period_max,
+                                "rotation_period_min",
+                                "rotation_period_max",
+                            )?,
+                            atmosphere_surface_pressure: band(
+                                b.atmosphere_surface_pressure_min,
+                                b.atmosphere_surface_pressure_max,
+                                "atmosphere_surface_pressure_min",
+                                "atmosphere_surface_pressure_max",
+                            )?,
+                            atmosphere_surface_density: band(
+                                b.atmosphere_surface_density_min,
+                                b.atmosphere_surface_density_max,
+                                "atmosphere_surface_density_min",
+                                "atmosphere_surface_density_max",
+                            )?,
+                            atmosphere_scale_height: band(
+                                b.atmosphere_scale_height_min,
+                                b.atmosphere_scale_height_max,
+                                "atmosphere_scale_height_min",
+                                "atmosphere_scale_height_max",
+                            )?,
+                            atmosphere_temperature: band(
+                                b.atmosphere_temperature_min,
+                                b.atmosphere_temperature_max,
+                                "atmosphere_temperature_min",
+                                "atmosphere_temperature_max",
+                            )?,
+                            ocean_surface_density: band(
+                                b.ocean_surface_density_min,
+                                b.ocean_surface_density_max,
+                                "ocean_surface_density_min",
+                                "ocean_surface_density_max",
+                            )?,
+                            ocean_temperature: band(
+                                b.ocean_temperature_min,
+                                b.ocean_temperature_max,
+                                "ocean_temperature_min",
+                                "ocean_temperature_max",
+                            )?,
+                        },
+                    };
+                    let seed = req(b.surface_seed, "surface_seed")? as u64;
+                    let mut body = bodygen::sample(seed, shape, &bands);
+                    // Identity + classifier offset are the recipe's, not the
+                    // generator's synthesized ones; the physics is the draw's.
+                    body.id = b.id.clone();
+                    body.name = b.name.clone().ok_or_else(|| missing(&b.id, "name"))?;
+                    body.surface.material = material;
+                    body
+                }
+                // Fixed (WI 881): the scalar fields are the body directly.
+                None => BodyAsset {
+                    id: b.id.clone(),
+                    name: b.name.clone().ok_or_else(|| missing(&b.id, "name"))?,
+                    mu: req(b.mu, "mu")?,
+                    radius: req(b.radius, "radius")?,
+                    rotation: Rotation {
+                        axis: DVec3::Z,
+                        sidereal_period: req(b.rotation_period, "rotation_period")?,
+                    },
+                    fluid_medium: FluidMedium {
+                        atmosphere_surface_density: req(
+                            b.atmosphere_surface_density,
+                            "atmosphere_surface_density",
+                        )?,
+                        atmosphere_surface_pressure: req(
+                            b.atmosphere_surface_pressure,
+                            "atmosphere_surface_pressure",
+                        )?,
+                        atmosphere_scale_height: req(
+                            b.atmosphere_scale_height,
+                            "atmosphere_scale_height",
+                        )?,
+                        ocean_surface_density: req(
+                            b.ocean_surface_density,
+                            "ocean_surface_density",
+                        )?,
+                        ocean_surface_pressure: req(
+                            b.ocean_surface_pressure,
+                            "ocean_surface_pressure",
+                        )?,
+                        ocean_density_gradient: req(
+                            b.ocean_density_gradient,
+                            "ocean_density_gradient",
+                        )?,
+                        gravity: req(b.gravity, "gravity")?,
+                        atmosphere_temperature: req(
+                            b.atmosphere_temperature,
+                            "atmosphere_temperature",
+                        )?,
+                        ocean_temperature: req(b.ocean_temperature, "ocean_temperature")?,
+                    },
+                    surface: SurfaceRecipe {
+                        material,
+                        ..SurfaceRecipe::from_seed(req(b.surface_seed, "surface_seed")? as u64)
+                    },
+                    render: serde_json::Value::Null,
                 },
-                fluid_medium: FluidMedium {
-                    atmosphere_surface_density: req(
-                        b.atmosphere_surface_density,
-                        "atmosphere_surface_density",
-                    )?,
-                    atmosphere_surface_pressure: req(
-                        b.atmosphere_surface_pressure,
-                        "atmosphere_surface_pressure",
-                    )?,
-                    atmosphere_scale_height: req(
-                        b.atmosphere_scale_height,
-                        "atmosphere_scale_height",
-                    )?,
-                    ocean_surface_density: req(b.ocean_surface_density, "ocean_surface_density")?,
-                    ocean_surface_pressure: req(
-                        b.ocean_surface_pressure,
-                        "ocean_surface_pressure",
-                    )?,
-                    ocean_density_gradient: req(
-                        b.ocean_density_gradient,
-                        "ocean_density_gradient",
-                    )?,
-                    gravity: req(b.gravity, "gravity")?,
-                    atmosphere_temperature: req(
-                        b.atmosphere_temperature,
-                        "atmosphere_temperature",
-                    )?,
-                    ocean_temperature: req(b.ocean_temperature, "ocean_temperature")?,
-                },
-                surface: SurfaceRecipe {
-                    material,
-                    ..SurfaceRecipe::from_seed(req(b.surface_seed, "surface_seed")? as u64)
-                },
-                render: serde_json::Value::Null,
             };
             Ok(Record::BodyRecipe(Box::new(BodyRecipeRecord {
                 id: b.id.clone(),
@@ -2555,6 +2833,14 @@ mod tests {
     fn assert_body_approx(got: &BodyAsset, want: &BodyAsset) {
         assert_eq!(got.id, want.id);
         assert_eq!(got.name, want.name);
+        assert_physics_approx(got, want);
+    }
+
+    /// Approximate equality of everything the sampler/derivation computes, but
+    /// **not** the authoring identity (`id`/`name`). Used to characterize a
+    /// sampled recipe body against `bodygen::generate`, whose id/name are
+    /// synthesized and differ from the recipe's authored ones by construction.
+    fn assert_physics_approx(got: &BodyAsset, want: &BodyAsset) {
         let close = |x: f64, y: f64| (x - y).abs() <= 1e-6 * x.abs().max(1.0);
         assert!(close(got.mu, want.mu), "mu {} vs {}", got.mu, want.mu);
         assert!(close(got.radius, want.radius));
@@ -2670,6 +2956,160 @@ mod tests {
         let p = pack(r#"BodyRecipe(( id: "bare", name: "Bare" )),"#);
         match Catalog::merge(&[&p], &[]) {
             Err(ContentError::MissingField { id, .. }) => assert_eq!(id, "bare"),
+            other => panic!("expected MissingField, got {other:?}"),
+        }
+    }
+
+    // WI 883: archetypes as sampled recipes — an abstract base carrying a `shape`
+    // + parameter bands, a concrete child supplying a seed; resolving samples the
+    // bands and reproduces `bodygen::generate` for that shape.
+
+    /// The three archetype base recipes (abstract), bands = today's generator
+    /// literals, paired with the `Archetype` the oracle `generate` uses.
+    fn archetype_bases() -> [(&'static str, &'static str, Archetype); 3] {
+        [
+            (
+                "moon",
+                r#"BodyRecipe(( id: "moon", abstract: true, shape: moon,
+                    radius_min: 2.0e5, radius_max: 2.0e6,
+                    gravity_min: 0.5, gravity_max: 3.0,
+                    rotation_period_min: 20000.0, rotation_period_max: 200000.0 )),"#,
+                Archetype::Moon,
+            ),
+            (
+                "rocky",
+                r#"BodyRecipe(( id: "rocky", abstract: true, shape: rocky_planet,
+                    radius_min: 2.5e6, radius_max: 8.0e6,
+                    gravity_min: 3.0, gravity_max: 12.0,
+                    rotation_period_min: 20000.0, rotation_period_max: 200000.0,
+                    atmosphere_surface_pressure_min: 50000.0, atmosphere_surface_pressure_max: 150000.0,
+                    atmosphere_surface_density_min: 0.2, atmosphere_surface_density_max: 2.0,
+                    atmosphere_scale_height_min: 5000.0, atmosphere_scale_height_max: 12000.0,
+                    atmosphere_temperature_min: 220.0, atmosphere_temperature_max: 300.0 )),"#,
+                Archetype::RockyPlanet,
+            ),
+            (
+                "ocean",
+                r#"BodyRecipe(( id: "ocean", abstract: true, shape: ocean_world,
+                    radius_min: 3.0e6, radius_max: 9.0e6,
+                    gravity_min: 5.0, gravity_max: 12.0,
+                    rotation_period_min: 20000.0, rotation_period_max: 200000.0,
+                    atmosphere_surface_pressure_min: 80000.0, atmosphere_surface_pressure_max: 180000.0,
+                    atmosphere_surface_density_min: 0.5, atmosphere_surface_density_max: 2.5,
+                    atmosphere_scale_height_min: 6000.0, atmosphere_scale_height_max: 12000.0,
+                    atmosphere_temperature_min: 250.0, atmosphere_temperature_max: 300.0,
+                    ocean_surface_density_min: 950.0, ocean_surface_density_max: 1100.0,
+                    ocean_temperature_min: 275.0, ocean_temperature_max: 300.0 )),"#,
+                Archetype::OceanWorld,
+            ),
+        ]
+    }
+
+    #[test]
+    fn archetype_recipe_reproduces_generate() {
+        // Seeds chosen to be exactly representable as f64 (the recipe seed field is
+        // numeric — WI 881's Num-seed tradeoff), so the recipe seed round-trips to
+        // the same u64 the oracle draws from. (u64::MAX would not round-trip.)
+        for (base_id, base_ron, arch) in archetype_bases() {
+            for seed in [0u64, 1, 42, 7777, 4_503_599_627_370_496] {
+                let child = format!(
+                    r#"BodyRecipe(( id: "body", name: "Body", parent: "{base_id}", surface_seed: {seed} )),"#
+                );
+                let p = pack(&format!("{base_ron}{child}"));
+                let cat = Catalog::merge(&[&p], &[]).unwrap();
+                let got = resolved_body(&cat, "body");
+                // Physics is the seeded draw; id/name are the recipe's, not the
+                // generator's synthesized ones (excluded from the comparison).
+                assert_physics_approx(&got, &bodygen::generate(seed, arch));
+                assert_eq!(got.id, "body");
+            }
+        }
+    }
+
+    #[test]
+    fn sampled_recipe_is_deterministic() {
+        let (base_id, base_ron, _) = archetype_bases()[2]; // ocean (most draws)
+        let child = format!(
+            r#"BodyRecipe(( id: "body", name: "Body", parent: "{base_id}", surface_seed: 314159 )),"#
+        );
+        let p = pack(&format!("{base_ron}{child}"));
+        let a = resolved_body(&Catalog::merge(&[&p], &[]).unwrap(), "body");
+        let b = resolved_body(&Catalog::merge(&[&p], &[]).unwrap(), "body");
+        assert_eq!(a, b, "same recipe + seed ⇒ byte-identical body");
+    }
+
+    /// A concrete sampled body authoring its own shape + bands (no parent), so the
+    /// band fields sit directly on a catalog record and are overridable there.
+    fn standalone_rocky() -> &'static str {
+        r#"BodyRecipe(( id: "r1", name: "R1", shape: rocky_planet, surface_seed: 5,
+            radius_min: 2.5e6, radius_max: 8.0e6,
+            gravity_min: 3.0, gravity_max: 12.0,
+            rotation_period_min: 20000.0, rotation_period_max: 200000.0,
+            atmosphere_surface_pressure_min: 50000.0, atmosphere_surface_pressure_max: 150000.0,
+            atmosphere_surface_density_min: 0.2, atmosphere_surface_density_max: 2.0,
+            atmosphere_scale_height_min: 5000.0, atmosphere_scale_height_max: 12000.0,
+            atmosphere_temperature_min: 220.0, atmosphere_temperature_max: 300.0 )),"#
+    }
+
+    #[test]
+    fn archetype_bands_compose_with_overrides() {
+        let p = pack(standalone_rocky());
+        // `set` both radius bounds to a fixed value (collapse the band); `multiply`
+        // the gravity upper bound. Both are ordinary scalar ops on band fields.
+        let ov = override_set(
+            "scn",
+            "Scenario",
+            "",
+            r#"( target: Id("r1"), field: "radius_min", op: Set(Number(4000000.0)) ),
+               ( target: Id("r1"), field: "radius_max", op: Set(Number(4000000.0)) ),
+               ( target: Id("r1"), field: "gravity_max", op: Multiply(0.5) ),"#,
+        );
+        let cat = Catalog::merge(&[&p], &[&ov]).unwrap();
+        let body = resolved_body(&cat, "r1");
+        // Zero-width radius band ⇒ the draw returns exactly the pinned value.
+        assert!((body.radius - 4.0e6).abs() < 1.0, "radius {}", body.radius);
+        // gravity band is now [3, 6]; the sampled g (= medium.gravity) lies within.
+        assert!(
+            (3.0..=6.0).contains(&body.fluid_medium.gravity),
+            "g {}",
+            body.fluid_medium.gravity
+        );
+        // Provenance: the multiply shadowed the authored upper bound.
+        let fp = &cat.get("r1").unwrap().field_provenance["gravity_max"];
+        assert_eq!(fp.shadows[0].value, ProvValue::Number(12.0));
+    }
+
+    #[test]
+    fn overriding_shape_is_rejected() {
+        let p = pack(standalone_rocky());
+        let bad = override_set(
+            "bad",
+            "Patch",
+            "",
+            r#"( target: Id("r1"), field: "shape", op: Set(Text("moon")) ),"#,
+        );
+        assert!(matches!(
+            Catalog::merge(&[&p], &[&bad]),
+            Err(ContentError::StructuralField { .. })
+        ));
+    }
+
+    #[test]
+    fn sampled_recipe_missing_band_is_loud() {
+        // A rocky-shaped recipe that omits the atmosphere bands its shape draws.
+        let p = pack(
+            r#"BodyRecipe(( id: "r1", name: "R1", shape: rocky_planet, surface_seed: 1,
+                radius_min: 2.5e6, radius_max: 8.0e6, gravity_min: 3.0, gravity_max: 12.0,
+                rotation_period_min: 20000.0, rotation_period_max: 200000.0 )),"#,
+        );
+        match Catalog::merge(&[&p], &[]) {
+            Err(ContentError::MissingField { id, field }) => {
+                assert_eq!(id, "r1");
+                assert!(
+                    field.starts_with("atmosphere_surface_pressure"),
+                    "field {field}"
+                );
+            }
             other => panic!("expected MissingField, got {other:?}"),
         }
     }

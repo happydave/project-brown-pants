@@ -100,26 +100,89 @@ impl Rng {
     }
 }
 
-/// Generates a [`BodyAsset`] deterministically from `seed` and `archetype`.
+/// The per-archetype parameter **bands** — the `[min, max)` range of every
+/// independently-drawn field (WI 883). The seeded [`sample`] draws each drawn
+/// field uniformly from its band; the archetype's *structure* (which fields are
+/// drawn vs literal, the draw order, the ocean-pressure coupling, the μ/gravity
+/// derivations) stays in `sample` as the deterministic spine. Fields a shape
+/// never draws are left at their [`Default`] (`(0.0, 0.0)`) and ignored.
 ///
-/// Pure: the same inputs always produce a bit-identical body. The body's `mu` is
-/// derived as `g · radius²` and its medium's `gravity` set to the same `g`, so it
-/// is internally consistent. Detailed surface/render parameters stay reserved
-/// (WI 763/764); only `surface.seed` is set (to `seed`).
-pub fn generate(seed: u64, archetype: Archetype) -> BodyAsset {
+/// These bands are the numbers that move into the authored body **recipes**
+/// (WI 883): a `BodyRecipe` carrying a `shape` supplies its bands as
+/// ladder-tunable fields, and content resolution samples them exactly as
+/// [`generate`] samples [`default_bands`]. [`generate`]'s in-code defaults are
+/// the transitional copy of the bands; WI 884 collapses the two onto the RON
+/// recipes.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct ArchetypeBands {
+    pub radius: (f64, f64),
+    pub gravity: (f64, f64),
+    pub sidereal_period: (f64, f64),
+    pub atmosphere_surface_pressure: (f64, f64),
+    pub atmosphere_surface_density: (f64, f64),
+    pub atmosphere_scale_height: (f64, f64),
+    pub atmosphere_temperature: (f64, f64),
+    pub ocean_surface_density: (f64, f64),
+    pub ocean_temperature: (f64, f64),
+}
+
+/// The canonical bands for an archetype — the ranges the generator has always
+/// used, now named. `sample(seed, arch, &default_bands(arch))` reproduces the
+/// historical [`generate`] output exactly.
+pub(crate) fn default_bands(archetype: Archetype) -> ArchetypeBands {
+    // A sidereal period drawn from one broad range for every archetype.
+    let sidereal_period = (20_000.0, 200_000.0);
+    match archetype {
+        Archetype::Moon => ArchetypeBands {
+            radius: (2.0e5, 2.0e6),
+            gravity: (0.5, 3.0),
+            sidereal_period,
+            ..ArchetypeBands::default()
+        },
+        Archetype::RockyPlanet => ArchetypeBands {
+            radius: (2.5e6, 8.0e6),
+            gravity: (3.0, 12.0),
+            sidereal_period,
+            atmosphere_surface_pressure: (50_000.0, 150_000.0),
+            atmosphere_surface_density: (0.2, 2.0),
+            atmosphere_scale_height: (5_000.0, 12_000.0),
+            atmosphere_temperature: (220.0, 300.0),
+            ..ArchetypeBands::default()
+        },
+        Archetype::OceanWorld => ArchetypeBands {
+            radius: (3.0e6, 9.0e6),
+            gravity: (5.0, 12.0),
+            sidereal_period,
+            atmosphere_surface_pressure: (80_000.0, 180_000.0),
+            atmosphere_surface_density: (0.5, 2.5),
+            atmosphere_scale_height: (6_000.0, 12_000.0),
+            atmosphere_temperature: (250.0, 300.0),
+            ocean_surface_density: (950.0, 1_100.0),
+            ocean_temperature: (275.0, 300.0),
+        },
+    }
+}
+
+/// Samples a [`BodyAsset`] deterministically from `seed`, an `archetype`
+/// (structure), and its parameter `bands` (numbers).
+///
+/// Pure: the same inputs always produce a bit-identical body. The **draw order**
+/// mirrors the archetype's field-evaluation order exactly (radius, gravity,
+/// sidereal period, then the shape's medium draws), so sourcing the numbers from
+/// `bands` rather than inline literals changes nothing about the stream. The
+/// body's `mu` is derived as `g · radius²` and its medium's `gravity` set to the
+/// same `g`; the ocean's surface pressure is continuous with the atmosphere.
+/// Only `surface.seed` is set (to `seed`); detailed surface/render stay reserved.
+pub(crate) fn sample(seed: u64, archetype: Archetype, bands: &ArchetypeBands) -> BodyAsset {
     let mut rng = Rng::new(seed ^ archetype.salt());
 
-    // Size + surface gravity ranges per archetype (SI). Drawn in a fixed order so
-    // the stream is stable.
-    let (radius, g) = match archetype {
-        Archetype::Moon => (rng.range(2.0e5, 2.0e6), rng.range(0.5, 3.0)),
-        Archetype::RockyPlanet => (rng.range(2.5e6, 8.0e6), rng.range(3.0, 12.0)),
-        Archetype::OceanWorld => (rng.range(3.0e6, 9.0e6), rng.range(5.0, 12.0)),
-    };
+    // Size + surface gravity, drawn in a fixed order so the stream is stable.
+    let radius = rng.range(bands.radius.0, bands.radius.1);
+    let g = rng.range(bands.gravity.0, bands.gravity.1);
     let mu = g * radius * radius;
 
-    // Rotation: a sidereal period drawn from a broad range, about +Z.
-    let sidereal_period = rng.range(20_000.0, 200_000.0);
+    // Rotation about +Z.
+    let sidereal_period = rng.range(bands.sidereal_period.0, bands.sidereal_period.1);
     let rotation = Rotation {
         axis: DVec3::Z,
         sidereal_period,
@@ -139,32 +202,57 @@ pub fn generate(seed: u64, archetype: Archetype) -> BodyAsset {
             ocean_temperature: 200.0,
         },
         Archetype::RockyPlanet => {
-            let surface_pressure = rng.range(50_000.0, 150_000.0);
+            let surface_pressure = rng.range(
+                bands.atmosphere_surface_pressure.0,
+                bands.atmosphere_surface_pressure.1,
+            );
             FluidMedium {
-                atmosphere_surface_density: rng.range(0.2, 2.0),
+                atmosphere_surface_density: rng.range(
+                    bands.atmosphere_surface_density.0,
+                    bands.atmosphere_surface_density.1,
+                ),
                 atmosphere_surface_pressure: surface_pressure,
-                atmosphere_scale_height: rng.range(5_000.0, 12_000.0),
+                atmosphere_scale_height: rng.range(
+                    bands.atmosphere_scale_height.0,
+                    bands.atmosphere_scale_height.1,
+                ),
                 ocean_surface_density: 0.0,
                 ocean_surface_pressure: 0.0,
                 ocean_density_gradient: 0.0,
                 gravity: g,
-                atmosphere_temperature: rng.range(220.0, 300.0),
+                atmosphere_temperature: rng.range(
+                    bands.atmosphere_temperature.0,
+                    bands.atmosphere_temperature.1,
+                ),
                 ocean_temperature: 280.0,
             }
         }
         Archetype::OceanWorld => {
-            let surface_pressure = rng.range(80_000.0, 180_000.0);
+            let surface_pressure = rng.range(
+                bands.atmosphere_surface_pressure.0,
+                bands.atmosphere_surface_pressure.1,
+            );
             FluidMedium {
-                atmosphere_surface_density: rng.range(0.5, 2.5),
+                atmosphere_surface_density: rng.range(
+                    bands.atmosphere_surface_density.0,
+                    bands.atmosphere_surface_density.1,
+                ),
                 atmosphere_surface_pressure: surface_pressure,
-                atmosphere_scale_height: rng.range(6_000.0, 12_000.0),
-                ocean_surface_density: rng.range(950.0, 1_100.0),
+                atmosphere_scale_height: rng.range(
+                    bands.atmosphere_scale_height.0,
+                    bands.atmosphere_scale_height.1,
+                ),
+                ocean_surface_density: rng
+                    .range(bands.ocean_surface_density.0, bands.ocean_surface_density.1),
                 // Continuous with the atmosphere at the surface.
                 ocean_surface_pressure: surface_pressure,
                 ocean_density_gradient: 0.0,
                 gravity: g,
-                atmosphere_temperature: rng.range(250.0, 300.0),
-                ocean_temperature: rng.range(275.0, 300.0),
+                atmosphere_temperature: rng.range(
+                    bands.atmosphere_temperature.0,
+                    bands.atmosphere_temperature.1,
+                ),
+                ocean_temperature: rng.range(bands.ocean_temperature.0, bands.ocean_temperature.1),
             }
         }
     };
@@ -179,6 +267,18 @@ pub fn generate(seed: u64, archetype: Archetype) -> BodyAsset {
         surface: SurfaceRecipe::from_seed(seed),
         render: serde_json::Value::Null,
     }
+}
+
+/// Generates a [`BodyAsset`] deterministically from `seed` and `archetype`.
+///
+/// Pure: the same inputs always produce a bit-identical body. Delegates to
+/// [`sample`] with the archetype's [`default_bands`], so the single sampler owns
+/// the draw structure and this function's output is unchanged by construction.
+/// The body's `mu` is derived as `g · radius²` and its medium's `gravity` set to
+/// the same `g`, so it is internally consistent. Detailed surface/render
+/// parameters stay reserved (WI 763/764); only `surface.seed` is set (to `seed`).
+pub fn generate(seed: u64, archetype: Archetype) -> BodyAsset {
+    sample(seed, archetype, &default_bands(archetype))
 }
 
 #[cfg(test)]
