@@ -71,7 +71,10 @@
 //! Headless and rendering-free. The sim does not consume the catalog yet
 //! (WI 550's scope).
 
+use crate::body_asset::{BodyAsset, Rotation, SurfaceRecipe};
+use crate::fluid::FluidMedium;
 use crate::voxel::{Material, Thermal};
+use glam::DVec3;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -267,6 +270,7 @@ enum RawRecord {
     Material(RawMaterial),
     Resource(RawResource),
     Body(RawBody),
+    BodyRecipe(RawBodyRecipe),
 }
 
 /// A record kind — the override target-selector vocabulary.
@@ -276,6 +280,7 @@ pub enum RecordKind {
     Material,
     Resource,
     Body,
+    BodyRecipe,
 }
 
 impl RawRecord {
@@ -285,6 +290,7 @@ impl RawRecord {
             RawRecord::Material(r) => &r.id,
             RawRecord::Resource(r) => &r.id,
             RawRecord::Body(r) => &r.id,
+            RawRecord::BodyRecipe(r) => &r.id,
         }
     }
     fn parent(&self) -> Option<&str> {
@@ -293,6 +299,7 @@ impl RawRecord {
             RawRecord::Material(r) => r.parent.as_deref(),
             RawRecord::Resource(r) => r.parent.as_deref(),
             RawRecord::Body(r) => r.parent.as_deref(),
+            RawRecord::BodyRecipe(r) => r.parent.as_deref(),
         }
     }
     fn is_abstract(&self) -> bool {
@@ -301,6 +308,7 @@ impl RawRecord {
             RawRecord::Material(r) => r.is_abstract,
             RawRecord::Resource(r) => r.is_abstract,
             RawRecord::Body(r) => r.is_abstract,
+            RawRecord::BodyRecipe(r) => r.is_abstract,
         }
     }
     fn kind(&self) -> RecordKind {
@@ -309,6 +317,7 @@ impl RawRecord {
             RawRecord::Material(_) => RecordKind::Material,
             RawRecord::Resource(_) => RecordKind::Resource,
             RawRecord::Body(_) => RecordKind::Body,
+            RawRecord::BodyRecipe(_) => RecordKind::BodyRecipe,
         }
     }
 
@@ -324,6 +333,9 @@ impl RawRecord {
                 Ok(RawRecord::Resource(c.merge_over(p)))
             }
             (RawRecord::Body(c), RawRecord::Body(p)) => Ok(RawRecord::Body(c.merge_over(p))),
+            (RawRecord::BodyRecipe(c), RawRecord::BodyRecipe(p)) => {
+                Ok(RawRecord::BodyRecipe(c.merge_over(p)))
+            }
             (c, p) => Err(ContentError::KindMismatch {
                 child: c.id().to_string(),
                 parent: p.id().to_string(),
@@ -510,6 +522,99 @@ impl RawBody {
             parent: self.parent,
             is_abstract: self.is_abstract,
             body: self.body.or_else(|| p.body.clone()),
+            tags: self.tags.or_else(|| p.tags.clone()),
+        }
+    }
+}
+
+/// A **body recipe** (WI 881): the *intrinsic* definition of a celestial body as
+/// composable content data — the flattened, ladder-tunable form of a
+/// [`BodyAsset`]. Distinct from [`RawBody`], which is a placement-side *reference*
+/// to a `body_library` slug (the asset ⊕ placement split, in the content layer).
+/// Nested `BodyAsset` structure is flattened onto scalar slots so the ladder can
+/// inherit/override each field; `validate` reassembles a `BodyAsset`. Axis is
+/// fixed to +Z this slice (both `bodygen` and `earthlike` rotate about +Z);
+/// axial tilt, moisture, and the ordered surface-layer stack are later slices.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBodyRecipe {
+    id: String,
+    #[serde(default)]
+    parent: Option<String>,
+    #[serde(default, rename = "abstract")]
+    is_abstract: bool,
+    /// Human-facing display name.
+    #[serde(default)]
+    name: Option<String>,
+    /// Gravitational parameter μ = G·M, m³/s².
+    #[serde(default)]
+    mu: Option<f64>,
+    /// Surface (sea-level) radius, metres.
+    #[serde(default)]
+    radius: Option<f64>,
+    /// Sidereal rotation period, seconds (`0.0` ⇒ non-rotating); axis is +Z.
+    #[serde(default)]
+    rotation_period: Option<f64>,
+    // Fluid medium (flattened) — see `fluid::FluidMedium`.
+    #[serde(default)]
+    atmosphere_surface_density: Option<f64>,
+    #[serde(default)]
+    atmosphere_surface_pressure: Option<f64>,
+    #[serde(default)]
+    atmosphere_scale_height: Option<f64>,
+    #[serde(default)]
+    ocean_surface_density: Option<f64>,
+    #[serde(default)]
+    ocean_surface_pressure: Option<f64>,
+    #[serde(default)]
+    ocean_density_gradient: Option<f64>,
+    #[serde(default)]
+    gravity: Option<f64>,
+    #[serde(default)]
+    atmosphere_temperature: Option<f64>,
+    #[serde(default)]
+    ocean_temperature: Option<f64>,
+    /// Master surface seed. A non-negative whole number (named-body seeds are
+    /// small; stored as a number, cast to `u64` at validate).
+    #[serde(default)]
+    surface_seed: Option<f64>,
+    /// Biome classifier base-temperature offset, K (WI 870/875). Absent ⇒ the
+    /// surface `material` resolves to JSON `null` (no override), matching a body
+    /// with no per-asset offset; present ⇒ `{"temperature": offset}`.
+    #[serde(default)]
+    surface_temperature_offset: Option<f64>,
+    /// Inert metadata tags.
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+}
+
+impl RawBodyRecipe {
+    fn merge_over(self, p: &RawBodyRecipe) -> RawBodyRecipe {
+        RawBodyRecipe {
+            id: self.id,
+            parent: self.parent,
+            is_abstract: self.is_abstract,
+            name: self.name.or_else(|| p.name.clone()),
+            mu: self.mu.or(p.mu),
+            radius: self.radius.or(p.radius),
+            rotation_period: self.rotation_period.or(p.rotation_period),
+            atmosphere_surface_density: self
+                .atmosphere_surface_density
+                .or(p.atmosphere_surface_density),
+            atmosphere_surface_pressure: self
+                .atmosphere_surface_pressure
+                .or(p.atmosphere_surface_pressure),
+            atmosphere_scale_height: self.atmosphere_scale_height.or(p.atmosphere_scale_height),
+            ocean_surface_density: self.ocean_surface_density.or(p.ocean_surface_density),
+            ocean_surface_pressure: self.ocean_surface_pressure.or(p.ocean_surface_pressure),
+            ocean_density_gradient: self.ocean_density_gradient.or(p.ocean_density_gradient),
+            gravity: self.gravity.or(p.gravity),
+            atmosphere_temperature: self.atmosphere_temperature.or(p.atmosphere_temperature),
+            ocean_temperature: self.ocean_temperature.or(p.ocean_temperature),
+            surface_seed: self.surface_seed.or(p.surface_seed),
+            surface_temperature_offset: self
+                .surface_temperature_offset
+                .or(p.surface_temperature_offset),
             tags: self.tags.or_else(|| p.tags.clone()),
         }
     }
@@ -799,6 +904,18 @@ pub struct BodyRefRecord {
     pub tags: Vec<String>,
 }
 
+/// A resolved body-recipe record (WI 881): the intrinsic body definition,
+/// reassembled from the flattened recipe fields into a [`BodyAsset`] the sim
+/// reads. Contrast [`BodyRefRecord`], which only links to a library slug.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BodyRecipeRecord {
+    pub id: String,
+    /// The resolved intrinsic body.
+    pub body: BodyAsset,
+    /// Inert metadata tags.
+    pub tags: Vec<String>,
+}
+
 /// A resolved, concrete content record.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Record {
@@ -806,6 +923,8 @@ pub enum Record {
     Material(MaterialRecord),
     Resource(ResourceRecord),
     Body(BodyRefRecord),
+    /// Boxed — a resolved body is much larger than the other records.
+    BodyRecipe(Box<BodyRecipeRecord>),
 }
 
 /// A catalog entry: the record, its defining pack, and per-field provenance
@@ -982,6 +1101,25 @@ fn slot<'a>(rec: &'a mut RawRecord, field: &str) -> Option<Slot<'a>> {
             "tags" => Some(Slot::List(&mut b.tags)),
             _ => None,
         },
+        RawRecord::BodyRecipe(b) => match field {
+            "name" => Some(Slot::Text(&mut b.name)),
+            "mu" => Some(Slot::Num(&mut b.mu)),
+            "radius" => Some(Slot::Num(&mut b.radius)),
+            "rotation_period" => Some(Slot::Num(&mut b.rotation_period)),
+            "atmosphere_surface_density" => Some(Slot::Num(&mut b.atmosphere_surface_density)),
+            "atmosphere_surface_pressure" => Some(Slot::Num(&mut b.atmosphere_surface_pressure)),
+            "atmosphere_scale_height" => Some(Slot::Num(&mut b.atmosphere_scale_height)),
+            "ocean_surface_density" => Some(Slot::Num(&mut b.ocean_surface_density)),
+            "ocean_surface_pressure" => Some(Slot::Num(&mut b.ocean_surface_pressure)),
+            "ocean_density_gradient" => Some(Slot::Num(&mut b.ocean_density_gradient)),
+            "gravity" => Some(Slot::Num(&mut b.gravity)),
+            "atmosphere_temperature" => Some(Slot::Num(&mut b.atmosphere_temperature)),
+            "ocean_temperature" => Some(Slot::Num(&mut b.ocean_temperature)),
+            "surface_seed" => Some(Slot::Num(&mut b.surface_seed)),
+            "surface_temperature_offset" => Some(Slot::Num(&mut b.surface_temperature_offset)),
+            "tags" => Some(Slot::List(&mut b.tags)),
+            _ => None,
+        },
     }
 }
 
@@ -1013,6 +1151,24 @@ fn field_names(kind: RecordKind) -> &'static [&'static str] {
         ],
         RecordKind::Resource => &["density", "tradable", "tags"],
         RecordKind::Body => &["body", "tags"],
+        RecordKind::BodyRecipe => &[
+            "name",
+            "mu",
+            "radius",
+            "rotation_period",
+            "atmosphere_surface_density",
+            "atmosphere_surface_pressure",
+            "atmosphere_scale_height",
+            "ocean_surface_density",
+            "ocean_surface_pressure",
+            "ocean_density_gradient",
+            "gravity",
+            "atmosphere_temperature",
+            "ocean_temperature",
+            "surface_seed",
+            "surface_temperature_offset",
+            "tags",
+        ],
     }
 }
 
@@ -1640,6 +1796,65 @@ fn validate(m: &RawRecord) -> Result<Record, ContentError> {
             body_slug: b.body.clone().ok_or_else(|| missing(&b.id, "body"))?,
             tags: b.tags.clone().unwrap_or_default(),
         })),
+        RawRecord::BodyRecipe(b) => {
+            let req = |v: Option<f64>, field: &'static str| v.ok_or_else(|| missing(&b.id, field));
+            // Absent offset ⇒ no per-asset override (material `null`), matching a
+            // body that reads its medium directly (WI 875); present ⇒ the JSON the
+            // biome classifier reads.
+            let material = match b.surface_temperature_offset {
+                Some(offset) => serde_json::json!({ "temperature": offset }),
+                None => serde_json::Value::Null,
+            };
+            let body = BodyAsset {
+                id: b.id.clone(),
+                name: b.name.clone().ok_or_else(|| missing(&b.id, "name"))?,
+                mu: req(b.mu, "mu")?,
+                radius: req(b.radius, "radius")?,
+                rotation: Rotation {
+                    axis: DVec3::Z,
+                    sidereal_period: req(b.rotation_period, "rotation_period")?,
+                },
+                fluid_medium: FluidMedium {
+                    atmosphere_surface_density: req(
+                        b.atmosphere_surface_density,
+                        "atmosphere_surface_density",
+                    )?,
+                    atmosphere_surface_pressure: req(
+                        b.atmosphere_surface_pressure,
+                        "atmosphere_surface_pressure",
+                    )?,
+                    atmosphere_scale_height: req(
+                        b.atmosphere_scale_height,
+                        "atmosphere_scale_height",
+                    )?,
+                    ocean_surface_density: req(b.ocean_surface_density, "ocean_surface_density")?,
+                    ocean_surface_pressure: req(
+                        b.ocean_surface_pressure,
+                        "ocean_surface_pressure",
+                    )?,
+                    ocean_density_gradient: req(
+                        b.ocean_density_gradient,
+                        "ocean_density_gradient",
+                    )?,
+                    gravity: req(b.gravity, "gravity")?,
+                    atmosphere_temperature: req(
+                        b.atmosphere_temperature,
+                        "atmosphere_temperature",
+                    )?,
+                    ocean_temperature: req(b.ocean_temperature, "ocean_temperature")?,
+                },
+                surface: SurfaceRecipe {
+                    material,
+                    ..SurfaceRecipe::from_seed(req(b.surface_seed, "surface_seed")? as u64)
+                },
+                render: serde_json::Value::Null,
+            };
+            Ok(Record::BodyRecipe(Box::new(BodyRecipeRecord {
+                id: b.id.clone(),
+                body,
+                tags: b.tags.clone().unwrap_or_default(),
+            })))
+        }
     }
 }
 
@@ -2302,6 +2517,160 @@ mod tests {
         match Catalog::merge(&[&p], &[&bad]) {
             Err(ContentError::TypeMismatch { op, .. }) => assert_eq!(op, "insert_after"),
             other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+    }
+
+    // WI 881: BodyRecipe as a content record kind — the canonical bodies authored
+    // as composable RON, characterization-equal to the constructors.
+
+    /// The earthlike body as a recipe record (values mirror the constructors).
+    fn earthlike_recipe() -> &'static str {
+        r#"BodyRecipe((
+            id: "earthlike", name: "Earth-like",
+            mu: 3.986e14, radius: 6360000.0, rotation_period: 86164.0905,
+            atmosphere_surface_density: 1.225, atmosphere_surface_pressure: 101325.0,
+            atmosphere_scale_height: 8500.0,
+            ocean_surface_density: 1025.0, ocean_surface_pressure: 101325.0,
+            ocean_density_gradient: 0.0, gravity: 9.81,
+            atmosphere_temperature: 288.15, ocean_temperature: 290.0,
+            surface_seed: 0,
+        )),"#
+    }
+
+    fn resolved_body(cat: &Catalog, id: &str) -> BodyAsset {
+        match &cat.get(id).unwrap().record {
+            Record::BodyRecipe(b) => b.body.clone(),
+            other => panic!("expected body recipe, got {other:?}"),
+        }
+    }
+
+    fn body_offset(b: &BodyAsset) -> Option<f64> {
+        b.surface
+            .material
+            .get("temperature")
+            .and_then(|v| v.as_f64())
+    }
+
+    /// Field-for-field approximate equality (RON-decimal → f64 is not bit-exact).
+    fn assert_body_approx(got: &BodyAsset, want: &BodyAsset) {
+        assert_eq!(got.id, want.id);
+        assert_eq!(got.name, want.name);
+        let close = |x: f64, y: f64| (x - y).abs() <= 1e-6 * x.abs().max(1.0);
+        assert!(close(got.mu, want.mu), "mu {} vs {}", got.mu, want.mu);
+        assert!(close(got.radius, want.radius));
+        assert_eq!(got.rotation.axis, want.rotation.axis);
+        assert!(close(
+            got.rotation.sidereal_period,
+            want.rotation.sidereal_period
+        ));
+        let (g, w) = (&got.fluid_medium, &want.fluid_medium);
+        for (x, y) in [
+            (g.atmosphere_surface_density, w.atmosphere_surface_density),
+            (g.atmosphere_surface_pressure, w.atmosphere_surface_pressure),
+            (g.atmosphere_scale_height, w.atmosphere_scale_height),
+            (g.ocean_surface_density, w.ocean_surface_density),
+            (g.ocean_surface_pressure, w.ocean_surface_pressure),
+            (g.ocean_density_gradient, w.ocean_density_gradient),
+            (g.gravity, w.gravity),
+            (g.atmosphere_temperature, w.atmosphere_temperature),
+            (g.ocean_temperature, w.ocean_temperature),
+        ] {
+            assert!(close(x, y), "medium field {x} vs {y}");
+        }
+        assert_eq!(got.surface.seed, want.surface.seed);
+        match (body_offset(got), body_offset(want)) {
+            (None, None) => {}
+            (Some(a), Some(b)) => assert!(close(a, b), "offset {a} vs {b}"),
+            (a, b) => panic!("material offset presence mismatch: {a:?} vs {b:?}"),
+        }
+    }
+
+    #[test]
+    fn earthlike_recipe_resolves_equal_to_constructor() {
+        let p = pack(earthlike_recipe());
+        let cat = Catalog::merge(&[&p], &[]).unwrap();
+        assert_body_approx(&resolved_body(&cat, "earthlike"), &BodyAsset::earthlike());
+        // No offset authored ⇒ material is JSON null (matches the WI 875 earthlike).
+        assert_eq!(
+            resolved_body(&cat, "earthlike").surface.material,
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn ice_age_recipe_is_inheritance_plus_offset() {
+        // Ice-age = parent earthlike + a single cold surface offset; nothing else
+        // re-authored. Physics must match the temperate twin exactly (inherited).
+        use crate::body_asset::EARTHLIKE_ICE_AGE_OFFSET;
+        let ice_age = r#"BodyRecipe(( id: "earthlike-ice-age", name: "Earth-like (Ice Age)",
+            parent: "earthlike", surface_temperature_offset: -40.15 )),"#;
+        let p = pack(&format!("{}{}", earthlike_recipe(), ice_age));
+        let cat = Catalog::merge(&[&p], &[]).unwrap();
+        let temperate = resolved_body(&cat, "earthlike");
+        let cold = resolved_body(&cat, "earthlike-ice-age");
+
+        // Same physics: medium / mu / radius / rotation inherited unchanged.
+        assert_eq!(cold.fluid_medium, temperate.fluid_medium);
+        assert_eq!(cold.mu, temperate.mu);
+        assert_eq!(cold.radius, temperate.radius);
+        assert_eq!(cold.rotation, temperate.rotation);
+        // Only the classifier offset differs, and it matches the constructor.
+        assert!(temperate.surface.material.is_null());
+        assert!(
+            (body_offset(&cold).unwrap() - EARTHLIKE_ICE_AGE_OFFSET).abs() < 0.05,
+            "ice-age offset {:?}",
+            body_offset(&cold)
+        );
+        // And the whole body matches the ice-age constructor.
+        assert_body_approx(&cold, &BodyAsset::earthlike_ice_age());
+    }
+
+    #[test]
+    fn body_recipe_participates_in_the_ladder() {
+        let p = pack(earthlike_recipe());
+        // A scenario override re-flows onto a recipe field, provenance-tracked.
+        let ov = override_set(
+            "scn",
+            "Scenario",
+            "",
+            r#"( target: Id("earthlike"), field: "radius", op: Multiply(2.0) ),"#,
+        );
+        let cat = Catalog::merge(&[&p], &[&ov]).unwrap();
+        assert!((resolved_body(&cat, "earthlike").radius - 2.0 * 6_360_000.0).abs() < 1.0);
+        let fp = &cat.get("earthlike").unwrap().field_provenance["radius"];
+        assert_eq!(fp.shadows[0].value, ProvValue::Number(6_360_000.0));
+
+        // Overriding a structural field is rejected.
+        let bad_struct = override_set(
+            "bad",
+            "Patch",
+            "",
+            r#"( target: Id("earthlike"), field: "id", op: Set(Text("x")) ),"#,
+        );
+        assert!(matches!(
+            Catalog::merge(&[&p], &[&bad_struct]),
+            Err(ContentError::StructuralField { .. })
+        ));
+
+        // A type-mismatched op is rejected (multiply on the text `name`).
+        let bad_type = override_set(
+            "bad",
+            "Patch",
+            "",
+            r#"( target: Id("earthlike"), field: "name", op: Multiply(2.0) ),"#,
+        );
+        assert!(matches!(
+            Catalog::merge(&[&p], &[&bad_type]),
+            Err(ContentError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn body_recipe_missing_required_field_is_loud() {
+        let p = pack(r#"BodyRecipe(( id: "bare", name: "Bare" )),"#);
+        match Catalog::merge(&[&p], &[]) {
+            Err(ContentError::MissingField { id, .. }) => assert_eq!(id, "bare"),
+            other => panic!("expected MissingField, got {other:?}"),
         }
     }
 
