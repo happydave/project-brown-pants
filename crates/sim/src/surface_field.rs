@@ -1431,10 +1431,10 @@ mod tests {
     }
 
     /// A temperate (288 K) ocean-bearing atmospheric climate rotating about +Z —
-    /// the classifier-scale "earthlike" the biome tests probe. (The canonical
-    /// `FluidMedium::EARTHLIKE` carries a representative *atmospheric* 250 K,
-    /// which classifies as an ice-age world — fine physically, but the variety
-    /// scenarios need the temperate regime.)
+    /// the classifier-scale "earthlike" the biome tests probe. (Since WI 875 the
+    /// canonical `FluidMedium::EARTHLIKE` itself carries the ISA 288.15 K and
+    /// reads temperate; this local fixture predates that and stays as the
+    /// independent classifier-scale probe.)
     fn temperate_climate() -> BodyClimate {
         BodyClimate {
             family: BiomeFamily::Atmospheric,

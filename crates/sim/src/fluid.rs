@@ -99,6 +99,13 @@ pub struct FluidMedium {
 /// in for it (WI 875; the anchor itself was introduced by WI 870).
 pub const ISA_SEA_LEVEL_TEMPERATURE: f64 = 288.15;
 
+/// Mean molar mass of dry air, kg/mol — the earthlike atmosphere's composition
+/// intent (WI 887). The digits **must** match the shipped recipe's
+/// `mean_molar_mass` (`crates/sim/content/bodies.ron`): both parse to the same
+/// `f64`, which is what keeps [`FluidMedium::EARTHLIKE`]'s derived scale height
+/// bit-identical to the resolved canonical body (weld-tested).
+pub const EARTHLIKE_MEAN_MOLAR_MASS: f64 = 0.028_964_4;
+
 impl FluidMedium {
     /// Empty space: zero density and pressure at every altitude.
     pub const VACUUM: FluidMedium = FluidMedium {
@@ -117,16 +124,37 @@ impl FluidMedium {
     /// an ocean (below it) — the canonical medium for the vacuum→atmosphere→ocean
     /// descent (the dive, WI 509). Surface pressures match across the boundary so
     /// pressure is continuous; density jumps (air → water) as physics requires.
+    ///
+    /// Since **WI 887** the two formerly-authored incoherent values are
+    /// **derived**: `gravity` = μ/R² (≈ 9.8542 m/s², not the legacy 9.81) and
+    /// `atmosphere_scale_height` = R·T/(M·g) (≈ 8394.6 m, not the legacy 8500) —
+    /// computed at const-eval by the *same* `body_derive` relations the recipe
+    /// resolver runs, so this constant is bit-identical to the shipped
+    /// `bodies.ron` earthlike by construction (the exact-equality weld tests
+    /// enforce it; a transcribed literal here is exactly the drift they exist
+    /// to catch).
     pub const EARTHLIKE: FluidMedium = FluidMedium {
-        atmosphere_surface_density: 1.225,      // kg/m³ at sea level
+        atmosphere_surface_density: 1.225, // kg/m³ at sea level (ISA; authored anchor)
         atmosphere_surface_pressure: 101_325.0, // 1 atm
-        atmosphere_scale_height: 8_500.0,       // m
-        ocean_surface_density: 1_025.0,         // kg/m³ seawater
-        ocean_surface_pressure: 101_325.0,      // continuous with the atmosphere
-        ocean_density_gradient: 0.0,            // near-incompressible: constant density
-        gravity: 9.81,                          // m/s²
-        atmosphere_temperature: ISA_SEA_LEVEL_TEMPERATURE, // surface ambient, 15 °C
-        ocean_temperature: 290.0,               // K — surface seawater (~17 °C, ISA-consistent)
+        // Derived (WI 887): isothermal hydrostatic H at the ISA anchor.
+        atmosphere_scale_height: crate::body_derive::scale_height(
+            ISA_SEA_LEVEL_TEMPERATURE,
+            EARTHLIKE_MEAN_MOLAR_MASS,
+            crate::body_derive::surface_gravity(
+                crate::sim::CentralBody::EARTHLIKE.mu,
+                crate::sim::CentralBody::EARTHLIKE.radius,
+            ),
+        ),
+        ocean_surface_density: 1_025.0,    // kg/m³ seawater
+        ocean_surface_pressure: 101_325.0, // continuous with the atmosphere
+        ocean_density_gradient: 0.0,       // near-incompressible: constant density
+        // Derived (WI 887): g = μ/R² from the canonical central body.
+        gravity: crate::body_derive::surface_gravity(
+            crate::sim::CentralBody::EARTHLIKE.mu,
+            crate::sim::CentralBody::EARTHLIKE.radius,
+        ),
+        atmosphere_temperature: ISA_SEA_LEVEL_TEMPERATURE, // surface ambient, 15 °C (authored anchor)
+        ocean_temperature: 290.0, // K — surface seawater (~17 °C, ISA-consistent)
     };
 
     /// Samples the medium at signed altitude `h` (metres): `h > 0` above the
@@ -238,8 +266,9 @@ mod tests {
 
         let deep = m.sample_altitude(-100.0); // 100 m depth
         assert_eq!(deep.medium, MediumKind::Liquid);
-        // Pressure rises ~ ρ·g·d above the surface pressure.
-        let expected = 101_325.0 + 1_025.0 * 9.81 * 100.0;
+        // Pressure rises ~ ρ·g·d above the surface pressure — with the medium's
+        // own g, which since WI 887 is the derived μ/R² (≈ 9.854), not 9.81.
+        let expected = 101_325.0 + 1_025.0 * m.gravity * 100.0;
         assert!((deep.pressure - expected).abs() < 1e-3);
         assert!(deep.pressure > surf.pressure);
     }

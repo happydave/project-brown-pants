@@ -22,30 +22,31 @@
     id: "sim-canonical-bodies",
     version: "1",
     records: [
-        // Since WI 886 the medium's derived fields are pin-or-derive: an
-        // authored value below is a **pin** (held exactly), an absent one is
-        // computed by its relation. Earthlike's pins hold the legacy values —
-        // gravity 9.81 (derived μ/R² would give ≈9.854), scale height 8500
-        // (ideal-gas would give ≈8400), temperature 288.15 (the WI-875 ISA
-        // anchor, pinned rather than routed through an insolation chain), and
-        // density 1.225 (exact ISA, but pinned for bit-stability). These four
-        // pin lines are the **WI 887 removal targets** (un-pin → adopt the
-        // fully derived values). `ocean_surface_pressure` is deliberately NOT
-        // authored: it derives (= atmosphere surface pressure, continuity) to
-        // the exact legacy value — the canonical body's live derivation proof.
+        // The medium's derived fields are pin-or-derive (WI 886): an authored
+        // value below is a **pin** (held exactly), an absent one is computed by
+        // its relation. Since **WI 887** earthlike's two legacy incoherences
+        // are un-pinned and **derive**: `gravity` = μ/R² ≈ 9.8542 (was 9.81)
+        // and `atmosphere_scale_height` = R·T/(M·g) ≈ 8394.6 m (was 8500),
+        // with `mean_molar_mass` (dry air; digits must match
+        // `fluid::EARTHLIKE_MEAN_MOLAR_MASS` — weld-tested) supplying the gas
+        // relation. `ocean_surface_pressure` also derives (continuity). The
+        // two remaining pins are **intentional anchors, not incoherences**:
+        // `atmosphere_temperature` 288.15 is the WI-875 ISA anchor (routing it
+        // through a C1 insolation chain is future authoring), and
+        // `atmosphere_surface_density` 1.225 is ISA-exact authored intent
+        // (coherent with the ideal-gas relation to 2e-5 relative).
         BodyRecipe((
             id: "earthlike",
             name: "Earth-like",
             mu: 3.986e14,
             radius: 6360000.0,
             rotation_period: 86164.0905,
-            atmosphere_surface_density: 1.225,    // pin (WI 887 target)
+            atmosphere_surface_density: 1.225,    // pin (intentional ISA anchor)
             atmosphere_surface_pressure: 101325.0,
-            atmosphere_scale_height: 8500.0,      // pin (WI 887 target)
+            mean_molar_mass: 0.0289644,
             ocean_surface_density: 1025.0,
             ocean_density_gradient: 0.0,
-            gravity: 9.81,                        // pin (WI 887 target)
-            atmosphere_temperature: 288.15,       // pin (WI 887 target)
+            atmosphere_temperature: 288.15,       // pin (WI-875 ISA anchor)
             ocean_temperature: 290.0,
             surface_seed: 0,
         )),

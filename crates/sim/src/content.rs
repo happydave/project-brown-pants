@@ -3095,14 +3095,17 @@ mod tests {
     // constructors, and a drift in the shipped bodies.ron fails here.
 
     /// The earthlike body as a recipe record — independent literal pin (WI 884).
+    /// WI 887: gravity and scale height are un-pinned here exactly as in the
+    /// shipped pack (they derive: μ/R² and R·T/(M·g)); mean molar mass supplies
+    /// the gas relation.
     fn earthlike_recipe() -> &'static str {
         r#"BodyRecipe((
             id: "earthlike", name: "Earth-like",
             mu: 3.986e14, radius: 6360000.0, rotation_period: 86164.0905,
             atmosphere_surface_density: 1.225, atmosphere_surface_pressure: 101325.0,
-            atmosphere_scale_height: 8500.0,
+            mean_molar_mass: 0.0289644,
             ocean_surface_density: 1025.0, ocean_surface_pressure: 101325.0,
-            ocean_density_gradient: 0.0, gravity: 9.81,
+            ocean_density_gradient: 0.0,
             atmosphere_temperature: 288.15, ocean_temperature: 290.0,
             surface_seed: 0,
         )),"#

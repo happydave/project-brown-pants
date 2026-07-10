@@ -23,7 +23,10 @@ pub(crate) const GAS_CONSTANT: f64 = 8.314462618;
 
 /// Surface gravity `g = μ / R²`, m/s². The single spelling of gravitational
 /// strength is `μ` (review N3); the medium's hydrostatic gravity derives here.
-pub(crate) fn surface_gravity(mu: f64, radius: f64) -> f64 {
+/// `const fn` (WI 887) so [`crate::fluid::FluidMedium::EARTHLIKE`] computes its
+/// gravity with these *same operations* at const-eval — bit-identical to the
+/// recipe resolver by construction, never a transcribed literal.
+pub(crate) const fn surface_gravity(mu: f64, radius: f64) -> f64 {
     mu / (radius * radius)
 }
 
@@ -54,7 +57,8 @@ pub(crate) fn atmosphere_surface_density(
 }
 
 /// Isothermal hydrostatic scale height `H = R·T_surf / (M·g)`, metres.
-pub(crate) fn scale_height(t_surf: f64, mean_molar_mass: f64, gravity: f64) -> f64 {
+/// `const fn` (WI 887) — see [`surface_gravity`].
+pub(crate) const fn scale_height(t_surf: f64, mean_molar_mass: f64, gravity: f64) -> f64 {
     GAS_CONSTANT * t_surf / (mean_molar_mass * gravity)
 }
 
@@ -87,10 +91,11 @@ mod tests {
 
     #[test]
     fn earth_scale_height_and_gravity_expose_the_legacy_incoherence() {
-        // The derived values earthlike will adopt when WI 887 removes its pins:
-        // g = μ/R² ≈ 9.854 (not the authored 9.81) and H ≈ 8400 m at that g
-        // (not the authored 8500). These asserts document the deltas the pins
-        // are holding back.
+        // The derived values earthlike **now carries** (WI 887 removed its
+        // gravity/scale-height pins): g = μ/R² ≈ 9.854 (the legacy authored
+        // value was 9.81) and H ≈ 8395 m at that g (legacy 8500; 8433 is what
+        // the legacy 9.81 would have given). Kept as the record of the
+        // deliberate one-time value change.
         let g = surface_gravity(3.986e14, 6.36e6);
         close(g, 9.854, 2e-3);
         close(scale_height(288.15, 0.028_964_4, g), 8395.0, 15.0);
