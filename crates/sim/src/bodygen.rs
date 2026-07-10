@@ -112,8 +112,8 @@ fn finish_child_seed(tag_hash: u64, parent_seed: u64) -> u64 {
 ///
 /// The design's seeding primitive (its literals are test-pinned); production
 /// body draws go through [`field_seed`], which hashes the same composite tag
-/// without allocating — future subsystems (rings, satellites, surface
-/// generation steps) enter here with their own domain tags.
+/// without allocating — other subsystems enter here with their own domain
+/// tags (first taker: the WI 890 height-golden probe directions, test-side).
 #[allow(dead_code)] // the contract primitive; exercised/pinned from tests
 pub(crate) fn child_seed(parent_seed: u64, domain_tag: &str) -> u64 {
     finish_child_seed(fnv1a(FNV_OFFSET, domain_tag.as_bytes()), parent_seed)

@@ -45,14 +45,18 @@
 //! ≤ 2 still **load** (snapshots bypass derive; refs/digest records carry
 //! their recorded version) but are **no longer regenerable at their old
 //! values** — resolution reports the version move as the deliberate-reroll
-//! fork (catalog-vs-snapshot, design I3). Note the boundary this harness
-//! does *not* yet cover: surface **heights** are excluded from goldens
-//! because the height/ejecta path still uses libm transcendentals (`exp`,
-//! `acos`, trig — a known, tracked violation of the design's no-libm noise
-//! rule; see WI 890, which executes inside this same version-3 break
-//! window), so height bits are not cross-platform-stable yet. Body
-//! *resolution* is clean: `bodygen`/`body_derive` are integer-splitmix +
-//! sqrt only.
+//! fork (catalog-vs-snapshot, design I3). **WI 890 (inside the same
+//! version-3 break window) closed the last boundary gap**: the height
+//! path's libm transcendentals are gone (the crater-rim exp Gaussian became
+//! a windowed polynomial; the ejecta-placement acos became the shader's
+//! chord metric), so surface **heights** are IEEE-primitive-only,
+//! cross-platform bit-stable, and pinned by their own golden
+//! (`golden/surface_heights.txt` via the test-side `digest_surface_heights`
+//! — same header/version/refusal mechanics, sharing [`BODY_OUTPUT_VERSION`] per
+//! the N2 global-granularity resolution: a deliberate height change bumps
+//! the one constant and regenerates BOTH golden files). A source-scan test
+//! in `surface_field.rs` guards the boundary permanently. Body *resolution*
+//! remains clean: `bodygen`/`body_derive` are integer-splitmix + sqrt only.
 
 use crate::body_asset::BodyAsset;
 
@@ -184,6 +188,55 @@ mod tests {
     /// The committed golden matrix (compile-time copy — for the regeneration
     /// test this is exactly the "old"/committed side of the comparison).
     const GOLDEN: &str = include_str!("../golden/body_digests.txt");
+
+    /// The committed surface-height golden (WI 890 — heights became
+    /// pinnable once the height path went IEEE-primitive-only).
+    const GOLDEN_HEIGHTS: &str = include_str!("../golden/surface_heights.txt");
+
+    /// Digest over a body's surface **heights** (WI 890): the analytic field
+    /// sampled at the fixed probe-direction set, `to_bits`-folded through
+    /// the same FNV-1a. Possible at all because the height path is now
+    /// IEEE-primitive-only (the exp rim Gaussian is gone); feeds the
+    /// `surface_heights.txt` golden. The probe set (count, derivation) is an
+    /// **output-contract** input like the seed tags — changing it is a
+    /// deliberate break (bump + regenerate). Coverage note: this hashes
+    /// sampled *outputs* of the field evaluation itself, so it tracks
+    /// whatever the field computes — no per-field destructure exists to
+    /// under-cover. Test-side today (the golden harness is its only
+    /// consumer); it graduates to production with the chunk-cache key.
+    fn digest_surface_heights(a: &BodyAsset) -> u64 {
+        let field = crate::surface_field::SurfaceField::from_asset(a);
+        let mut h = Fnv::new();
+        for dir in golden_probe_directions() {
+            h.f64(field.elevation(dir));
+        }
+        h.0
+    }
+
+    /// The fixed height-probe directions: components hashed from the WI 889
+    /// child-seed primitive (integer splitmix — trig-free), normalized
+    /// (`sqrt` only). Deterministic and platform-stable; degenerate
+    /// (near-zero) candidates are re-hashed with a bumped attempt tag.
+    fn golden_probe_directions() -> [glam::DVec3; 32] {
+        let mut out = [glam::DVec3::X; 32];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let mut attempt = 0u64;
+            *slot = loop {
+                let comp = |axis: &str| {
+                    let tag = format!("height-golden/{i}/{attempt}/{axis}");
+                    let u = crate::bodygen::child_seed(0x00D1_6E57_u64, &tag);
+                    // 53-bit unit in [0, 1) → [-1, 1).
+                    ((u >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+                };
+                let v = glam::DVec3::new(comp("x"), comp("y"), comp("z"));
+                if v.length_squared() > 0.25 {
+                    break v.normalize();
+                }
+                attempt += 1;
+            };
+        }
+        out
+    }
 
     /// Seeds spanning the u64 range (0 and `u64::MAX` are legal here —
     /// `generate` takes a true u64; the WI-881 numeric-seed ceiling is a RON
@@ -324,6 +377,110 @@ mod tests {
         }
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("golden/body_digests.txt");
         std::fs::write(&path, render_golden(&fresh)).expect("write golden file");
+        println!("wrote {} entries to {}", fresh.len(), path.display());
+    }
+
+    // --- WI 890: the surface-height golden (same matrix, heights sampled) ---
+
+    /// The height matrix: the same body set as [`golden_matrix`], digested
+    /// over sampled elevations instead of the resolved asset.
+    fn height_matrix() -> Vec<(String, u64)> {
+        let mut rows = Vec::new();
+        for arch in Archetype::ALL {
+            for seed in SEEDS {
+                let body = generate(seed, arch);
+                rows.push((
+                    format!("gen:{}:{seed}", arch.slug()),
+                    digest_surface_heights(&body),
+                ));
+            }
+        }
+        for id in ["earthlike", "earthlike-ice-age"] {
+            let body = crate::content::canonical_body(id);
+            rows.push((format!("canonical:{id}"), digest_surface_heights(&body)));
+        }
+        rows
+    }
+
+    /// The probe directions are unit vectors, distinct, and deterministic
+    /// (their derivation is an output contract — see
+    /// [`golden_probe_directions`]).
+    #[test]
+    fn height_probe_directions_are_unit_distinct_and_deterministic() {
+        let a = golden_probe_directions();
+        let b = golden_probe_directions();
+        assert_eq!(a, b, "probe set must be deterministic");
+        let mut seen = std::collections::HashSet::new();
+        for d in a {
+            assert!((d.length() - 1.0).abs() < 1e-12, "non-unit probe {d}");
+            assert!(
+                seen.insert(d.to_array().map(f64::to_bits)),
+                "duplicate probe"
+            );
+        }
+    }
+
+    /// THE height harness (WI 890): every body's sampled surface heights
+    /// match the committed digest at the current output version. A failure
+    /// means the height field changed — if unintended, fix the drift; if
+    /// deliberate, bump [`BODY_OUTPUT_VERSION`] and regenerate BOTH golden
+    /// files.
+    #[test]
+    fn golden_surface_heights_match() {
+        let (version, committed) = parse_golden(GOLDEN_HEIGHTS);
+        assert_eq!(
+            version, BODY_OUTPUT_VERSION,
+            "height golden generated at output_version {version}, but the \
+             build is {BODY_OUTPUT_VERSION} — regenerate the goldens"
+        );
+        let fresh = height_matrix();
+        assert_eq!(
+            committed.len(),
+            fresh.len(),
+            "height golden matrix size changed — regenerate deliberately"
+        );
+        for ((c_label, c_digest), (f_label, f_digest)) in committed.iter().zip(&fresh) {
+            assert_eq!(c_label, f_label, "height matrix order/labels drifted");
+            assert_eq!(
+                c_digest, f_digest,
+                "surface-height digest drifted for `{c_label}` — unintended \
+                 height change, or bump BODY_OUTPUT_VERSION deliberately"
+            );
+        }
+    }
+
+    /// Regeneration path for the height golden (run explicitly:
+    /// `cargo test -p sounding_sim regenerate_golden_surface_heights -- --ignored`).
+    /// Same refusal semantics as the body golden; bootstrap (empty committed
+    /// file) allowed — WI 890's initial commit is the bootstrap.
+    #[test]
+    #[ignore = "regenerates the committed height golden; run explicitly"]
+    fn regenerate_golden_surface_heights() {
+        let fresh = height_matrix();
+        if !GOLDEN_HEIGHTS.trim().is_empty() {
+            let (old_version, old_entries) = parse_golden(GOLDEN_HEIGHTS);
+            let digests_changed = old_entries
+                .iter()
+                .zip(&fresh)
+                .any(|((ol, od), (fl, fd))| ol != fl || od != fd)
+                || old_entries.len() != fresh.len();
+            if digests_changed && old_version == BODY_OUTPUT_VERSION {
+                let first = old_entries
+                    .iter()
+                    .zip(&fresh)
+                    .find(|((ol, od), (fl, fd))| ol != fl || od != fd)
+                    .map(|((ol, _), _)| ol.clone())
+                    .unwrap_or_else(|| "matrix size".to_string());
+                panic!(
+                    "refusing to regenerate: height digests changed (first: `{first}`) \
+                     but BODY_OUTPUT_VERSION is still {BODY_OUTPUT_VERSION} — a \
+                     deliberate output change requires a deliberate version bump first"
+                );
+            }
+        }
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("golden/surface_heights.txt");
+        std::fs::write(&path, render_golden(&fresh)).expect("write height golden");
         println!("wrote {} entries to {}", fresh.len(), path.display());
     }
 }

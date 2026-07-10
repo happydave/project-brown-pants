@@ -507,11 +507,6 @@ impl SurfaceField {
         let base = q.floor();
         let density = (o.density * self.crater.density).min(1.0);
         let amp = self.amplitude * o.depth_frac * self.crater.depth;
-        // The rim Gaussian's value at reach (t = 1); subtracted so the rim term is
-        // exactly zero where the crater's influence ends. The coefficient below is
-        // rescaled (0.25 → 0.3163) so the rim's peak height at t ≈ 0.85 is
-        // unchanged by the subtraction.
-        let rim_residual = (-((1.0_f64 - 0.85) / 0.12).powi(2)).exp();
         let mut delta = 0.0;
         for dx in -1..=1 {
             for dy in -1..=1 {
@@ -541,15 +536,11 @@ impl SurfaceField {
                     let depth = amp
                         * (0.3 + 0.7 * hash_unit(cx, cy, cz, oseed ^ 0x55))
                         * (ar / o.reach_max);
-                    // Bowl: −depth at the centre rising to exactly 0 at reach; plus
-                    // a raised rim bump near t ≈ 0.85, windowed to exactly 0 at
-                    // reach (the `.max(0.0)` also clips the Gaussian's inner tail,
-                    // where the bowl dominates anyway).
+                    // Bowl: −depth at the centre rising to exactly 0 at reach;
+                    // plus the raised rim bump near t ≈ 0.85 (see [`rim_bump`] —
+                    // IEEE-primitive-only since WI 890).
                     let bowl = -depth * (1.0 - t * t);
-                    let rim = 0.3163
-                        * depth
-                        * ((-((t - 0.85) / 0.12).powi(2)).exp() - rim_residual).max(0.0);
-                    delta += bowl + rim;
+                    delta += bowl + rim_bump(t, depth);
                 }
             }
         }
@@ -692,8 +683,17 @@ impl SurfaceField {
                         }
                         let cdir = normalize_or_x(center);
                         let extent = er / o.freq;
-                        let sep = cdir.dot(d).clamp(-1.0, 1.0).acos();
-                        if sep >= angular_radius + extent {
+                        // Separation via the chord metric |d − cdir| = 2·sin(sep/2)
+                        // (WI 890): acos-free — the same spelling the render
+                        // shader already uses (precision-safe near dot ≈ 1, and
+                        // IEEE-primitive-only). Chord ≤ angle, so this cull
+                        // predicate only *widens*: every system the old angle
+                        // cull admitted is admitted here (at cones already at
+                        // the MAX_EJECTA_SYSTEMS cap the intensity ranking may
+                        // shift which faintest-overlap systems survive
+                        // truncation — accepted, render-side).
+                        let sep_chord = (d - cdir).length();
+                        if sep_chord >= angular_radius + extent {
                             continue;
                         }
                         let sys = EjectaSystem {
@@ -715,6 +715,23 @@ impl SurfaceField {
         }
         (out, n)
     }
+}
+
+/// The crater rim bump (WI 890): a **windowed polynomial** replacing the old
+/// exp-based Gaussian so the height path is IEEE-primitive-only (multiply-add
+/// exact, bit-stable cross-platform — the design's no-libm noise rule).
+///
+/// Contract (pinned by test): support is `t ∈ (0.70, 1.00)` — the old
+/// Gaussian's effective window — with the value AND slope exactly zero at
+/// both edges (strictly smoother than the old clipped Gaussian, whose clip
+/// edges were kinked; the WI 866 zero-at-reach continuity invariant holds by
+/// construction, no residual-subtraction trick needed); peak at `t = 0.85`
+/// of exactly `0.25 · depth` (the height the old 0.3163 coefficient existed
+/// to preserve under its residual subtraction); exactly linear in `depth`.
+fn rim_bump(t: f64, depth: f64) -> f64 {
+    let x = (t - 0.85) / 0.15;
+    let u = (1.0 - x * x).max(0.0);
+    0.25 * depth * u * u
 }
 
 /// Normalizes `v`, falling back to +X for a (near-)zero vector.
@@ -1026,6 +1043,117 @@ mod tests {
             max_step < 5.0,
             "crater term stepped {max_step} m in one ~7 cm sample — perimeter discontinuity"
         );
+    }
+
+    /// WI 890: the chord cull predicate is over-inclusive relative to the
+    /// angle predicate it replaced — chord = |a − b| = 2·sin(sep/2) ≤ sep on
+    /// the whole sphere, so for ANY threshold, `angle < thr ⇒ chord < thr`:
+    /// every ejecta system the old acos cull admitted is admitted by the
+    /// chord cull. (Post-truncation displacement at MAX_EJECTA_SYSTEMS-capped
+    /// cones is the plan's accepted render-side effect, not asserted.)
+    #[test]
+    fn chord_cull_admits_everything_the_angle_cull_admitted() {
+        // Deterministic direction pairs spanning the separation range
+        // [0, π] — including near-identical (dot ≈ 1, acos's bad regime)
+        // and antipodal pairs.
+        let ds = dirs();
+        let mut checked = 0usize;
+        for (i, a) in ds.iter().enumerate() {
+            for b in ds.iter().skip(i) {
+                let dot = a.dot(*b).clamp(-1.0, 1.0);
+                let angle = dot.acos(); // test-only oracle
+                let chord = (*a - *b).length();
+                assert!(
+                    chord <= angle + 1e-12,
+                    "chord {chord} > angle {angle} at pair {i}"
+                );
+                // The predicate implication at representative thresholds.
+                for thr in [1e-4, 0.01, 0.1, 0.5, 1.0, 2.0] {
+                    if angle < thr {
+                        assert!(chord < thr, "angle-admitted pair culled by chord");
+                    }
+                }
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 1000,
+            "direction set too small to be representative"
+        );
+        // Antipodal extreme: chord 2.0 ≤ angle π.
+        assert!((DVec3::X - (-DVec3::X)).length() <= std::f64::consts::PI);
+    }
+
+    /// WI 890 (the workitem's audit, as a permanent mechanical guard): the
+    /// production half of this file — everything before the test module —
+    /// contains NO libm-variant transcendental, so surface heights and the
+    /// field evaluators stay IEEE-primitive-only and cross-platform
+    /// bit-stable. `#[cfg(test)]` probe helpers are exempt (not shipped
+    /// output). A deliberate re-introduction must re-open the boundary
+    /// (ARCHITECTURE.md Forbidden line) and take a deliberate version bump.
+    #[test]
+    fn production_code_has_no_libm_transcendentals() {
+        let src = include_str!("surface_field.rs");
+        // Anchor on the test module's own header (not a bare `#[cfg(test)]`,
+        // which a future test-gated helper above the module would match and
+        // silently exempt everything after it).
+        let (prod, _tests) = src
+            .split_once("#[cfg(test)]\nmod tests {")
+            .expect("the test-module marker must exist");
+        const FORBIDDEN: [&str; 20] = [
+            ".exp(", ".exp2(", ".exp_m1(", ".acos(", ".asin(", ".atan", ".sin(", ".cos(", ".tan(",
+            ".sinh(", ".cosh(", ".tanh(", ".asinh(", ".acosh(", ".powf(", ".ln(", ".ln_1p(",
+            ".log", ".cbrt(", ".hypot(",
+        ];
+        for (lineno, line) in prod.lines().enumerate() {
+            // Strip line comments — prose may name the forbidden functions.
+            let code = line.split("//").next().unwrap_or("");
+            for tok in FORBIDDEN {
+                assert!(
+                    !code.contains(tok),
+                    "libm-variant `{tok}` in production code at surface_field.rs:{} — \
+                     the height/field path must stay IEEE-primitive-only (WI 890)",
+                    lineno + 1
+                );
+            }
+        }
+    }
+
+    /// WI 890: the rim bump's reformulation contract — the windowed
+    /// polynomial that replaced the exp Gaussian keeps the invariants the
+    /// old shape carried (zero at/beyond the window incl. reach, the
+    /// 0.25·depth peak at t = 0.85, monotone flanks) and is exactly linear
+    /// in depth (bit-exact under power-of-two scaling).
+    #[test]
+    fn rim_bump_honors_the_reformulation_contract() {
+        // Exactly zero at the window edges and everywhere outside them
+        // (t = 1 is the crater reach — the WI 866 continuity anchor).
+        for t in [0.0, 0.3, 0.5, 0.65, 0.70, 1.0, 1.2, 5.0] {
+            assert_eq!(rim_bump(t, 123.0), 0.0, "t = {t} must contribute 0");
+        }
+        // Peak: exactly 0.25·depth at t = 0.85 (bit-exact — x = 0, u = 1).
+        assert_eq!(rim_bump(0.85, 100.0), 25.0);
+        assert_eq!(rim_bump(0.85, 1.0), 0.25);
+        // Monotone rise on [0.70, 0.85] and fall on [0.85, 1.00].
+        let mut prev = 0.0;
+        for i in 0..=100 {
+            let t = 0.70 + 0.15 * (i as f64 / 100.0);
+            let v = rim_bump(t, 1.0);
+            assert!(v >= prev, "not rising at t = {t}");
+            prev = v;
+        }
+        for i in 0..=100 {
+            let t = 0.85 + 0.15 * (i as f64 / 100.0);
+            let v = rim_bump(t, 1.0);
+            assert!(v <= prev, "not falling at t = {t}");
+            prev = v;
+        }
+        // Exact linearity in depth (the WI 782 depth-scaling identity's
+        // stronger, bit-exact form under ×2).
+        for i in 0..=20 {
+            let t = 0.70 + 0.015 * i as f64;
+            assert_eq!(rim_bump(t, 2.0 * 7.25), 2.0 * rim_bump(t, 7.25));
+        }
     }
 
     #[test]
