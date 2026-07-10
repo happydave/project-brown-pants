@@ -20,6 +20,7 @@ use crate::body_derive;
 use crate::fluid::FluidMedium;
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// A family of body the generator can produce. Determines the medium (atmosphere
 /// and/or ocean) and the size/gravity ranges.
@@ -189,22 +190,78 @@ pub(crate) struct ArchetypeBands {
     pub ocean_temperature: (f64, f64),
 }
 
+/// The generator-drawn fields of each archetype, in the **recipe vocabulary**
+/// (WI 880): the names authors may `suppress`. These are the band base-names —
+/// note the one seam: the recipe says `rotation_period` where the sampler's
+/// stream tag says `sidereal_period` ([`recipe_alias`] maps it; the tags are
+/// frozen, they key committed golden streams). [`SUPPRESSIBLE_FIELDS`] is the
+/// union (= OceanWorld's full set); membership drift against `sample`'s actual
+/// draws is pinned by test.
+pub(crate) fn suppressible_fields(archetype: Archetype) -> &'static [&'static str] {
+    match archetype {
+        Archetype::Moon => &SUPPRESSIBLE_FIELDS[..5],
+        Archetype::RockyPlanet => &SUPPRESSIBLE_FIELDS[..8],
+        Archetype::OceanWorld => &SUPPRESSIBLE_FIELDS,
+    }
+}
+
+/// Every suppressible (generator-drawn) field name, recipe vocabulary.
+/// Ordered so each archetype's set is a prefix: the Moon five, then the
+/// atmosphere trio (Rocky), then the ocean pair (OceanWorld).
+pub(crate) const SUPPRESSIBLE_FIELDS: [&str; 10] = [
+    "radius",
+    "gravity",
+    "rotation_period",
+    "nominal_insolation",
+    "bond_albedo",
+    "atmosphere_surface_pressure",
+    "greenhouse_delta_t",
+    "mean_molar_mass",
+    "ocean_surface_density",
+    "ocean_temperature",
+];
+
+/// The recipe-vocabulary name of a sampler stream tag (WI 880): identity for
+/// every field except the `sidereal_period` tag, which authors know as
+/// `rotation_period`.
+fn recipe_alias(tag: &str) -> &str {
+    if tag == "sidereal_period" {
+        "rotation_period"
+    } else {
+        tag
+    }
+}
+
 /// Samples a [`BodyAsset`] deterministically from `seed`, an `archetype`
-/// (structure), and its parameter `bands` (numbers).
+/// (structure), its parameter `bands` (numbers), and any suppressed-field
+/// `pins` (WI 880: recipe-vocabulary name → explicit value, replacing that
+/// field's draw).
 ///
 /// Pure: the same inputs always produce a bit-identical body. Every drawn field
 /// is the **first draw of its own hash-derived stream** (WI 889 — see
 /// [`child_seed`]), keyed `"<archetype-slug>/<field>"`, so the set of drawn
-/// fields — not any draw *order* — defines the output. The body's `mu` is
+/// fields — not any draw *order* — defines the output. That is exactly what
+/// makes a pin shift-free: a pinned field's stream is simply never opened, and
+/// no other field can notice (an empty `pins` map is bit-identical to the
+/// pre-pin sampler). The body's `mu` is
 /// derived as `g · radius²` and its medium's `gravity` set to the same `g`;
 /// the ocean's surface pressure is continuous with the atmosphere.
 /// Only `surface.seed` is set (to `seed`, **verbatim** — the persisted
 /// `BodyRef` round-trip regenerates from it); detailed surface/render stay
 /// reserved.
-pub(crate) fn sample(seed: u64, archetype: Archetype, bands: &ArchetypeBands) -> BodyAsset {
-    // One single-purpose stream per drawn field.
+pub(crate) fn sample(
+    seed: u64,
+    archetype: Archetype,
+    bands: &ArchetypeBands,
+    pins: &BTreeMap<&str, f64>,
+) -> BodyAsset {
+    // One single-purpose stream per drawn field — unless the field is pinned
+    // (suppressed + explicit), in which case its stream is never opened.
     let draw = |field: &str, band: (f64, f64)| -> f64 {
-        Rng::new(field_seed(seed, archetype, field)).range(band.0, band.1)
+        match pins.get(recipe_alias(field)) {
+            Some(v) => *v,
+            None => Rng::new(field_seed(seed, archetype, field)).range(band.0, band.1),
+        }
     };
 
     // Size + surface gravity.
@@ -334,7 +391,13 @@ pub(crate) fn sample(seed: u64, archetype: Archetype, bands: &ArchetypeBands) ->
 /// the same `g`, so it is internally consistent. Detailed surface/render
 /// parameters stay reserved (WI 763/764); only `surface.seed` is set (to `seed`).
 pub fn generate(seed: u64, archetype: Archetype) -> BodyAsset {
-    sample(seed, archetype, &crate::content::canonical_bands(archetype))
+    // The canonical path never suppresses (empty pins ⇒ bit-identical draws).
+    sample(
+        seed,
+        archetype,
+        &crate::content::canonical_bands(archetype),
+        &BTreeMap::new(),
+    )
 }
 
 #[cfg(test)]
@@ -662,6 +725,54 @@ mod tests {
                     assert_eq!(
                         m.ocean_surface_pressure, m.atmosphere_surface_pressure,
                         "ocean pressure continuous with the atmosphere"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn suppressible_fields_match_the_actual_draws() {
+        // WI 880 drift guard: per archetype, pinning a listed field must move
+        // the sampled body (the list has no phantom entries — and the
+        // `rotation_period` alias reaches the `sidereal_period` stream), while
+        // pinning an unlisted field must change nothing (the archetype never
+        // draws it, so the per-arch lists don't under-claim either).
+        let seed = 42;
+        for arch in [
+            Archetype::Moon,
+            Archetype::RockyPlanet,
+            Archetype::OceanWorld,
+        ] {
+            let bands = crate::content::canonical_bands(arch);
+            let baseline = sample(seed, arch, &bands, &BTreeMap::new());
+            for field in SUPPRESSIBLE_FIELDS {
+                // An in-band midpoint: deterministic, and distinct from the
+                // uniform draw at this fixed seed (verified by the assert).
+                let band = match field {
+                    "radius" => bands.radius,
+                    "gravity" => bands.gravity,
+                    "rotation_period" => bands.sidereal_period,
+                    "nominal_insolation" => bands.nominal_insolation,
+                    "bond_albedo" => bands.bond_albedo,
+                    "atmosphere_surface_pressure" => bands.atmosphere_surface_pressure,
+                    "greenhouse_delta_t" => bands.greenhouse_delta_t,
+                    "mean_molar_mass" => bands.mean_molar_mass,
+                    "ocean_surface_density" => bands.ocean_surface_density,
+                    "ocean_temperature" => bands.ocean_temperature,
+                    other => panic!("unmapped suppressible field {other}"),
+                };
+                let pins = BTreeMap::from([(field, (band.0 + band.1) / 2.0)]);
+                let pinned = sample(seed, arch, &bands, &pins);
+                if suppressible_fields(arch).contains(&field) {
+                    assert_ne!(
+                        pinned, baseline,
+                        "{arch:?}: pinning drawn field {field} must move the body"
+                    );
+                } else {
+                    assert_eq!(
+                        pinned, baseline,
+                        "{arch:?}: {field} is not drawn — a pin must change nothing"
                     );
                 }
             }

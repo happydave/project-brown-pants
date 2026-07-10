@@ -22,7 +22,10 @@
 //! **The override model + merge ladder (WI 548).** Every tunable field is
 //! reachable by one field-operation mechanism — **set / multiply / extend /
 //! delete** over an inherited base, with the proportional **multiply** as the
-//! first-class tuning primitive. Overrides live in **override sets** (RON
+//! first-class tuning primitive; **suppress** (WI 880, design I4) is the
+//! body-recipe-specific "do not generate" marker, distinct from delete in
+//! both semantics and provenance (a suppressed drawn field is supplied by its
+//! same-name explicit scalar instead of its seeded draw). Overrides live in **override sets** (RON
 //! documents declaring a source id + a **phase**) and resolve through the
 //! deterministic **named-phase ladder**: settings (reserved for WI 549) →
 //! base packs (record *definitions*) → pack-to-pack patches → scenario →
@@ -94,7 +97,9 @@ use std::sync::OnceLock;
 /// project's first non-additive pack-grammar change. Stale packs are refused
 /// **by version** via the header-first probe in `merge_composition` (the
 /// [`crate::persist`] two-stage-probe pattern) — never by an incidental
-/// unknown-field parse error.
+/// unknown-field parse error. WI 880 (the `suppress` op + record field) was
+/// **additive** — every format-2 document resolves unchanged — so the
+/// version did not move.
 pub const CONTENT_FORMAT_VERSION: u32 = 2;
 
 /// Field names that overrides may never target: record identity and
@@ -159,6 +164,10 @@ pub enum ContentError {
     DuplicateStackLayer { body: String, layer: String },
     /// A surface layer declares a `layer_type` this build does not know.
     UnknownLayerType { id: String, layer_type: String },
+    /// A `suppress` names a field that is not generator-drawn (WI 880) —
+    /// suppression applies to the drawn independents only (design I2);
+    /// derived quantities and non-body fields have nothing to suppress.
+    NotSuppressible { record: String, field: String },
     /// An override's target matches nothing (unknown record id or base id).
     UnknownTarget { target: String },
     /// An override names a field the targeted record's kind does not have.
@@ -259,6 +268,11 @@ impl fmt::Display for ContentError {
                     "record `{id}` field `{field}` is outside its physical domain for derivation"
                 )
             }
+            ContentError::NotSuppressible { record, field } => write!(
+                f,
+                "suppress on record `{record}` names `{field}`, which is not a generator-drawn \
+                 field — suppression applies to drawn independents only"
+            ),
             ContentError::UnknownTarget { target } => {
                 write!(f, "override targets unknown {target}")
             }
@@ -738,6 +752,14 @@ struct RawBodyRecipe {
     /// Application order is list order; the WI 879 id-keyed list ops splice it.
     #[serde(default)]
     surface_stack: Option<Vec<String>>,
+    /// Suppressed generator-drawn fields (WI 880, design I4 "do-not-generate"):
+    /// recipe-vocabulary names from [`bodygen::SUPPRESSIBLE_FIELDS`]. Shaped
+    /// recipes only. Each listed field is not drawn; its same-name scalar —
+    /// admitted through the WI 884 mode wall for exactly these names — supplies
+    /// the value. Inherits whole-value like every field; the `Suppress` ladder
+    /// op appends to it (generic list ops cannot touch it).
+    #[serde(default)]
+    suppress: Option<Vec<String>>,
     // Derivation inputs (WI 886) — the independent thermal/gas intent a fixed
     // recipe may author *instead of* pinning the derived medium fields:
     // T_surf = T_eq(nominal_insolation, bond_albedo) + greenhouse_delta_t;
@@ -836,6 +858,7 @@ impl RawBodyRecipe {
                 .surface_temperature_offset
                 .or(p.surface_temperature_offset),
             surface_stack: self.surface_stack.or_else(|| p.surface_stack.clone()),
+            suppress: self.suppress.or_else(|| p.suppress.clone()),
             nominal_insolation: self.nominal_insolation.or(p.nominal_insolation),
             bond_albedo: self.bond_albedo.or(p.bond_albedo),
             greenhouse_delta_t: self.greenhouse_delta_t.or(p.greenhouse_delta_t),
@@ -942,13 +965,22 @@ impl Target {
 /// fields carry ordered, **id-keyed** ops (WI 879): `Extend` appends, `Delete`
 /// removes by id, and `InsertAfter`/`Replace` splice relative to a named element
 /// so an ordered list (e.g. a body's surface-layer stack) composes across the
-/// ladder by element identity, never by index.
+/// ladder by element identity, never by index. `Suppress` (WI 880, design I4)
+/// marks a shaped `BodyRecipe`'s generator-drawn field "do not generate" —
+/// `field` names the *drawn field* (recipe vocabulary), and the mark lands in
+/// the record's `suppress` list; the field's value must then come from the
+/// same-name explicit scalar. Distinct from `Delete` in semantics (a positive
+/// marker, never an absence trick) and in provenance (ledgered under the
+/// `suppress` key). The dedicated op is the **only** ladder spelling: generic
+/// ops aimed at the `suppress` list itself are rejected.
 #[derive(Debug, Deserialize)]
 enum Op {
     Set(SetValue),
     Multiply(f64),
     Extend(Vec<String>),
     Delete(String),
+    /// Mark `field` suppressed on the target `BodyRecipe` (WI 880).
+    Suppress,
     /// Insert `items` immediately after the first element equal to `anchor`.
     InsertAfter {
         anchor: String,
@@ -1396,6 +1428,7 @@ fn slot<'a>(rec: &'a mut RawRecord, field: &str) -> Option<Slot<'a>> {
             "surface_seed" => Some(Slot::Num(&mut b.surface_seed)),
             "surface_temperature_offset" => Some(Slot::Num(&mut b.surface_temperature_offset)),
             "surface_stack" => Some(Slot::List(&mut b.surface_stack)),
+            "suppress" => Some(Slot::List(&mut b.suppress)),
             "nominal_insolation" => Some(Slot::Num(&mut b.nominal_insolation)),
             "bond_albedo" => Some(Slot::Num(&mut b.bond_albedo)),
             "greenhouse_delta_t" => Some(Slot::Num(&mut b.greenhouse_delta_t)),
@@ -1509,6 +1542,7 @@ fn field_names(kind: RecordKind) -> &'static [&'static str] {
             "ocean_temperature_min",
             "ocean_temperature_max",
             "surface_stack",
+            "suppress",
             "tags",
         ],
         RecordKind::SurfaceLayer => &[
@@ -1644,6 +1678,73 @@ fn apply_op(
             field: field.to_string(),
         });
     }
+    // WI 880: the `suppress` list composes only through the dedicated op —
+    // its `field` names the *drawn field to suppress*, and the mark lands in
+    // the record's suppress list with its own provenance key. Generic ops
+    // aimed at the list itself are rejected below (design I4: the marker is
+    // never an ordinary list edit, so it cannot be conflated with `delete`).
+    if let Op::Suppress = op {
+        let RawRecord::BodyRecipe(b) = rec else {
+            return Err(ContentError::UnknownField {
+                record: record_id,
+                field: field.to_string(),
+            });
+        };
+        if !bodygen::SUPPRESSIBLE_FIELDS.contains(&field) {
+            return Err(ContentError::NotSuppressible {
+                record: record_id,
+                field: field.to_string(),
+            });
+        }
+        let old = b
+            .suppress
+            .clone()
+            .map(ProvValue::List)
+            .unwrap_or(ProvValue::Unset);
+        let list = b.suppress.get_or_insert_with(Vec::new);
+        if !list.iter().any(|e| e == field) {
+            list.push(field.to_string());
+        }
+        // Same ledger discipline as every op, keyed under `suppress` (the
+        // list the mark lives in), so the marker's chain is queryable and
+        // distinct from any drawn field's value provenance.
+        let key = (record_id, "suppress".to_string());
+        let prior_source = prov
+            .get(&key)
+            .map(|p| p.source.clone())
+            .unwrap_or(SourceRef::Pack {
+                id: defining_pack.to_string(),
+            });
+        let entry = prov.entry(key).or_insert_with(|| FieldProvenance {
+            source: prior_source.clone(),
+            shadows: Vec::new(),
+        });
+        entry.shadows.insert(
+            0,
+            Shadow {
+                value: old,
+                source: prior_source,
+            },
+        );
+        entry.source = source.clone();
+        return Ok(());
+    }
+    if field == "suppress" {
+        let op_name = match op {
+            Op::Set(_) => "set",
+            Op::Multiply(_) => "multiply",
+            Op::Extend(_) => "extend",
+            Op::Delete(_) => "delete",
+            Op::InsertAfter { .. } => "insert_after",
+            Op::Replace { .. } => "replace",
+            Op::Suppress => "suppress",
+        };
+        return Err(ContentError::TypeMismatch {
+            record: record_id,
+            field: field.to_string(),
+            op: op_name,
+        });
+    }
     let parentless = rec.parent().is_none();
     let Some(mut s) = slot(rec, field) else {
         return Err(ContentError::UnknownField {
@@ -1761,6 +1862,8 @@ fn apply_op(
             }
         }
         (_, Op::Replace { .. }) => return Err(mismatch("replace")),
+        // Handled by the early arm above (never reaches the slot machinery).
+        (_, Op::Suppress) => unreachable!("suppress is applied before slot dispatch"),
     }
     // Provenance: the displaced value's source is whoever last wrote it (or
     // the defining pack for an authored/unset original).
@@ -2255,6 +2358,15 @@ fn validate(m: &RawRecord, merged: &HashMap<String, RawRecord>) -> Result<Record
                 id: b.id.clone(),
                 field,
             };
+            // WI 880: the resolved suppress set (BTreeSet — deterministic
+            // iteration, duplicates idempotent). Only shaped recipes have a
+            // generator to veto; the fixed path is pin-or-derive-or-loud
+            // (WI 886), so any suppression there is inapplicable.
+            let suppressed: BTreeSet<&str> =
+                b.suppress.iter().flatten().map(String::as_str).collect();
+            if b.shape.is_none() && !suppressed.is_empty() {
+                return Err(inapplicable("suppress"));
+            }
             let fixed_scalars = [
                 (b.mu.is_some(), "mu"),
                 (b.radius.is_some(), "radius"),
@@ -2325,7 +2437,13 @@ fn validate(m: &RawRecord, merged: &HashMap<String, RawRecord>) -> Result<Record
             } else {
                 &band_fields[..]
             };
-            if let Some((_, field)) = off_mode.iter().find(|(present, _)| *present) {
+            // A suppressed field's same-name scalar is the sanctioned explicit
+            // source (WI 880) — the mode wall admits exactly those names; every
+            // other off-mode field stays as loud as it was (WI 884).
+            if let Some((_, field)) = off_mode
+                .iter()
+                .find(|(present, name)| *present && !suppressed.contains(name))
+            {
                 return Err(inapplicable(field));
             }
             // The surface-layer stack (WI 892). The stack starts from the
@@ -2519,8 +2637,52 @@ fn validate(m: &RawRecord, merged: &HashMap<String, RawRecord>) -> Result<Record
                             }
                         }
                     };
+                    // WI 880: suppressed fields — validate each name against
+                    // the drawn vocabulary (all shapes, then this shape),
+                    // require its same-name explicit scalar, hold the scalar
+                    // to the same physical domain its band bounds obey, and
+                    // pin it into the sample (that field's stream is never
+                    // opened; every other draw is bit-unchanged, WI 889).
+                    let mut pins: BTreeMap<&str, f64> = BTreeMap::new();
+                    for &name in &suppressed {
+                        let Some(&stat) = bodygen::SUPPRESSIBLE_FIELDS.iter().find(|&&f| f == name)
+                        else {
+                            return Err(ContentError::NotSuppressible {
+                                record: b.id.clone(),
+                                field: name.to_string(),
+                            });
+                        };
+                        if !bodygen::suppressible_fields(shape).contains(&stat) {
+                            return Err(inapplicable(stat));
+                        }
+                        let scalar = match stat {
+                            "radius" => b.radius,
+                            "gravity" => b.gravity,
+                            "rotation_period" => b.rotation_period,
+                            "nominal_insolation" => b.nominal_insolation,
+                            "bond_albedo" => b.bond_albedo,
+                            "atmosphere_surface_pressure" => b.atmosphere_surface_pressure,
+                            "greenhouse_delta_t" => b.greenhouse_delta_t,
+                            "mean_molar_mass" => b.mean_molar_mass,
+                            "ocean_surface_density" => b.ocean_surface_density,
+                            "ocean_temperature" => b.ocean_temperature,
+                            other => unreachable!("suppressible field {other} has no scalar"),
+                        };
+                        let v = req(scalar, stat)?;
+                        let in_domain = v.is_finite()
+                            && match stat {
+                                "nominal_insolation" | "greenhouse_delta_t" => v >= 0.0,
+                                "bond_albedo" => (0.0..1.0).contains(&v),
+                                "mean_molar_mass" => v > 0.0,
+                                _ => true,
+                            };
+                        if !in_domain {
+                            return Err(unphysical(stat));
+                        }
+                        pins.insert(stat, v);
+                    }
                     let seed = surface_seed()?;
-                    let mut body = bodygen::sample(seed, shape, &bands);
+                    let mut body = bodygen::sample(seed, shape, &bands, &pins);
                     // Identity + classifier offset are the recipe's, not the
                     // generator's synthesized ones; the physics is the draw's.
                     body.id = b.id.clone();
@@ -4328,6 +4490,345 @@ mod tests {
                 ocean_surface_density: 1000.0, ocean_density_gradient: 0.0,
                 ocean_temperature: 285.0, surface_seed: 7, {extra} )),"#
         )
+    }
+
+    // ------------------------------------------------------------------
+    // WI 880 — `suppress`: do-not-generate on the sampled path (design I4).
+    // ------------------------------------------------------------------
+
+    fn shaped_child(base_id: &str, extra: &str) -> String {
+        format!(
+            r#"BodyRecipe(( id: "body", name: "Body", parent: "{base_id}", surface_seed: 42, {extra} )),"#
+        )
+    }
+
+    fn shaped_body(base_ron: &str, base_id: &str, extra: &str) -> BodyAsset {
+        let p = pack(&format!("{base_ron}{}", shaped_child(base_id, extra)));
+        resolved_body(&Catalog::merge(&[&p], &[]).unwrap(), "body")
+    }
+
+    #[test]
+    fn suppress_pins_the_scalar_and_shifts_no_other_draw() {
+        let (base_id, base_ron, _) = archetype_bases()[1]; // rocky
+        let baseline = shaped_body(base_ron, base_id, "");
+        let pinned = shaped_body(
+            base_ron,
+            base_id,
+            r#"suppress: ["bond_albedo"], bond_albedo: 0.123,"#,
+        );
+        // Every unsuppressed stream is bit-untouched (WI 889 per-field
+        // seeding: the vetoed field's stream is simply never opened)...
+        assert_eq!(pinned.radius, baseline.radius);
+        assert_eq!(pinned.mu, baseline.mu);
+        assert_eq!(pinned.rotation, baseline.rotation);
+        assert_eq!(
+            pinned.fluid_medium.atmosphere_surface_pressure,
+            baseline.fluid_medium.atmosphere_surface_pressure
+        );
+        // ...while the albedo-derived temperature moved.
+        assert_ne!(
+            pinned.fluid_medium.atmosphere_temperature,
+            baseline.fluid_medium.atmosphere_temperature
+        );
+        // Suppressing the full thermal set determines T_surf exactly: the
+        // explicit values feed the same shared relations, verbatim.
+        let all = shaped_body(
+            base_ron,
+            base_id,
+            r#"suppress: ["nominal_insolation", "bond_albedo", "greenhouse_delta_t"],
+               nominal_insolation: 1361.0, bond_albedo: 0.3, greenhouse_delta_t: 33.0,"#,
+        );
+        assert_eq!(
+            all.fluid_medium.atmosphere_temperature,
+            body_derive::surface_temperature(
+                body_derive::equilibrium_temperature(1361.0, 0.3),
+                33.0
+            )
+        );
+        assert_eq!(all.radius, baseline.radius);
+    }
+
+    #[test]
+    fn suppressed_zero_pressure_is_a_coherent_airless_body() {
+        // SpaceEngine's `NoAtmosphere`, spelled as data: suppress the drawn
+        // pressure and author 0 — the derivation seam does the rest (airless
+        // density, and `gate_ocean` closes the ocean at p_atm == 0).
+        let (base_id, base_ron, _) = archetype_bases()[2]; // ocean world
+        let baseline = shaped_body(base_ron, base_id, "");
+        assert!(
+            baseline.fluid_medium.ocean_surface_density > 0.0,
+            "fixture bands must gate the baseline ocean open"
+        );
+        let airless = shaped_body(
+            base_ron,
+            base_id,
+            r#"suppress: ["atmosphere_surface_pressure"], atmosphere_surface_pressure: 0.0,"#,
+        );
+        let m = &airless.fluid_medium;
+        assert_eq!(m.atmosphere_surface_pressure, 0.0);
+        assert_eq!(m.atmosphere_surface_density, 0.0);
+        assert_eq!(m.ocean_surface_density, 0.0);
+        assert_eq!(m.ocean_surface_pressure, 0.0);
+        assert_eq!(m.ocean_density_gradient, 0.0);
+        // The unsuppressed streams didn't move; the inert ocean temperature
+        // is still its own draw.
+        assert_eq!(airless.radius, baseline.radius);
+        assert_eq!(m.ocean_temperature, baseline.fluid_medium.ocean_temperature);
+    }
+
+    #[test]
+    fn suppress_op_rides_the_ladder_with_its_own_provenance() {
+        let (base_id, base_ron, _) = archetype_bases()[1];
+        let p = pack(&format!("{base_ron}{}", shaped_child(base_id, "")));
+        // A base-targeted suppress fans out to the variant's raw record; the
+        // explicit value arrives as an ordinary ladder Set on the scalar the
+        // wall now admits.
+        let s = override_set(
+            "scn",
+            "Scenario",
+            "",
+            &format!(
+                r#"( target: Base("{base_id}"), field: "bond_albedo", op: Suppress ),
+                   ( target: Id("body"), field: "bond_albedo", op: Set(Number(0.2)) ),"#
+            ),
+        );
+        let via_ladder = resolved_body(&Catalog::merge(&[&p], &[&s]).unwrap(), "body");
+        // Semantics identical to authoring the suppression on the record.
+        let via_record = shaped_body(
+            base_ron,
+            base_id,
+            r#"suppress: ["bond_albedo"], bond_albedo: 0.2,"#,
+        );
+        assert_eq!(via_ladder, via_record);
+        // The marker's provenance: its own `suppress` key, sourced to the
+        // override set — never `delete`'s pathway, never a value shadow of
+        // the drawn field itself (AC: no conflation).
+        let cat = Catalog::merge(&[&p], &[&s]).unwrap();
+        let fp = &cat.get("body").unwrap().field_provenance["suppress"];
+        assert_eq!(
+            fp.source,
+            SourceRef::Override {
+                source: "scn".into(),
+                phase: OverridePhase::Scenario
+            }
+        );
+        assert_eq!(
+            fp.shadows,
+            vec![Shadow {
+                value: ProvValue::Unset,
+                source: SourceRef::Pack { id: "test".into() }
+            }]
+        );
+    }
+
+    #[test]
+    fn suppress_inherits_whole_value_like_every_field() {
+        let (base_id, base_ron, _) = archetype_bases()[1];
+        // The base is abstract, so hang the suppression on a concrete middle
+        // record and inherit from it.
+        let mid = format!(
+            r#"BodyRecipe(( id: "mid", name: "Mid", parent: "{base_id}", surface_seed: 42,
+                suppress: ["bond_albedo"], bond_albedo: 0.2 )),"#
+        );
+        let child = r#"BodyRecipe(( id: "body", name: "Body", parent: "mid" )),"#;
+        let p = pack(&format!("{base_ron}{mid}{child}"));
+        let cat = Catalog::merge(&[&p], &[]).unwrap();
+        // The child inherits list + scalar together and resolves identically
+        // to authoring both directly.
+        assert_eq!(
+            resolved_body(&cat, "body").fluid_medium,
+            shaped_body(
+                base_ron,
+                base_id,
+                r#"suppress: ["bond_albedo"], bond_albedo: 0.2,"#
+            )
+            .fluid_medium
+        );
+        // A child declaring its OWN suppress list replaces the parent's
+        // whole-value (the uniform field rule) — the still-inherited albedo
+        // scalar is then no longer admitted, and the wall says so loudly
+        // rather than half-merging the two lists.
+        let child2 = r#"BodyRecipe(( id: "body2", name: "Body2", parent: "mid",
+            suppress: ["greenhouse_delta_t"], greenhouse_delta_t: 10.0 )),"#;
+        let p2 = pack(&format!("{base_ron}{mid}{child2}"));
+        match Catalog::merge(&[&p2], &[]) {
+            Err(ContentError::InapplicableField { id, field }) => {
+                assert_eq!(id, "body2");
+                assert_eq!(field, "bond_albedo");
+            }
+            other => panic!("expected InapplicableField(bond_albedo), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn suppress_twice_is_idempotent() {
+        // Plan edge case: marking an already-suppressed field (authored + op,
+        // with a duplicated authored entry for good measure) is one marker,
+        // no error, and both sources stay visible in the ledger chain.
+        let (base_id, base_ron, _) = archetype_bases()[1];
+        let p = pack(&format!(
+            "{base_ron}{}",
+            shaped_child(
+                base_id,
+                r#"suppress: ["bond_albedo", "bond_albedo"], bond_albedo: 0.2,"#
+            )
+        ));
+        let s = override_set(
+            "scn",
+            "Scenario",
+            "",
+            r#"( target: Id("body"), field: "bond_albedo", op: Suppress ),"#,
+        );
+        let cat = Catalog::merge(&[&p], &[&s]).unwrap();
+        assert_eq!(
+            resolved_body(&cat, "body"),
+            shaped_body(
+                base_ron,
+                base_id,
+                r#"suppress: ["bond_albedo"], bond_albedo: 0.2,"#
+            )
+        );
+        // The redundant op still ledgers: the pack-authored list is the
+        // shadow, the override set is the current source.
+        let fp = &cat.get("body").unwrap().field_provenance["suppress"];
+        assert_eq!(
+            fp.source,
+            SourceRef::Override {
+                source: "scn".into(),
+                phase: OverridePhase::Scenario
+            }
+        );
+        assert_eq!(
+            fp.shadows,
+            vec![Shadow {
+                value: ProvValue::List(vec!["bond_albedo".into(), "bond_albedo".into()]),
+                source: SourceRef::Pack { id: "test".into() }
+            }]
+        );
+    }
+
+    #[test]
+    fn suppress_misuse_is_loud_and_typed() {
+        let (base_id, base_ron, _) = archetype_bases()[1];
+        let (moon_id, moon_ron, _) = archetype_bases()[0];
+        // (a) A fixed recipe has no generator to veto.
+        let fixed = pack(&derive_recipe(r#"suppress: ["bond_albedo"],"#));
+        match Catalog::merge(&[&fixed], &[]) {
+            Err(ContentError::InapplicableField { id, field }) => {
+                assert_eq!((id.as_str(), field), ("d1", "suppress"));
+            }
+            other => panic!("(a) expected InapplicableField(suppress), got {other:?}"),
+        }
+        // (b) The shape never draws it (recipe-authored path).
+        let p = pack(&format!(
+            "{moon_ron}{}",
+            shaped_child(
+                moon_id,
+                r#"suppress: ["ocean_temperature"], ocean_temperature: 280.0,"#
+            )
+        ));
+        match Catalog::merge(&[&p], &[]) {
+            Err(ContentError::InapplicableField { id, field }) => {
+                assert_eq!((id.as_str(), field), ("body", "ocean_temperature"));
+            }
+            other => panic!("(b) expected InapplicableField(ocean_temperature), got {other:?}"),
+        }
+        // (c) Not a drawn field anywhere: derived quantities are not
+        // suppressible (design I2) — recipe-authored path.
+        let p = pack(&format!(
+            "{base_ron}{}",
+            shaped_child(base_id, r#"suppress: ["mu"],"#)
+        ));
+        match Catalog::merge(&[&p], &[]) {
+            Err(ContentError::NotSuppressible { record, field }) => {
+                assert_eq!((record.as_str(), field.as_str()), ("body", "mu"));
+            }
+            other => panic!("(c) expected NotSuppressible(mu), got {other:?}"),
+        }
+        // (d) Same refusal at ladder time.
+        let p = pack(&format!("{base_ron}{}", shaped_child(base_id, "")));
+        let s = override_set(
+            "scn",
+            "Scenario",
+            "",
+            r#"( target: Id("body"), field: "mu", op: Suppress ),"#,
+        );
+        match Catalog::merge(&[&p], &[&s]) {
+            Err(ContentError::NotSuppressible { record, field }) => {
+                assert_eq!((record.as_str(), field.as_str()), ("body", "mu"));
+            }
+            other => panic!("(d) expected NotSuppressible(mu), got {other:?}"),
+        }
+        // (e) Suppress aimed at a kind with no generator at all.
+        let p = pack(&format!(
+            "{base_ron}{}Resource(( id: \"fuel\", density: 800.0 )),",
+            shaped_child(base_id, "")
+        ));
+        let s = override_set(
+            "scn",
+            "Scenario",
+            "",
+            r#"( target: Id("fuel"), field: "bond_albedo", op: Suppress ),"#,
+        );
+        match Catalog::merge(&[&p], &[&s]) {
+            Err(ContentError::UnknownField { record, field }) => {
+                assert_eq!((record.as_str(), field.as_str()), ("fuel", "bond_albedo"));
+            }
+            other => panic!("(e) expected UnknownField, got {other:?}"),
+        }
+        // (f) Suppressed with no explicit source: the scalar is now required.
+        let p = pack(&format!(
+            "{base_ron}{}",
+            shaped_child(base_id, r#"suppress: ["bond_albedo"],"#)
+        ));
+        match Catalog::merge(&[&p], &[]) {
+            Err(ContentError::MissingField { id, field }) => {
+                assert_eq!((id.as_str(), field), ("body", "bond_albedo"));
+            }
+            other => panic!("(f) expected MissingField(bond_albedo), got {other:?}"),
+        }
+        // (g) The explicit scalar obeys the band domain — one albedo domain
+        // across every arm (WI 889/893 posture).
+        let p = pack(&format!(
+            "{base_ron}{}",
+            shaped_child(base_id, r#"suppress: ["bond_albedo"], bond_albedo: 1.0,"#)
+        ));
+        match Catalog::merge(&[&p], &[]) {
+            Err(ContentError::UnphysicalValue { id, field }) => {
+                assert_eq!((id.as_str(), field), ("body", "bond_albedo"));
+            }
+            other => panic!("(g) expected UnphysicalValue(bond_albedo), got {other:?}"),
+        }
+        // (h) A scalar with NO matching suppress stays exactly as loud as
+        // WI 884 left it — presence never implies suppression (design I4).
+        let p = pack(&format!(
+            "{base_ron}{}",
+            shaped_child(base_id, r#"bond_albedo: 0.3,"#)
+        ));
+        match Catalog::merge(&[&p], &[]) {
+            Err(ContentError::InapplicableField { id, field }) => {
+                assert_eq!((id.as_str(), field), ("body", "bond_albedo"));
+            }
+            other => panic!("(h) expected InapplicableField(bond_albedo), got {other:?}"),
+        }
+        // (i) The suppress list itself is not a generic op target: the
+        // dedicated op is the only ladder spelling (no delete conflation).
+        let p = pack(&format!("{base_ron}{}", shaped_child(base_id, "")));
+        let s = override_set(
+            "scn",
+            "Scenario",
+            "",
+            r#"( target: Id("body"), field: "suppress", op: Extend(["bond_albedo"]) ),"#,
+        );
+        match Catalog::merge(&[&p], &[&s]) {
+            Err(ContentError::TypeMismatch { record, field, op }) => {
+                assert_eq!(
+                    (record.as_str(), field.as_str(), op),
+                    ("body", "suppress", "extend")
+                );
+            }
+            other => panic!("(i) expected TypeMismatch(suppress/extend), got {other:?}"),
+        }
     }
 
     #[test]
