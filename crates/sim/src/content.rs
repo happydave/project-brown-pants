@@ -746,7 +746,7 @@ struct RawBodyRecipe {
     /// Intent-level insolation, W/m² ("as if at nominal orbit", design C1).
     #[serde(default)]
     nominal_insolation: Option<f64>,
-    /// Bond albedo, 0–1.
+    /// Bond albedo, in `[0, 1)` — `1 − A` must stay positive for T_eq.
     #[serde(default)]
     bond_albedo: Option<f64>,
     /// Greenhouse warming above equilibrium, K.
@@ -2570,7 +2570,9 @@ fn validate(m: &RawRecord, merged: &HashMap<String, RawRecord>) -> Result<Record
                             if !(s.is_finite() && s >= 0.0) {
                                 return Err(unphysical("nominal_insolation"));
                             }
-                            if !(0.0..=1.0).contains(&a) {
+                            // Same domain as the band validation: `[0, 1)` —
+                            // `1 − A` must stay positive for T_eq (WI 893).
+                            if !(0.0..1.0).contains(&a) {
                                 return Err(unphysical("bond_albedo"));
                             }
                             body_derive::surface_temperature(
@@ -4473,6 +4475,44 @@ mod tests {
             }
             other => panic!("expected UnphysicalValue, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fixed_albedo_domain_is_half_open_like_the_bands() {
+        // WI 893: both resolve arms share one albedo domain, `[0, 1)`. The
+        // fixture varies only the thermal fields; everything else is valid.
+        let recipe = |thermal: &str| {
+            pack(&format!(
+                r#"BodyRecipe(( id: "d1", name: "D1",
+                    mu: 4.0e14, radius: 6.0e6, rotation_period: 86400.0,
+                    atmosphere_surface_pressure: 100000.0,
+                    nominal_insolation: 1361.0, {thermal} greenhouse_delta_t: 33.0,
+                    mean_molar_mass: 0.029,
+                    ocean_surface_density: 1000.0, ocean_density_gradient: 0.0,
+                    ocean_temperature: 285.0, surface_seed: 7 )),"#
+            ))
+        };
+        // Exactly 1.0 on the derive path: refused loudly, naming the input —
+        // not a silent T_eq = 0 K body (band parity: the shaped arm already
+        // refuses any bound touching 1.0).
+        match Catalog::merge(&[&recipe("bond_albedo: 1.0,")], &[]) {
+            Err(ContentError::UnphysicalValue { id, field }) => {
+                assert_eq!(id, "d1");
+                assert_eq!(field, "bond_albedo");
+            }
+            other => panic!("expected UnphysicalValue(bond_albedo), got {other:?}"),
+        }
+        // Just inside the boundary: resolves as before (the domain is
+        // half-open at exactly 1.0, nothing below it moved).
+        Catalog::merge(&[&recipe("bond_albedo: 0.999,")], &[])
+            .expect("albedo just below 1 resolves");
+        // A pinned temperature short-circuits the derivation, so the unused
+        // albedo is never consumed — the WI 886 posture, preserved.
+        Catalog::merge(
+            &[&recipe("bond_albedo: 1.0, atmosphere_temperature: 285.0,")],
+            &[],
+        )
+        .expect("pinned T_surf never consumes the albedo");
     }
 
     #[test]
