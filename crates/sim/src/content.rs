@@ -771,7 +771,7 @@ struct RawBodyRecipe {
     /// Bond albedo, in `[0, 1)` — `1 − A` must stay positive for T_eq.
     #[serde(default)]
     bond_albedo: Option<f64>,
-    /// Greenhouse warming above equilibrium, K.
+    /// Greenhouse warming above equilibrium, K — finite, ≥ 0.
     #[serde(default)]
     greenhouse_delta_t: Option<f64>,
     /// Mean molar mass of the atmosphere, kg/mol.
@@ -2736,6 +2736,11 @@ fn validate(m: &RawRecord, merged: &HashMap<String, RawRecord>) -> Result<Record
                             // `1 − A` must stay positive for T_eq (WI 893).
                             if !(0.0..1.0).contains(&a) {
                                 return Err(unphysical("bond_albedo"));
+                            }
+                            // Same domain as the bands and the suppressed
+                            // scalar: greenhouse is *warming*, ΔT ≥ 0 (WI 895).
+                            if !(dt.is_finite() && dt >= 0.0) {
+                                return Err(unphysical("greenhouse_delta_t"));
                             }
                             body_derive::surface_temperature(
                                 body_derive::equilibrium_temperature(s, a),
@@ -5014,6 +5019,54 @@ mod tests {
             &[],
         )
         .expect("pinned T_surf never consumes the albedo");
+    }
+
+    #[test]
+    fn fixed_greenhouse_domain_is_nonnegative_like_the_bands() {
+        // WI 895: the thermal trio's last unguarded input. All three ΔT
+        // doors (bands, suppressed scalar, fixed arm) share one domain:
+        // finite, ≥ 0 — greenhouse is *warming* above equilibrium.
+        let recipe = |thermal: &str| {
+            pack(&format!(
+                r#"BodyRecipe(( id: "d1", name: "D1",
+                    mu: 4.0e14, radius: 6.0e6, rotation_period: 86400.0,
+                    atmosphere_surface_pressure: 100000.0,
+                    nominal_insolation: 1361.0, bond_albedo: 0.3, {thermal}
+                    mean_molar_mass: 0.029,
+                    ocean_surface_density: 1000.0, ocean_density_gradient: 0.0,
+                    ocean_temperature: 285.0, surface_seed: 7 )),"#
+            ))
+        };
+        // Negative and non-finite on the derive path: refused loudly,
+        // naming the input — not a silently sub-equilibrium body.
+        for bad in ["greenhouse_delta_t: -10.0,", "greenhouse_delta_t: inf,"] {
+            match Catalog::merge(&[&recipe(bad)], &[]) {
+                Err(ContentError::UnphysicalValue { id, field }) => {
+                    assert_eq!(id, "d1");
+                    assert_eq!(field, "greenhouse_delta_t");
+                }
+                other => panic!("{bad}: expected UnphysicalValue, got {other:?}"),
+            }
+        }
+        // The zero boundary is legal — no greenhouse means T_surf = T_eq
+        // bit-exactly (the airless posture, shared with the Moon arm).
+        let cat = Catalog::merge(&[&recipe("greenhouse_delta_t: 0.0,")], &[])
+            .expect("zero greenhouse resolves");
+        assert_eq!(
+            resolved_body(&cat, "d1")
+                .fluid_medium
+                .atmosphere_temperature,
+            body_derive::equilibrium_temperature(1361.0, 0.3)
+        );
+        // A pinned temperature short-circuits the derivation, so the unused
+        // ΔT is never consumed — the WI 886 posture, preserved.
+        Catalog::merge(
+            &[&recipe(
+                "greenhouse_delta_t: -5.0, atmosphere_temperature: 285.0,",
+            )],
+            &[],
+        )
+        .expect("pinned T_surf never consumes the greenhouse delta");
     }
 
     #[test]
