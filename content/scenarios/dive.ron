@@ -7,7 +7,7 @@
 // packs/settings/overrides — the world and the craft are the content.
 #![enable(implicit_some)]
 (
-    format: 1,
+    format: 2,
     id: "dive",
     name: "The Dive",
     world: Earthlike,

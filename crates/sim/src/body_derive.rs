@@ -62,6 +62,30 @@ pub(crate) const fn scale_height(t_surf: f64, mean_molar_mass: f64, gravity: f64
     GAS_CONSTANT * t_surf / (mean_molar_mass * gravity)
 }
 
+/// Ocean gating — a *presence* decision, applied last, wins over pins/draws
+/// (WI 886, shared with the sampled path since WI 889): an authored/drawn
+/// ocean (`density > 0`) that is frozen (surface temperature at/below the
+/// classifier freeze point — never the WI-875 presentation offset) or airless
+/// (`P_atm == 0`) has no liquid — the `(density, pressure, gradient)` trio
+/// zeroes; otherwise it passes through. The **single implementation** for
+/// both resolve arms.
+pub(crate) fn gate_ocean(
+    t_surf: f64,
+    atmosphere_surface_pressure: f64,
+    density: f64,
+    pressure: f64,
+    gradient: f64,
+) -> (f64, f64, f64) {
+    let present = density > 0.0;
+    let gated_off = present
+        && (t_surf <= crate::biome::OCEAN_FREEZE_THRESHOLD_K || atmosphere_surface_pressure == 0.0);
+    if gated_off {
+        (0.0, 0.0, 0.0)
+    } else {
+        (density, pressure, gradient)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

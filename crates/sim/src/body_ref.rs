@@ -327,6 +327,34 @@ mod tests {
         assert!(r.regenerate().is_ok(), "the caller may still reroll");
     }
 
+    /// WI 889 (kept-body semantics, workitem AC 3): a ref recorded at output
+    /// version **2** — the real predecessor of the batched stream break —
+    /// resolves to the designed deliberate-reroll fork, and `regenerate()`
+    /// past it yields the version-3 body. Regeneration at the old values is
+    /// retired: nothing can recreate the version-2 output from the ref.
+    #[test]
+    fn version_two_era_refs_reroll_to_the_version_three_body() {
+        assert_eq!(BODY_OUTPUT_VERSION, 3, "this test narrates the 2 → 3 break");
+        let mut r = BodyRef::for_generated(Archetype::RockyPlanet, 11);
+        r.output_version = 2;
+        r.digest = "feedfacefeedface".to_string(); // v2-era digest, unverifiable now
+        match r.resolve() {
+            Err(BodyRefError::OutputVersionMoved {
+                recorded, current, ..
+            }) => {
+                assert_eq!(recorded, 2);
+                assert_eq!(current, 3);
+            }
+            other => panic!("expected OutputVersionMoved, got {other:?}"),
+        }
+        let rerolled = r.regenerate().expect("deliberate reroll");
+        assert_eq!(
+            rerolled,
+            crate::bodygen::generate(11, Archetype::RockyPlanet),
+            "the reroll is the current-generator body"
+        );
+    }
+
     /// Unresolvable sources are typed and name the offender (scenarios A4 and
     /// the unknown-archetype edge case).
     #[test]

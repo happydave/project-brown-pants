@@ -7,7 +7,7 @@
 // director path.
 #![enable(implicit_some)]
 (
-    format: 1,
+    format: 2,
     id: "harbor",
     name: "Harbor",
     world: Earthlike,

@@ -3,7 +3,7 @@
 // override layers (WIs 548/549), never here.
 #![enable(implicit_some)]
 (
-    format: 1,
+    format: 2,
     id: "core",
     version: "0.1.0",
     records: [

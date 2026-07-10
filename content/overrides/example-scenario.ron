@@ -3,7 +3,7 @@
 // on an abstract base re-flows to every variant (bulk tuning by one line).
 // Balance stays a modifier over real physics, never a replacement.
 (
-    format: 1,
+    format: 2,
     id: "example-scenario",
     phase: Scenario,
     overrides: [

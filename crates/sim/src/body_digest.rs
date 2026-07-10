@@ -35,18 +35,23 @@
 //! set stores maps sorted); `f64` as `to_bits` little-endian; integers
 //! little-endian.
 //!
-//! **Deliberate-break policy** (recorded WI 888, updated WI 892): the
-//! surface-layer stack landed at output version 2 — a **layout** bump only
-//! (rendered/physical behavior unchanged; equivalence tested). The two known
-//! intentional **stream** breaks — hash-derived child seeds (vs today's
-//! `seed ^ salt`) and sampled-path derivation — remain deferred and batched
-//! into the follow-up break WI, which takes the next bump with this harness
-//! auditing the regeneration. Note the boundary this harness does *not* yet
-//! cover: surface **heights** are excluded from goldens because the
-//! height/ejecta path still uses libm transcendentals (`exp`, `acos`, trig —
-//! a known, tracked violation of the design's no-libm noise rule; see the
-//! follow-up work item), so height bits are not cross-platform-stable yet.
-//! Body *resolution* is clean: `bodygen`/`body_derive` are integer-splitmix +
+//! **Deliberate-break policy** (recorded WI 888, updated WI 892/889): the
+//! surface-layer stack landed at output version 2 (a **layout** bump), and
+//! the two batched intentional **stream** breaks landed together at output
+//! version 3 (WI 889): hash-derived per-field child seeds (replacing
+//! `seed ^ salt` — the domain-tag strings in `bodygen` are output-contract
+//! inputs) and sampled-path derivation (archetype bands draw the independent
+//! set; the medium derives via `body_derive`). Bodies kept/saved at version
+//! ≤ 2 still **load** (snapshots bypass derive; refs/digest records carry
+//! their recorded version) but are **no longer regenerable at their old
+//! values** — resolution reports the version move as the deliberate-reroll
+//! fork (catalog-vs-snapshot, design I3). Note the boundary this harness
+//! does *not* yet cover: surface **heights** are excluded from goldens
+//! because the height/ejecta path still uses libm transcendentals (`exp`,
+//! `acos`, trig — a known, tracked violation of the design's no-libm noise
+//! rule; see WI 890, which executes inside this same version-3 break
+//! window), so height bits are not cross-platform-stable yet. Body
+//! *resolution* is clean: `bodygen`/`body_derive` are integer-splitmix +
 //! sqrt only.
 
 use crate::body_asset::BodyAsset;
@@ -55,8 +60,10 @@ use crate::body_asset::BodyAsset;
 /// generator output is meant to change, and regenerate the golden file in the
 /// same commit (the regeneration test refuses digest changes without a bump).
 /// History: 1 = WI 888 baseline; 2 = WI 892 surface-layer stack (canonical
-/// layout change only — no value/stream change).
-pub const BODY_OUTPUT_VERSION: u32 = 2;
+/// layout change only — no value/stream change); 3 = WI 889 batched stream
+/// breaks (hash-derived per-field child seeds + sampled-path derivation —
+/// every `gen:` row moved, the two `canonical:` rows byte-identical).
+pub const BODY_OUTPUT_VERSION: u32 = 3;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;

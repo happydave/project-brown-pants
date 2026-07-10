@@ -4,7 +4,7 @@
 // ramped over 1.5 s — an accepted migration deviation (plan, Stage 1).
 #![enable(implicit_some)]
 (
-    format: 1,
+    format: 2,
     id: "liftoff",
     name: "Liftoff",
     offer: Immediate,

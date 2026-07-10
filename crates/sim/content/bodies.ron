@@ -18,7 +18,7 @@
 // future authored children.
 #![enable(implicit_some)]
 (
-    format: 1,
+    format: 2,
     id: "sim-canonical-bodies",
     version: "1",
     records: [
@@ -59,7 +59,15 @@
             parent: "earthlike",
             surface_temperature_offset: -40.15,
         )),
-        // Archetypes: the historic generator bands (WI 762 literals), as data.
+        // Archetypes (WI 889): bands express the drawn INDEPENDENT set — the
+        // medium (temperature, density, scale height) is DERIVED via the same
+        // `body_derive` relations the fixed recipes use, never drawn directly.
+        // Earth anchors: S ≈ 1361 W/m², A ≈ 0.29, ΔT_greenhouse ≈ 33 K,
+        // M = 0.0289644 kg/mol. Derived spans at the band-box corners (noted
+        // per shape below) approximate the retired direct bands; density and
+        // scale-height spans come out wider than the old direct bands — that
+        // is the point of derivation (a light atmosphere on a low-g world IS
+        // puffy), and populations shift under this deliberate values bump.
         BodyRecipe((
             id: "moon",
             name: "Moon",
@@ -68,6 +76,11 @@
             radius_min: 2.0e5, radius_max: 2.0e6,
             gravity_min: 0.5, gravity_max: 3.0,
             rotation_period_min: 20000.0, rotation_period_max: 200000.0,
+            // Airless: T_surf = T_eq(S, A), greenhouse zero. Corner span
+            // ~155 K (S=200, A=0.35) to ~335 K (S=3000, A=0.05) — replaces
+            // the old literal 200 K with sun-near/sun-far variety.
+            nominal_insolation_min: 200.0, nominal_insolation_max: 3000.0,
+            bond_albedo_min: 0.05, bond_albedo_max: 0.35,
         )),
         BodyRecipe((
             id: "rocky",
@@ -78,9 +91,14 @@
             gravity_min: 3.0, gravity_max: 12.0,
             rotation_period_min: 20000.0, rotation_period_max: 200000.0,
             atmosphere_surface_pressure_min: 50000.0, atmosphere_surface_pressure_max: 150000.0,
-            atmosphere_surface_density_min: 0.2, atmosphere_surface_density_max: 2.0,
-            atmosphere_scale_height_min: 5000.0, atmosphere_scale_height_max: 12000.0,
-            atmosphere_temperature_min: 220.0, atmosphere_temperature_max: 300.0,
+            // T_surf corner span ~219.5 K (S=800, A=0.4, ΔT=5) to ~338.5 K
+            // (S=2000, A=0.1, ΔT=40) — approximates the retired direct
+            // 220–300 K band. Derived density ~0.36–3.7 kg/m³ (was 0.2–2.0);
+            // derived scale height ~3.4–47 km (was 5–12 km).
+            nominal_insolation_min: 800.0, nominal_insolation_max: 2000.0,
+            bond_albedo_min: 0.1, bond_albedo_max: 0.4,
+            greenhouse_delta_t_min: 5.0, greenhouse_delta_t_max: 40.0,
+            mean_molar_mass_min: 0.02, mean_molar_mass_max: 0.045,
         )),
         BodyRecipe((
             id: "ocean",
@@ -91,9 +109,16 @@
             gravity_min: 5.0, gravity_max: 12.0,
             rotation_period_min: 20000.0, rotation_period_max: 200000.0,
             atmosphere_surface_pressure_min: 80000.0, atmosphere_surface_pressure_max: 180000.0,
-            atmosphere_surface_density_min: 0.5, atmosphere_surface_density_max: 2.5,
-            atmosphere_scale_height_min: 6000.0, atmosphere_scale_height_max: 12000.0,
-            atmosphere_temperature_min: 250.0, atmosphere_temperature_max: 300.0,
+            // T_surf corner span ~281.4 K (S=1400, A=0.3, ΔT=25) to ~334.2 K
+            // (S=2000, A=0.15, ΔT=40): every corner clears the 254 K ocean
+            // freeze gate with margin, so the canonical ocean world always
+            // keeps its liquid ocean (the gating mechanism is uniform, but
+            // these bands never trip it). Derived density ~0.52–2.3 kg/m³
+            // (was 0.5–2.5); derived scale height ~6.5–31 km (was 6–12 km).
+            nominal_insolation_min: 1400.0, nominal_insolation_max: 2000.0,
+            bond_albedo_min: 0.15, bond_albedo_max: 0.3,
+            greenhouse_delta_t_min: 25.0, greenhouse_delta_t_max: 40.0,
+            mean_molar_mass_min: 0.018, mean_molar_mass_max: 0.03,
             ocean_surface_density_min: 950.0, ocean_surface_density_max: 1100.0,
             ocean_temperature_min: 275.0, ocean_temperature_max: 300.0,
         )),

@@ -410,7 +410,7 @@ mod tests {
 
     #[test]
     fn parse_validates_format_and_vacuousness() {
-        let good = r#"(format: 1, id: "m", name: "M",
+        let good = r#"(format: 2, id: "m", name: "M",
             objective: AltitudeAbove(100.0),
             effects: [Lore("nice hop")])"#;
         let m = parse_mission(good).unwrap();
@@ -422,11 +422,11 @@ mod tests {
             Err(MissionError::Format { found: 9 })
         ));
         assert!(matches!(
-            parse_mission(r#"(format: 1, id: "m", name: "M", objective: All([]))"#),
+            parse_mission(r#"(format: 2, id: "m", name: "M", objective: All([]))"#),
             Err(MissionError::VacuousObjective)
         ));
         assert!(matches!(
-            parse_mission(r#"(format: 1, id: "m", name: "M", objective: Airborne, surprise: 1)"#),
+            parse_mission(r#"(format: 2, id: "m", name: "M", objective: Airborne, surprise: 1)"#),
             Err(MissionError::Parse(_))
         ));
     }
@@ -435,7 +435,7 @@ mod tests {
     fn command_effects_are_the_envelope() {
         // An effect carrying a real Command round-trips through serde (the
         // document is data; the command is the same envelope the bus uses).
-        let text = r#"(format: 1, id: "m", name: "M",
+        let text = r#"(format: 2, id: "m", name: "M",
             objective: Airborne,
             effects: [Command(SetWarp(4.0)), Lore("go")])"#;
         let m = parse_mission(text).unwrap();

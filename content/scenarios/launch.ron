@@ -3,7 +3,7 @@
 // auto-throttle, now a mission effect through the command envelope).
 #![enable(implicit_some)]
 (
-    format: 1,
+    format: 2,
     id: "launch",
     name: "Launch — surface lift-off",
     world: Earthlike,

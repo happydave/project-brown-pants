@@ -71,7 +71,6 @@
 //! Headless and rendering-free. The sim does not consume the catalog yet
 //! (WI 550's scope).
 
-use crate::biome::OCEAN_FREEZE_THRESHOLD_K;
 use crate::body_asset::{BodyAsset, Rotation, SurfaceRecipe};
 use crate::body_derive;
 use crate::bodygen::{self, Archetype, ArchetypeBands};
@@ -87,7 +86,16 @@ use std::sync::OnceLock;
 /// Version of the authored content-document *format* (packs and override
 /// sets; not of any pack's content). Rejected loudly when a document declares
 /// anything else. Increments only on a schema change to the document shapes.
-pub const CONTENT_FORMAT_VERSION: u32 = 1;
+///
+/// History: 1 = through WI 892. 2 = WI 889 — the archetype band vocabulary
+/// swapped to the drawn independent set (`nominal_insolation` / `bond_albedo`
+/// / `greenhouse_delta_t` / `mean_molar_mass` band pairs replace the direct
+/// `atmosphere_surface_density`/`_scale_height`/`_temperature` pairs), the
+/// project's first non-additive pack-grammar change. Stale packs are refused
+/// **by version** via the header-first probe in `merge_composition` (the
+/// [`crate::persist`] two-stage-probe pattern) — never by an incidental
+/// unknown-field parse error.
+pub const CONTENT_FORMAT_VERSION: u32 = 2;
 
 /// Field names that overrides may never target: record identity and
 /// inheritance topology are definitions, not tunables.
@@ -747,10 +755,13 @@ struct RawBodyRecipe {
     /// Mean molar mass of the atmosphere, kg/mol.
     #[serde(default)]
     mean_molar_mass: Option<f64>,
-    // Archetype bands (WI 883) — the `[min, max)` ranges the sampler draws when
-    // `shape` is set. Each bound is an independent, ladder-tunable field; a shape
-    // requires only the bounds it draws (Moon: radius/gravity/rotation; Rocky adds
-    // the four atmosphere bands; Ocean adds the two ocean bands).
+    // Archetype bands (WI 883, re-vocabularied WI 889) — the `[min, max)`
+    // ranges the sampler draws when `shape` is set. Each bound is an
+    // independent, ladder-tunable field; a shape requires only the bounds it
+    // draws (Moon: radius/gravity/rotation + insolation/albedo; Rocky adds
+    // pressure/greenhouse/molar-mass; Ocean adds the two ocean bands). The
+    // medium is **derived** from the drawn independents via `body_derive` —
+    // there are no direct temperature/density/scale-height bands.
     #[serde(default)]
     radius_min: Option<f64>,
     #[serde(default)]
@@ -768,17 +779,21 @@ struct RawBodyRecipe {
     #[serde(default)]
     atmosphere_surface_pressure_max: Option<f64>,
     #[serde(default)]
-    atmosphere_surface_density_min: Option<f64>,
+    nominal_insolation_min: Option<f64>,
     #[serde(default)]
-    atmosphere_surface_density_max: Option<f64>,
+    nominal_insolation_max: Option<f64>,
     #[serde(default)]
-    atmosphere_scale_height_min: Option<f64>,
+    bond_albedo_min: Option<f64>,
     #[serde(default)]
-    atmosphere_scale_height_max: Option<f64>,
+    bond_albedo_max: Option<f64>,
     #[serde(default)]
-    atmosphere_temperature_min: Option<f64>,
+    greenhouse_delta_t_min: Option<f64>,
     #[serde(default)]
-    atmosphere_temperature_max: Option<f64>,
+    greenhouse_delta_t_max: Option<f64>,
+    #[serde(default)]
+    mean_molar_mass_min: Option<f64>,
+    #[serde(default)]
+    mean_molar_mass_max: Option<f64>,
     #[serde(default)]
     ocean_surface_density_min: Option<f64>,
     #[serde(default)]
@@ -837,24 +852,14 @@ impl RawBodyRecipe {
             atmosphere_surface_pressure_max: self
                 .atmosphere_surface_pressure_max
                 .or(p.atmosphere_surface_pressure_max),
-            atmosphere_surface_density_min: self
-                .atmosphere_surface_density_min
-                .or(p.atmosphere_surface_density_min),
-            atmosphere_surface_density_max: self
-                .atmosphere_surface_density_max
-                .or(p.atmosphere_surface_density_max),
-            atmosphere_scale_height_min: self
-                .atmosphere_scale_height_min
-                .or(p.atmosphere_scale_height_min),
-            atmosphere_scale_height_max: self
-                .atmosphere_scale_height_max
-                .or(p.atmosphere_scale_height_max),
-            atmosphere_temperature_min: self
-                .atmosphere_temperature_min
-                .or(p.atmosphere_temperature_min),
-            atmosphere_temperature_max: self
-                .atmosphere_temperature_max
-                .or(p.atmosphere_temperature_max),
+            nominal_insolation_min: self.nominal_insolation_min.or(p.nominal_insolation_min),
+            nominal_insolation_max: self.nominal_insolation_max.or(p.nominal_insolation_max),
+            bond_albedo_min: self.bond_albedo_min.or(p.bond_albedo_min),
+            bond_albedo_max: self.bond_albedo_max.or(p.bond_albedo_max),
+            greenhouse_delta_t_min: self.greenhouse_delta_t_min.or(p.greenhouse_delta_t_min),
+            greenhouse_delta_t_max: self.greenhouse_delta_t_max.or(p.greenhouse_delta_t_max),
+            mean_molar_mass_min: self.mean_molar_mass_min.or(p.mean_molar_mass_min),
+            mean_molar_mass_max: self.mean_molar_mass_max.or(p.mean_molar_mass_max),
             ocean_surface_density_min: self
                 .ocean_surface_density_min
                 .or(p.ocean_surface_density_min),
@@ -1407,16 +1412,14 @@ fn slot<'a>(rec: &'a mut RawRecord, field: &str) -> Option<Slot<'a>> {
             "atmosphere_surface_pressure_max" => {
                 Some(Slot::Num(&mut b.atmosphere_surface_pressure_max))
             }
-            "atmosphere_surface_density_min" => {
-                Some(Slot::Num(&mut b.atmosphere_surface_density_min))
-            }
-            "atmosphere_surface_density_max" => {
-                Some(Slot::Num(&mut b.atmosphere_surface_density_max))
-            }
-            "atmosphere_scale_height_min" => Some(Slot::Num(&mut b.atmosphere_scale_height_min)),
-            "atmosphere_scale_height_max" => Some(Slot::Num(&mut b.atmosphere_scale_height_max)),
-            "atmosphere_temperature_min" => Some(Slot::Num(&mut b.atmosphere_temperature_min)),
-            "atmosphere_temperature_max" => Some(Slot::Num(&mut b.atmosphere_temperature_max)),
+            "nominal_insolation_min" => Some(Slot::Num(&mut b.nominal_insolation_min)),
+            "nominal_insolation_max" => Some(Slot::Num(&mut b.nominal_insolation_max)),
+            "bond_albedo_min" => Some(Slot::Num(&mut b.bond_albedo_min)),
+            "bond_albedo_max" => Some(Slot::Num(&mut b.bond_albedo_max)),
+            "greenhouse_delta_t_min" => Some(Slot::Num(&mut b.greenhouse_delta_t_min)),
+            "greenhouse_delta_t_max" => Some(Slot::Num(&mut b.greenhouse_delta_t_max)),
+            "mean_molar_mass_min" => Some(Slot::Num(&mut b.mean_molar_mass_min)),
+            "mean_molar_mass_max" => Some(Slot::Num(&mut b.mean_molar_mass_max)),
             "ocean_surface_density_min" => Some(Slot::Num(&mut b.ocean_surface_density_min)),
             "ocean_surface_density_max" => Some(Slot::Num(&mut b.ocean_surface_density_max)),
             "ocean_temperature_min" => Some(Slot::Num(&mut b.ocean_temperature_min)),
@@ -1493,12 +1496,14 @@ fn field_names(kind: RecordKind) -> &'static [&'static str] {
             "rotation_period_max",
             "atmosphere_surface_pressure_min",
             "atmosphere_surface_pressure_max",
-            "atmosphere_surface_density_min",
-            "atmosphere_surface_density_max",
-            "atmosphere_scale_height_min",
-            "atmosphere_scale_height_max",
-            "atmosphere_temperature_min",
-            "atmosphere_temperature_max",
+            "nominal_insolation_min",
+            "nominal_insolation_max",
+            "bond_albedo_min",
+            "bond_albedo_max",
+            "greenhouse_delta_t_min",
+            "greenhouse_delta_t_max",
+            "mean_molar_mass_min",
+            "mean_molar_mass_max",
             "ocean_surface_density_min",
             "ocean_surface_density_max",
             "ocean_temperature_min",
@@ -1790,10 +1795,31 @@ fn merge_composition(
     settings_texts: &[&str],
     override_texts: &[&str],
 ) -> Result<Catalog, ContentError> {
-    // Parse + format-check every document.
+    // Parse + format-check every document. Packs get a **header-first**
+    // format probe (WI 889): the typed `RawPack` parse is `deny_unknown_fields`
+    // over the record grammar, so a stale-format pack authoring since-retired
+    // fields would otherwise die as an incidental unknown-field parse error
+    // without ever reaching the version gate — for exactly the document class
+    // the version exists to refuse. The lenient probe reads only `format`
+    // (the `persist` two-stage-probe pattern), so refusal is by version,
+    // loud and named, regardless of what fields the document authors.
+    #[derive(Deserialize)]
+    struct FormatProbe {
+        format: u32,
+    }
     let mut packs = Vec::with_capacity(pack_texts.len());
     for text in pack_texts {
+        let probe: FormatProbe =
+            ron::from_str(text).map_err(|e| ContentError::Parse(e.to_string()))?;
+        if probe.format != CONTENT_FORMAT_VERSION {
+            return Err(ContentError::Format {
+                found: probe.format,
+            });
+        }
         let p: RawPack = ron::from_str(text).map_err(|e| ContentError::Parse(e.to_string()))?;
+        // The typed gate stays authoritative (the probe read the same bytes,
+        // so this can only agree — it exists so the typed field is the one
+        // the contract hangs on).
         if p.format != CONTENT_FORMAT_VERSION {
             return Err(ContentError::Format { found: p.format });
         }
@@ -2251,8 +2277,10 @@ fn validate(m: &RawRecord, merged: &HashMap<String, RawRecord>) -> Result<Record
                 (b.gravity.is_some(), "gravity"),
                 (b.atmosphere_temperature.is_some(), "atmosphere_temperature"),
                 (b.ocean_temperature.is_some(), "ocean_temperature"),
-                // Derivation inputs (WI 886) are fixed-mode-only too: a shaped
-                // recipe's medium comes from its bands, not the relations.
+                // The scalar derivation inputs (WI 886) are fixed-mode-only
+                // too: a shaped recipe authors the same independents as
+                // `_min`/`_max` BANDS (WI 889) and both modes feed the same
+                // `body_derive` relations.
                 (b.nominal_insolation.is_some(), "nominal_insolation"),
                 (b.bond_albedo.is_some(), "bond_albedo"),
                 (b.greenhouse_delta_t.is_some(), "greenhouse_delta_t"),
@@ -2273,30 +2301,14 @@ fn validate(m: &RawRecord, merged: &HashMap<String, RawRecord>) -> Result<Record
                     b.atmosphere_surface_pressure_max.is_some(),
                     "atmosphere_surface_pressure_max",
                 ),
-                (
-                    b.atmosphere_surface_density_min.is_some(),
-                    "atmosphere_surface_density_min",
-                ),
-                (
-                    b.atmosphere_surface_density_max.is_some(),
-                    "atmosphere_surface_density_max",
-                ),
-                (
-                    b.atmosphere_scale_height_min.is_some(),
-                    "atmosphere_scale_height_min",
-                ),
-                (
-                    b.atmosphere_scale_height_max.is_some(),
-                    "atmosphere_scale_height_max",
-                ),
-                (
-                    b.atmosphere_temperature_min.is_some(),
-                    "atmosphere_temperature_min",
-                ),
-                (
-                    b.atmosphere_temperature_max.is_some(),
-                    "atmosphere_temperature_max",
-                ),
+                (b.nominal_insolation_min.is_some(), "nominal_insolation_min"),
+                (b.nominal_insolation_max.is_some(), "nominal_insolation_max"),
+                (b.bond_albedo_min.is_some(), "bond_albedo_min"),
+                (b.bond_albedo_max.is_some(), "bond_albedo_max"),
+                (b.greenhouse_delta_t_min.is_some(), "greenhouse_delta_t_min"),
+                (b.greenhouse_delta_t_max.is_some(), "greenhouse_delta_t_max"),
+                (b.mean_molar_mass_min.is_some(), "mean_molar_mass_min"),
+                (b.mean_molar_mass_max.is_some(), "mean_molar_mass_max"),
                 (
                     b.ocean_surface_density_min.is_some(),
                     "ocean_surface_density_min",
@@ -2361,120 +2373,151 @@ fn validate(m: &RawRecord, merged: &HashMap<String, RawRecord>) -> Result<Record
                 // The scalar fields are unused here; identity + classifier offset
                 // come from the recipe, everything else from the seeded draw.
                 Some(shape) => {
+                    let unphysical = |field: &'static str| ContentError::UnphysicalValue {
+                        id: b.id.clone(),
+                        field,
+                    };
+                    // A used band requires both bounds; every used band must be
+                    // finite and ordered (min ≤ max), and the drawn-independent
+                    // bands respect their physical domains (WI 889 — the WI 886
+                    // `UnphysicalValue` posture extended to bounds; a violating
+                    // band names the record and the offending bound).
                     let band = |lo: Option<f64>,
                                 hi: Option<f64>,
                                 fmin: &'static str,
                                 fmax: &'static str| {
-                        Ok::<(f64, f64), ContentError>((req(lo, fmin)?, req(hi, fmax)?))
+                        let lo = req(lo, fmin)?;
+                        let hi = req(hi, fmax)?;
+                        if !lo.is_finite() {
+                            return Err(unphysical(fmin));
+                        }
+                        if !hi.is_finite() {
+                            return Err(unphysical(fmax));
+                        }
+                        if lo > hi {
+                            return Err(unphysical(fmin));
+                        }
+                        Ok::<(f64, f64), ContentError>((lo, hi))
+                    };
+                    let physical = |(lo, hi): (f64, f64),
+                                    ok: &dyn Fn(f64) -> bool,
+                                    fmin: &'static str,
+                                    fmax: &'static str| {
+                        if !ok(lo) {
+                            return Err(unphysical(fmin));
+                        }
+                        if !ok(hi) {
+                            return Err(unphysical(fmax));
+                        }
+                        Ok(())
+                    };
+                    // The drawn independents every shape needs (the medium
+                    // derives from them, WI 889): insolation ≥ 0, albedo in
+                    // [0, 1) — `1 − A` must stay positive for T_eq.
+                    let insolation = band(
+                        b.nominal_insolation_min,
+                        b.nominal_insolation_max,
+                        "nominal_insolation_min",
+                        "nominal_insolation_max",
+                    )?;
+                    physical(
+                        insolation,
+                        &|v| v >= 0.0,
+                        "nominal_insolation_min",
+                        "nominal_insolation_max",
+                    )?;
+                    let albedo = band(
+                        b.bond_albedo_min,
+                        b.bond_albedo_max,
+                        "bond_albedo_min",
+                        "bond_albedo_max",
+                    )?;
+                    physical(
+                        albedo,
+                        &|v| (0.0..1.0).contains(&v),
+                        "bond_albedo_min",
+                        "bond_albedo_max",
+                    )?;
+                    // The atmosphere trio (Rocky/Ocean): greenhouse ≥ 0,
+                    // molar mass > 0.
+                    let atmosphere = |b: &RawBodyRecipe| {
+                        let pressure = band(
+                            b.atmosphere_surface_pressure_min,
+                            b.atmosphere_surface_pressure_max,
+                            "atmosphere_surface_pressure_min",
+                            "atmosphere_surface_pressure_max",
+                        )?;
+                        let greenhouse = band(
+                            b.greenhouse_delta_t_min,
+                            b.greenhouse_delta_t_max,
+                            "greenhouse_delta_t_min",
+                            "greenhouse_delta_t_max",
+                        )?;
+                        physical(
+                            greenhouse,
+                            &|v| v >= 0.0,
+                            "greenhouse_delta_t_min",
+                            "greenhouse_delta_t_max",
+                        )?;
+                        let molar_mass = band(
+                            b.mean_molar_mass_min,
+                            b.mean_molar_mass_max,
+                            "mean_molar_mass_min",
+                            "mean_molar_mass_max",
+                        )?;
+                        physical(
+                            molar_mass,
+                            &|v| v > 0.0,
+                            "mean_molar_mass_min",
+                            "mean_molar_mass_max",
+                        )?;
+                        Ok::<_, ContentError>((pressure, greenhouse, molar_mass))
+                    };
+                    let common = ArchetypeBands {
+                        radius: band(b.radius_min, b.radius_max, "radius_min", "radius_max")?,
+                        gravity: band(b.gravity_min, b.gravity_max, "gravity_min", "gravity_max")?,
+                        sidereal_period: band(
+                            b.rotation_period_min,
+                            b.rotation_period_max,
+                            "rotation_period_min",
+                            "rotation_period_max",
+                        )?,
+                        nominal_insolation: insolation,
+                        bond_albedo: albedo,
+                        ..ArchetypeBands::default()
                     };
                     let bands = match shape {
-                        Archetype::Moon => ArchetypeBands {
-                            radius: band(b.radius_min, b.radius_max, "radius_min", "radius_max")?,
-                            gravity: band(
-                                b.gravity_min,
-                                b.gravity_max,
-                                "gravity_min",
-                                "gravity_max",
-                            )?,
-                            sidereal_period: band(
-                                b.rotation_period_min,
-                                b.rotation_period_max,
-                                "rotation_period_min",
-                                "rotation_period_max",
-                            )?,
-                            ..ArchetypeBands::default()
-                        },
-                        Archetype::RockyPlanet => ArchetypeBands {
-                            radius: band(b.radius_min, b.radius_max, "radius_min", "radius_max")?,
-                            gravity: band(
-                                b.gravity_min,
-                                b.gravity_max,
-                                "gravity_min",
-                                "gravity_max",
-                            )?,
-                            sidereal_period: band(
-                                b.rotation_period_min,
-                                b.rotation_period_max,
-                                "rotation_period_min",
-                                "rotation_period_max",
-                            )?,
-                            atmosphere_surface_pressure: band(
-                                b.atmosphere_surface_pressure_min,
-                                b.atmosphere_surface_pressure_max,
-                                "atmosphere_surface_pressure_min",
-                                "atmosphere_surface_pressure_max",
-                            )?,
-                            atmosphere_surface_density: band(
-                                b.atmosphere_surface_density_min,
-                                b.atmosphere_surface_density_max,
-                                "atmosphere_surface_density_min",
-                                "atmosphere_surface_density_max",
-                            )?,
-                            atmosphere_scale_height: band(
-                                b.atmosphere_scale_height_min,
-                                b.atmosphere_scale_height_max,
-                                "atmosphere_scale_height_min",
-                                "atmosphere_scale_height_max",
-                            )?,
-                            atmosphere_temperature: band(
-                                b.atmosphere_temperature_min,
-                                b.atmosphere_temperature_max,
-                                "atmosphere_temperature_min",
-                                "atmosphere_temperature_max",
-                            )?,
-                            ..ArchetypeBands::default()
-                        },
-                        Archetype::OceanWorld => ArchetypeBands {
-                            radius: band(b.radius_min, b.radius_max, "radius_min", "radius_max")?,
-                            gravity: band(
-                                b.gravity_min,
-                                b.gravity_max,
-                                "gravity_min",
-                                "gravity_max",
-                            )?,
-                            sidereal_period: band(
-                                b.rotation_period_min,
-                                b.rotation_period_max,
-                                "rotation_period_min",
-                                "rotation_period_max",
-                            )?,
-                            atmosphere_surface_pressure: band(
-                                b.atmosphere_surface_pressure_min,
-                                b.atmosphere_surface_pressure_max,
-                                "atmosphere_surface_pressure_min",
-                                "atmosphere_surface_pressure_max",
-                            )?,
-                            atmosphere_surface_density: band(
-                                b.atmosphere_surface_density_min,
-                                b.atmosphere_surface_density_max,
-                                "atmosphere_surface_density_min",
-                                "atmosphere_surface_density_max",
-                            )?,
-                            atmosphere_scale_height: band(
-                                b.atmosphere_scale_height_min,
-                                b.atmosphere_scale_height_max,
-                                "atmosphere_scale_height_min",
-                                "atmosphere_scale_height_max",
-                            )?,
-                            atmosphere_temperature: band(
-                                b.atmosphere_temperature_min,
-                                b.atmosphere_temperature_max,
-                                "atmosphere_temperature_min",
-                                "atmosphere_temperature_max",
-                            )?,
-                            ocean_surface_density: band(
-                                b.ocean_surface_density_min,
-                                b.ocean_surface_density_max,
-                                "ocean_surface_density_min",
-                                "ocean_surface_density_max",
-                            )?,
-                            ocean_temperature: band(
-                                b.ocean_temperature_min,
-                                b.ocean_temperature_max,
-                                "ocean_temperature_min",
-                                "ocean_temperature_max",
-                            )?,
-                        },
+                        Archetype::Moon => common,
+                        Archetype::RockyPlanet => {
+                            let (pressure, greenhouse, molar_mass) = atmosphere(b)?;
+                            ArchetypeBands {
+                                atmosphere_surface_pressure: pressure,
+                                greenhouse_delta_t: greenhouse,
+                                mean_molar_mass: molar_mass,
+                                ..common
+                            }
+                        }
+                        Archetype::OceanWorld => {
+                            let (pressure, greenhouse, molar_mass) = atmosphere(b)?;
+                            ArchetypeBands {
+                                atmosphere_surface_pressure: pressure,
+                                greenhouse_delta_t: greenhouse,
+                                mean_molar_mass: molar_mass,
+                                ocean_surface_density: band(
+                                    b.ocean_surface_density_min,
+                                    b.ocean_surface_density_max,
+                                    "ocean_surface_density_min",
+                                    "ocean_surface_density_max",
+                                )?,
+                                ocean_temperature: band(
+                                    b.ocean_temperature_min,
+                                    b.ocean_temperature_max,
+                                    "ocean_temperature_min",
+                                    "ocean_temperature_max",
+                                )?,
+                                ..common
+                            }
+                        }
                     };
                     let seed = surface_seed()?;
                     let mut body = bodygen::sample(seed, shape, &bands);
@@ -2579,15 +2622,17 @@ fn validate(m: &RawRecord, merged: &HashMap<String, RawRecord>) -> Result<Record
                     // over pins: frozen (medium T_surf at/below the classifier
                     // freeze point; never the WI-875 presentation offset) or
                     // airless ⇒ no liquid ocean (the trio zeroes; temperatures
-                    // stay, matching the airless `generate` skeleton).
-                    let gated_off =
-                        ocean_present && (t_surf <= OCEAN_FREEZE_THRESHOLD_K || p_atm == 0.0);
+                    // stay, matching the airless `generate` skeleton). The
+                    // decision itself is `body_derive::gate_ocean` — the ONE
+                    // implementation both resolve arms share (WI 889).
                     let (ocean_surface_density, ocean_surface_pressure, ocean_density_gradient) =
-                        if gated_off {
-                            (0.0, 0.0, 0.0)
-                        } else {
-                            (ocean_density, ocean_surface_pressure, ocean_gradient)
-                        };
+                        body_derive::gate_ocean(
+                            t_surf,
+                            p_atm,
+                            ocean_density,
+                            ocean_surface_pressure,
+                            ocean_gradient,
+                        );
 
                     let body = BodyAsset {
                         id: b.id.clone(),
@@ -2807,24 +2852,25 @@ pub(crate) fn canonical_bands(archetype: Archetype) -> ArchetypeBands {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::biome::OCEAN_FREEZE_THRESHOLD_K;
 
     /// A minimal valid pack around the given records list (RON snippet).
     fn pack(records: &str) -> String {
         format!(
-            "#![enable(implicit_some)]\n(format: 1, id: \"test\", version: \"1\", records: [{records}])"
+            "#![enable(implicit_some)]\n(format: 2, id: \"test\", version: \"1\", records: [{records}])"
         )
     }
 
     /// A minimal pack with an explicit id (multi-pack tests).
     fn pack_named(id: &str, extra: &str, records: &str) -> String {
         format!(
-            "#![enable(implicit_some)]\n(format: 1, id: \"{id}\", version: \"1\", {extra} records: [{records}])"
+            "#![enable(implicit_some)]\n(format: 2, id: \"{id}\", version: \"1\", {extra} records: [{records}])"
         )
     }
 
     /// A minimal override set.
     fn override_set(id: &str, phase: &str, extra: &str, overrides: &str) -> String {
-        format!("(format: 1, id: \"{id}\", phase: {phase}, {extra} overrides: [{overrides}])")
+        format!("(format: 2, id: \"{id}\", phase: {phase}, {extra} overrides: [{overrides}])")
     }
 
     fn engine_base() -> &'static str {
@@ -3090,7 +3136,7 @@ mod tests {
     #[test]
     fn empty_pack_loads_to_empty_catalog() {
         let cat =
-            Catalog::from_ron_str("(format: 1, id: \"p\", version: \"1\", records: [])").unwrap();
+            Catalog::from_ron_str("(format: 2, id: \"p\", version: \"1\", records: [])").unwrap();
         assert!(cat.is_empty());
     }
 
@@ -3861,12 +3907,13 @@ mod tests {
     // + parameter bands, a concrete child supplying a seed; resolving samples the
     // bands and reproduces `bodygen::generate` for that shape. Since WI 884
     // `generate` reads the *shipped* bands, so these inline literal fixtures are
-    // the independent pin welding shipped bands to the historical values (the
-    // stream itself is pinned by bodygen's golden test).
+    // the independent pin welding the shipped bands to these values (the
+    // stream itself is pinned by bodygen's golden test). Re-authored to the
+    // WI 889 independent-set vocabulary, band-identical to the shipped pack.
 
-    /// The three archetype base recipes (abstract), bands = the historic
-    /// generator literals (independent pin, WI 884), paired with the
-    /// `Archetype` the oracle `generate` uses.
+    /// The three archetype base recipes (abstract), bands = independent literal
+    /// copies of the shipped canonical bands (the WI 884 weld, re-authored at
+    /// WI 889), paired with the `Archetype` the oracle `generate` uses.
     fn archetype_bases() -> [(&'static str, &'static str, Archetype); 3] {
         [
             (
@@ -3874,7 +3921,9 @@ mod tests {
                 r#"BodyRecipe(( id: "moon", abstract: true, shape: moon,
                     radius_min: 2.0e5, radius_max: 2.0e6,
                     gravity_min: 0.5, gravity_max: 3.0,
-                    rotation_period_min: 20000.0, rotation_period_max: 200000.0 )),"#,
+                    rotation_period_min: 20000.0, rotation_period_max: 200000.0,
+                    nominal_insolation_min: 200.0, nominal_insolation_max: 3000.0,
+                    bond_albedo_min: 0.05, bond_albedo_max: 0.35 )),"#,
                 Archetype::Moon,
             ),
             (
@@ -3884,9 +3933,10 @@ mod tests {
                     gravity_min: 3.0, gravity_max: 12.0,
                     rotation_period_min: 20000.0, rotation_period_max: 200000.0,
                     atmosphere_surface_pressure_min: 50000.0, atmosphere_surface_pressure_max: 150000.0,
-                    atmosphere_surface_density_min: 0.2, atmosphere_surface_density_max: 2.0,
-                    atmosphere_scale_height_min: 5000.0, atmosphere_scale_height_max: 12000.0,
-                    atmosphere_temperature_min: 220.0, atmosphere_temperature_max: 300.0 )),"#,
+                    nominal_insolation_min: 800.0, nominal_insolation_max: 2000.0,
+                    bond_albedo_min: 0.1, bond_albedo_max: 0.4,
+                    greenhouse_delta_t_min: 5.0, greenhouse_delta_t_max: 40.0,
+                    mean_molar_mass_min: 0.02, mean_molar_mass_max: 0.045 )),"#,
                 Archetype::RockyPlanet,
             ),
             (
@@ -3896,9 +3946,10 @@ mod tests {
                     gravity_min: 5.0, gravity_max: 12.0,
                     rotation_period_min: 20000.0, rotation_period_max: 200000.0,
                     atmosphere_surface_pressure_min: 80000.0, atmosphere_surface_pressure_max: 180000.0,
-                    atmosphere_surface_density_min: 0.5, atmosphere_surface_density_max: 2.5,
-                    atmosphere_scale_height_min: 6000.0, atmosphere_scale_height_max: 12000.0,
-                    atmosphere_temperature_min: 250.0, atmosphere_temperature_max: 300.0,
+                    nominal_insolation_min: 1400.0, nominal_insolation_max: 2000.0,
+                    bond_albedo_min: 0.15, bond_albedo_max: 0.3,
+                    greenhouse_delta_t_min: 25.0, greenhouse_delta_t_max: 40.0,
+                    mean_molar_mass_min: 0.018, mean_molar_mass_max: 0.03,
                     ocean_surface_density_min: 950.0, ocean_surface_density_max: 1100.0,
                     ocean_temperature_min: 275.0, ocean_temperature_max: 300.0 )),"#,
                 Archetype::OceanWorld,
@@ -3947,9 +3998,10 @@ mod tests {
             gravity_min: 3.0, gravity_max: 12.0,
             rotation_period_min: 20000.0, rotation_period_max: 200000.0,
             atmosphere_surface_pressure_min: 50000.0, atmosphere_surface_pressure_max: 150000.0,
-            atmosphere_surface_density_min: 0.2, atmosphere_surface_density_max: 2.0,
-            atmosphere_scale_height_min: 5000.0, atmosphere_scale_height_max: 12000.0,
-            atmosphere_temperature_min: 220.0, atmosphere_temperature_max: 300.0 )),"#
+            nominal_insolation_min: 800.0, nominal_insolation_max: 2000.0,
+            bond_albedo_min: 0.1, bond_albedo_max: 0.4,
+            greenhouse_delta_t_min: 5.0, greenhouse_delta_t_max: 40.0,
+            mean_molar_mass_min: 0.02, mean_molar_mass_max: 0.045 )),"#
     }
 
     #[test]
@@ -3963,7 +4015,8 @@ mod tests {
             "",
             r#"( target: Id("r1"), field: "radius_min", op: Set(Number(4000000.0)) ),
                ( target: Id("r1"), field: "radius_max", op: Set(Number(4000000.0)) ),
-               ( target: Id("r1"), field: "gravity_max", op: Multiply(0.5) ),"#,
+               ( target: Id("r1"), field: "gravity_max", op: Multiply(0.5) ),
+               ( target: Id("r1"), field: "nominal_insolation_max", op: Multiply(0.5) ),"#,
         );
         let cat = Catalog::merge(&[&p], &[&ov]).unwrap();
         let body = resolved_body(&cat, "r1");
@@ -3975,9 +4028,12 @@ mod tests {
             "g {}",
             body.fluid_medium.gravity
         );
-        // Provenance: the multiply shadowed the authored upper bound.
+        // Provenance: the multiplies shadowed the authored upper bounds — the
+        // WI 889 independent-set bands are ordinary ladder-tunable fields.
         let fp = &cat.get("r1").unwrap().field_provenance["gravity_max"];
         assert_eq!(fp.shadows[0].value, ProvValue::Number(12.0));
+        let fp = &cat.get("r1").unwrap().field_provenance["nominal_insolation_max"];
+        assert_eq!(fp.shadows[0].value, ProvValue::Number(2000.0));
     }
 
     #[test]
@@ -4006,12 +4062,149 @@ mod tests {
         match Catalog::merge(&[&p], &[]) {
             Err(ContentError::MissingField { id, field }) => {
                 assert_eq!(id, "r1");
-                assert!(
-                    field.starts_with("atmosphere_surface_pressure"),
-                    "field {field}"
-                );
+                // The drawn independents are checked first (WI 889); the first
+                // missing band its shape requires is named.
+                assert_eq!(field, "nominal_insolation_min");
             }
             other => panic!("expected MissingField, got {other:?}"),
+        }
+    }
+
+    /// WI 889: the drawn-independent bands respect their physical domains —
+    /// a violating bound is loud, typed, and names record + bound.
+    #[test]
+    fn band_domain_violations_are_loud_and_named() {
+        let moon_with = |albedo_max: &str, insolation: &str| {
+            pack(&format!(
+                r#"BodyRecipe(( id: "m1", name: "M", shape: moon, surface_seed: 1,
+                    radius_min: 2.0e5, radius_max: 2.0e6,
+                    gravity_min: 0.5, gravity_max: 3.0,
+                    rotation_period_min: 20000.0, rotation_period_max: 200000.0,
+                    {insolation},
+                    bond_albedo_min: 0.05, bond_albedo_max: {albedo_max} )),"#
+            ))
+        };
+        let expect_unphysical = |p: String, want: &str| match Catalog::merge(&[&p], &[]) {
+            Err(ContentError::UnphysicalValue { id, field }) => {
+                assert_eq!(id, "m1");
+                assert_eq!(field, want);
+            }
+            other => panic!("expected UnphysicalValue({want}), got {other:?}"),
+        };
+        // Albedo touching 1.0: `1 − A` must stay positive for T_eq.
+        expect_unphysical(
+            moon_with(
+                "1.0",
+                "nominal_insolation_min: 200.0, nominal_insolation_max: 3000.0",
+            ),
+            "bond_albedo_max",
+        );
+        // Negative insolation.
+        expect_unphysical(
+            moon_with(
+                "0.35",
+                "nominal_insolation_min: -1.0, nominal_insolation_max: 3000.0",
+            ),
+            "nominal_insolation_min",
+        );
+        // Inverted band (min > max).
+        expect_unphysical(
+            moon_with(
+                "0.35",
+                "nominal_insolation_min: 3000.0, nominal_insolation_max: 200.0",
+            ),
+            "nominal_insolation_min",
+        );
+        // Rocky's atmosphere trio: negative greenhouse; non-positive molar mass.
+        let rocky_with = |greenhouse_min: &str, molar_min: &str| {
+            pack(&format!(
+                r#"BodyRecipe(( id: "m1", name: "R", shape: rocky_planet, surface_seed: 1,
+                    radius_min: 2.5e6, radius_max: 8.0e6,
+                    gravity_min: 3.0, gravity_max: 12.0,
+                    rotation_period_min: 20000.0, rotation_period_max: 200000.0,
+                    atmosphere_surface_pressure_min: 50000.0, atmosphere_surface_pressure_max: 150000.0,
+                    nominal_insolation_min: 800.0, nominal_insolation_max: 2000.0,
+                    bond_albedo_min: 0.1, bond_albedo_max: 0.4,
+                    greenhouse_delta_t_min: {greenhouse_min}, greenhouse_delta_t_max: 40.0,
+                    mean_molar_mass_min: {molar_min}, mean_molar_mass_max: 0.045 )),"#
+            ))
+        };
+        expect_unphysical(rocky_with("-5.0", "0.02"), "greenhouse_delta_t_min");
+        expect_unphysical(rocky_with("5.0", "0.0"), "mean_molar_mass_min");
+    }
+
+    /// WI 889: ocean gating is one shared decision across both resolve arms —
+    /// a sampled ocean world drawn into the frozen regime loses its liquid
+    /// exactly as a fixed recipe does, while the canonical ocean bands clear
+    /// the gate at every corner of their band box.
+    #[test]
+    fn sampled_ocean_gating_is_uniform_with_the_fixed_arm() {
+        let p = pack(
+            r#"BodyRecipe(( id: "cold", name: "Cold", shape: ocean_world, surface_seed: 3,
+                radius_min: 3.0e6, radius_max: 9.0e6,
+                gravity_min: 5.0, gravity_max: 12.0,
+                rotation_period_min: 20000.0, rotation_period_max: 200000.0,
+                atmosphere_surface_pressure_min: 80000.0, atmosphere_surface_pressure_max: 180000.0,
+                nominal_insolation_min: 50.0, nominal_insolation_max: 60.0,
+                bond_albedo_min: 0.25, bond_albedo_max: 0.3,
+                greenhouse_delta_t_min: 0.0, greenhouse_delta_t_max: 1.0,
+                mean_molar_mass_min: 0.018, mean_molar_mass_max: 0.03,
+                ocean_surface_density_min: 950.0, ocean_surface_density_max: 1100.0,
+                ocean_temperature_min: 275.0, ocean_temperature_max: 300.0 )),"#,
+        );
+        let body = resolved_body(&Catalog::merge(&[&p], &[]).unwrap(), "cold");
+        let m = &body.fluid_medium;
+        assert!(
+            m.atmosphere_temperature < OCEAN_FREEZE_THRESHOLD_K,
+            "fixture must land frozen (T {})",
+            m.atmosphere_temperature
+        );
+        assert_eq!(m.ocean_surface_density, 0.0, "frozen ⇒ no liquid ocean");
+        assert_eq!(m.ocean_surface_pressure, 0.0);
+        assert_eq!(m.ocean_density_gradient, 0.0);
+        assert!(
+            m.atmosphere_surface_density > 0.0,
+            "the atmosphere survives the gate"
+        );
+
+        // Canonical ocean bands: every (S, A, ΔT) corner resolves above the
+        // freeze gate — the shipped population always keeps its ocean.
+        let bands = canonical_bands(Archetype::OceanWorld);
+        for s in [bands.nominal_insolation.0, bands.nominal_insolation.1] {
+            for a in [bands.bond_albedo.0, bands.bond_albedo.1] {
+                for dt in [bands.greenhouse_delta_t.0, bands.greenhouse_delta_t.1] {
+                    let t = body_derive::surface_temperature(
+                        body_derive::equilibrium_temperature(s, a),
+                        dt,
+                    );
+                    assert!(
+                        t > OCEAN_FREEZE_THRESHOLD_K,
+                        "canonical corner (S={s}, A={a}, dT={dt}) freezes at {t} K"
+                    );
+                }
+            }
+        }
+    }
+
+    /// WI 889 (plan-review H1): a stale `format: 1` pack authoring the
+    /// RETIRED band vocabulary — exactly the document class the grammar bump
+    /// exists for — is refused **by version** via the header-first probe, not
+    /// by an incidental unknown-field parse error.
+    #[test]
+    fn stale_format_pack_is_refused_by_version_not_parse() {
+        let src = r#"(
+            format: 1, id: "old", version: "1",
+            records: [ BodyRecipe(( id: "r1", name: "R1", shape: rocky_planet, surface_seed: 1,
+                radius_min: 2.5e6, radius_max: 8.0e6, gravity_min: 3.0, gravity_max: 12.0,
+                rotation_period_min: 20000.0, rotation_period_max: 200000.0,
+                atmosphere_surface_pressure_min: 50000.0, atmosphere_surface_pressure_max: 150000.0,
+                atmosphere_surface_density_min: 0.2, atmosphere_surface_density_max: 2.0,
+                atmosphere_scale_height_min: 5000.0, atmosphere_scale_height_max: 12000.0,
+                atmosphere_temperature_min: 220.0, atmosphere_temperature_max: 300.0 )) ],
+        )"#;
+        match Catalog::merge(&[src], &[]) {
+            Err(ContentError::Format { found: 1 }) => {}
+            other => panic!("expected Format {{ found: 1 }}, got {other:?}"),
         }
     }
 
@@ -4518,7 +4711,7 @@ mod tests {
 
     /// A minimal settings document.
     fn settings_doc(id: &str, scalars: &str) -> String {
-        format!("(format: 1, id: \"{id}\", scalars: [{scalars}])")
+        format!("(format: 2, id: \"{id}\", scalars: [{scalars}])")
     }
 
     #[test]

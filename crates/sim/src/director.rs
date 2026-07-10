@@ -962,7 +962,7 @@ mod tests {
 
     fn hop(id: &str, offer: Offer, altitude: f64) -> Mission {
         Mission {
-            format: 1,
+            format: 2,
             id: id.into(),
             name: format!("hop {id}"),
             offer,

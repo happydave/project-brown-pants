@@ -691,7 +691,7 @@ mod tests {
     /// A minimal engine+tank pack: abstract base, concrete engine, tank.
     fn pack_text() -> &'static str {
         r#"#![enable(implicit_some)]
-        (format: 1, id: "p", version: "1", records: [
+        (format: 2, id: "p", version: "1", records: [
             Device(( id: "eb", abstract: true, class: Engine, exhaust_velocity: 3000.0 )),
             Device(( id: "e", parent: "eb", density: 3000.0, max_mass_flow: 2.0 )),
             Device(( id: "t", class: Tank, density: 500.0, capacity: 800.0 )),
@@ -733,7 +733,7 @@ mod tests {
 
     fn base_scenario(extra: &str) -> String {
         format!(
-            r#"(format: 1, id: "s", name: "S", world: Earthlike, packs: ["p"],
+            r#"(format: 2, id: "s", name: "S", world: Earthlike, packs: ["p"],
                 start: (blueprint: "bp", placement: Pad,
                         bindings: {{ Engine: "e", Tank: "t" }}), {extra})"#
         )
@@ -820,7 +820,7 @@ mod tests {
         let roots = scratch_roots("missing-pack");
         let path = standard_fixture(
             &roots,
-            r#"(format: 1, id: "s", name: "S", world: Earthlike, packs: ["nope"],
+            r#"(format: 2, id: "s", name: "S", world: Earthlike, packs: ["nope"],
                 start: (blueprint: "bp", placement: Pad, bindings: { Engine: "e", Tank: "t" }))"#,
         );
         match load_scenario(&path, &roots) {
@@ -834,7 +834,7 @@ mod tests {
         let roots = scratch_roots("missing-bp");
         let path = standard_fixture(
             &roots,
-            r#"(format: 1, id: "s", name: "S", world: Earthlike, packs: ["p"],
+            r#"(format: 2, id: "s", name: "S", world: Earthlike, packs: ["p"],
                 start: (blueprint: "ghost", placement: Pad, bindings: { Engine: "e", Tank: "t" }))"#,
         );
         match load_scenario(&path, &roots) {
@@ -848,7 +848,7 @@ mod tests {
         let roots = scratch_roots("missing-sys");
         let path = standard_fixture(
             &roots,
-            r#"(format: 1, id: "s", name: "S", world: System("nowhere"), packs: ["p"],
+            r#"(format: 2, id: "s", name: "S", world: System("nowhere"), packs: ["p"],
                 start: (blueprint: "bp", placement: Pad, bindings: { Engine: "e", Tank: "t" }))"#,
         );
         match load_scenario(&path, &roots) {
@@ -869,7 +869,7 @@ mod tests {
         crate::system_library::save_system(&roots.saves.join("systems"), &sys).unwrap();
         let path = standard_fixture(
             &roots,
-            r#"(format: 1, id: "s", name: "S", world: System("home"), packs: ["p"],
+            r#"(format: 2, id: "s", name: "S", world: System("home"), packs: ["p"],
                 start: (blueprint: "bp", placement: Pad, bindings: { Engine: "e", Tank: "t" }))"#,
         );
         let s = load_scenario(&path, &roots).unwrap();
@@ -920,7 +920,7 @@ mod tests {
         crate::system_library::save_system(&roots.saves.join("systems"), &sys).unwrap();
         let path = standard_fixture(
             &roots,
-            r#"(format: 1, id: "s", name: "S", world: System("home"), packs: ["p"],
+            r#"(format: 2, id: "s", name: "S", world: System("home"), packs: ["p"],
                 start: (blueprint: "bp", placement: Pad, bindings: { Engine: "e", Tank: "t" }))"#,
         );
 
@@ -951,7 +951,7 @@ mod tests {
         // Unknown record.
         let path = standard_fixture(
             &roots,
-            r#"(format: 1, id: "s", name: "S", world: Earthlike, packs: ["p"],
+            r#"(format: 2, id: "s", name: "S", world: Earthlike, packs: ["p"],
                 start: (blueprint: "bp", placement: Pad, bindings: { Engine: "ghost", Tank: "t" }))"#,
         );
         assert!(matches!(
@@ -973,7 +973,7 @@ mod tests {
         // Wrong class.
         std::fs::write(
             &path,
-            r#"(format: 1, id: "s", name: "S", world: Earthlike, packs: ["p"],
+            r#"(format: 2, id: "s", name: "S", world: Earthlike, packs: ["p"],
                 start: (blueprint: "bp", placement: Pad, bindings: { Engine: "t", Tank: "t" }))"#,
         )
         .unwrap();
@@ -987,7 +987,7 @@ mod tests {
         // Blueprint has engines but no Engine binding.
         std::fs::write(
             &path,
-            r#"(format: 1, id: "s", name: "S", world: Earthlike, packs: ["p"],
+            r#"(format: 2, id: "s", name: "S", world: Earthlike, packs: ["p"],
                 start: (blueprint: "bp", placement: Pad, bindings: { Tank: "t" }))"#,
         )
         .unwrap();
@@ -1006,13 +1006,13 @@ mod tests {
         write_doc(
             &roots.content.join("packs"),
             "q",
-            r#"(format: 1, id: "q", version: "1", records: [
+            r#"(format: 2, id: "q", version: "1", records: [
                 Resource(( id: "ore", tradable: Some(true) )),
             ])"#,
         );
         let scenario = |packs: &str| {
             format!(
-                r#"(format: 1, id: "s", name: "S", world: Earthlike, packs: {packs},
+                r#"(format: 2, id: "s", name: "S", world: Earthlike, packs: {packs},
                     start: (blueprint: "bp", placement: Pad,
                             bindings: {{ Engine: "e", Tank: "t" }}))"#
             )
@@ -1049,7 +1049,7 @@ mod tests {
         write_doc(
             &roots.content.join("missions"),
             "reach-orbit",
-            r#"(format: 1, id: "reach-orbit", name: "Reach 100 m",
+            r#"(format: 2, id: "reach-orbit", name: "Reach 100 m",
                 objective: AltitudeAbove(100.0), effects: [Lore("done")])"#,
         );
         let s = load_scenario(&path, &roots).unwrap();
@@ -1069,7 +1069,7 @@ mod tests {
         write_doc(
             &roots.content.join("missions"),
             "vacuous",
-            r#"(format: 1, id: "vacuous", name: "V", objective: Any([]))"#,
+            r#"(format: 2, id: "vacuous", name: "V", objective: Any([]))"#,
         );
         std::fs::write(&path, base_scenario(r#"missions: ["vacuous"],"#)).unwrap();
         assert!(matches!(
@@ -1083,7 +1083,7 @@ mod tests {
         write_doc(
             &roots.content.join("missions"),
             "later",
-            r#"(format: 1, id: "later", name: "L", offer: AfterMission("ghost"),
+            r#"(format: 2, id: "later", name: "L", offer: AfterMission("ghost"),
                 objective: Airborne)"#,
         );
         std::fs::write(&path, base_scenario(r#"missions: ["later"],"#)).unwrap();
@@ -1097,7 +1097,7 @@ mod tests {
         write_doc(
             &roots.content.join("missions"),
             "stem",
-            r#"(format: 1, id: "not-stem", name: "S", objective: Airborne)"#,
+            r#"(format: 2, id: "not-stem", name: "S", objective: Airborne)"#,
         );
         std::fs::write(&path, base_scenario(r#"missions: ["stem"],"#)).unwrap();
         assert!(matches!(
@@ -1112,7 +1112,7 @@ mod tests {
         write_doc(
             &roots.content.join("overrides"),
             "house",
-            r#"(format: 1, id: "house", phase: Local, overrides: [])"#,
+            r#"(format: 2, id: "house", phase: Local, overrides: [])"#,
         );
         let path = standard_fixture(&roots, &base_scenario(r#"overrides: ["house"],"#));
         match load_scenario(&path, &roots) {
@@ -1126,7 +1126,7 @@ mod tests {
         let roots = scratch_roots("stem");
         let path = standard_fixture(
             &roots,
-            r#"(format: 1, id: "not-s", name: "S", world: Earthlike, packs: ["p"],
+            r#"(format: 2, id: "not-s", name: "S", world: Earthlike, packs: ["p"],
                 start: (blueprint: "bp", placement: Pad, bindings: { Engine: "e", Tank: "t" }))"#,
         );
         assert!(matches!(
@@ -1143,7 +1143,7 @@ mod tests {
             load_scenario(&path, &roots),
             Err(ScenarioError::Parse(_))
         ));
-        std::fs::write(&path, base_scenario("").replace("format: 1", "format: 99")).unwrap();
+        std::fs::write(&path, base_scenario("").replace("format: 2", "format: 99")).unwrap();
         assert!(matches!(
             load_scenario(&path, &roots),
             Err(ScenarioError::Format { found: 99 })

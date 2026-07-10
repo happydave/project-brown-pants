@@ -4,7 +4,7 @@
 // session tracks Launch → Flight → Recovery.
 #![enable(implicit_some)]
 (
-    format: 1,
+    format: 2,
     id: "autopilot",
     name: "Autopilot — a sounding",
     world: Earthlike,

@@ -8,7 +8,7 @@
 // snake_case; renaming one is an outward-facing change (WI 550).
 #![enable(implicit_some)]
 (
-    format: 1,
+    format: 2,
     id: "example-settings",
     scalars: [
         // Family-wide engine efficiency knob: multiplies the abstract base's

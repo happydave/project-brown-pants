@@ -11,7 +11,7 @@
 // — real value × named modifiers, visible in telemetry provenance.
 #![enable(implicit_some)]
 (
-    format: 1,
+    format: 2,
     id: "first-flight",
     name: "First Flight",
     world: Earthlike,

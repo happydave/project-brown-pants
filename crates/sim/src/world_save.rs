@@ -818,6 +818,53 @@ mod tests {
         ));
     }
 
+    /// WI 889 (kept-body semantics, workitem AC 3): version-2-era records —
+    /// the real predecessors of the batched stream break — load with the
+    /// designed drift taxonomy. A snapshot's integrity digest verifies over
+    /// the STORED body (no regeneration), so it loads unaffected, wins, and
+    /// reports the version-pin drift line; a digest-tier record reports the
+    /// expected reroll and proceeds with the version-3 regeneration.
+    /// Regeneration at the old values is retired — nothing recreates them.
+    #[test]
+    fn version_two_era_records_load_with_the_designed_drift_taxonomy() {
+        use crate::body_digest::{digest_hex, BODY_OUTPUT_VERSION};
+        use crate::bodygen::{generate, Archetype};
+        assert_eq!(BODY_OUTPUT_VERSION, 3, "this test narrates the 2 → 3 break");
+
+        // Model the v2-era stored body as one the v3 generator provably does
+        // not produce (the stream break moved every generated value).
+        let current = generate(7, Archetype::OceanWorld);
+        let mut v2_body = current.clone();
+        v2_body.radius -= 12_345.0;
+        v2_body.mu = v2_body.fluid_medium.gravity * v2_body.radius * v2_body.radius;
+
+        // Snapshot tier: loads unaffected (derive bypassed), wins verbatim,
+        // named version-pin drift line.
+        let snap = SavedBodyRecord::Snapshot {
+            id: current.id.clone(),
+            output_version: 2,
+            digest: digest_hex(&v2_body),
+            body: Box::new(v2_body.clone()),
+        };
+        let mut loaded = vec![current.clone()];
+        let drift = apply_body_records(std::slice::from_ref(&snap), &mut loaded).unwrap();
+        assert_eq!(loaded[0], v2_body, "the v2 snapshot wins verbatim");
+        assert_eq!(drift.len(), 1);
+        assert!(drift[0].contains("pins output version"), "{}", drift[0]);
+
+        // Digest tier: the v2 digest cannot match the v3 regeneration — the
+        // expected reroll, and the regenerated (v3) body is kept.
+        let dig = SavedBodyRecord::Digest {
+            id: current.id.clone(),
+            output_version: 2,
+            digest: digest_hex(&v2_body),
+        };
+        let mut loaded = vec![current.clone()];
+        let drift = apply_body_records(&[dig], &mut loaded).unwrap();
+        assert!(drift[0].contains("expected reroll"), "{}", drift[0]);
+        assert_eq!(loaded[0], current, "regeneration at old values is retired");
+    }
+
     /// WI 891 resume reconciliation: a loaded snapshot pin replaces its fresh
     /// same-id record verbatim (the recorded output version survives the next
     /// save), digest records rebuild fresh, and records for absent bodies drop.

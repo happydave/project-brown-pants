@@ -3,7 +3,7 @@
 // so the craft flies with the scene's original numbers.
 #![enable(implicit_some)]
 (
-    format: 1,
+    format: 2,
     id: "play",
     name: "Play — fly by hand",
     world: Earthlike,
