@@ -55,6 +55,9 @@ pub enum Kind {
     /// A vessel record (WI 855, multiplayer arc): a vessel's identity + time-stamped
     /// semantic state — the sync unit and world-save element. Added additively.
     VesselRecord,
+    /// A body catalog reference (WI 891): recipe/archetype + seed + output
+    /// version + digest — regenerates instead of snapshotting. Added additively.
+    BodyRef,
 }
 
 /// A craft-scope serialized subgraph. A craft, a subassembly, and a blueprint are
@@ -158,6 +161,10 @@ pub enum Payload {
     /// sync unit and the world-save vessel element. Added additively; the format
     /// version is unchanged per the additive-variant rule.
     VesselRecord(VesselRecord),
+    /// A body catalog reference (WI 891): the persisted "recipe+seed is truth"
+    /// spelling — the body regenerates through resolve/derive on load and is
+    /// digest-verified. Added additively per the additive-variant rule.
+    BodyRef(crate::body_ref::BodyRef),
 }
 
 impl Payload {
@@ -171,6 +178,7 @@ impl Payload {
             Payload::BodyAsset(_) => Kind::BodyAsset,
             Payload::System(_) => Kind::System,
             Payload::VesselRecord(_) => Kind::VesselRecord,
+            Payload::BodyRef(_) => Kind::BodyRef,
         }
     }
 }
@@ -212,12 +220,30 @@ impl SavedDocument {
         let probe: VersionProbe =
             serde_json::from_str(s).map_err(|e| FormatError::Malformed(e.to_string()))?;
         match probe.format_version {
-            // Format v1 (pre-WI-824 legacy cell-panel flags) was retired at
-            // WI 820 (pre-release, owner direction): its migration is gone and
-            // v1 files are rejected by version like any other unsupported one.
             FORMAT_VERSION => {
                 let mut doc: SavedDocument =
                     serde_json::from_str(s).map_err(|e| FormatError::Malformed(e.to_string()))?;
+                doc.normalize_craft();
+                doc.validate_craft_shapes()?;
+                Ok(doc)
+            }
+            // Format v1 (pre-WI-824 legacy cell-panel flags) was retired at
+            // WI 820 (pre-release, owner direction): its migration is gone and
+            // v1 files are rejected by version — **except the body-asset
+            // kind** (WI 891): the v1→v2 reshape was craft-scope only, a v1
+            // body-asset payload is field-identical to today's, and real
+            // pre-recipe body files exist on disk (`saves/bodies/`). Those
+            // migrate in memory (a re-save writes the current version); every
+            // other v1 kind keeps the WI 820 rejection.
+            1 => {
+                let kind: KindProbe =
+                    serde_json::from_str(s).map_err(|_| FormatError::UnsupportedVersion(1))?;
+                if kind.payload.kind != Kind::BodyAsset {
+                    return Err(FormatError::UnsupportedVersion(1));
+                }
+                let mut doc: SavedDocument =
+                    serde_json::from_str(s).map_err(|e| FormatError::Malformed(e.to_string()))?;
+                doc.format_version = FORMAT_VERSION;
                 doc.normalize_craft();
                 doc.validate_craft_shapes()?;
                 Ok(doc)
@@ -235,7 +261,10 @@ impl SavedDocument {
             // A vessel record embeds a full craft subgraph — it gets the same
             // load hygiene as the craft-scope kinds (WI 855).
             Payload::VesselRecord(r) => &mut r.structure.craft,
-            Payload::WorldSave(_) | Payload::BodyAsset(_) | Payload::System(_) => return,
+            Payload::WorldSave(_)
+            | Payload::BodyAsset(_)
+            | Payload::System(_)
+            | Payload::BodyRef(_) => return,
         };
         craft.normalize_shapes();
         craft.normalize_face_panels();
@@ -251,7 +280,10 @@ impl SavedDocument {
             Payload::Craft(c) | Payload::Subassembly(c) | Payload::Blueprint(c) => &c.craft,
             // Same boundary validation for the subgraph a vessel record embeds.
             Payload::VesselRecord(r) => &r.structure.craft,
-            Payload::WorldSave(_) | Payload::BodyAsset(_) | Payload::System(_) => return Ok(()),
+            Payload::WorldSave(_)
+            | Payload::BodyAsset(_)
+            | Payload::System(_)
+            | Payload::BodyRef(_) => return Ok(()),
         };
         for s in &craft.shapes {
             if s.orientation as usize >= crate::shape::rotations().len() {
@@ -271,6 +303,21 @@ impl SavedDocument {
 #[derive(Deserialize)]
 struct VersionProbe {
     format_version: u32,
+}
+
+/// Kind-only probe for the v1 compatibility arm (WI 891): reads just the
+/// payload's `kind` tag, so a v1 craft document (whose payload shape no longer
+/// parses) is still classified — and rejected by version — without a payload
+/// decode.
+#[derive(Deserialize)]
+struct KindProbe {
+    payload: KindOnly,
+}
+
+/// See [`KindProbe`].
+#[derive(Deserialize)]
+struct KindOnly {
+    kind: Kind,
 }
 
 /// A persistence-format error. Typed and non-panicking, so malformed or foreign
@@ -316,6 +363,75 @@ mod tests {
             material: Material::ALUMINIUM,
         });
         craft
+    }
+
+    /// WI 891 (AC 3): a **v1 body-asset** document — the exact shape of the
+    /// stranded pre-recipe file `saves/bodies/rocky-planet-000e.json` — loads
+    /// through the compatibility arm, migrates in memory, and re-saves at the
+    /// current version. Every other v1 kind keeps the WI 820 rejection (the
+    /// craft case is pinned by the test below); a v1 world-save is rejected
+    /// by version, and a v1 body-asset with a broken payload is `Malformed`,
+    /// not silently versioned through.
+    #[test]
+    fn v1_body_assets_load_via_the_compat_arm_and_other_v1_kinds_stay_rejected() {
+        // A faithful reduction of the on-disk stranded file's shape.
+        let v1_body = r#"{
+          "format_version": 1,
+          "payload": {
+            "kind": "body_asset",
+            "id": "gen-rocky-000000000000000e",
+            "name": "Rocky Planet 000E",
+            "mu": 62764103801452.414,
+            "radius": 4081155.3230753234,
+            "rotation": { "axis": [0.0, 0.0, 1.0], "sidereal_period": 89564.68576833663 },
+            "fluid_medium": {
+              "atmosphere_surface_density": 1.9500294966428244,
+              "atmosphere_surface_pressure": 101513.99014409662,
+              "atmosphere_scale_height": 5070.794859367081,
+              "ocean_surface_density": 0.0,
+              "ocean_surface_pressure": 0.0,
+              "ocean_density_gradient": 0.0,
+              "gravity": 3.768296652429817,
+              "atmosphere_temperature": 286.1116039326881,
+              "ocean_temperature": 280.0
+            },
+            "surface": { "seed": 14, "terrain": null, "crater": null, "material": null },
+            "render": null
+          }
+        }"#;
+        let doc = SavedDocument::from_json(v1_body).expect("v1 body asset loads");
+        assert_eq!(doc.format_version, FORMAT_VERSION, "migrated in memory");
+        let Payload::BodyAsset(a) = &doc.payload else {
+            panic!("body scope");
+        };
+        assert_eq!(a.id, "gen-rocky-000000000000000e");
+        assert_eq!(a.surface.seed, 14);
+        // A re-save writes the current version; loading that back is clean
+        // (save → load → save is stable once migrated).
+        let resaved = doc.to_json().unwrap();
+        assert!(resaved.contains("\"format_version\": 2"));
+        assert_eq!(
+            SavedDocument::from_json(&resaved)
+                .unwrap()
+                .to_json()
+                .unwrap(),
+            resaved
+        );
+
+        // A v1 world-save stays rejected by version.
+        let v1_world = r#"{"format_version":1,"payload":{"kind":"world_save","vessels":[]}}"#;
+        assert_eq!(
+            SavedDocument::from_json(v1_world),
+            Err(FormatError::UnsupportedVersion(1))
+        );
+
+        // A v1 body-asset whose payload no longer parses is malformed, not
+        // silently versioned through.
+        let v1_broken = r#"{"format_version":1,"payload":{"kind":"body_asset","id":"x"}}"#;
+        assert!(matches!(
+            SavedDocument::from_json(v1_broken),
+            Err(FormatError::Malformed(_))
+        ));
     }
 
     #[test]

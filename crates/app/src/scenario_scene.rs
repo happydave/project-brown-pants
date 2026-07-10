@@ -152,10 +152,22 @@ fn load_and_stage(
                 path.display()
             );
         };
-        let scenario = load(&format!(
-            "content/scenarios/{}.ron",
-            saved.content.scenario_id
-        ));
+        // Re-resolve with the save's per-body records applied (WI 891):
+        // snapshot-tier bodies load pinned (bypassing derive), digest-tier
+        // bodies regenerate and verify — drift is warned by name, like the
+        // content drift below.
+        let doc_path = format!("content/scenarios/{}.ron", saved.content.scenario_id);
+        let (scenario, body_drift) = match sounding_sim::scenario::load_scenario_resumed(
+            std::path::Path::new(&doc_path),
+            &ScenarioRoots::default(),
+            &saved.bodies,
+        ) {
+            Ok(x) => x,
+            Err(e) => panic!("scenario `{doc_path}` failed to load: {e}"),
+        };
+        for line in body_drift {
+            warn!("body drift since save: {line}");
+        }
         let current = sounding_sim::world_save::ContentIdentity::from_scenario(&scenario);
         for line in sounding_sim::world_save::drift_report(&saved.content, &current) {
             warn!("content drift since save: {line}");

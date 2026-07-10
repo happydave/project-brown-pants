@@ -93,6 +93,12 @@ pub const CONTENT_FORMAT_VERSION: u32 = 1;
 /// inheritance topology are definitions, not tunables.
 const STRUCTURAL_FIELDS: [&str; 5] = ["id", "parent", "abstract", "class", "shape"];
 
+/// The largest integer an authored (f64 Num) `surface_seed` may carry: 2^53,
+/// the ceiling of exact integer representation in an f64. Above it the slot
+/// silently loses precision, so validation rejects it loudly instead (WI 891,
+/// parked decision (b) from WIs 881/883).
+const MAX_AUTHORED_SEED: f64 = 9_007_199_254_740_992.0;
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -1995,6 +2001,23 @@ fn validate(m: &RawRecord) -> Result<Record, ContentError> {
         })),
         RawRecord::BodyRecipe(b) => {
             let req = |v: Option<f64>, field: &'static str| v.ok_or_else(|| missing(&b.id, field));
+            // WI 891 (parked decision (b)): the authored seed is a Num slot
+            // cast to u64 — validate the cast instead of letting a negative
+            // saturate, a fraction truncate, or a value above 2^53 silently
+            // lose integer precision. Full-width u64 seeds travel only through
+            // persisted refs / `bodygen::generate`, never through this slot.
+            let surface_seed = || -> Result<u64, ContentError> {
+                let raw = req(b.surface_seed, "surface_seed")?;
+                let valid =
+                    raw.is_finite() && raw >= 0.0 && raw.fract() == 0.0 && raw <= MAX_AUTHORED_SEED;
+                if !valid {
+                    return Err(ContentError::UnphysicalValue {
+                        id: b.id.clone(),
+                        field: "surface_seed",
+                    });
+                }
+                Ok(raw as u64)
+            };
             // WI 884: a recipe is either **sampled** (`shape` + band fields) or
             // **fixed** (scalar fields) — authoring the other mode's fields is a
             // loud error, mirroring `device_spec`'s class-dependent rejection
@@ -2220,7 +2243,7 @@ fn validate(m: &RawRecord) -> Result<Record, ContentError> {
                             )?,
                         },
                     };
-                    let seed = req(b.surface_seed, "surface_seed")? as u64;
+                    let seed = surface_seed()?;
                     let mut body = bodygen::sample(seed, shape, &bands);
                     // Identity + classifier offset are the recipe's, not the
                     // generator's synthesized ones; the physics is the draw's.
@@ -2355,7 +2378,7 @@ fn validate(m: &RawRecord) -> Result<Record, ContentError> {
                         },
                         surface: SurfaceRecipe {
                             material,
-                            ..SurfaceRecipe::from_seed(req(b.surface_seed, "surface_seed")? as u64)
+                            ..SurfaceRecipe::from_seed(surface_seed()?)
                         },
                         render: serde_json::Value::Null,
                     };
@@ -2464,6 +2487,29 @@ pub(crate) fn canonical_body(id: &str) -> BodyAsset {
         Record::BodyRecipe(r) => r.body.clone(),
         other => panic!("canonical record `{id}` is not a body recipe: {other:?}"),
     }
+}
+
+/// Non-panicking sibling of [`canonical_body`] for **persisted input** (WI 891):
+/// a saved catalog ref names a recipe id this build may simply not have, which
+/// is a load error to report, never a build-integrity panic. `None` when the id
+/// is absent from the embedded pack or is not a body recipe.
+pub(crate) fn try_canonical_body(id: &str) -> Option<BodyAsset> {
+    match &canonical_catalog().get(id)?.record {
+        Record::BodyRecipe(r) => Some(r.body.clone()),
+        _ => None,
+    }
+}
+
+/// The embedded canonical pack's identity — `(pack id, pack version)` — for
+/// recording provenance into persisted catalog refs (WI 891). The embedded
+/// pack is exactly one pack by construction; covered by the build-integrity
+/// tests over `canonical_catalog`.
+pub(crate) fn canonical_pack_identity() -> (String, String) {
+    canonical_catalog()
+        .packs
+        .first()
+        .cloned()
+        .expect("embedded canonical bodies pack records its identity")
 }
 
 /// The ladder-resolved parameter bands of the canonical archetype record for
@@ -3556,6 +3602,38 @@ mod tests {
         assert_eq!(m.ocean_surface_pressure, 100_000.0);
         assert_eq!(m.ocean_surface_density, 1_000.0);
         assert_eq!(m.ocean_temperature, 285.0);
+    }
+
+    /// WI 891 (parked decision (b), settled): the authored Num seed is
+    /// validated at its u64 cast — negative, fractional, and beyond-2^53
+    /// values are loud, never silently saturated/truncated/imprecise. The
+    /// ceiling itself (2^53, exactly representable) is allowed.
+    #[test]
+    fn unphysical_surface_seeds_are_loud() {
+        let recipe = |seed: &str| {
+            format!(
+                r#"BodyRecipe(( id: "s1", name: "S1",
+                    mu: 4.0e14, radius: 6.0e6, rotation_period: 86400.0,
+                    atmosphere_surface_pressure: 100000.0,
+                    nominal_insolation: 1361.0, bond_albedo: 0.3, greenhouse_delta_t: 33.0,
+                    mean_molar_mass: 0.029,
+                    ocean_surface_density: 1000.0, ocean_density_gradient: 0.0,
+                    ocean_temperature: 285.0, surface_seed: {seed} )),"#
+            )
+        };
+        for bad in ["-1", "1.5", "9007199254740994"] {
+            let p = pack(&recipe(bad));
+            match Catalog::merge(&[&p], &[]) {
+                Err(ContentError::UnphysicalValue { id, field }) => {
+                    assert_eq!(id, "s1");
+                    assert_eq!(field, "surface_seed");
+                }
+                other => panic!("seed {bad}: expected UnphysicalValue, got {other:?}"),
+            }
+        }
+        let ceiling = pack(&recipe("9007199254740992"));
+        let cat = Catalog::merge(&[&ceiling], &[]).expect("2^53 exactly is allowed");
+        assert_eq!(resolved_body(&cat, "s1").surface.seed, 1u64 << 53);
     }
 
     #[test]

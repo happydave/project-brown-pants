@@ -12,6 +12,7 @@
 //! scanning) are unit-testable without any rendering.
 
 use crate::body_asset::BodyAsset;
+use crate::body_ref::BodyRef;
 use crate::library::{slugify, LibraryError};
 use crate::persist::{FormatError, Payload, SavedDocument};
 use std::path::{Path, PathBuf};
@@ -55,17 +56,40 @@ pub fn save_body(dir: &Path, asset: &BodyAsset) -> Result<PathBuf, LibraryError>
     Ok(path)
 }
 
-/// Reads a saved body-asset document from `path` and returns its asset.
+/// Saves a body catalog **ref** into `dir` (WI 891): the recipe+seed spelling
+/// that regenerates on load instead of snapshotting. Same slot semantics as
+/// [`save_body`] — the file is named by the slug of the ref's display name,
+/// so a ref and a snapshot of the same name share one slot deliberately (one
+/// name, one body, whichever spelling was saved last).
+pub fn save_body_ref(dir: &Path, body_ref: &BodyRef) -> Result<PathBuf, LibraryError> {
+    let mut slug = slugify(&body_ref.name);
+    if slug.is_empty() {
+        slug = FALLBACK_SLUG.to_string();
+    }
+    std::fs::create_dir_all(dir).map_err(|e| LibraryError::Io(e.to_string()))?;
+    let path = body_path(dir, &slug);
+    let json = SavedDocument::new(Payload::BodyRef(body_ref.clone())).to_json()?;
+    std::fs::write(&path, json).map_err(|e| LibraryError::Io(e.to_string()))?;
+    Ok(path)
+}
+
+/// Reads a saved body document from `path` and returns its asset. A snapshot
+/// document yields its asset unchanged; a **ref** document (WI 891)
+/// regenerates through resolve/derive and is digest-verified — an
+/// unresolvable source, moved output version, or digest mismatch surfaces
+/// typed as [`LibraryError::BodyRef`].
 pub fn load_body(path: &Path) -> Result<BodyAsset, LibraryError> {
     let bytes = std::fs::read_to_string(path).map_err(|e| LibraryError::Io(e.to_string()))?;
     body_from_document(&bytes)
 }
 
 /// Pure decode counterpart to [`load_body`]: parses a document string and extracts
-/// the body asset, mapping any other scope (craft/world) to a format error.
+/// the body asset (resolving a ref), mapping any other scope (craft/world) to a
+/// format error.
 pub fn body_from_document(json: &str) -> Result<BodyAsset, LibraryError> {
     match SavedDocument::from_json(json)?.payload {
         Payload::BodyAsset(a) => Ok(a),
+        Payload::BodyRef(r) => r.resolve().map_err(LibraryError::BodyRef),
         _ => Err(LibraryError::Format(FormatError::Malformed(
             "expected a body-asset document, found another scope".to_string(),
         ))),
@@ -95,6 +119,9 @@ pub fn list_bodies(dir: &Path) -> Vec<BodyEntry> {
             Ok(bytes) => match SavedDocument::from_json(&bytes) {
                 Ok(doc) => match doc.payload {
                     Payload::BodyAsset(a) => a.name,
+                    // A ref lists by its recorded name — discovery must not
+                    // pay (or fail on) a resolve; `load_body` verifies.
+                    Payload::BodyRef(r) => r.name,
                     _ => continue, // wrong scope (craft/world) — skip
                 },
                 Err(_) => continue,
@@ -207,6 +234,59 @@ mod tests {
             body_from_document(&ws),
             Err(LibraryError::Format(_))
         ));
+    }
+
+    /// WI 891 scenario A1, library level: a saved ref lists by its recorded
+    /// name and loads by regenerating bit-identically (digest-verified inside
+    /// `BodyRef::resolve`), for both the generated and the canonical source.
+    #[test]
+    fn body_refs_save_list_and_regenerate_bit_identically() {
+        use crate::bodygen::{generate, Archetype};
+        let dir = scratch_dir("ref");
+        let gen_ref = BodyRef::for_generated(Archetype::RockyPlanet, 42);
+        let canon_ref = BodyRef::for_canonical("earthlike").expect("earthlike is canonical");
+        let gen_path = save_body_ref(&dir, &gen_ref).unwrap();
+        let canon_path = save_body_ref(&dir, &canon_ref).unwrap();
+
+        let names: Vec<String> = list_bodies(&dir).into_iter().map(|e| e.name).collect();
+        assert!(names.contains(&gen_ref.name) && names.contains(&canon_ref.name));
+
+        assert_eq!(
+            load_body(&gen_path).unwrap(),
+            generate(42, Archetype::RockyPlanet)
+        );
+        assert_eq!(load_body(&canon_path).unwrap(), BodyAsset::earthlike());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WI 891 scenario A2 at the library boundary: a tampered digest fails
+    /// typed (`LibraryError::BodyRef`), and discovery still lists the file
+    /// (verification is `load_body`'s job, not `list_bodies`').
+    #[test]
+    fn tampered_ref_fails_typed_but_still_lists() {
+        use crate::bodygen::Archetype;
+        let dir = scratch_dir("tamper");
+        let mut r = BodyRef::for_generated(Archetype::Moon, 7);
+        r.digest = "0000000000000000".to_string();
+        let path = save_body_ref(&dir, &r).unwrap();
+        assert!(matches!(
+            load_body(&path),
+            Err(LibraryError::BodyRef(
+                crate::body_ref::BodyRefError::DigestMismatch { .. }
+            ))
+        ));
+        assert_eq!(list_bodies(&dir).len(), 1, "listed, not resolved");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WI 891 byte-identity posture: a ref document re-encodes byte-identically
+    /// after a load round trip.
+    #[test]
+    fn ref_document_is_byte_stable_across_load_save() {
+        let r = BodyRef::for_canonical("earthlike").unwrap();
+        let json = SavedDocument::new(Payload::BodyRef(r)).to_json().unwrap();
+        let doc = SavedDocument::from_json(&json).unwrap();
+        assert_eq!(doc.to_json().unwrap(), json);
     }
 
     #[test]

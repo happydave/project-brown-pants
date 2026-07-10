@@ -190,6 +190,9 @@ pub enum ScenarioError {
     Mission { id: String, error: MissionError },
     /// A mission's `AfterMission` offer names a mission not in this scenario.
     UnknownMissionRef { mission: String, after: String },
+    /// A world-save per-body record failed at load (WI 891): a snapshot's
+    /// integrity digest mismatched, or the record list is malformed.
+    BodyRecord(crate::world_save::BodyRecordError),
 }
 
 impl fmt::Display for ScenarioError {
@@ -250,6 +253,7 @@ impl fmt::Display for ScenarioError {
                 "mission `{mission}` offers after `{after}`, which is not a mission of this \
                  scenario"
             ),
+            ScenarioError::BodyRecord(e) => write!(f, "world-save body record: {e}"),
         }
     }
 }
@@ -306,6 +310,12 @@ pub struct Scenario {
     pub universe: Universe,
     /// The root body's asset (surface constants + fluid medium).
     pub root_asset: BodyAsset,
+    /// Every body asset of the compiled world, in system order and
+    /// deduplicated (WI 891) — what per-body world-save records are built
+    /// over. Includes the root; one entry per asset id even when several
+    /// system bodies instance the same asset (per-body records are keyed by
+    /// asset id, and a duplicate id in a save is malformed).
+    pub assets: Vec<BodyAsset>,
     /// The starting craft's lattice, loaded from its blueprint.
     pub blueprint: VoxelCraft,
     /// The starting placement.
@@ -337,6 +347,23 @@ struct PhaseProbe {
 /// blueprint, and checking the device bindings. Any failure is a typed
 /// [`ScenarioError`] naming the offending reference.
 pub fn load_scenario(path: &Path, roots: &ScenarioRoots) -> Result<Scenario, ScenarioError> {
+    // With no saved body records there is nothing to substitute or verify —
+    // the drift list is empty by construction.
+    let (scenario, _drift) = load_scenario_resumed(path, roots, &[])?;
+    Ok(scenario)
+}
+
+/// [`load_scenario`] with a world save's per-body records applied (WI 891):
+/// snapshot-tier bodies substitute their pinned assets **before**
+/// `System::compile` (load bypasses resolve/derive for them), digest-tier
+/// bodies verify against the regenerated assets. Returns the body drift
+/// lines alongside the scenario (empty = silent resume); a snapshot
+/// integrity failure or malformed record list is a typed error.
+pub fn load_scenario_resumed(
+    path: &Path,
+    roots: &ScenarioRoots,
+    saved_bodies: &[crate::world_save::SavedBodyRecord],
+) -> Result<(Scenario, Vec<String>), ScenarioError> {
     let text = read(path)?;
     let doc: ScenarioDoc = ron::from_str(&text).map_err(|e| ScenarioError::Parse(e.to_string()))?;
     if doc.format != CONTENT_FORMAT_VERSION {
@@ -351,12 +378,23 @@ pub fn load_scenario(path: &Path, roots: &ScenarioRoots) -> Result<Scenario, Sce
             });
         }
     }
-    load_doc(doc, roots)
+    load_doc_resumed(doc, roots, saved_bodies)
 }
 
 /// Loads and validates an already-parsed scenario document (the path-id check
 /// is the caller's when a path exists).
 pub fn load_doc(doc: ScenarioDoc, roots: &ScenarioRoots) -> Result<Scenario, ScenarioError> {
+    let (scenario, _drift) = load_doc_resumed(doc, roots, &[])?;
+    Ok(scenario)
+}
+
+/// [`load_doc`] with a world save's per-body records applied — see
+/// [`load_scenario_resumed`].
+pub fn load_doc_resumed(
+    doc: ScenarioDoc,
+    roots: &ScenarioRoots,
+    saved_bodies: &[crate::world_save::SavedBodyRecord],
+) -> Result<(Scenario, Vec<String>), ScenarioError> {
     // Missions (WI 551): resolve each referenced document, loudly.
     let mut missions: Vec<Mission> = Vec::with_capacity(doc.missions.len());
     for id in &doc.missions {
@@ -448,15 +486,20 @@ pub fn load_doc(doc: ScenarioDoc, roots: &ScenarioRoots) -> Result<Scenario, Sce
     known.insert(EARTHLIKE_SLUG.to_string());
     catalog.validate_body_refs(&known)?;
 
-    // The world, by reference.
-    let (universe, root_asset) = match &doc.world {
+    // The world, by reference. Saved per-body records apply to the resolved
+    // asset list before compile (WI 891): pinned snapshots substitute in,
+    // digest fingerprints verify — the drift lines carry out to the caller.
+    let (universe, root_asset, assets, body_drift) = match &doc.world {
         WorldRef::Earthlike => {
-            let asset = BodyAsset::earthlike();
+            let mut assets = vec![BodyAsset::earthlike()];
+            let body_drift = crate::world_save::apply_body_records(saved_bodies, &mut assets)
+                .map_err(ScenarioError::BodyRecord)?;
+            let asset = assets[0].clone();
             let system = System::single_body(EARTHLIKE_SLUG, "Earthlike", &asset.id);
             let universe = system
                 .compile(std::slice::from_ref(&asset))
                 .map_err(ScenarioError::Compile)?;
-            (universe, asset)
+            (universe, asset, assets, body_drift)
         }
         WorldRef::System(slug) => {
             let sys_path = system_library::system_path(&roots.saves.join("systems"), slug);
@@ -479,18 +522,36 @@ pub fn load_doc(doc: ScenarioDoc, roots: &ScenarioRoots) -> Result<Scenario, Sce
                 assets.push(asset);
             }
             assets.push(BodyAsset::earthlike());
-            let universe = system.compile(&assets).map_err(ScenarioError::Compile)?;
+            // The world's assets, in system order and deduplicated (two
+            // system bodies may instance one asset): what saved records apply
+            // to, what compile reads, and what per-body records are built
+            // over. Library bodies the system does not reference are not part
+            // of this world — a saved record naming one is "not in the
+            // resolved world" drift, not a silent apply.
+            let mut world_assets: Vec<BodyAsset> = Vec::new();
+            for b in &system.bodies {
+                if world_assets.iter().all(|a| a.id != b.asset_id) {
+                    if let Some(a) = assets.iter().find(|a| a.id == b.asset_id) {
+                        world_assets.push(a.clone());
+                    }
+                }
+            }
+            let body_drift = crate::world_save::apply_body_records(saved_bodies, &mut world_assets)
+                .map_err(ScenarioError::BodyRecord)?;
+            let universe = system
+                .compile(&world_assets)
+                .map_err(ScenarioError::Compile)?;
             let root = system
                 .bodies
                 .iter()
                 .find(|b| matches!(b.placement, Placement::Root))
                 .expect("compile validated exactly one root");
-            let root_asset = assets
+            let root_asset = world_assets
                 .iter()
                 .find(|a| a.id == root.asset_id)
                 .expect("compile validated known assets")
                 .clone();
-            (universe, root_asset)
+            (universe, root_asset, world_assets, body_drift)
         }
     };
 
@@ -527,19 +588,23 @@ pub fn load_doc(doc: ScenarioDoc, roots: &ScenarioRoots) -> Result<Scenario, Sce
         }
     }
 
-    Ok(Scenario {
-        id: doc.id,
-        version: doc.version,
-        name: doc.name,
-        catalog,
-        universe,
-        root_asset,
-        blueprint,
-        placement: doc.start.placement,
-        bindings: doc.start.bindings,
-        lore: doc.lore,
-        missions,
-    })
+    Ok((
+        Scenario {
+            id: doc.id,
+            version: doc.version,
+            name: doc.name,
+            catalog,
+            universe,
+            root_asset,
+            assets,
+            blueprint,
+            placement: doc.start.placement,
+            bindings: doc.start.bindings,
+            lore: doc.lore,
+            missions,
+        },
+        body_drift,
+    ))
 }
 
 /// The device class a resolved spec belongs to.
@@ -694,6 +759,62 @@ mod tests {
         }
     }
 
+    /// WI 891 scenarios B1/B3 at the load seam: a resumed load substitutes a
+    /// pinned snapshot before compile — the scenario's root asset IS the
+    /// snapshot (derive bypassed) — with the version pin named as drift; a
+    /// tampered snapshot is a typed error, not a fallback.
+    #[test]
+    fn resumed_load_pins_snapshots_and_names_drift() {
+        use crate::body_digest::{digest_hex, BODY_OUTPUT_VERSION};
+        use crate::world_save::{BodyRecordError, SavedBodyRecord};
+        let roots = scratch_roots("resume-bodies");
+        let path = standard_fixture(&roots, &base_scenario(""));
+
+        let mut pinned = BodyAsset::earthlike();
+        pinned.radius += 500.0;
+        let records = vec![SavedBodyRecord::Snapshot {
+            id: pinned.id.clone(),
+            output_version: BODY_OUTPUT_VERSION + 1,
+            digest: digest_hex(&pinned),
+            body: Box::new(pinned.clone()),
+        }];
+        let (s, drift) = load_scenario_resumed(&path, &roots, &records).unwrap();
+        assert_eq!(s.root_asset, pinned, "snapshot pinned in, derive bypassed");
+        assert_eq!(s.assets, vec![pinned.clone()]);
+        assert_eq!(drift.len(), 1);
+        assert!(drift[0].contains("pins output version"), "{}", drift[0]);
+
+        let bad = vec![SavedBodyRecord::Snapshot {
+            id: pinned.id.clone(),
+            output_version: BODY_OUTPUT_VERSION,
+            digest: "0".repeat(16),
+            body: Box::new(pinned.clone()),
+        }];
+        match load_scenario_resumed(&path, &roots, &bad) {
+            Err(ScenarioError::BodyRecord(BodyRecordError::SnapshotIntegrity { id })) => {
+                assert_eq!(id, pinned.id)
+            }
+            other => panic!("expected SnapshotIntegrity, got {other:?}"),
+        }
+    }
+
+    /// WI 891 production default (plan Phase B): the spawn's per-body records
+    /// snapshot the root/central body; a plain (non-resumed) load carries the
+    /// world's assets for the builder.
+    #[test]
+    fn spawn_records_default_to_a_root_snapshot() {
+        let roots = scratch_roots("spawn-records");
+        let path = standard_fixture(&roots, &base_scenario(""));
+        let s = load_scenario(&path, &roots).unwrap();
+        assert_eq!(s.assets, vec![s.root_asset.clone()]);
+        let spawn = crate::director::ScenarioSpawn::from_scenario(&s);
+        assert_eq!(spawn.bodies.len(), 1);
+        assert!(matches!(
+            &spawn.bodies[0],
+            crate::world_save::SavedBodyRecord::Snapshot { id, .. } if *id == s.root_asset.id
+        ));
+    }
+
     #[test]
     fn missing_pack_is_named() {
         let roots = scratch_roots("missing-pack");
@@ -753,6 +874,75 @@ mod tests {
         );
         let s = load_scenario(&path, &roots).unwrap();
         assert_eq!(s.root_asset.id, "mun");
+    }
+
+    /// WI 891 edge cases at the system-world seam: a saved record naming a
+    /// body that is in the *library* but not the *system* is "not in the
+    /// resolved world" drift (inert, never applied); and two system bodies
+    /// instancing one asset yield a single `Scenario.assets` entry, so the
+    /// per-body records a save builds from it stay free of duplicate ids
+    /// (a duplicate id in a save is malformed and would block resume).
+    #[test]
+    fn system_world_records_apply_to_world_assets_only_and_shared_assets_dedupe() {
+        use crate::body_digest::{digest_hex, BODY_OUTPUT_VERSION};
+        use crate::frame::FrameId;
+        use crate::orbit::Orbit;
+        use crate::system::SystemBody;
+        use crate::world_save::SavedBodyRecord;
+        let roots = scratch_roots("system-world-records");
+        let mut mun = BodyAsset::earthlike();
+        mun.name = "Mun".to_string();
+        mun.id = "mun".to_string();
+        crate::body_library::save_body(&roots.saves.join("bodies"), &mun).unwrap();
+        // A second library body the system does NOT reference.
+        let mut far = BodyAsset::earthlike();
+        far.name = "Far".to_string();
+        far.id = "far".to_string();
+        crate::body_library::save_body(&roots.saves.join("bodies"), &far).unwrap();
+        // Two system bodies instancing the same asset (compile allows this).
+        let mut sys = System::single_body("home", "Home", "mun");
+        sys.bodies.push(SystemBody {
+            frame: FrameId(FrameId::CENTRAL_BODY.0 + 1),
+            asset_id: "mun".to_string(),
+            placement: Placement::Orbiting {
+                parent: FrameId::CENTRAL_BODY,
+                orbit: Orbit {
+                    mu: mun.mu,
+                    semi_major_axis: 1.0e9,
+                    eccentricity: 0.0,
+                    arg_periapsis: 0.0,
+                    mean_anomaly_at_epoch: 0.0,
+                    epoch: 0.0,
+                    sense: 1.0,
+                },
+            },
+        });
+        crate::system_library::save_system(&roots.saves.join("systems"), &sys).unwrap();
+        let path = standard_fixture(
+            &roots,
+            r#"(format: 1, id: "s", name: "S", world: System("home"), packs: ["p"],
+                start: (blueprint: "bp", placement: Pad, bindings: { Engine: "e", Tank: "t" }))"#,
+        );
+
+        // A record for the unreferenced library body: named as not-in-world
+        // drift, never applied to the library asset.
+        let records = vec![SavedBodyRecord::Digest {
+            id: "far".to_string(),
+            output_version: BODY_OUTPUT_VERSION,
+            digest: digest_hex(&far),
+        }];
+        let (s, drift) = load_scenario_resumed(&path, &roots, &records).unwrap();
+        assert_eq!(drift.len(), 1);
+        assert!(
+            drift[0].contains("far") && drift[0].contains("not in the resolved world"),
+            "{}",
+            drift[0]
+        );
+        // Shared asset dedupes: one entry, so a save built from it has no
+        // duplicate record ids.
+        assert_eq!(s.assets, vec![mun]);
+        let spawn = crate::director::ScenarioSpawn::from_scenario(&s);
+        assert_eq!(spawn.bodies.len(), 1);
     }
 
     #[test]

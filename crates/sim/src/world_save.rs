@@ -27,6 +27,8 @@
 //! the family's idioms: slug-of-name file identity, wrong-scope rejection,
 //! skip-don't-abort discovery.
 
+use crate::body_asset::BodyAsset;
+use crate::body_digest::{digest_hex, BODY_OUTPUT_VERSION};
 use crate::content::Setting;
 use crate::director::ScenarioFlight;
 use crate::flight::FlightCraft;
@@ -39,7 +41,8 @@ use crate::session::GameSession;
 use crate::vessel::VesselRecord;
 use glam::{DQuat, DVec3};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -110,6 +113,88 @@ pub struct SavedBodyState {
     pub angular_momentum: DVec3,
 }
 
+/// One celestial body's world-save record (WI 891, design-review N1): the
+/// **tier is a stored field**, chosen at save time — there is no per-body
+/// player-progression model yet to derive it from, and Starbound's shipped
+/// per-object policy is the survey's model. A body absent from the list is
+/// the *virtual* tier: nothing stored, a pure function of recipe+seed
+/// (today's behavior, unchanged).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "tier", rename_all = "snake_case")]
+pub enum SavedBodyRecord {
+    /// The settled tier: the full resolved body is **pinned**. Load uses it
+    /// verbatim, bypassing resolve/derive unconditionally; a moved generator
+    /// is reported, never silently swapped in (plan invariant).
+    Snapshot {
+        /// The body-asset id (the System's reference key).
+        id: String,
+        /// [`BODY_OUTPUT_VERSION`] at save time — a difference at load means
+        /// the snapshot pins against a moved generator (a drift line).
+        output_version: u32,
+        /// `digest_hex` of `body` at save time — the **record-integrity**
+        /// check: recomputed over the loaded snapshot itself (no regeneration),
+        /// a mismatch is a corrupt/hand-edited record and a typed load error.
+        digest: String,
+        /// The pinned resolved body. Boxed so the rare snapshot variant does
+        /// not inflate every record (the crate's `large_enum_variant`
+        /// discipline).
+        body: Box<BodyAsset>,
+    },
+    /// The visited tier: fingerprint only. The body regenerates through the
+    /// normal resolve/derive path; the recorded digest detects drift —
+    /// same-version mismatch reads as unintended drift, a version move as the
+    /// expected reroll. Load proceeds with the regenerated body either way.
+    Digest {
+        /// The body-asset id.
+        id: String,
+        /// [`BODY_OUTPUT_VERSION`] at save time.
+        output_version: u32,
+        /// `digest_hex` of the resolved body at save time.
+        digest: String,
+    },
+}
+
+impl SavedBodyRecord {
+    /// The body-asset id this record covers.
+    pub fn id(&self) -> &str {
+        match self {
+            SavedBodyRecord::Snapshot { id, .. } | SavedBodyRecord::Digest { id, .. } => id,
+        }
+    }
+}
+
+/// A typed per-body record failure at load (WI 891). Loud and naming the
+/// offender; never a silent fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodyRecordError {
+    /// A snapshot-tier record failed its integrity check: the stored body no
+    /// longer hashes to the stored digest (corrupt or hand-edited record).
+    SnapshotIntegrity {
+        /// The record's body id.
+        id: String,
+    },
+    /// The per-body list names the same id twice — malformed.
+    DuplicateId {
+        /// The duplicated body id.
+        id: String,
+    },
+}
+
+impl fmt::Display for BodyRecordError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BodyRecordError::SnapshotIntegrity { id } => write!(
+                f,
+                "world-save body snapshot `{id}` fails its integrity digest \
+                 (corrupt or hand-edited record)"
+            ),
+            BodyRecordError::DuplicateId { id } => {
+                write!(f, "world-save body records name `{id}` twice")
+            }
+        }
+    }
+}
+
 /// One mission's saved runtime state. The definition is deliberately **not**
 /// saved — it re-resolves from current content on load (the migration
 /// posture); state applies by id where the objective's shape still matches.
@@ -149,6 +234,10 @@ pub struct ScenarioSaveState {
     /// Per-mission runtime state, in save order.
     #[serde(default)]
     pub missions: Vec<MissionSave>,
+    /// Per-body snapshot/digest records (WI 891, additive — absent in older
+    /// saves and absent when empty, so pre-891 documents are byte-unchanged).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bodies: Vec<SavedBodyRecord>,
 }
 
 // ---------------------------------------------------------------------------
@@ -185,8 +274,147 @@ pub fn capture(flight: &ScenarioFlight, vessels: Vec<VesselRecord>) -> WorldPayl
                     nodes: m.nodes.clone(),
                 })
                 .collect(),
+            bodies: flight.bodies.clone(),
         })),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-body record policy (WI 891, design-review N1).
+// ---------------------------------------------------------------------------
+
+/// Builds the per-body records for a resolved world: ids in `snapshot_ids`
+/// get the snapshot tier, every other body the digest tier. The production
+/// default assignment (the root/central body snapshotted, the rest digested)
+/// is the caller's — `ScenarioSpawn::from_scenario` supplies it — because the
+/// tier is a save-time choice, not derivable world state.
+pub fn body_records(assets: &[BodyAsset], snapshot_ids: &BTreeSet<String>) -> Vec<SavedBodyRecord> {
+    assets
+        .iter()
+        .map(|a| {
+            let digest = digest_hex(a);
+            if snapshot_ids.contains(&a.id) {
+                SavedBodyRecord::Snapshot {
+                    id: a.id.clone(),
+                    output_version: BODY_OUTPUT_VERSION,
+                    digest,
+                    body: Box::new(a.clone()),
+                }
+            } else {
+                SavedBodyRecord::Digest {
+                    id: a.id.clone(),
+                    output_version: BODY_OUTPUT_VERSION,
+                    digest,
+                }
+            }
+        })
+        .collect()
+}
+
+/// The load path (WI 891): applies saved per-body records to a resolved asset
+/// list **before** `System::compile` (the survey's verify-before-wire rule).
+///
+/// - **Snapshot tier**: two checks, neither running resolve/derive — the
+///   record's integrity digest (recomputed over the stored snapshot itself;
+///   a mismatch is the typed error), then the substitution: the snapshot
+///   replaces the same-id asset unconditionally. A recorded output version
+///   differing from this build's is a drift line (the snapshot pins against a
+///   moved generator — never silently swapped).
+/// - **Digest tier**: the asset in the list is already the regenerated body;
+///   its digest is compared — same-version mismatch reads as unintended
+///   drift, a version move as the expected reroll. Both are drift lines; load
+///   proceeds with the regenerated body.
+/// - A record whose id is not among the assets is a drift line and otherwise
+///   inert; a duplicated id is malformed (typed error).
+///
+/// Returns the drift lines (empty = silent resume).
+pub fn apply_body_records(
+    records: &[SavedBodyRecord],
+    assets: &mut [BodyAsset],
+) -> Result<Vec<String>, BodyRecordError> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut drift = Vec::new();
+    for record in records {
+        if !seen.insert(record.id()) {
+            return Err(BodyRecordError::DuplicateId {
+                id: record.id().to_string(),
+            });
+        }
+        let slot = assets.iter_mut().find(|a| a.id == record.id());
+        match (record, slot) {
+            (_, None) => drift.push(format!(
+                "body record `{}` names a body not in the resolved world",
+                record.id()
+            )),
+            (
+                SavedBodyRecord::Snapshot {
+                    id,
+                    output_version,
+                    digest,
+                    body,
+                },
+                Some(slot),
+            ) => {
+                if digest_hex(body) != *digest {
+                    return Err(BodyRecordError::SnapshotIntegrity { id: id.clone() });
+                }
+                if *output_version != BODY_OUTPUT_VERSION {
+                    drift.push(format!(
+                        "body `{id}` snapshot pins output version {output_version} \
+                         (this build generates {BODY_OUTPUT_VERSION})"
+                    ));
+                }
+                *slot = (**body).clone();
+            }
+            (
+                SavedBodyRecord::Digest {
+                    id,
+                    output_version,
+                    digest,
+                },
+                Some(slot),
+            ) => {
+                let computed = digest_hex(slot);
+                if *output_version != BODY_OUTPUT_VERSION {
+                    drift.push(format!(
+                        "body `{id}` regenerated under output version {BODY_OUTPUT_VERSION} \
+                         (saved at {output_version}) — expected reroll"
+                    ));
+                } else if computed != *digest {
+                    drift.push(format!(
+                        "body `{id}` regenerated with digest {computed}, but {digest} was \
+                         recorded — unintended generator drift"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(drift)
+}
+
+/// Carries snapshot pins across a resume (WI 891): a freshly rebuilt record
+/// list would re-stamp a pinned snapshot with this build's output version,
+/// silently erasing the "pinned against a moved generator" marker on the next
+/// save. So a loaded **snapshot** record replaces its same-id fresh record
+/// verbatim; loaded digest records are superseded by the fresh ones (an
+/// accepted reroll updates the fingerprint). Records for bodies no longer in
+/// the world are dropped (they were already named in the load drift report).
+pub fn reconcile_body_records(
+    fresh: Vec<SavedBodyRecord>,
+    saved: &[SavedBodyRecord],
+) -> Vec<SavedBodyRecord> {
+    fresh
+        .into_iter()
+        .map(|record| {
+            let pinned = saved
+                .iter()
+                .find(|s| s.id() == record.id() && matches!(s, SavedBodyRecord::Snapshot { .. }));
+            match (pinned, &record) {
+                (Some(pin), SavedBodyRecord::Snapshot { .. }) => pin.clone(),
+                _ => record,
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -494,6 +722,138 @@ mod tests {
             latest.slug
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WI 891 (design-review N1): the builder assigns tiers from the caller's
+    /// snapshot set; `apply_body_records` runs the two regeneration-free
+    /// snapshot checks (integrity digest, output-version pin note) and the
+    /// digest-tier comparison; drift lines follow the plan's taxonomy.
+    #[test]
+    fn body_records_policy_pins_verifies_and_reports_drift() {
+        use crate::body_digest::{digest_hex, BODY_OUTPUT_VERSION};
+        use crate::bodygen::{generate, Archetype};
+        let root = BodyAsset::earthlike();
+        let visited = generate(42, Archetype::RockyPlanet);
+        let assets = vec![root.clone(), visited.clone()];
+        let snapshot_ids: BTreeSet<String> = std::iter::once(root.id.clone()).collect();
+        let records = body_records(&assets, &snapshot_ids);
+        assert!(matches!(&records[0], SavedBodyRecord::Snapshot { id, .. } if *id == root.id));
+        assert!(matches!(&records[1], SavedBodyRecord::Digest { id, .. } if *id == visited.id));
+
+        // Clean apply: silent, nothing changed.
+        let mut loaded = assets.clone();
+        let drift = apply_body_records(&records, &mut loaded).unwrap();
+        assert!(drift.is_empty(), "{drift:?}");
+        assert_eq!(loaded, assets);
+
+        // Scenario B3 (pin): a snapshot differing from the regenerated body
+        // wins unconditionally — the substitution IS the derive bypass — and
+        // a moved output version is a named drift line, never a swap.
+        let mut pinned_body = root.clone();
+        pinned_body.radius += 1000.0;
+        let pin = SavedBodyRecord::Snapshot {
+            id: root.id.clone(),
+            output_version: BODY_OUTPUT_VERSION + 1,
+            digest: digest_hex(&pinned_body),
+            body: Box::new(pinned_body.clone()),
+        };
+        let mut loaded = assets.clone();
+        let drift = apply_body_records(std::slice::from_ref(&pin), &mut loaded).unwrap();
+        assert_eq!(loaded[0], pinned_body, "snapshot wins");
+        assert_eq!(drift.len(), 1);
+        assert!(drift[0].contains("pins output version"), "{}", drift[0]);
+
+        // Scenario B3 (integrity): tampered snapshot content is typed.
+        let bad = SavedBodyRecord::Snapshot {
+            id: root.id.clone(),
+            output_version: BODY_OUTPUT_VERSION,
+            digest: "0".repeat(16),
+            body: Box::new(pinned_body.clone()),
+        };
+        let mut loaded = assets.clone();
+        assert!(matches!(
+            apply_body_records(&[bad], &mut loaded),
+            Err(BodyRecordError::SnapshotIntegrity { id }) if id == root.id
+        ));
+
+        // Scenario B2 (digest tier): same-version mismatch reads as
+        // unintended drift; a version move as the expected reroll — the
+        // regenerated body is kept in both cases.
+        let wrong = SavedBodyRecord::Digest {
+            id: visited.id.clone(),
+            output_version: BODY_OUTPUT_VERSION,
+            digest: "0".repeat(16),
+        };
+        let mut loaded = assets.clone();
+        let drift = apply_body_records(&[wrong], &mut loaded).unwrap();
+        assert!(
+            drift[0].contains("unintended generator drift"),
+            "{}",
+            drift[0]
+        );
+        assert_eq!(loaded, assets, "regenerated body kept");
+        let moved = SavedBodyRecord::Digest {
+            id: visited.id.clone(),
+            output_version: BODY_OUTPUT_VERSION + 1,
+            digest: digest_hex(&visited),
+        };
+        let mut loaded = assets.clone();
+        let drift = apply_body_records(&[moved], &mut loaded).unwrap();
+        assert!(drift[0].contains("expected reroll"), "{}", drift[0]);
+
+        // Unknown id: named, inert. Duplicate id: malformed, typed.
+        let ghost = SavedBodyRecord::Digest {
+            id: "ghost".into(),
+            output_version: BODY_OUTPUT_VERSION,
+            digest: "0".repeat(16),
+        };
+        let mut loaded = assets.clone();
+        let drift = apply_body_records(std::slice::from_ref(&ghost), &mut loaded).unwrap();
+        assert!(drift[0].contains("ghost"), "{}", drift[0]);
+        assert_eq!(loaded, assets);
+        let mut loaded = assets.clone();
+        assert!(matches!(
+            apply_body_records(&[ghost.clone(), ghost], &mut loaded),
+            Err(BodyRecordError::DuplicateId { id }) if id == "ghost"
+        ));
+    }
+
+    /// WI 891 resume reconciliation: a loaded snapshot pin replaces its fresh
+    /// same-id record verbatim (the recorded output version survives the next
+    /// save), digest records rebuild fresh, and records for absent bodies drop.
+    #[test]
+    fn reconcile_preserves_pins_and_refreshes_digests() {
+        use crate::body_digest::{digest_hex, BODY_OUTPUT_VERSION};
+        use crate::bodygen::{generate, Archetype};
+        let root = BodyAsset::earthlike();
+        let visited = generate(42, Archetype::RockyPlanet);
+        let snapshot_ids: BTreeSet<String> = std::iter::once(root.id.clone()).collect();
+        let fresh = body_records(&[root.clone(), visited.clone()], &snapshot_ids);
+
+        let mut old_root = root.clone();
+        old_root.radius += 1000.0;
+        let saved = vec![
+            SavedBodyRecord::Snapshot {
+                id: root.id.clone(),
+                output_version: BODY_OUTPUT_VERSION + 1,
+                digest: digest_hex(&old_root),
+                body: Box::new(old_root),
+            },
+            SavedBodyRecord::Digest {
+                id: visited.id.clone(),
+                output_version: BODY_OUTPUT_VERSION + 1,
+                digest: "0".repeat(16),
+            },
+            SavedBodyRecord::Digest {
+                id: "gone".into(),
+                output_version: BODY_OUTPUT_VERSION,
+                digest: "0".repeat(16),
+            },
+        ];
+        let out = reconcile_body_records(fresh.clone(), &saved);
+        assert_eq!(out.len(), 2, "absent-body record dropped");
+        assert_eq!(out[0], saved[0], "snapshot pin preserved verbatim");
+        assert_eq!(out[1], fresh[1], "digest record rebuilt fresh");
     }
 
     /// The drift report names every change class and stays silent on an

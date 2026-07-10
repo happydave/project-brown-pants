@@ -82,6 +82,13 @@ impl Fnv {
     }
 }
 
+/// [`digest_body`] as 16 lowercase hex digits — the golden file's spelling,
+/// and the one persisted surface (WI 891: catalog refs and world-save body
+/// records store and compare this string form).
+pub fn digest_hex(a: &BodyAsset) -> String {
+    format!("{:016x}", digest_body(a))
+}
+
 /// The stable digest of a resolved body — a pure function of the asset's
 /// canonical byte layout (module docs). Feeds the golden harness now; the
 /// world-save digest and surface-chunk cache key later.

@@ -39,6 +39,10 @@ pub enum LibraryError {
     /// derived slug is empty before the fallback is applied — callers should validate
     /// the display name first (the overlay rejects blank names).
     EmptyName,
+    /// A body catalog ref failed to resolve on load (WI 891): unresolvable
+    /// source, moved output version, or digest mismatch — typed and naming
+    /// the offender, never flattened into a string.
+    BodyRef(crate::body_ref::BodyRefError),
 }
 
 impl std::fmt::Display for LibraryError {
@@ -47,6 +51,7 @@ impl std::fmt::Display for LibraryError {
             LibraryError::Io(m) => write!(f, "craft library I/O error: {m}"),
             LibraryError::Format(e) => write!(f, "craft library format error: {e}"),
             LibraryError::EmptyName => write!(f, "craft name is empty after slugging"),
+            LibraryError::BodyRef(e) => write!(f, "body library ref error: {e}"),
         }
     }
 }
@@ -185,7 +190,8 @@ pub fn craft_from_document(json: &str) -> Result<VoxelCraft, LibraryError> {
         Payload::WorldSave(_)
         | Payload::BodyAsset(_)
         | Payload::System(_)
-        | Payload::VesselRecord(_) => Err(LibraryError::Format(FormatError::Malformed(
+        | Payload::VesselRecord(_)
+        | Payload::BodyRef(_) => Err(LibraryError::Format(FormatError::Malformed(
             "expected a craft-scope document".to_string(),
         ))),
     }
@@ -219,7 +225,8 @@ pub fn list_crafts(dir: &Path) -> Vec<CraftEntry> {
                     Payload::WorldSave(_)
                     | Payload::BodyAsset(_)
                     | Payload::System(_)
-                    | Payload::VesselRecord(_) => continue,
+                    | Payload::VesselRecord(_)
+                    | Payload::BodyRef(_) => continue,
                 },
                 Err(_) => continue,
             },

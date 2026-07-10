@@ -120,6 +120,13 @@ pub struct ScenarioSpawn {
     /// + dynamic overwrite, one spawn path. Boxed — it embeds a full craft.
     #[serde(default)]
     pub resume: Option<Box<ScenarioSaveState>>,
+    /// Per-body world-save records for this world (WI 891): built from the
+    /// scenario's resolved assets (root ⇒ snapshot tier, the rest ⇒ digest
+    /// tier — the production default), carried to the flight and written into
+    /// world saves by `capture`. On resume, loaded snapshot pins are
+    /// preserved verbatim (`world_save::reconcile_body_records`).
+    #[serde(default)]
+    pub bodies: Vec<crate::world_save::SavedBodyRecord>,
 }
 
 impl ScenarioSpawn {
@@ -167,6 +174,10 @@ impl ScenarioSpawn {
             missions: s.missions.clone(),
             content: ContentIdentity::from_scenario(s),
             resume: None,
+            bodies: crate::world_save::body_records(
+                &s.assets,
+                &std::iter::once(s.root_asset.id.clone()).collect(),
+            ),
         }
     }
 }
@@ -217,6 +228,10 @@ pub struct ScenarioFlight {
     /// The resolved-content identity this flight was composed from (WI 553)
     /// — what a world save records.
     pub content: ContentIdentity,
+    /// Per-body world-save records (WI 891) — what `capture` writes. On a
+    /// resumed flight, loaded snapshot pins were preserved verbatim so a
+    /// re-save never silently re-stamps a pinned body's output version.
+    pub bodies: Vec<crate::world_save::SavedBodyRecord>,
 }
 
 /// One mission's runtime state: its definition, lifecycle state, and the
@@ -413,9 +428,14 @@ pub fn instantiate(spawn: &ScenarioSpawn) -> Option<ScenarioFlight> {
         },
         g_force: 1.0,
         content: spawn.content.clone(),
+        bodies: spawn.bodies.clone(),
     };
     if let Some(saved) = &spawn.resume {
         apply_resume(&mut flight, saved, &spawn.missions);
+        // Carry loaded snapshot pins through the resume verbatim (WI 891) —
+        // a rebuilt record must not re-stamp a pin's recorded output version.
+        flight.bodies =
+            crate::world_save::reconcile_body_records(spawn.bodies.clone(), &saved.bodies);
     }
     Some(flight)
 }
@@ -928,6 +948,7 @@ mod tests {
             missions: Vec::new(),
             content: ContentIdentity::default(),
             resume: None,
+            bodies: Vec::new(),
         }
     }
 
@@ -1515,6 +1536,59 @@ mod tests {
             MissionState::Completed
         );
         assert_eq!(app.world().resource::<SimClock>().warp, 4.0);
+    }
+
+    /// WI 891: `capture` writes the flight's per-body records; an empty list
+    /// stays absent from the JSON (pre-891 world saves are byte-unchanged by
+    /// this WI); records round-trip through the envelope; and a resume
+    /// carries a loaded snapshot pin through reconciliation verbatim.
+    #[test]
+    fn capture_carries_body_records_and_resume_preserves_pins() {
+        use crate::world_save::SavedBodyRecord;
+        // Empty records: the member is absent (the additive rule's byte test).
+        let spawn = spawn_payload();
+        let flight = instantiate(&spawn).unwrap();
+        let json = crate::persist::SavedDocument::new(crate::persist::Payload::WorldSave(
+            crate::world_save::capture(&flight, vec![]),
+        ))
+        .to_json()
+        .unwrap();
+        assert!(!json.contains("\"bodies\""), "absent member stays absent");
+
+        // With records: capture writes them; the envelope round-trips them.
+        let root = crate::body_asset::BodyAsset::earthlike();
+        let mut spawn = spawn_payload();
+        spawn.bodies = crate::world_save::body_records(
+            std::slice::from_ref(&root),
+            &std::iter::once(root.id.clone()).collect(),
+        );
+        let flight = instantiate(&spawn).unwrap();
+        let payload = crate::world_save::capture(&flight, vec![]);
+        let json = crate::persist::SavedDocument::new(crate::persist::Payload::WorldSave(payload))
+            .to_json()
+            .unwrap();
+        let saved = match crate::persist::SavedDocument::from_json(&json)
+            .unwrap()
+            .payload
+        {
+            crate::persist::Payload::WorldSave(w) => w.scenario.unwrap(),
+            _ => panic!("world scope"),
+        };
+        assert_eq!(saved.bodies, spawn.bodies);
+
+        // Resume: a loaded pin (older output version) survives reconciliation
+        // verbatim — a re-save must not re-stamp it with this build's version.
+        let mut old = saved.clone();
+        match &mut old.bodies[0] {
+            SavedBodyRecord::Snapshot { output_version, .. } => *output_version = 0,
+            other => panic!("root record should be a snapshot, got {other:?}"),
+        }
+        let resumed = instantiate(&ScenarioSpawn {
+            resume: Some(old.clone()),
+            ..spawn.clone()
+        })
+        .unwrap();
+        assert_eq!(resumed.bodies, old.bodies, "pin preserved verbatim");
     }
 
     /// WI 553: capture → JSON → restore is a live-state round-trip — the

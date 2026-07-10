@@ -59,6 +59,12 @@ impl Archetype {
         }
     }
 
+    /// Inverse of [`slug`](Self::slug), for persisted refs (WI 891). `None`
+    /// for an unknown slug — persisted input is reported, never panicked on.
+    pub fn from_slug(slug: &str) -> Option<Archetype> {
+        Archetype::ALL.into_iter().find(|a| a.slug() == slug)
+    }
+
     /// A per-archetype salt so the same seed yields distinct bodies per archetype.
     fn salt(self) -> u64 {
         match self {

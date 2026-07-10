@@ -17,6 +17,7 @@ pub mod body_asset;
 mod body_derive;
 pub mod body_digest;
 pub mod body_library;
+pub mod body_ref;
 pub mod bodygen;
 pub mod breakage;
 pub mod collision;

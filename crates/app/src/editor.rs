@@ -1353,7 +1353,8 @@ fn craft_from_json(json: &str) -> Option<VoxelCraft> {
         Payload::WorldSave(_)
         | Payload::BodyAsset(_)
         | Payload::System(_)
-        | Payload::VesselRecord(_) => None,
+        | Payload::VesselRecord(_)
+        | Payload::BodyRef(_) => None,
     }
 }
 
