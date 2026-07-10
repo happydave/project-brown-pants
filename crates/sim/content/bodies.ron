@@ -22,20 +22,30 @@
     id: "sim-canonical-bodies",
     version: "1",
     records: [
+        // Since WI 886 the medium's derived fields are pin-or-derive: an
+        // authored value below is a **pin** (held exactly), an absent one is
+        // computed by its relation. Earthlike's pins hold the legacy values —
+        // gravity 9.81 (derived μ/R² would give ≈9.854), scale height 8500
+        // (ideal-gas would give ≈8400), temperature 288.15 (the WI-875 ISA
+        // anchor, pinned rather than routed through an insolation chain), and
+        // density 1.225 (exact ISA, but pinned for bit-stability). These four
+        // pin lines are the **WI 887 removal targets** (un-pin → adopt the
+        // fully derived values). `ocean_surface_pressure` is deliberately NOT
+        // authored: it derives (= atmosphere surface pressure, continuity) to
+        // the exact legacy value — the canonical body's live derivation proof.
         BodyRecipe((
             id: "earthlike",
             name: "Earth-like",
             mu: 3.986e14,
             radius: 6360000.0,
             rotation_period: 86164.0905,
-            atmosphere_surface_density: 1.225,
+            atmosphere_surface_density: 1.225,    // pin (WI 887 target)
             atmosphere_surface_pressure: 101325.0,
-            atmosphere_scale_height: 8500.0,
+            atmosphere_scale_height: 8500.0,      // pin (WI 887 target)
             ocean_surface_density: 1025.0,
-            ocean_surface_pressure: 101325.0,
             ocean_density_gradient: 0.0,
-            gravity: 9.81,
-            atmosphere_temperature: 288.15,
+            gravity: 9.81,                        // pin (WI 887 target)
+            atmosphere_temperature: 288.15,       // pin (WI 887 target)
             ocean_temperature: 290.0,
             surface_seed: 0,
         )),

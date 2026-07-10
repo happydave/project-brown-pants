@@ -14,6 +14,7 @@ pub mod autopilot;
 pub mod ballast;
 pub mod biome;
 pub mod body_asset;
+mod body_derive;
 pub mod body_library;
 pub mod bodygen;
 pub mod breakage;

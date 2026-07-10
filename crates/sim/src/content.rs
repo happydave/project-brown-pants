@@ -71,7 +71,9 @@
 //! Headless and rendering-free. The sim does not consume the catalog yet
 //! (WI 550's scope).
 
+use crate::biome::OCEAN_FREEZE_THRESHOLD_K;
 use crate::body_asset::{BodyAsset, Rotation, SurfaceRecipe};
+use crate::body_derive;
 use crate::bodygen::{self, Archetype, ArchetypeBands};
 use crate::fluid::FluidMedium;
 use crate::voxel::{Material, Thermal};
@@ -126,6 +128,12 @@ pub enum ContentError {
     /// A device record carries a field that does not apply to its class
     /// (an authoring error caught loudly, like unknown fields).
     InapplicableField { id: String, field: &'static str },
+    /// A derivation input is outside its physical domain (WI 886: a bond
+    /// albedo above 1, a non-positive molar mass/radius, a negative
+    /// insolation, a non-positive surface temperature feeding the gas
+    /// relations) — no non-finite or unphysical value may enter a resolved
+    /// body.
+    UnphysicalValue { id: String, field: &'static str },
     /// An override's target matches nothing (unknown record id or base id).
     UnknownTarget { target: String },
     /// An override names a field the targeted record's kind does not have.
@@ -199,6 +207,12 @@ impl fmt::Display for ContentError {
             }
             ContentError::InapplicableField { id, field } => {
                 write!(f, "record `{id}` carries field `{field}` inapplicable to its class")
+            }
+            ContentError::UnphysicalValue { id, field } => {
+                write!(
+                    f,
+                    "record `{id}` field `{field}` is outside its physical domain for derivation"
+                )
             }
             ContentError::UnknownTarget { target } => {
                 write!(f, "override targets unknown {target}")
@@ -604,6 +618,23 @@ struct RawBodyRecipe {
     /// with no per-asset offset; present ⇒ `{"temperature": offset}`.
     #[serde(default)]
     surface_temperature_offset: Option<f64>,
+    // Derivation inputs (WI 886) — the independent thermal/gas intent a fixed
+    // recipe may author *instead of* pinning the derived medium fields:
+    // T_surf = T_eq(nominal_insolation, bond_albedo) + greenhouse_delta_t;
+    // density/scale-height follow by ideal gas / hydrostatics with
+    // mean_molar_mass. Inapplicable on shaped recipes (bands own the medium).
+    /// Intent-level insolation, W/m² ("as if at nominal orbit", design C1).
+    #[serde(default)]
+    nominal_insolation: Option<f64>,
+    /// Bond albedo, 0–1.
+    #[serde(default)]
+    bond_albedo: Option<f64>,
+    /// Greenhouse warming above equilibrium, K.
+    #[serde(default)]
+    greenhouse_delta_t: Option<f64>,
+    /// Mean molar mass of the atmosphere, kg/mol.
+    #[serde(default)]
+    mean_molar_mass: Option<f64>,
     // Archetype bands (WI 883) — the `[min, max)` ranges the sampler draws when
     // `shape` is set. Each bound is an independent, ladder-tunable field; a shape
     // requires only the bounds it draws (Moon: radius/gravity/rotation; Rocky adds
@@ -677,6 +708,10 @@ impl RawBodyRecipe {
             surface_temperature_offset: self
                 .surface_temperature_offset
                 .or(p.surface_temperature_offset),
+            nominal_insolation: self.nominal_insolation.or(p.nominal_insolation),
+            bond_albedo: self.bond_albedo.or(p.bond_albedo),
+            greenhouse_delta_t: self.greenhouse_delta_t.or(p.greenhouse_delta_t),
+            mean_molar_mass: self.mean_molar_mass.or(p.mean_molar_mass),
             radius_min: self.radius_min.or(p.radius_min),
             radius_max: self.radius_max.or(p.radius_max),
             gravity_min: self.gravity_min.or(p.gravity_min),
@@ -1227,6 +1262,10 @@ fn slot<'a>(rec: &'a mut RawRecord, field: &str) -> Option<Slot<'a>> {
             "ocean_temperature" => Some(Slot::Num(&mut b.ocean_temperature)),
             "surface_seed" => Some(Slot::Num(&mut b.surface_seed)),
             "surface_temperature_offset" => Some(Slot::Num(&mut b.surface_temperature_offset)),
+            "nominal_insolation" => Some(Slot::Num(&mut b.nominal_insolation)),
+            "bond_albedo" => Some(Slot::Num(&mut b.bond_albedo)),
+            "greenhouse_delta_t" => Some(Slot::Num(&mut b.greenhouse_delta_t)),
+            "mean_molar_mass" => Some(Slot::Num(&mut b.mean_molar_mass)),
             "radius_min" => Some(Slot::Num(&mut b.radius_min)),
             "radius_max" => Some(Slot::Num(&mut b.radius_max)),
             "gravity_min" => Some(Slot::Num(&mut b.gravity_min)),
@@ -1303,6 +1342,10 @@ fn field_names(kind: RecordKind) -> &'static [&'static str] {
             "ocean_temperature",
             "surface_seed",
             "surface_temperature_offset",
+            "nominal_insolation",
+            "bond_albedo",
+            "greenhouse_delta_t",
+            "mean_molar_mass",
             "radius_min",
             "radius_max",
             "gravity_min",
@@ -1984,6 +2027,12 @@ fn validate(m: &RawRecord) -> Result<Record, ContentError> {
                 (b.gravity.is_some(), "gravity"),
                 (b.atmosphere_temperature.is_some(), "atmosphere_temperature"),
                 (b.ocean_temperature.is_some(), "ocean_temperature"),
+                // Derivation inputs (WI 886) are fixed-mode-only too: a shaped
+                // recipe's medium comes from its bands, not the relations.
+                (b.nominal_insolation.is_some(), "nominal_insolation"),
+                (b.bond_albedo.is_some(), "bond_albedo"),
+                (b.greenhouse_delta_t.is_some(), "greenhouse_delta_t"),
+                (b.mean_molar_mass.is_some(), "mean_molar_mass"),
             ];
             let band_fields = [
                 (b.radius_min.is_some(), "radius_min"),
@@ -2182,57 +2231,136 @@ fn validate(m: &RawRecord) -> Result<Record, ContentError> {
                     // re-sample the family at other seeds.
                     (body, Some(bands))
                 }
-                // Fixed (WI 881): the scalar fields are the body directly.
-                None => (
-                    BodyAsset {
+                // Fixed (WI 881/886): independents are authored; each derived
+                // medium field is **pin-or-derive** — an authored value holds
+                // exactly (the design's `pin:`, keyed by the derived field's
+                // own name), an absent one is computed by its named relation
+                // (`body_derive`), and neither-pin-nor-inputs is loud.
+                None => {
+                    let unphysical = |field: &'static str| ContentError::UnphysicalValue {
+                        id: b.id.clone(),
+                        field,
+                    };
+                    // Independent set (required, as they always were).
+                    let mu = req(b.mu, "mu")?;
+                    let radius = req(b.radius, "radius")?;
+                    let p_atm = req(b.atmosphere_surface_pressure, "atmosphere_surface_pressure")?;
+                    let ocean_density = req(b.ocean_surface_density, "ocean_surface_density")?;
+                    let ocean_gradient = req(b.ocean_density_gradient, "ocean_density_gradient")?;
+                    let ocean_temperature = req(b.ocean_temperature, "ocean_temperature")?;
+
+                    // g = μ/R² (pin wins; relation needs a physical radius).
+                    let gravity = match b.gravity {
+                        Some(pin) => pin,
+                        None => {
+                            if !(radius.is_finite() && radius > 0.0) {
+                                return Err(unphysical("radius"));
+                            }
+                            body_derive::surface_gravity(mu, radius)
+                        }
+                    };
+                    // T_surf = T_eq(S, A) + ΔT_greenhouse (C1). The relation
+                    // errors name the missing/unphysical *input* — strictly
+                    // more actionable than naming the derived field.
+                    let t_surf = match b.atmosphere_temperature {
+                        Some(pin) => pin,
+                        None => {
+                            let s = req(b.nominal_insolation, "nominal_insolation")?;
+                            let a = req(b.bond_albedo, "bond_albedo")?;
+                            let dt = req(b.greenhouse_delta_t, "greenhouse_delta_t")?;
+                            if !(s.is_finite() && s >= 0.0) {
+                                return Err(unphysical("nominal_insolation"));
+                            }
+                            if !(0.0..=1.0).contains(&a) {
+                                return Err(unphysical("bond_albedo"));
+                            }
+                            body_derive::surface_temperature(
+                                body_derive::equilibrium_temperature(s, a),
+                                dt,
+                            )
+                        }
+                    };
+                    // A positive molar mass, where a gas relation needs it.
+                    let molar_mass = |field: &'static str| {
+                        let m = req(b.mean_molar_mass, "mean_molar_mass")?;
+                        if !(m.is_finite() && m > 0.0) {
+                            return Err(unphysical("mean_molar_mass"));
+                        }
+                        if !(t_surf.is_finite() && t_surf > 0.0) {
+                            return Err(unphysical(field));
+                        }
+                        Ok(m)
+                    };
+                    // Airless skeleton (P₀ = 0): density 0, the positive
+                    // placeholder scale height `generate` has always used.
+                    let atmosphere_surface_density = match b.atmosphere_surface_density {
+                        Some(pin) => pin,
+                        None if p_atm == 0.0 => 0.0,
+                        None => body_derive::atmosphere_surface_density(
+                            p_atm,
+                            molar_mass("atmosphere_temperature")?,
+                            t_surf,
+                        ),
+                    };
+                    let atmosphere_scale_height = match b.atmosphere_scale_height {
+                        Some(pin) => pin,
+                        None if p_atm == 0.0 => 1.0,
+                        None => body_derive::scale_height(
+                            t_surf,
+                            molar_mass("atmosphere_temperature")?,
+                            gravity,
+                        ),
+                    };
+                    // Ocean surface pressure: continuous with the atmosphere
+                    // when an ocean is present (authored density > 0).
+                    let ocean_present = ocean_density > 0.0;
+                    let ocean_surface_pressure = match b.ocean_surface_pressure {
+                        Some(pin) => pin,
+                        None if ocean_present => p_atm,
+                        None => 0.0,
+                    };
+                    // Ocean gating — a *presence* decision, applied last, wins
+                    // over pins: frozen (medium T_surf at/below the classifier
+                    // freeze point; never the WI-875 presentation offset) or
+                    // airless ⇒ no liquid ocean (the trio zeroes; temperatures
+                    // stay, matching the airless `generate` skeleton).
+                    let gated_off =
+                        ocean_present && (t_surf <= OCEAN_FREEZE_THRESHOLD_K || p_atm == 0.0);
+                    let (ocean_surface_density, ocean_surface_pressure, ocean_density_gradient) =
+                        if gated_off {
+                            (0.0, 0.0, 0.0)
+                        } else {
+                            (ocean_density, ocean_surface_pressure, ocean_gradient)
+                        };
+
+                    let body = BodyAsset {
                         id: b.id.clone(),
                         name: b.name.clone().ok_or_else(|| missing(&b.id, "name"))?,
-                        mu: req(b.mu, "mu")?,
-                        radius: req(b.radius, "radius")?,
+                        mu,
+                        radius,
                         rotation: Rotation {
                             axis: DVec3::Z,
                             sidereal_period: req(b.rotation_period, "rotation_period")?,
                         },
                         fluid_medium: FluidMedium {
-                            atmosphere_surface_density: req(
-                                b.atmosphere_surface_density,
-                                "atmosphere_surface_density",
-                            )?,
-                            atmosphere_surface_pressure: req(
-                                b.atmosphere_surface_pressure,
-                                "atmosphere_surface_pressure",
-                            )?,
-                            atmosphere_scale_height: req(
-                                b.atmosphere_scale_height,
-                                "atmosphere_scale_height",
-                            )?,
-                            ocean_surface_density: req(
-                                b.ocean_surface_density,
-                                "ocean_surface_density",
-                            )?,
-                            ocean_surface_pressure: req(
-                                b.ocean_surface_pressure,
-                                "ocean_surface_pressure",
-                            )?,
-                            ocean_density_gradient: req(
-                                b.ocean_density_gradient,
-                                "ocean_density_gradient",
-                            )?,
-                            gravity: req(b.gravity, "gravity")?,
-                            atmosphere_temperature: req(
-                                b.atmosphere_temperature,
-                                "atmosphere_temperature",
-                            )?,
-                            ocean_temperature: req(b.ocean_temperature, "ocean_temperature")?,
+                            atmosphere_surface_density,
+                            atmosphere_surface_pressure: p_atm,
+                            atmosphere_scale_height,
+                            ocean_surface_density,
+                            ocean_surface_pressure,
+                            ocean_density_gradient,
+                            gravity,
+                            atmosphere_temperature: t_surf,
+                            ocean_temperature,
                         },
                         surface: SurfaceRecipe {
                             material,
                             ..SurfaceRecipe::from_seed(req(b.surface_seed, "surface_seed")? as u64)
                         },
                         render: serde_json::Value::Null,
-                    },
-                    None,
-                ),
+                    };
+                    (body, None)
+                }
             };
             Ok(Record::BodyRecipe(Box::new(BodyRecipeRecord {
                 id: b.id.clone(),
@@ -3376,6 +3504,195 @@ mod tests {
             Err(ContentError::InapplicableField { id, field }) => {
                 assert_eq!(id, "b1");
                 assert_eq!(field, "radius_min");
+            }
+            other => panic!("expected InapplicableField, got {other:?}"),
+        }
+    }
+
+    // WI 886: the derivation pass — fixed recipes author independents (or pins);
+    // derived medium fields are computed by the named relations in
+    // `body_derive`, pins hold exactly, gating decides ocean presence last.
+
+    /// A fixed recipe with the full independent set and NO pins — every derived
+    /// field must come from its relation. `{extra}` appends/overrides fields.
+    fn derive_recipe(extra: &str) -> String {
+        format!(
+            r#"BodyRecipe(( id: "d1", name: "D1",
+                mu: 4.0e14, radius: 6.0e6, rotation_period: 86400.0,
+                atmosphere_surface_pressure: 100000.0,
+                nominal_insolation: 1361.0, bond_albedo: 0.3, greenhouse_delta_t: 33.0,
+                mean_molar_mass: 0.029,
+                ocean_surface_density: 1000.0, ocean_density_gradient: 0.0,
+                ocean_temperature: 285.0, surface_seed: 7, {extra} )),"#
+        )
+    }
+
+    #[test]
+    fn fixed_recipe_derives_medium_from_independents() {
+        let p = pack(&derive_recipe(""));
+        let m = resolved_body(&Catalog::merge(&[&p], &[]).unwrap(), "d1").fluid_medium;
+        // Bit-exact against the relations (validate runs the same functions on
+        // the same inputs).
+        let g = crate::body_derive::surface_gravity(4.0e14, 6.0e6);
+        let t = crate::body_derive::surface_temperature(
+            crate::body_derive::equilibrium_temperature(1361.0, 0.3),
+            33.0,
+        );
+        assert_eq!(m.gravity, g);
+        assert_eq!(m.atmosphere_temperature, t);
+        assert!(t > OCEAN_FREEZE_THRESHOLD_K, "fixture must not gate");
+        assert_eq!(
+            m.atmosphere_surface_density,
+            crate::body_derive::atmosphere_surface_density(100_000.0, 0.029, t)
+        );
+        assert_eq!(
+            m.atmosphere_scale_height,
+            crate::body_derive::scale_height(t, 0.029, g)
+        );
+        // Ocean pressure derives by continuity; independents pass through.
+        assert_eq!(m.ocean_surface_pressure, 100_000.0);
+        assert_eq!(m.ocean_surface_density, 1_000.0);
+        assert_eq!(m.ocean_temperature, 285.0);
+    }
+
+    #[test]
+    fn derivation_is_deterministic() {
+        let p = pack(&derive_recipe(""));
+        let a = resolved_body(&Catalog::merge(&[&p], &[]).unwrap(), "d1");
+        let b = resolved_body(&Catalog::merge(&[&p], &[]).unwrap(), "d1");
+        assert_eq!(a, b, "same recipe ⇒ bit-identical derived body");
+    }
+
+    #[test]
+    fn pins_win_and_chain_through_derivation() {
+        // Pin gravity and temperature; density/scale-height must derive from
+        // the *effective* (pinned) upstream values — pin precedence composes
+        // through the relation chain.
+        let p = pack(&derive_recipe(
+            "gravity: 5.0, atmosphere_temperature: 280.0,",
+        ));
+        let m = resolved_body(&Catalog::merge(&[&p], &[]).unwrap(), "d1").fluid_medium;
+        assert_eq!(m.gravity, 5.0);
+        assert_eq!(m.atmosphere_temperature, 280.0);
+        assert_eq!(
+            m.atmosphere_scale_height,
+            crate::body_derive::scale_height(280.0, 0.029, 5.0)
+        );
+
+        // A ladder op on a pin is a re-pin, provenance-tracked; the chain
+        // re-flows from the new pin.
+        let ov = override_set(
+            "scn",
+            "Scenario",
+            "",
+            r#"( target: Id("d1"), field: "gravity", op: Multiply(2.0) ),"#,
+        );
+        let cat = Catalog::merge(&[&p], &[&ov]).unwrap();
+        let m2 = resolved_body(&cat, "d1").fluid_medium;
+        assert_eq!(m2.gravity, 10.0);
+        assert_eq!(
+            m2.atmosphere_scale_height,
+            crate::body_derive::scale_height(280.0, 0.029, 10.0)
+        );
+        let fp = &cat.get("d1").unwrap().field_provenance["gravity"];
+        assert_eq!(fp.shadows[0].value, ProvValue::Number(5.0));
+    }
+
+    #[test]
+    fn derivation_missing_inputs_are_loud() {
+        // No temperature pin and an incomplete insolation chain: the error
+        // names the missing *input* (more actionable than the derived field).
+        let p = pack(
+            r#"BodyRecipe(( id: "d1", name: "D1",
+                mu: 4.0e14, radius: 6.0e6, rotation_period: 86400.0,
+                atmosphere_surface_pressure: 100000.0,
+                nominal_insolation: 1361.0, greenhouse_delta_t: 33.0,
+                mean_molar_mass: 0.029,
+                ocean_surface_density: 1000.0, ocean_density_gradient: 0.0,
+                ocean_temperature: 285.0, surface_seed: 7 )),"#,
+        );
+        match Catalog::merge(&[&p], &[]) {
+            Err(ContentError::MissingField { id, field }) => {
+                assert_eq!(id, "d1");
+                assert_eq!(field, "bond_albedo");
+            }
+            other => panic!("expected MissingField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unphysical_derivation_inputs_are_loud() {
+        // A bond albedo above 1 would put a negative number under the fourth
+        // root — rejected before any relation runs.
+        let p = pack(
+            r#"BodyRecipe(( id: "d1", name: "D1",
+                mu: 4.0e14, radius: 6.0e6, rotation_period: 86400.0,
+                atmosphere_surface_pressure: 100000.0,
+                nominal_insolation: 1361.0, bond_albedo: 1.5, greenhouse_delta_t: 33.0,
+                mean_molar_mass: 0.029,
+                ocean_surface_density: 1000.0, ocean_density_gradient: 0.0,
+                ocean_temperature: 285.0, surface_seed: 7 )),"#,
+        );
+        match Catalog::merge(&[&p], &[]) {
+            Err(ContentError::UnphysicalValue { id, field }) => {
+                assert_eq!(id, "d1");
+                assert_eq!(field, "bond_albedo");
+            }
+            other => panic!("expected UnphysicalValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ocean_gating_zeroes_the_trio() {
+        // Frozen (pinned T at/below the freeze point): the ocean trio zeroes —
+        // even a *pinned* ocean pressure (gating is a presence decision and
+        // applies last) — while temperatures stay.
+        let p = pack(&derive_recipe(
+            "atmosphere_temperature: 200.0, ocean_surface_pressure: 100000.0,",
+        ));
+        let m = resolved_body(&Catalog::merge(&[&p], &[]).unwrap(), "d1").fluid_medium;
+        assert_eq!(m.ocean_surface_density, 0.0);
+        assert_eq!(m.ocean_surface_pressure, 0.0);
+        assert_eq!(m.ocean_density_gradient, 0.0);
+        assert_eq!(m.ocean_temperature, 285.0);
+
+        // The WI-875 classifier offset is presentation-only: a warm medium
+        // with a cold offset keeps its ocean (the ice-age contract).
+        let p = pack(&derive_recipe(
+            "atmosphere_temperature: 288.15, surface_temperature_offset: -40.15,",
+        ));
+        let m = resolved_body(&Catalog::merge(&[&p], &[]).unwrap(), "d1").fluid_medium;
+        assert_eq!(m.ocean_surface_density, 1_000.0);
+
+        // Airless (P₀ = 0): the skeleton (density 0, placeholder scale height)
+        // plus a gated-off ocean; no molar mass or insolation chain needed
+        // when the remaining derived fields are pinned or skeleton-supplied.
+        let p = pack(
+            r#"BodyRecipe(( id: "d1", name: "D1",
+                mu: 4.0e14, radius: 6.0e6, rotation_period: 86400.0,
+                atmosphere_surface_pressure: 0.0, atmosphere_temperature: 200.0,
+                ocean_surface_density: 1000.0, ocean_density_gradient: 0.0,
+                ocean_temperature: 200.0, surface_seed: 7 )),"#,
+        );
+        let m = resolved_body(&Catalog::merge(&[&p], &[]).unwrap(), "d1").fluid_medium;
+        assert_eq!(m.atmosphere_surface_density, 0.0);
+        assert_eq!(m.atmosphere_scale_height, 1.0);
+        assert_eq!(m.ocean_surface_density, 0.0);
+        assert_eq!(m.ocean_surface_pressure, 0.0);
+    }
+
+    #[test]
+    fn derivation_inputs_inapplicable_on_shaped() {
+        let p = pack(
+            r#"BodyRecipe(( id: "r1", name: "R1", shape: moon, surface_seed: 1,
+                nominal_insolation: 1361.0,
+                radius_min: 2.0e5, radius_max: 2.0e6, gravity_min: 0.5, gravity_max: 3.0,
+                rotation_period_min: 20000.0, rotation_period_max: 200000.0 )),"#,
+        );
+        match Catalog::merge(&[&p], &[]) {
+            Err(ContentError::InapplicableField { id, field }) => {
+                assert_eq!(id, "r1");
+                assert_eq!(field, "nominal_insolation");
             }
             other => panic!("expected InapplicableField, got {other:?}"),
         }
