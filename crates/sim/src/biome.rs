@@ -41,9 +41,9 @@ pub enum BiomeFamily {
     Airless,
 }
 
-/// Per-body biome/climate knobs (WI 870), read from the **reserved**
-/// `SurfaceRecipe.material` area — the WI 782 `CraterParams` pattern verbatim
-/// (a defaulted `serde_json::Value`, so no persistence-format change; lenient:
+/// Per-body biome/climate knobs (WI 870), read from the first enabled
+/// `material` layer of the surface stack (`SurfaceRecipe::params_of`, WI 892)
+/// — the WI 782 `CraterParams` pattern verbatim (a lenient `serde_json::Value`:
 /// absent / null / non-object values and missing or non-numeric keys all fall
 /// back to defaults). Recognized keys:
 /// - `"temperature"` — additive offset (Kelvin) on the **classifier's** base
@@ -134,7 +134,7 @@ impl BodyClimate {
     /// Reads the climate inputs from an asset: family from atmosphere presence,
     /// sea level from ocean presence, latitude axis from the rotation axis
     /// (normalized; a degenerate axis falls back to +Z), biome knobs from the
-    /// reserved `surface.material` area (WI 870).
+    /// first enabled `material` layer of the surface stack (WI 870/892).
     pub fn from_asset(asset: &BodyAsset) -> Self {
         let m = &asset.fluid_medium;
         let axis = asset.rotation.axis.normalize_or_zero();
@@ -147,7 +147,11 @@ impl BodyClimate {
             base_temperature: m.atmosphere_temperature,
             sea_level: (m.ocean_surface_density > 0.0).then_some(0.0),
             axis: if axis == DVec3::ZERO { DVec3::Z } else { axis },
-            params: BiomeParams::from_value(&asset.surface.material),
+            params: BiomeParams::from_value(
+                asset
+                    .surface
+                    .params_of(crate::body_asset::SurfaceLayerType::Material),
+            ),
         }
     }
 }

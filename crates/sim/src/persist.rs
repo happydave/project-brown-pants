@@ -37,7 +37,11 @@ use std::fmt;
 /// build meeting the new kind rejects it as an unknown kind (`Malformed`). A version
 /// bump is reserved for changes to an *existing* payload's shape (which would require
 /// a migration arm). `BodyAsset` (WI 760) and `System` (WI 761) were added additively.
-pub const FORMAT_VERSION: u32 = 2;
+///
+/// History: 2 = WI 824 face panels (v1 retired at WI 820, body-asset kind
+/// re-widened at WI 891); 3 = WI 892 surface-layer stack (`SurfaceRecipe`'s
+/// flat areas → the ordered layer list; the v2 arm migrates on load).
+pub const FORMAT_VERSION: u32 = 3;
 
 /// What a serialized artifact is used as. One format, several uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,22 +231,81 @@ impl SavedDocument {
                 doc.validate_craft_shapes()?;
                 Ok(doc)
             }
+            // v2 → v3 (WI 892): the only reshape is `SurfaceRecipe` (flat
+            // `terrain`/`crater`/`material` areas → the ordered layer stack),
+            // which real documents carry in exactly two places — a body-asset
+            // payload's `surface`, and the embedded bodies of a world-save's
+            // snapshot-tier records (whose recorded digests are then restored
+            // over the migrated body; the recorded output_version is left
+            // untouched, so an old snapshot stays an old-generator pin and
+            // WI 891's drift line reports it). Every other kind is
+            // shape-unchanged and re-tags through the direct parse.
+            2 => {
+                let kind: KindProbe =
+                    serde_json::from_str(s).map_err(|e| FormatError::Malformed(e.to_string()))?;
+                let mut doc = match kind.payload.kind {
+                    Kind::BodyAsset | Kind::WorldSave => {
+                        let mut root: serde_json::Value = serde_json::from_str(s)
+                            .map_err(|e| FormatError::Malformed(e.to_string()))?;
+                        if let Some(surface) = root.pointer_mut("/payload/surface") {
+                            migrate_flat_surface(surface);
+                        }
+                        if let Some(records) = root
+                            .pointer_mut("/payload/scenario/bodies")
+                            .and_then(|v| v.as_array_mut())
+                        {
+                            for record in records {
+                                if let Some(surface) = record.pointer_mut("/body/surface") {
+                                    migrate_flat_surface(surface);
+                                }
+                            }
+                        }
+                        serde_json::from_value::<SavedDocument>(root)
+                            .map_err(|e| FormatError::Malformed(e.to_string()))?
+                    }
+                    _ => serde_json::from_str::<SavedDocument>(s)
+                        .map_err(|e| FormatError::Malformed(e.to_string()))?,
+                };
+                doc.format_version = FORMAT_VERSION;
+                if let Payload::WorldSave(w) = &mut doc.payload {
+                    if let Some(scenario) = &mut w.scenario {
+                        for record in &mut scenario.bodies {
+                            if let crate::world_save::SavedBodyRecord::Snapshot {
+                                digest,
+                                body,
+                                ..
+                            } = record
+                            {
+                                *digest = crate::body_digest::digest_hex(body);
+                            }
+                        }
+                    }
+                }
+                doc.normalize_craft();
+                doc.validate_craft_shapes()?;
+                Ok(doc)
+            }
             // Format v1 (pre-WI-824 legacy cell-panel flags) was retired at
             // WI 820 (pre-release, owner direction): its migration is gone and
             // v1 files are rejected by version — **except the body-asset
-            // kind** (WI 891): the v1→v2 reshape was craft-scope only, a v1
-            // body-asset payload is field-identical to today's, and real
-            // pre-recipe body files exist on disk (`saves/bodies/`). Those
-            // migrate in memory (a re-save writes the current version); every
-            // other v1 kind keeps the WI 820 rejection.
+            // kind** (WI 891): the v1→v2 reshape was craft-scope only, and
+            // real pre-recipe body files exist on disk (`saves/bodies/`).
+            // Those migrate in memory, chaining through the WI 892 surface
+            // conversion (a re-save writes the current version); every other
+            // v1 kind keeps the WI 820 rejection.
             1 => {
                 let kind: KindProbe =
                     serde_json::from_str(s).map_err(|_| FormatError::UnsupportedVersion(1))?;
                 if kind.payload.kind != Kind::BodyAsset {
                     return Err(FormatError::UnsupportedVersion(1));
                 }
-                let mut doc: SavedDocument =
+                let mut root: serde_json::Value =
                     serde_json::from_str(s).map_err(|e| FormatError::Malformed(e.to_string()))?;
+                if let Some(surface) = root.pointer_mut("/payload/surface") {
+                    migrate_flat_surface(surface);
+                }
+                let mut doc = serde_json::from_value::<SavedDocument>(root)
+                    .map_err(|e| FormatError::Malformed(e.to_string()))?;
                 doc.format_version = FORMAT_VERSION;
                 doc.normalize_craft();
                 doc.validate_craft_shapes()?;
@@ -320,6 +383,37 @@ struct KindOnly {
     kind: Kind,
 }
 
+/// v2 → v3 surface conversion (WI 892), at the JSON level so the pre-stack
+/// shape needs no legacy struct: the flat `terrain`/`crater`/`material` areas
+/// become one layer each — **in that canonical order** — carrying their blob
+/// as the layer's params; a null area produces no layer (exactly the lenient
+/// readers' "absent = defaults"), and each converted layer takes its type's
+/// slug as its well-known id. Unrecognized keys inside a blob are carried
+/// verbatim (the readers ignored them before; no new data loss). A surface
+/// already carrying `layers` is left untouched (defensive idempotence).
+fn migrate_flat_surface(surface: &mut serde_json::Value) {
+    let Some(obj) = surface.as_object_mut() else {
+        return;
+    };
+    if obj.contains_key("layers") {
+        return;
+    }
+    let mut layers = Vec::new();
+    for layer_type in crate::body_asset::SurfaceLayerType::ALL {
+        if let Some(params) = obj.remove(layer_type.slug()) {
+            if !params.is_null() {
+                layers.push(serde_json::json!({
+                    "id": layer_type.slug(),
+                    "layer_type": layer_type.slug(),
+                    "enabled": true,
+                    "params": params,
+                }));
+            }
+        }
+    }
+    obj.insert("layers".to_string(), serde_json::Value::Array(layers));
+}
+
 /// A persistence-format error. Typed and non-panicking, so malformed or foreign
 /// input is rejected cleanly at the boundary.
 #[derive(Debug, Clone, PartialEq)]
@@ -363,6 +457,88 @@ mod tests {
             material: Material::ALUMINIUM,
         });
         craft
+    }
+
+    /// WI 892 (scenarios A1/A3): the v2 arm converts flat surface areas into
+    /// the ordered layer stack (canonical order, params carried verbatim,
+    /// well-known ids), retags shape-unchanged kinds, and the migrated
+    /// document re-saves at v3 byte-stably.
+    #[test]
+    fn v2_documents_migrate_flat_surfaces_and_retag() {
+        use crate::body_asset::SurfaceLayerType;
+        // A v2 body asset with populated crater/material areas.
+        let mut root = serde_json::to_value(SavedDocument::new(Payload::BodyAsset(
+            BodyAsset::earthlike(),
+        )))
+        .unwrap();
+        root["format_version"] = 2.into();
+        root["payload"]["surface"] = serde_json::json!({
+            "seed": 7,
+            "terrain": null,
+            "crater": { "density": 0.5, "depth": 2.0 },
+            "material": { "temperature": -10.0, "palette": "unrecognized-carried" }
+        });
+        let doc = SavedDocument::from_json(&root.to_string()).expect("v2 body migrates");
+        assert_eq!(doc.format_version, FORMAT_VERSION);
+        let Payload::BodyAsset(a) = &doc.payload else {
+            panic!("body scope");
+        };
+        assert_eq!(a.surface.seed, 7);
+        assert_eq!(
+            a.surface
+                .layers
+                .iter()
+                .map(|l| (l.id.as_str(), l.layer_type, l.enabled))
+                .collect::<Vec<_>>(),
+            vec![
+                ("crater", SurfaceLayerType::Crater, true),
+                ("material", SurfaceLayerType::Material, true),
+            ],
+            "null terrain ⇒ no layer; canonical order; well-known ids"
+        );
+        // The readers see exactly the values the flat areas carried —
+        // including unrecognized keys carried verbatim (no new data loss).
+        assert_eq!(
+            a.surface.params_of(SurfaceLayerType::Crater)["density"].as_f64(),
+            Some(0.5)
+        );
+        assert_eq!(
+            a.surface.params_of(SurfaceLayerType::Material)["temperature"].as_f64(),
+            Some(-10.0)
+        );
+        assert_eq!(
+            a.surface.params_of(SurfaceLayerType::Material)["palette"].as_str(),
+            Some("unrecognized-carried")
+        );
+        // Migrated documents re-save at v3, byte-stably.
+        let resaved = doc.to_json().unwrap();
+        assert!(resaved.contains("\"format_version\": 3"));
+        assert_eq!(
+            SavedDocument::from_json(&resaved)
+                .unwrap()
+                .to_json()
+                .unwrap(),
+            resaved
+        );
+
+        // A v2 craft document (shape unchanged since v2) retags through the
+        // direct parse: payload identical, version current, re-save stable.
+        let craft_doc = SavedDocument::new(Payload::Craft(CraftSubgraph::new(
+            "c",
+            "C",
+            sample_pos(),
+            sample_craft(),
+        )));
+        let mut croot = serde_json::to_value(&craft_doc).unwrap();
+        croot["format_version"] = 2.into();
+        let migrated = SavedDocument::from_json(&croot.to_string()).expect("v2 craft retags");
+        assert_eq!(migrated.format_version, FORMAT_VERSION);
+        assert_eq!(migrated.payload, craft_doc.payload, "payload untouched");
+        let out = migrated.to_json().unwrap();
+        assert_eq!(
+            SavedDocument::from_json(&out).unwrap().to_json().unwrap(),
+            out
+        );
     }
 
     /// WI 891 (AC 3): a **v1 body-asset** document — the exact shape of the
@@ -409,7 +585,7 @@ mod tests {
         // A re-save writes the current version; loading that back is clean
         // (save → load → save is stable once migrated).
         let resaved = doc.to_json().unwrap();
-        assert!(resaved.contains("\"format_version\": 2"));
+        assert!(resaved.contains("\"format_version\": 3"));
         assert_eq!(
             SavedDocument::from_json(&resaved)
                 .unwrap()
@@ -645,10 +821,10 @@ mod tests {
     fn newer_version_rejected_by_version_not_payload_parse() {
         // Alien payload shape (a bare number) this build cannot parse — the
         // version-stable probe still reads the version and rejects by version.
-        let newer = r#"{ "format_version": 3, "payload": 12345 }"#;
+        let newer = r#"{ "format_version": 4, "payload": 12345 }"#;
         assert_eq!(
             SavedDocument::from_json(newer),
-            Err(FormatError::UnsupportedVersion(3))
+            Err(FormatError::UnsupportedVersion(4))
         );
     }
 
@@ -805,8 +981,9 @@ mod tests {
     }
 
     #[test]
-    fn format_version_is_two() {
-        // v2 = WI 824 (face panels; legacy cell-panel flags convert at load).
-        assert_eq!(FORMAT_VERSION, 2);
+    fn format_version_is_three() {
+        // v2 = WI 824 (face panels; legacy cell-panel flags convert at load);
+        // v3 = WI 892 (surface-layer stack; the v2 arm converts at load).
+        assert_eq!(FORMAT_VERSION, 3);
     }
 }

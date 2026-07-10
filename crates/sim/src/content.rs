@@ -79,7 +79,7 @@ use crate::fluid::FluidMedium;
 use crate::voxel::{Material, Thermal};
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -91,7 +91,7 @@ pub const CONTENT_FORMAT_VERSION: u32 = 1;
 
 /// Field names that overrides may never target: record identity and
 /// inheritance topology are definitions, not tunables.
-const STRUCTURAL_FIELDS: [&str; 5] = ["id", "parent", "abstract", "class", "shape"];
+const STRUCTURAL_FIELDS: [&str; 6] = ["id", "parent", "abstract", "class", "shape", "layer_type"];
 
 /// The largest integer an authored (f64 Num) `surface_seed` may carry: 2^53,
 /// the ceiling of exact integer representation in an f64. Above it the slot
@@ -140,6 +140,17 @@ pub enum ContentError {
     /// relations) — no non-finite or unphysical value may enter a resolved
     /// body.
     UnphysicalValue { id: String, field: &'static str },
+    /// A body recipe's `surface_stack` names a record that does not exist as
+    /// a concrete record (unknown id, or an abstract base — those are
+    /// inheritance targets, not content) (WI 892).
+    UnknownStackLayer { body: String, layer: String },
+    /// A body recipe's `surface_stack` names a record of another kind.
+    StackLayerWrongKind { body: String, layer: String },
+    /// A body recipe's `surface_stack` names the same layer twice — by-id
+    /// addressing would be ambiguous.
+    DuplicateStackLayer { body: String, layer: String },
+    /// A surface layer declares a `layer_type` this build does not know.
+    UnknownLayerType { id: String, layer_type: String },
     /// An override's target matches nothing (unknown record id or base id).
     UnknownTarget { target: String },
     /// An override names a field the targeted record's kind does not have.
@@ -214,6 +225,26 @@ impl fmt::Display for ContentError {
             ContentError::InapplicableField { id, field } => {
                 write!(f, "record `{id}` carries field `{field}` inapplicable to its class")
             }
+            ContentError::UnknownStackLayer { body, layer } => write!(
+                f,
+                "body recipe `{body}` surface_stack names `{layer}`, which is not a concrete \
+                 record of the composition (abstract bases are inheritance targets, not content)"
+            ),
+            ContentError::StackLayerWrongKind { body, layer } => write!(
+                f,
+                "body recipe `{body}` surface_stack names `{layer}`, which is not a SurfaceLayer \
+                 record"
+            ),
+            ContentError::DuplicateStackLayer { body, layer } => write!(
+                f,
+                "body recipe `{body}` surface_stack names `{layer}` twice — by-id addressing \
+                 would be ambiguous"
+            ),
+            ContentError::UnknownLayerType { id, layer_type } => write!(
+                f,
+                "surface layer `{id}` declares unknown layer_type `{layer_type}` \
+                 (known: terrain, crater, material)"
+            ),
             ContentError::UnphysicalValue { id, field } => {
                 write!(
                     f,
@@ -296,6 +327,8 @@ enum RawRecord {
     /// raw records (fixed scalars + WI 883 archetype bands), so an unboxed variant
     /// would bloat every `RawRecord`.
     BodyRecipe(Box<RawBodyRecipe>),
+    /// One element definition of a body's surface-layer stack (WI 892).
+    SurfaceLayer(RawSurfaceLayer),
 }
 
 /// A record kind — the override target-selector vocabulary.
@@ -306,6 +339,7 @@ pub enum RecordKind {
     Resource,
     Body,
     BodyRecipe,
+    SurfaceLayer,
 }
 
 impl RawRecord {
@@ -316,6 +350,7 @@ impl RawRecord {
             RawRecord::Resource(r) => &r.id,
             RawRecord::Body(r) => &r.id,
             RawRecord::BodyRecipe(r) => &r.id,
+            RawRecord::SurfaceLayer(r) => &r.id,
         }
     }
     fn parent(&self) -> Option<&str> {
@@ -325,6 +360,7 @@ impl RawRecord {
             RawRecord::Resource(r) => r.parent.as_deref(),
             RawRecord::Body(r) => r.parent.as_deref(),
             RawRecord::BodyRecipe(r) => r.parent.as_deref(),
+            RawRecord::SurfaceLayer(r) => r.parent.as_deref(),
         }
     }
     fn is_abstract(&self) -> bool {
@@ -334,6 +370,7 @@ impl RawRecord {
             RawRecord::Resource(r) => r.is_abstract,
             RawRecord::Body(r) => r.is_abstract,
             RawRecord::BodyRecipe(r) => r.is_abstract,
+            RawRecord::SurfaceLayer(r) => r.is_abstract,
         }
     }
     fn kind(&self) -> RecordKind {
@@ -343,6 +380,7 @@ impl RawRecord {
             RawRecord::Resource(_) => RecordKind::Resource,
             RawRecord::Body(_) => RecordKind::Body,
             RawRecord::BodyRecipe(_) => RecordKind::BodyRecipe,
+            RawRecord::SurfaceLayer(_) => RecordKind::SurfaceLayer,
         }
     }
 
@@ -360,6 +398,9 @@ impl RawRecord {
             (RawRecord::Body(c), RawRecord::Body(p)) => Ok(RawRecord::Body(c.merge_over(p))),
             (RawRecord::BodyRecipe(c), RawRecord::BodyRecipe(p)) => {
                 Ok(RawRecord::BodyRecipe(Box::new(c.merge_over(p))))
+            }
+            (RawRecord::SurfaceLayer(c), RawRecord::SurfaceLayer(p)) => {
+                Ok(RawRecord::SurfaceLayer(c.merge_over(p)))
             }
             (c, p) => Err(ContentError::KindMismatch {
                 child: c.id().to_string(),
@@ -552,6 +593,67 @@ impl RawBody {
     }
 }
 
+/// One element definition of a body's **surface-layer stack** (WI 892): a
+/// stable-id, typed, switchable parameter carrier the ladder tunes like any
+/// record. `layer_type` is **structural** (like `class`/`shape` — a
+/// definition, not a tunable); `enabled` is the design's `disable` op
+/// expressed as an ordinary Flag field (`set enabled=false` via the ladder);
+/// the param fields are the union of the well-known types' keys, and
+/// authoring an off-type param is loud (`InapplicableField`, the WI 884
+/// posture). Bodies reference these records by id from `surface_stack`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSurfaceLayer {
+    id: String,
+    #[serde(default)]
+    parent: Option<String>,
+    #[serde(default, rename = "abstract")]
+    is_abstract: bool,
+    /// Structural: which well-known type this layer is (`terrain`/`crater`/
+    /// `material`).
+    #[serde(default)]
+    layer_type: Option<String>,
+    /// Default true; `false` = carried but read as absent (the kill switch).
+    #[serde(default)]
+    enabled: Option<bool>,
+    /// Crater: global density multiplier.
+    #[serde(default)]
+    density: Option<f64>,
+    /// Crater: global depth multiplier.
+    #[serde(default)]
+    depth: Option<f64>,
+    /// Material: classifier base-temperature offset, K.
+    #[serde(default)]
+    temperature: Option<f64>,
+    /// Material: moisture midpoint offset.
+    #[serde(default)]
+    moisture: Option<f64>,
+    /// Material: moisture deviation multiplier.
+    #[serde(default)]
+    moisture_scale: Option<f64>,
+    /// Inert metadata tags.
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+}
+
+impl RawSurfaceLayer {
+    fn merge_over(self, p: &RawSurfaceLayer) -> RawSurfaceLayer {
+        RawSurfaceLayer {
+            id: self.id,
+            parent: self.parent,
+            is_abstract: self.is_abstract,
+            layer_type: self.layer_type.or_else(|| p.layer_type.clone()),
+            enabled: self.enabled.or(p.enabled),
+            density: self.density.or(p.density),
+            depth: self.depth.or(p.depth),
+            temperature: self.temperature.or(p.temperature),
+            moisture: self.moisture.or(p.moisture),
+            moisture_scale: self.moisture_scale.or(p.moisture_scale),
+            tags: self.tags.or_else(|| p.tags.clone()),
+        }
+    }
+}
+
 /// A **body recipe** (WI 881): the *intrinsic* definition of a celestial body as
 /// composable content data — the flattened, ladder-tunable form of a
 /// [`BodyAsset`]. Distinct from [`RawBody`], which is a placement-side *reference*
@@ -624,6 +726,10 @@ struct RawBodyRecipe {
     /// with no per-asset offset; present ⇒ `{"temperature": offset}`.
     #[serde(default)]
     surface_temperature_offset: Option<f64>,
+    /// The ordered surface-layer stack, as `SurfaceLayer` record ids (WI 892).
+    /// Application order is list order; the WI 879 id-keyed list ops splice it.
+    #[serde(default)]
+    surface_stack: Option<Vec<String>>,
     // Derivation inputs (WI 886) — the independent thermal/gas intent a fixed
     // recipe may author *instead of* pinning the derived medium fields:
     // T_surf = T_eq(nominal_insolation, bond_albedo) + greenhouse_delta_t;
@@ -714,6 +820,7 @@ impl RawBodyRecipe {
             surface_temperature_offset: self
                 .surface_temperature_offset
                 .or(p.surface_temperature_offset),
+            surface_stack: self.surface_stack.or_else(|| p.surface_stack.clone()),
             nominal_insolation: self.nominal_insolation.or(p.nominal_insolation),
             bond_albedo: self.bond_albedo.or(p.bond_albedo),
             greenhouse_delta_t: self.greenhouse_delta_t.or(p.greenhouse_delta_t),
@@ -1045,6 +1152,19 @@ pub struct BodyRefRecord {
     pub tags: Vec<String>,
 }
 
+/// A resolved surface-layer record (WI 892): the stack element bodies
+/// reference by id from `surface_stack`. The embedded element's `id` equals
+/// the record id (one namespace — the ladder's and the stack's addressing
+/// key are the same string).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SurfaceLayerRecord {
+    pub id: String,
+    /// The resolved element, ready to join a body's stack.
+    pub layer: crate::body_asset::SurfaceLayer,
+    /// Inert metadata tags.
+    pub tags: Vec<String>,
+}
+
 /// A resolved body-recipe record (WI 881): the intrinsic body definition,
 /// reassembled from the flattened recipe fields into a [`BodyAsset`] the sim
 /// reads. Contrast [`BodyRefRecord`], which only links to a library slug.
@@ -1076,6 +1196,8 @@ pub enum Record {
     Body(BodyRefRecord),
     /// Boxed — a resolved body is much larger than the other records.
     BodyRecipe(Box<BodyRecipeRecord>),
+    /// A resolved surface-layer element (WI 892).
+    SurfaceLayer(SurfaceLayerRecord),
 }
 
 /// A catalog entry: the record, its defining pack, and per-field provenance
@@ -1268,6 +1390,7 @@ fn slot<'a>(rec: &'a mut RawRecord, field: &str) -> Option<Slot<'a>> {
             "ocean_temperature" => Some(Slot::Num(&mut b.ocean_temperature)),
             "surface_seed" => Some(Slot::Num(&mut b.surface_seed)),
             "surface_temperature_offset" => Some(Slot::Num(&mut b.surface_temperature_offset)),
+            "surface_stack" => Some(Slot::List(&mut b.surface_stack)),
             "nominal_insolation" => Some(Slot::Num(&mut b.nominal_insolation)),
             "bond_albedo" => Some(Slot::Num(&mut b.bond_albedo)),
             "greenhouse_delta_t" => Some(Slot::Num(&mut b.greenhouse_delta_t)),
@@ -1299,6 +1422,16 @@ fn slot<'a>(rec: &'a mut RawRecord, field: &str) -> Option<Slot<'a>> {
             "ocean_temperature_min" => Some(Slot::Num(&mut b.ocean_temperature_min)),
             "ocean_temperature_max" => Some(Slot::Num(&mut b.ocean_temperature_max)),
             "tags" => Some(Slot::List(&mut b.tags)),
+            _ => None,
+        },
+        RawRecord::SurfaceLayer(l) => match field {
+            "enabled" => Some(Slot::Flag(&mut l.enabled)),
+            "density" => Some(Slot::Num(&mut l.density)),
+            "depth" => Some(Slot::Num(&mut l.depth)),
+            "temperature" => Some(Slot::Num(&mut l.temperature)),
+            "moisture" => Some(Slot::Num(&mut l.moisture)),
+            "moisture_scale" => Some(Slot::Num(&mut l.moisture_scale)),
+            "tags" => Some(Slot::List(&mut l.tags)),
             _ => None,
         },
     }
@@ -1370,6 +1503,16 @@ fn field_names(kind: RecordKind) -> &'static [&'static str] {
             "ocean_surface_density_max",
             "ocean_temperature_min",
             "ocean_temperature_max",
+            "surface_stack",
+            "tags",
+        ],
+        RecordKind::SurfaceLayer => &[
+            "enabled",
+            "density",
+            "depth",
+            "temperature",
+            "moisture",
+            "moisture_scale",
             "tags",
         ],
     }
@@ -1851,7 +1994,7 @@ fn merge_composition(
         if m.is_abstract() {
             continue; // bases are inheritance targets, not content
         }
-        let record = validate(m)?;
+        let record = validate(m, &merged)?;
         // Per-field provenance: each present field traces to the chain member
         // whose (post-ladder) raw value supplied it.
         let mut field_provenance = BTreeMap::new();
@@ -1947,7 +2090,60 @@ fn merge_chain(
 }
 
 /// Validate a fully-merged concrete record into its resolved, fully-typed form.
-fn validate(m: &RawRecord) -> Result<Record, ContentError> {
+/// Resolves one raw surface-layer record into its stack element (WI 892):
+/// `layer_type` is required and must be a known slug; off-type params are
+/// loud (`InapplicableField`); params JSON carries exactly the authored
+/// keys (none authored ⇒ `Null`, the lenient readers' defaults spelling).
+fn resolve_surface_layer(
+    l: &RawSurfaceLayer,
+) -> Result<crate::body_asset::SurfaceLayer, ContentError> {
+    use crate::body_asset::SurfaceLayerType;
+    let slug = l.layer_type.clone().ok_or(ContentError::MissingField {
+        id: l.id.clone(),
+        field: "layer_type",
+    })?;
+    let layer_type =
+        SurfaceLayerType::from_slug(&slug).ok_or_else(|| ContentError::UnknownLayerType {
+            id: l.id.clone(),
+            layer_type: slug,
+        })?;
+    // Off-type params are loud, per-key (the WI 884 mode-exclusivity posture).
+    let keys: [(&'static str, Option<f64>, SurfaceLayerType); 5] = [
+        ("density", l.density, SurfaceLayerType::Crater),
+        ("depth", l.depth, SurfaceLayerType::Crater),
+        ("temperature", l.temperature, SurfaceLayerType::Material),
+        ("moisture", l.moisture, SurfaceLayerType::Material),
+        (
+            "moisture_scale",
+            l.moisture_scale,
+            SurfaceLayerType::Material,
+        ),
+    ];
+    let mut params = serde_json::Map::new();
+    for (field, value, applies_to) in keys {
+        if let Some(v) = value {
+            if layer_type != applies_to {
+                return Err(ContentError::InapplicableField {
+                    id: l.id.clone(),
+                    field,
+                });
+            }
+            params.insert(field.to_string(), serde_json::json!(v));
+        }
+    }
+    Ok(crate::body_asset::SurfaceLayer {
+        id: l.id.clone(),
+        layer_type,
+        enabled: l.enabled.unwrap_or(true),
+        params: if params.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::Object(params)
+        },
+    })
+}
+
+fn validate(m: &RawRecord, merged: &HashMap<String, RawRecord>) -> Result<Record, ContentError> {
     let missing = |id: &str, field: &'static str| ContentError::MissingField {
         id: id.to_string(),
         field,
@@ -1998,6 +2194,11 @@ fn validate(m: &RawRecord) -> Result<Record, ContentError> {
             id: b.id.clone(),
             body_slug: b.body.clone().ok_or_else(|| missing(&b.id, "body"))?,
             tags: b.tags.clone().unwrap_or_default(),
+        })),
+        RawRecord::SurfaceLayer(l) => Ok(Record::SurfaceLayer(SurfaceLayerRecord {
+            id: l.id.clone(),
+            layer: resolve_surface_layer(l)?,
+            tags: l.tags.clone().unwrap_or_default(),
         })),
         RawRecord::BodyRecipe(b) => {
             let req = |v: Option<f64>, field: &'static str| v.ok_or_else(|| missing(&b.id, field));
@@ -2115,13 +2316,45 @@ fn validate(m: &RawRecord) -> Result<Record, ContentError> {
             if let Some((_, field)) = off_mode.iter().find(|(present, _)| *present) {
                 return Err(inapplicable(field));
             }
-            // Absent offset ⇒ no per-asset override (material `null`), matching a
-            // body that reads its medium directly (WI 875); present ⇒ the JSON the
-            // biome classifier reads.
-            let material = match b.surface_temperature_offset {
-                Some(offset) => serde_json::json!({ "temperature": offset }),
-                None => serde_json::Value::Null,
-            };
+            // The surface-layer stack (WI 892). The stack starts from the
+            // recipe's resolved `surface_stack` (Phase B — empty until then),
+            // and the `surface_temperature_offset` sugar composes onto it per
+            // the pinned rule (see `apply_temperature_sugar`): absent offset +
+            // empty stack ⇒ no layers, matching a body that reads its medium
+            // directly (WI 875); a bare offset ⇒ one synthesized material
+            // layer carrying the JSON the biome classifier reads.
+            let mut surface_layers: Vec<crate::body_asset::SurfaceLayer> = Vec::new();
+            if let Some(stack) = &b.surface_stack {
+                let mut seen: BTreeSet<&str> = BTreeSet::new();
+                for layer_id in stack {
+                    if !seen.insert(layer_id) {
+                        return Err(ContentError::DuplicateStackLayer {
+                            body: b.id.clone(),
+                            layer: layer_id.clone(),
+                        });
+                    }
+                    match merged.get(layer_id) {
+                        Some(RawRecord::SurfaceLayer(l)) if !l.is_abstract => {
+                            surface_layers.push(resolve_surface_layer(l)?);
+                        }
+                        // An abstract layer is an inheritance target, not
+                        // content — same refusal as an absent record.
+                        Some(RawRecord::SurfaceLayer(_)) | None => {
+                            return Err(ContentError::UnknownStackLayer {
+                                body: b.id.clone(),
+                                layer: layer_id.clone(),
+                            });
+                        }
+                        Some(_) => {
+                            return Err(ContentError::StackLayerWrongKind {
+                                body: b.id.clone(),
+                                layer: layer_id.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            apply_temperature_sugar(&mut surface_layers, b.surface_temperature_offset);
             let (body, bands) = match b.shape {
                 // Sampled (WI 883): an archetype. Draw the shape's bands at the
                 // seed via the shared sampler, reproducing `bodygen::generate`.
@@ -2249,7 +2482,7 @@ fn validate(m: &RawRecord) -> Result<Record, ContentError> {
                     // generator's synthesized ones; the physics is the draw's.
                     body.id = b.id.clone();
                     body.name = b.name.clone().ok_or_else(|| missing(&b.id, "name"))?;
-                    body.surface.material = material;
+                    body.surface.layers = surface_layers;
                     // Retain the resolved bands (WI 884) so consumers can
                     // re-sample the family at other seeds.
                     (body, Some(bands))
@@ -2377,7 +2610,7 @@ fn validate(m: &RawRecord) -> Result<Record, ContentError> {
                             ocean_temperature,
                         },
                         surface: SurfaceRecipe {
-                            material,
+                            layers: surface_layers,
                             ..SurfaceRecipe::from_seed(surface_seed()?)
                         },
                         render: serde_json::Value::Null,
@@ -2474,6 +2707,44 @@ fn canonical_catalog() -> &'static Catalog {
         Catalog::from_ron_str(CANONICAL_BODIES_RON)
             .expect("embedded canonical bodies pack (crates/sim/content/bodies.ron) must resolve")
     })
+}
+
+/// The `surface_temperature_offset` sugar composed onto a resolved layer
+/// stack (WI 892, plan-pinned rule): the offset applies to the **first
+/// enabled material layer** in stack order, overwriting that layer's own
+/// `temperature` param (body-local authoring is the more specific); if
+/// material layers exist but **none is enabled**, the sugar is **discarded**
+/// (an explicit disable is the stronger authoring — the kill switch keeps its
+/// teeth); if **no material layer exists** (the pre-stack universal case), a
+/// synthesized enabled layer with the well-known id `material` is appended at
+/// the tail. Non-object params on the receiving layer are replaced by the
+/// offset object (they were unreadable to the classifier anyway).
+fn apply_temperature_sugar(layers: &mut Vec<crate::body_asset::SurfaceLayer>, offset: Option<f64>) {
+    use crate::body_asset::{SurfaceLayer, SurfaceLayerType};
+    let Some(offset) = offset else {
+        return;
+    };
+    if let Some(layer) = layers
+        .iter_mut()
+        .find(|l| l.enabled && l.layer_type == SurfaceLayerType::Material)
+    {
+        match &mut layer.params {
+            serde_json::Value::Object(map) => {
+                map.insert("temperature".to_string(), serde_json::json!(offset));
+            }
+            other => *other = serde_json::json!({ "temperature": offset }),
+        }
+    } else if layers
+        .iter()
+        .any(|l| l.layer_type == SurfaceLayerType::Material)
+    {
+        // Material layers exist but every one is disabled: discarded.
+    } else {
+        layers.push(SurfaceLayer::well_known(
+            SurfaceLayerType::Material,
+            serde_json::json!({ "temperature": offset }),
+        ));
+    }
 }
 
 /// Resolve a canonical body by record id from the embedded pack (WI 884).
@@ -3038,6 +3309,290 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------
+    // WI 892 — the surface-layer stack.
+    // -----------------------------------------------------------------
+
+    /// A fixed recipe body carrying the derive_recipe independents plus
+    /// `extra` (e.g. a surface_stack) — the WI 892 stack fixtures' base.
+    fn stack_body(extra: &str) -> String {
+        format!(
+            r#"BodyRecipe(( id: "sb", name: "SB",
+                mu: 4.0e14, radius: 6.0e6, rotation_period: 86400.0,
+                atmosphere_surface_pressure: 100000.0,
+                nominal_insolation: 1361.0, bond_albedo: 0.3, greenhouse_delta_t: 33.0,
+                mean_molar_mass: 0.029,
+                ocean_surface_density: 1000.0, ocean_density_gradient: 0.0,
+                ocean_temperature: 285.0, surface_seed: 7, {extra} )),"#
+        )
+    }
+
+    fn stack_layers_of(cat: &Catalog, id: &str) -> Vec<(String, String, bool)> {
+        resolved_body(cat, id)
+            .surface
+            .layers
+            .iter()
+            .map(|l| (l.id.clone(), l.layer_type.slug().to_string(), l.enabled))
+            .collect()
+    }
+
+    /// WI 892 Phase B scenario 1: an authored stack resolves in order; layer
+    /// params reach the body; a ladder `multiply` on the layer record's param
+    /// re-flows into the resolved stack (per-layer-field provenance for free).
+    #[test]
+    fn authored_stack_resolves_in_order_and_ladder_tunes_layer_params() {
+        let p = pack(&format!(
+            r#"SurfaceLayer(( id: "big-craters", layer_type: "crater", density: 1.5, depth: 2.0 )),
+               SurfaceLayer(( id: "climate", layer_type: "material", temperature: -10.0 )),
+               {}"#,
+            stack_body(r#"surface_stack: ["big-craters", "climate"],"#)
+        ));
+        let cat = Catalog::merge(&[&p], &[]).unwrap();
+        assert_eq!(
+            stack_layers_of(&cat, "sb"),
+            vec![
+                ("big-craters".to_string(), "crater".to_string(), true),
+                ("climate".to_string(), "material".to_string(), true),
+            ],
+            "stack order is list order; enabled defaults true"
+        );
+        let body = resolved_body(&cat, "sb");
+        assert_eq!(
+            body.surface
+                .params_of(crate::body_asset::SurfaceLayerType::Crater)["density"]
+                .as_f64(),
+            Some(1.5)
+        );
+
+        // Ladder-multiply the layer record's density: the body re-resolves
+        // with the tuned value (layers are ordinary records to the ladder).
+        let ov = override_set(
+            "scn",
+            "Scenario",
+            "",
+            r#"( target: Id("big-craters"), field: "density", op: Multiply(2.0) ),"#,
+        );
+        let cat2 = Catalog::merge(&[&p], &[&ov]).unwrap();
+        assert_eq!(
+            resolved_body(&cat2, "sb")
+                .surface
+                .params_of(crate::body_asset::SurfaceLayerType::Crater)["density"]
+                .as_f64(),
+            Some(3.0),
+            "multiply on the layer record re-flows into the resolved stack"
+        );
+        // Provenance recorded on the layer record's field.
+        let fp = &cat2.get("big-craters").unwrap().field_provenance["density"];
+        assert_eq!(fp.shadows[0].value, ProvValue::Number(1.5));
+    }
+
+    /// WI 892 Phase B scenario 3 + edge cases: unknown / wrong-kind /
+    /// duplicate / abstract stack references and unknown layer types are
+    /// loud and named; off-type params are `InapplicableField`.
+    #[test]
+    fn stack_reference_failures_are_loud_and_named() {
+        // Unknown id.
+        let p = pack(&stack_body(r#"surface_stack: ["ghost"],"#));
+        match Catalog::merge(&[&p], &[]) {
+            Err(ContentError::UnknownStackLayer { body, layer }) => {
+                assert_eq!((body.as_str(), layer.as_str()), ("sb", "ghost"));
+            }
+            other => panic!("expected UnknownStackLayer, got {other:?}"),
+        }
+        // Wrong kind (a Resource is not a layer).
+        let p = pack(&format!(
+            r#"Resource(( id: "fuel", density: 800.0 )), {}"#,
+            stack_body(r#"surface_stack: ["fuel"],"#)
+        ));
+        match Catalog::merge(&[&p], &[]) {
+            Err(ContentError::StackLayerWrongKind { body, layer }) => {
+                assert_eq!((body.as_str(), layer.as_str()), ("sb", "fuel"));
+            }
+            other => panic!("expected StackLayerWrongKind, got {other:?}"),
+        }
+        // Duplicate id in one stack.
+        let p = pack(&format!(
+            r#"SurfaceLayer(( id: "c", layer_type: "crater" )), {}"#,
+            stack_body(r#"surface_stack: ["c", "c"],"#)
+        ));
+        match Catalog::merge(&[&p], &[]) {
+            Err(ContentError::DuplicateStackLayer { body, layer }) => {
+                assert_eq!((body.as_str(), layer.as_str()), ("sb", "c"));
+            }
+            other => panic!("expected DuplicateStackLayer, got {other:?}"),
+        }
+        // An abstract layer is an inheritance target, not content.
+        let p = pack(&format!(
+            r#"SurfaceLayer(( id: "base", abstract: true, layer_type: "crater" )), {}"#,
+            stack_body(r#"surface_stack: ["base"],"#)
+        ));
+        assert!(matches!(
+            Catalog::merge(&[&p], &[]),
+            Err(ContentError::UnknownStackLayer { .. })
+        ));
+        // Unknown layer type.
+        let p = pack(r#"SurfaceLayer(( id: "x", layer_type: "volcano" )),"#);
+        match Catalog::merge(&[&p], &[]) {
+            Err(ContentError::UnknownLayerType { id, layer_type }) => {
+                assert_eq!((id.as_str(), layer_type.as_str()), ("x", "volcano"));
+            }
+            other => panic!("expected UnknownLayerType, got {other:?}"),
+        }
+        // Off-type param (temperature on a crater layer) — Phase B scenario 4.
+        let p = pack(r#"SurfaceLayer(( id: "x", layer_type: "crater", temperature: -5.0 )),"#);
+        match Catalog::merge(&[&p], &[]) {
+            Err(ContentError::InapplicableField { id, field }) => {
+                assert_eq!((id.as_str(), field), ("x", "temperature"));
+            }
+            other => panic!("expected InapplicableField, got {other:?}"),
+        }
+        // Missing layer_type.
+        let p = pack(r#"SurfaceLayer(( id: "x", density: 1.0 )),"#);
+        assert!(matches!(
+            Catalog::merge(&[&p], &[]),
+            Err(ContentError::MissingField {
+                field: "layer_type",
+                ..
+            })
+        ));
+        // layer_type is structural (a definition, not a tunable): an override
+        // targeting it is rejected via the existing mechanism (plan invariant).
+        let p = pack(r#"SurfaceLayer(( id: "x", layer_type: "crater" )),"#);
+        let bad = override_set(
+            "bad",
+            "Patch",
+            "",
+            r#"( target: Id("x"), field: "layer_type", op: Set(Text("material")) ),"#,
+        );
+        assert!(matches!(
+            Catalog::merge(&[&p], &[&bad]),
+            Err(ContentError::StructuralField { .. })
+        ));
+    }
+
+    /// WI 892 pinned sugar rule: the offset lands on the first ENABLED
+    /// material layer (overriding its own temperature); all-disabled ⇒
+    /// discarded; none ⇒ a synthesized well-known `material` layer appends.
+    #[test]
+    fn temperature_sugar_composes_per_the_pinned_rule() {
+        use crate::body_asset::SurfaceLayerType;
+        // First enabled material layer receives (and is overridden by) the sugar.
+        let p = pack(&format!(
+            r#"SurfaceLayer(( id: "climate", layer_type: "material", temperature: -10.0, moisture: 0.2 )),
+               {}"#,
+            stack_body(r#"surface_stack: ["climate"], surface_temperature_offset: -40.0,"#)
+        ));
+        let cat = Catalog::merge(&[&p], &[]).unwrap();
+        let body = resolved_body(&cat, "sb");
+        let params = body.surface.params_of(SurfaceLayerType::Material);
+        assert_eq!(params["temperature"].as_f64(), Some(-40.0), "sugar wins");
+        assert_eq!(params["moisture"].as_f64(), Some(0.2), "other keys kept");
+        assert_eq!(body.surface.layers.len(), 1, "no synthesized layer");
+
+        // No material layer at all ⇒ synthesized well-known layer appended.
+        let p = pack(&format!(
+            r#"SurfaceLayer(( id: "c", layer_type: "crater" )), {}"#,
+            stack_body(r#"surface_stack: ["c"], surface_temperature_offset: -40.0,"#)
+        ));
+        let body = resolved_body(&Catalog::merge(&[&p], &[]).unwrap(), "sb");
+        assert_eq!(
+            body.surface
+                .layers
+                .iter()
+                .map(|l| l.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c", "material"],
+            "synthesized layer appended at the tail with the well-known id"
+        );
+
+        // Phase C scenario 2 (second half): all material layers disabled ⇒
+        // the sugar is DISCARDED (explicit disable is the stronger authoring).
+        let p = pack(&format!(
+            r#"SurfaceLayer(( id: "climate", layer_type: "material", temperature: -10.0, enabled: false )),
+               {}"#,
+            stack_body(r#"surface_stack: ["climate"], surface_temperature_offset: -40.0,"#)
+        ));
+        let body = resolved_body(&Catalog::merge(&[&p], &[]).unwrap(), "sb");
+        assert!(
+            body.surface.params_of(SurfaceLayerType::Material).is_null(),
+            "disabled layer reads as absent and the sugar does not resurrect it"
+        );
+        assert_eq!(body.surface.layers.len(), 1, "carried, not removed");
+    }
+
+    /// WI 892 Phase C: the WI 879 id-keyed ops splice `surface_stack`, and
+    /// `set enabled=false` on a layer record via the ladder is the design's
+    /// `disable` — the classifier returns to defaults, stack order untouched.
+    #[test]
+    fn stack_ops_splice_by_id_and_disable_is_a_field_set() {
+        use crate::body_asset::SurfaceLayerType;
+        let p = pack(&format!(
+            r#"SurfaceLayer(( id: "craters", layer_type: "crater", density: 1.5 )),
+               SurfaceLayer(( id: "climate", layer_type: "material", temperature: -40.0 )),
+               SurfaceLayer(( id: "climate2", layer_type: "material", temperature: 5.0 )),
+               {}"#,
+            stack_body(r#"surface_stack: ["craters"],"#)
+        ));
+        // InsertAfter by id, then Replace by id (Phase C scenario 1).
+        let ins = override_set(
+            "ins",
+            "Patch",
+            "",
+            r#"( target: Id("sb"), field: "surface_stack", op: InsertAfter(anchor: "craters", items: ["climate"]) ),"#,
+        );
+        let cat = Catalog::merge(&[&p], &[&ins]).unwrap();
+        assert_eq!(
+            stack_layers_of(&cat, "sb")
+                .iter()
+                .map(|(id, _, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["craters", "climate"]
+        );
+        let rep = override_set(
+            "rep",
+            "Scenario",
+            "",
+            r#"( target: Id("sb"), field: "surface_stack", op: Replace(target: "climate", items: ["climate2"]) ),"#,
+        );
+        let cat = Catalog::merge(&[&p], &[&ins, &rep]).unwrap();
+        assert_eq!(
+            stack_layers_of(&cat, "sb")
+                .iter()
+                .map(|(id, _, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["craters", "climate2"]
+        );
+        // Whole-list provenance shows the transitions.
+        let fp = &cat.get("sb").unwrap().field_provenance["surface_stack"];
+        assert_eq!(
+            fp.shadows[0].value,
+            ProvValue::List(vec!["craters".into(), "climate".into()])
+        );
+
+        // Disable via the ladder (Phase C scenario 2, first half): the layer
+        // stays in the stack but reads as absent.
+        let off = override_set(
+            "off",
+            "Local",
+            "",
+            r#"( target: Id("climate2"), field: "enabled", op: Set(Bool(false)) ),"#,
+        );
+        let cat = Catalog::merge(&[&p], &[&ins, &rep, &off]).unwrap();
+        let body = resolved_body(&cat, "sb");
+        assert_eq!(
+            stack_layers_of(&cat, "sb")
+                .iter()
+                .map(|(id, _, enabled)| (id.as_str(), *enabled))
+                .collect::<Vec<_>>(),
+            vec![("craters", true), ("climate2", false)],
+            "order untouched; the layer is carried disabled"
+        );
+        assert!(
+            body.surface.params_of(SurfaceLayerType::Material).is_null(),
+            "disabled ⇒ classifier defaults"
+        );
+    }
+
     #[test]
     fn insert_after_and_replace_are_id_keyed() {
         let p = pack(r#"Resource(( id: "fuel", density: 800.0 )),"#);
@@ -3166,7 +3721,7 @@ mod tests {
 
     fn body_offset(b: &BodyAsset) -> Option<f64> {
         b.surface
-            .material
+            .params_of(crate::body_asset::SurfaceLayerType::Material)
             .get("temperature")
             .and_then(|v| v.as_f64())
     }
@@ -3219,9 +3774,9 @@ mod tests {
         let cat = Catalog::merge(&[&p], &[]).unwrap();
         assert_body_approx(&resolved_body(&cat, "earthlike"), &BodyAsset::earthlike());
         // No offset authored ⇒ material is JSON null (matches the WI 875 earthlike).
-        assert_eq!(
-            resolved_body(&cat, "earthlike").surface.material,
-            serde_json::Value::Null
+        assert!(
+            resolved_body(&cat, "earthlike").surface.layers.is_empty(),
+            "no offset authored => empty stack (matches the WI 875 earthlike)"
         );
     }
 
@@ -3243,7 +3798,7 @@ mod tests {
         assert_eq!(cold.radius, temperate.radius);
         assert_eq!(cold.rotation, temperate.rotation);
         // Only the classifier offset differs, and it matches the constructor.
-        assert!(temperate.surface.material.is_null());
+        assert!(temperate.surface.layers.is_empty());
         assert!(
             (body_offset(&cold).unwrap() - EARTHLIKE_ICE_AGE_OFFSET).abs() < 0.05,
             "ice-age offset {:?}",
@@ -3479,7 +4034,7 @@ mod tests {
         assert_eq!(e.rotation, Rotation::EARTHLIKE);
         assert_eq!(e.fluid_medium, FluidMedium::EARTHLIKE);
         assert_eq!(e.surface.seed, 0);
-        assert!(e.surface.material.is_null());
+        assert!(e.surface.layers.is_empty());
 
         // The ice-age sibling: inherited physics identical to the twin; its
         // authored offset pins to the WI-875 derived constant (tolerance covers
@@ -3489,7 +4044,11 @@ mod tests {
         assert_eq!(i.mu, e.mu);
         assert_eq!(i.radius, e.radius);
         assert_eq!(i.rotation, e.rotation);
-        let offset = i.surface.material["temperature"].as_f64().unwrap();
+        let offset = i
+            .surface
+            .params_of(crate::body_asset::SurfaceLayerType::Material)["temperature"]
+            .as_f64()
+            .unwrap();
         assert!(
             (offset - EARTHLIKE_ICE_AGE_OFFSET).abs() < 1e-9,
             "shipped ice-age offset {offset} drifted from the derived constant \

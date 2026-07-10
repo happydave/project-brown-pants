@@ -30,9 +30,9 @@
 //! crosses a lattice plane. Per-sample cost is therefore a constant (octaves ×
 //! 27 cells), **independent of the total crater count**, and the crater term is
 //! continuous (every profile exactly zero at reach, rim included). Per-body
-//! crater **density/depth multipliers** ([`CraterParams`]) ride the reserved
-//! `SurfaceRecipe.crater` area (lenient parse, defaults on anything absent or
-//! malformed — no persistence-format change).
+//! crater **density/depth multipliers** ([`CraterParams`]) ride the first
+//! enabled `crater` layer of the surface stack (`SurfaceRecipe::params_of`,
+//! WI 892; lenient parse, defaults on anything absent or malformed).
 
 use crate::biome::{classify, BiomeFamily, BiomeWeights, BodyClimate, ClimateSample};
 use crate::body_asset::BodyAsset;
@@ -148,9 +148,9 @@ pub struct EjectaSystem {
     pub intensity: f64,
 }
 
-/// Per-body crater parameters (WI 782), read from the **reserved**
-/// `SurfaceRecipe.crater` area (a defaulted `serde_json::Value`, so no
-/// persistence-format change). Lenient: absent / null / non-object values and
+/// Per-body crater parameters (WI 782), read from the first enabled `crater`
+/// layer of the surface stack (`SurfaceRecipe::params_of`, WI 892).
+/// Lenient: absent / null / non-object values and
 /// missing or non-numeric keys all fall back to defaults; recognized keys are
 /// `"density"` and `"depth"` — global multipliers over the octave table, each
 /// clamped to `[0, 4]`.
@@ -227,7 +227,11 @@ impl SurfaceField {
         Self::with_params(
             asset.surface.seed,
             asset.radius,
-            CraterParams::from_value(&asset.surface.crater),
+            CraterParams::from_value(
+                asset
+                    .surface
+                    .params_of(crate::body_asset::SurfaceLayerType::Crater),
+            ),
             BodyClimate::from_asset(asset),
         )
     }
@@ -1127,14 +1131,20 @@ mod tests {
         }
 
         // Density multiplier 0 ⇒ a craterless (but still continuous) body.
-        asset.surface.crater = serde_json::json!({"density": 0.0});
+        asset.surface.layers = vec![crate::body_asset::SurfaceLayer::well_known(
+            crate::body_asset::SurfaceLayerType::Crater,
+            serde_json::json!({"density": 0.0}),
+        )];
         let craterless = SurfaceField::from_asset(&asset);
         for d in dirs() {
             assert_eq!(craterless.crater_delta(d), 0.0);
         }
 
         // Depth multiplier scales the crater term linearly where it is nonzero.
-        asset.surface.crater = serde_json::json!({"depth": 2.0});
+        asset.surface.layers = vec![crate::body_asset::SurfaceLayer::well_known(
+            crate::body_asset::SurfaceLayerType::Crater,
+            serde_json::json!({"depth": 2.0}),
+        )];
         let deep = SurfaceField::from_asset(&asset);
         let mut checked = 0;
         for d in dirs() {
@@ -1282,14 +1292,20 @@ mod tests {
         let mut asset = BodyAsset::earthlike();
         asset.surface.seed = 2024;
         asset.radius = 1_000_000.0;
-        asset.surface.crater = serde_json::json!({"density": 0.0});
+        asset.surface.layers = vec![crate::body_asset::SurfaceLayer::well_known(
+            crate::body_asset::SurfaceLayerType::Crater,
+            serde_json::json!({"density": 0.0}),
+        )];
         let craterless = SurfaceField::from_asset(&asset);
         for d in dirs() {
             assert_eq!(craterless.ejecta(d), 0.0, "no craters ⇒ no rays");
         }
         // …while the depth multiplier does not apply (rays are albedo, not
         // relief).
-        asset.surface.crater = serde_json::json!({"depth": 2.0});
+        asset.surface.layers = vec![crate::body_asset::SurfaceLayer::well_known(
+            crate::body_asset::SurfaceLayerType::Crater,
+            serde_json::json!({"depth": 2.0}),
+        )];
         let deep = SurfaceField::from_asset(&asset);
         for d in dirs() {
             assert_eq!(deep.ejecta(d), f.ejecta(d));

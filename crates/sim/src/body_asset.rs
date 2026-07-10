@@ -67,35 +67,111 @@ pub struct SurfaceRecipe {
     /// Master seed — the deterministic source of the whole surface (same seed ⇒
     /// same surface, every visit and every new game).
     pub seed: u64,
-    /// Reserved: base-terrain noise parameters (WI 763).
+    /// The **ordered surface-layer stack** (WI 892), replacing the flat
+    /// `terrain`/`crater`/`material` areas (v2 documents migrate at load —
+    /// `persist`'s v2 arm). Application order IS list order (an explicit sort
+    /// key, never map iteration — design I1); the ladder addresses elements
+    /// by stable id, never index. Empty is the common case and means
+    /// all-defaults, exactly like the null areas it replaces.
     #[serde(default)]
-    pub terrain: serde_json::Value,
-    /// Crater-population parameters (defined by WI 782; reserved since WI 763).
-    /// Read leniently by `surface_field::CraterParams::from_value` — recognized
-    /// keys are `"density"` and `"depth"` (global multipliers over the crater
-    /// octave table, clamped to `[0, 4]`); anything absent or malformed means
-    /// defaults, so pre-782 assets read unchanged (no format bump).
-    #[serde(default)]
-    pub crater: serde_json::Value,
-    /// Biome/climate parameters (defined by WI 870; reserved since WI 763).
-    /// Read leniently by `biome::BiomeParams::from_value` — recognized keys are
-    /// `"temperature"` (classifier base-temperature offset, Kelvin, clamped
-    /// ±100; the physics medium is untouched — WI 875), `"moisture"` (midpoint
-    /// offset, clamped ±1), and `"moisture_scale"` (deviation multiplier,
-    /// clamped [0, 4]); a palette/variant selector stays reserved. Anything
-    /// absent or malformed means defaults, so pre-870 assets read unchanged
-    /// (no format bump).
-    #[serde(default)]
-    pub material: serde_json::Value,
+    pub layers: Vec<SurfaceLayer>,
 }
 
 impl SurfaceRecipe {
-    /// A recipe seeded with `seed` and empty (reserved) parameter areas.
+    /// A recipe seeded with `seed` and an empty layer stack.
     pub fn from_seed(seed: u64) -> Self {
         Self {
             seed,
-            ..Self::default()
+            layers: Vec::new(),
         }
+    }
+
+    /// The parameters of the **first enabled** layer of `layer_type` — the one
+    /// consumer contract (pinned by WI 892's plan): a disabled layer reads as
+    /// absent, an absent layer means defaults (`Null`, the lenient readers'
+    /// existing posture). Blending multiple enabled layers of one type is
+    /// future generation work; until then first-enabled wins.
+    pub fn params_of(&self, layer_type: SurfaceLayerType) -> &serde_json::Value {
+        const NULL: serde_json::Value = serde_json::Value::Null;
+        self.layers
+            .iter()
+            .find(|l| l.enabled && l.layer_type == layer_type)
+            .map(|l| &l.params)
+            .unwrap_or(&NULL)
+    }
+}
+
+/// One element of the surface-layer stack (WI 892): a stable-id, typed,
+/// switchable parameter carrier. The machine-created layers (the
+/// `surface_temperature_offset` sugar, the persist v2 migration) use their
+/// type's slug as their id — well-known, deterministic, digest-stable.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceLayer {
+    /// Stable identifier — the ladder's addressing key (by id, never index).
+    pub id: String,
+    /// Which well-known type this layer is (decides which consumer reads it
+    /// and what its params mean).
+    pub layer_type: SurfaceLayerType,
+    /// A disabled layer is carried (and digested) but reads as absent — the
+    /// design's `disable` semantics, expressed as data rather than a new op.
+    pub enabled: bool,
+    /// Type-specific parameters, read leniently by the type's consumer
+    /// (`crater`: `density`/`depth` — `surface_field::CraterParams`;
+    /// `material`: `temperature`/`moisture`/`moisture_scale` —
+    /// `biome::BiomeParams`; `terrain`: reserved, opaque).
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+/// The well-known surface-layer types (WI 892) — the flat reserved areas of
+/// the pre-stack `SurfaceRecipe`, promoted to layer types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceLayerType {
+    /// Base-terrain noise parameters (reserved since WI 763 — no reader yet).
+    Terrain,
+    /// Crater-population parameters (WI 782).
+    Crater,
+    /// Biome/climate parameters (WI 870/875).
+    Material,
+}
+
+impl SurfaceLayer {
+    /// A machine-created (well-known) layer: enabled, with its type's slug as
+    /// its id — the shape the `surface_temperature_offset` sugar and the
+    /// persist v2 migration produce.
+    pub fn well_known(layer_type: SurfaceLayerType, params: serde_json::Value) -> SurfaceLayer {
+        SurfaceLayer {
+            id: layer_type.slug().to_string(),
+            layer_type,
+            enabled: true,
+            params,
+        }
+    }
+}
+
+impl SurfaceLayerType {
+    /// All types, in the canonical (migration) order.
+    pub const ALL: [SurfaceLayerType; 3] = [
+        SurfaceLayerType::Terrain,
+        SurfaceLayerType::Crater,
+        SurfaceLayerType::Material,
+    ];
+
+    /// The type's stable slug — its serde spelling, the machine-created
+    /// layer id, and the digest input.
+    pub fn slug(self) -> &'static str {
+        match self {
+            SurfaceLayerType::Terrain => "terrain",
+            SurfaceLayerType::Crater => "crater",
+            SurfaceLayerType::Material => "material",
+        }
+    }
+
+    /// Inverse of [`slug`](Self::slug); `None` for an unknown slug (persisted
+    /// or authored input is reported, never panicked on).
+    pub fn from_slug(slug: &str) -> Option<SurfaceLayerType> {
+        SurfaceLayerType::ALL.into_iter().find(|t| t.slug() == slug)
     }
 }
 
@@ -277,7 +353,41 @@ mod tests {
         }"#;
         let back: BodyAsset = serde_json::from_str(minimal).unwrap();
         assert_eq!(back.surface.seed, 42);
-        assert!(back.surface.terrain.is_null());
+        assert!(back.surface.layers.is_empty(), "absent stack ⇒ empty");
         assert!(back.render.is_null());
+    }
+
+    /// WI 892: the one consumer contract — `params_of` returns the first
+    /// **enabled** layer of the type; disabled layers read as absent, an
+    /// absent type means `Null` (the lenient readers' defaults).
+    #[test]
+    fn params_of_is_first_enabled_of_type() {
+        use serde_json::json;
+        let mut s = SurfaceRecipe::from_seed(1);
+        assert!(s.params_of(SurfaceLayerType::Crater).is_null(), "empty");
+        s.layers = vec![
+            SurfaceLayer {
+                id: "dead".into(),
+                layer_type: SurfaceLayerType::Crater,
+                enabled: false,
+                params: json!({"density": 9.0}),
+            },
+            SurfaceLayer::well_known(SurfaceLayerType::Crater, json!({"density": 2.0})),
+            SurfaceLayer {
+                id: "later".into(),
+                layer_type: SurfaceLayerType::Crater,
+                enabled: true,
+                params: json!({"density": 3.0}),
+            },
+        ];
+        assert_eq!(
+            s.params_of(SurfaceLayerType::Crater)["density"].as_f64(),
+            Some(2.0),
+            "first ENABLED of type wins; disabled skipped"
+        );
+        assert!(
+            s.params_of(SurfaceLayerType::Material).is_null(),
+            "absent type ⇒ Null"
+        );
     }
 }

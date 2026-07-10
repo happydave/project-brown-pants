@@ -1591,6 +1591,88 @@ mod tests {
         assert_eq!(resumed.bodies, old.bodies, "pin preserved verbatim");
     }
 
+    /// WI 892 (scenario A-3b): a v2 world save carrying WI 891 per-body
+    /// records migrates coherently — the snapshot record's embedded body gets
+    /// the flat→stack conversion and its digest is restored over the migrated
+    /// body (integrity by construction) while its recorded output_version is
+    /// left untouched (an old snapshot stays an old-generator pin: the WI 891
+    /// drift line fires, the snapshot wins); a digest-tier record is carried
+    /// unmodified (its stale version already routes to "expected reroll").
+    #[test]
+    fn v2_world_save_body_records_migrate_coherently() {
+        use crate::world_save::{apply_body_records, SavedBodyRecord};
+        let root = crate::body_asset::BodyAsset::earthlike();
+        let visited = crate::bodygen::generate(42, crate::bodygen::Archetype::RockyPlanet);
+        let mut spawn = spawn_payload();
+        spawn.bodies = crate::world_save::body_records(
+            &[root.clone(), visited.clone()],
+            &std::iter::once(root.id.clone()).collect(),
+        );
+        let flight = instantiate(&spawn).unwrap();
+        let payload = crate::world_save::capture(&flight, vec![]);
+        let doc = crate::persist::SavedDocument::new(crate::persist::Payload::WorldSave(payload));
+
+        // Regress the document to v2 shape: version tag, flat surfaces on the
+        // snapshot record's embedded body, a stale (old-layout) digest, and
+        // output_version 1 (the v2 era's value).
+        let mut v2 = serde_json::to_value(&doc).unwrap();
+        v2["format_version"] = 2.into();
+        let rec = &mut v2["payload"]["scenario"]["bodies"][0];
+        assert_eq!(rec["tier"], "snapshot");
+        rec["output_version"] = 1.into();
+        rec["digest"] = "0123456789abcdef".into(); // stale old-layout digest
+        rec["body"]["surface"] = serde_json::json!({
+            "seed": 0, "terrain": null, "crater": null,
+            "material": { "temperature": -5.0 }
+        });
+        v2["payload"]["scenario"]["bodies"][1]["output_version"] = 1.into();
+
+        let migrated = crate::persist::SavedDocument::from_json(&v2.to_string())
+            .expect("v2 world save migrates");
+        assert_eq!(migrated.format_version, crate::persist::FORMAT_VERSION);
+        let crate::persist::Payload::WorldSave(w) = &migrated.payload else {
+            panic!("world scope");
+        };
+        let records = &w.scenario.as_ref().unwrap().bodies;
+
+        // Snapshot record: surface converted, digest restored, version kept.
+        let SavedBodyRecord::Snapshot {
+            output_version,
+            digest,
+            body,
+            ..
+        } = &records[0]
+        else {
+            panic!("snapshot tier");
+        };
+        assert_eq!(*output_version, 1, "recorded output_version untouched");
+        assert_eq!(
+            *digest,
+            crate::body_digest::digest_hex(body),
+            "digest restored over the migrated body"
+        );
+        assert_eq!(
+            body.surface.layers.len(),
+            1,
+            "flat material area became one layer"
+        );
+        let pinned_body = (**body).clone();
+
+        // And the load path accepts it: integrity passes, the stale versions
+        // are the designed drift lines, the snapshot substitutes.
+        let mut assets = vec![root.clone(), visited.clone()];
+        let drift = apply_body_records(records, &mut assets).expect("no integrity failure");
+        assert!(
+            drift.iter().any(|l| l.contains("pins output version")),
+            "{drift:?}"
+        );
+        assert!(
+            drift.iter().any(|l| l.contains("expected reroll")),
+            "digest-tier stale version reads as the designed reroll: {drift:?}"
+        );
+        assert_eq!(assets[0], pinned_body, "snapshot substituted");
+    }
+
     /// WI 553: capture → JSON → restore is a live-state round-trip — the
     /// resumed flight matches the saved one (dynamic state, reservoirs,
     /// session, elapsed, mission latches) and keeps flying.

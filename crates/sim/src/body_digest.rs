@@ -28,29 +28,35 @@
 //! **Digest layout contract** (changing it is itself an output change —
 //! regenerate + bump): id, name, mu, radius, rotation axis (x, y, z), sidereal
 //! period, the nine `FluidMedium` fields in declaration order, surface seed,
-//! then the `terrain`/`crater`/`material`/`render` JSON areas. Strings and
-//! JSON are length-prefixed UTF-8 (JSON via `serde_json::to_string`, which is
-//! deterministic here: the default feature set stores maps sorted); `f64` as
-//! `to_bits` little-endian; integers little-endian.
+//! then the **surface-layer stack** (WI 892: layer count, then per layer its
+//! id, type slug, enabled flag, and params JSON — in stack order) and the
+//! `render` JSON area. Strings and JSON are length-prefixed UTF-8 (JSON via
+//! `serde_json::to_string`, which is deterministic here: the default feature
+//! set stores maps sorted); `f64` as `to_bits` little-endian; integers
+//! little-endian.
 //!
-//! **Deliberate-break policy** (recorded WI 888): the two known intentional
-//! stream breaks — hash-derived child seeds (vs today's `seed ^ salt`) and
-//! sampled-path derivation — are deferred, **batched**, and will land together
-//! under one `BODY_OUTPUT_VERSION` bump alongside the slice that adds
-//! generation steps (the surface-layer stack), with this harness auditing the
-//! regeneration. Note the boundary this harness does *not* yet cover: surface
-//! **heights** are excluded from goldens because the height/ejecta path still
-//! uses libm transcendentals (`exp`, `acos`, trig — a known, tracked violation
-//! of the design's no-libm noise rule; see the follow-up work item), so height
-//! bits are not cross-platform-stable yet. Body *resolution* is clean:
-//! `bodygen`/`body_derive` are integer-splitmix + sqrt only.
+//! **Deliberate-break policy** (recorded WI 888, updated WI 892): the
+//! surface-layer stack landed at output version 2 — a **layout** bump only
+//! (rendered/physical behavior unchanged; equivalence tested). The two known
+//! intentional **stream** breaks — hash-derived child seeds (vs today's
+//! `seed ^ salt`) and sampled-path derivation — remain deferred and batched
+//! into the follow-up break WI, which takes the next bump with this harness
+//! auditing the regeneration. Note the boundary this harness does *not* yet
+//! cover: surface **heights** are excluded from goldens because the
+//! height/ejecta path still uses libm transcendentals (`exp`, `acos`, trig —
+//! a known, tracked violation of the design's no-libm noise rule; see the
+//! follow-up work item), so height bits are not cross-platform-stable yet.
+//! Body *resolution* is clean: `bodygen`/`body_derive` are integer-splitmix +
+//! sqrt only.
 
 use crate::body_asset::BodyAsset;
 
 /// The bit-level resolved-body output version. Bump **deliberately** when
 /// generator output is meant to change, and regenerate the golden file in the
 /// same commit (the regeneration test refuses digest changes without a bump).
-pub const BODY_OUTPUT_VERSION: u32 = 1;
+/// History: 1 = WI 888 baseline; 2 = WI 892 surface-layer stack (canonical
+/// layout change only — no value/stream change).
+pub const BODY_OUTPUT_VERSION: u32 = 2;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -123,12 +129,7 @@ pub fn digest_body(a: &BodyAsset) -> u64 {
         atmosphere_temperature,
         ocean_temperature,
     } = fluid_medium;
-    let crate::body_asset::SurfaceRecipe {
-        seed,
-        terrain,
-        crater,
-        material,
-    } = surface;
+    let crate::body_asset::SurfaceRecipe { seed, layers } = surface;
 
     let mut h = Fnv::new();
     h.str(id);
@@ -149,9 +150,21 @@ pub fn digest_body(a: &BodyAsset) -> u64 {
     h.f64(*atmosphere_temperature);
     h.f64(*ocean_temperature);
     h.u64(*seed);
-    h.json(terrain);
-    h.json(crater);
-    h.json(material);
+    h.u64(layers.len() as u64);
+    for layer in layers {
+        // Exhaustive like the rest of the layout: a new layer field is a
+        // compile error here, never a silent digest under-coverage.
+        let crate::body_asset::SurfaceLayer {
+            id: layer_id,
+            layer_type,
+            enabled,
+            params,
+        } = layer;
+        h.str(layer_id);
+        h.str(layer_type.slug());
+        h.u64(*enabled as u64);
+        h.json(params);
+    }
     h.json(render);
     h.0
 }
@@ -233,7 +246,10 @@ mod tests {
         b.mu += 1.0;
         assert_ne!(digest_body(&a), digest_body(&b));
         let mut c = a.clone();
-        c.surface.material = serde_json::json!({ "temperature": -1.0 });
+        c.surface.layers = vec![crate::body_asset::SurfaceLayer::well_known(
+            crate::body_asset::SurfaceLayerType::Material,
+            serde_json::json!({ "temperature": -1.0 }),
+        )];
         assert_ne!(digest_body(&a), digest_body(&c));
         // Distinct bodies differ.
         let ice = crate::content::canonical_body("earthlike-ice-age");
