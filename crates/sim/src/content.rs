@@ -1220,6 +1220,15 @@ pub struct BodyRecipeRecord {
     pub shape: Option<Archetype>,
     /// The ladder-resolved bands a shaped record was sampled from (WI 884).
     pub(crate) bands: Option<ArchetypeBands>,
+    /// Authored derivation inputs retained for reporting (WI 896): the fixed
+    /// arm's thermal/gas scalars (insolation / albedo / greenhouse ΔT / molar
+    /// mass, when authored) or a shaped record's suppress-admitted explicit
+    /// scalars, keyed by field name. In-memory only — the raw record these
+    /// came from is otherwise dropped after validation, and `sounding check`
+    /// needs them to recompute relations beside pins.
+    pub derivation_inputs: BTreeMap<&'static str, f64>,
+    /// The resolved suppress list (WI 880), sorted; empty when none.
+    pub suppress: Vec<String>,
     /// Inert metadata tags.
     pub tags: Vec<String>,
 }
@@ -2485,7 +2494,7 @@ fn validate(m: &RawRecord, merged: &HashMap<String, RawRecord>) -> Result<Record
                 }
             }
             apply_temperature_sugar(&mut surface_layers, b.surface_temperature_offset);
-            let (body, bands) = match b.shape {
+            let (body, bands, derivation_inputs) = match b.shape {
                 // Sampled (WI 883): an archetype. Draw the shape's bands at the
                 // seed via the shared sampler, reproducing `bodygen::generate`.
                 // The scalar fields are unused here; identity + classifier offset
@@ -2689,8 +2698,9 @@ fn validate(m: &RawRecord, merged: &HashMap<String, RawRecord>) -> Result<Record
                     body.name = b.name.clone().ok_or_else(|| missing(&b.id, "name"))?;
                     body.surface.layers = surface_layers;
                     // Retain the resolved bands (WI 884) so consumers can
-                    // re-sample the family at other seeds.
-                    (body, Some(bands))
+                    // re-sample the family at other seeds; the suppress pins
+                    // double as the record's retained explicit inputs (WI 896).
+                    (body, Some(bands), pins)
                 }
                 // Fixed (WI 881/886): independents are authored; each derived
                 // medium field is **pin-or-derive** — an authored value holds
@@ -2829,7 +2839,25 @@ fn validate(m: &RawRecord, merged: &HashMap<String, RawRecord>) -> Result<Record
                         },
                         render: serde_json::Value::Null,
                     };
-                    (body, None)
+                    // Retain the authored derivation inputs for reporting
+                    // (WI 896) — the raw record is dropped after validation.
+                    let mut inputs: BTreeMap<&'static str, f64> = BTreeMap::new();
+                    for (v, name) in [
+                        (b.nominal_insolation, "nominal_insolation"),
+                        (b.bond_albedo, "bond_albedo"),
+                        (b.greenhouse_delta_t, "greenhouse_delta_t"),
+                        (b.mean_molar_mass, "mean_molar_mass"),
+                        // Ocean intent (WI 896 report 3): gating zeroes the
+                        // body's trio last — even over pins — so the authored
+                        // values survive only here.
+                        (b.ocean_surface_density, "ocean_surface_density"),
+                        (b.ocean_surface_pressure, "ocean_surface_pressure"),
+                    ] {
+                        if let Some(v) = v {
+                            inputs.insert(name, v);
+                        }
+                    }
+                    (body, None, inputs)
                 }
             };
             Ok(Record::BodyRecipe(Box::new(BodyRecipeRecord {
@@ -2837,6 +2865,8 @@ fn validate(m: &RawRecord, merged: &HashMap<String, RawRecord>) -> Result<Record
                 body,
                 shape: b.shape,
                 bands,
+                derivation_inputs,
+                suppress: suppressed.iter().map(|s| s.to_string()).collect(),
                 tags: b.tags.clone().unwrap_or_default(),
             })))
         }
@@ -2911,6 +2941,20 @@ fn device_spec(d: &RawDevice, class: DeviceClass) -> Result<DeviceSpec, ContentE
 /// resolve from here — the hardcoded constructor assemblies and generator band
 /// literals they replaced are gone.
 const CANONICAL_BODIES_RON: &str = include_str!("../content/bodies.ron");
+
+/// The embedded canonical catalog, resolved once (WI 896: the `sounding
+/// check` default input — the same parse-once catalog `generate`/constructor
+/// paths read).
+pub fn embedded_catalog() -> &'static Catalog {
+    canonical_catalog()
+}
+
+/// The embedded canonical pack's RON source (WI 896): `sounding check
+/// --pack` compositions prepend it so external packs can parent from the
+/// canonical bases (`rocky`, `earthlike`, ...) they tune.
+pub fn embedded_pack_source() -> &'static str {
+    CANONICAL_BODIES_RON
+}
 
 /// The resolved canonical-bodies catalog, parsed once per process. The embedded
 /// pack is a compile-time asset gated by a unit test, so the `expect`s here are

@@ -42,6 +42,7 @@ mod bodies_scene;
 mod break_scene;
 mod build;
 mod bus;
+mod check_cli;
 mod collide_scene;
 mod compartments_scene;
 mod craft_library;
@@ -164,6 +165,12 @@ fn selected_scene() -> Scene {
 }
 
 fn main() {
+    // `sounding check` (WI 896): a headless authoring report — dispatched
+    // before any Bevy `App` exists, prints and exits (warnings exit 0).
+    if std::env::args().nth(1).as_deref() == Some("check") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(check_cli::run(&args));
+    }
     // Toys 1–3 keep running headless: the on-rails orbit and the runtime bus stay
     // live so the companion still works, whichever scene is shown. All SI (WI 527):
     // the one canonical unit system, shared with the scenes via `CentralBody::EARTHLIKE`.

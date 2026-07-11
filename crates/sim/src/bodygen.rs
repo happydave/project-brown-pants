@@ -232,6 +232,57 @@ fn recipe_alias(tag: &str) -> &str {
     }
 }
 
+/// The sampler stream tag of a recipe-vocabulary field name — the inverse of
+/// [`recipe_alias`].
+fn tag_alias(recipe_name: &str) -> &str {
+    if recipe_name == "rotation_period" {
+        "sidereal_period"
+    } else {
+        recipe_name
+    }
+}
+
+/// The drawn independents of one sampled body, in the recipe vocabulary
+/// (WI 896, for `sounding check`): for each field the `archetype` draws, the
+/// value [`sample`] consumed — a suppressed field's pin, otherwise the first
+/// draw of the field's own stream — plus the stream's full domain tag (empty
+/// for a pinned field: its stream is never opened). Welded to `sample` by
+/// test, so this view cannot drift from what the sampler actually did.
+pub(crate) fn drawn_independents(
+    seed: u64,
+    archetype: Archetype,
+    bands: &ArchetypeBands,
+    pins: &BTreeMap<&str, f64>,
+) -> Vec<(&'static str, f64, String)> {
+    suppressible_fields(archetype)
+        .iter()
+        .map(|&name| {
+            let band = match name {
+                "radius" => bands.radius,
+                "gravity" => bands.gravity,
+                "rotation_period" => bands.sidereal_period,
+                "nominal_insolation" => bands.nominal_insolation,
+                "bond_albedo" => bands.bond_albedo,
+                "atmosphere_surface_pressure" => bands.atmosphere_surface_pressure,
+                "greenhouse_delta_t" => bands.greenhouse_delta_t,
+                "mean_molar_mass" => bands.mean_molar_mass,
+                "ocean_surface_density" => bands.ocean_surface_density,
+                "ocean_temperature" => bands.ocean_temperature,
+                other => unreachable!("suppressible field {other} has no band"),
+            };
+            let tag = tag_alias(name);
+            match pins.get(name) {
+                Some(v) => (name, *v, String::new()),
+                None => (
+                    name,
+                    Rng::new(field_seed(seed, archetype, tag)).range(band.0, band.1),
+                    format!("{}/{}", archetype.slug(), tag),
+                ),
+            }
+        })
+        .collect()
+}
+
 /// Samples a [`BodyAsset`] deterministically from `seed`, an `archetype`
 /// (structure), its parameter `bands` (numbers), and any suppressed-field
 /// `pins` (WI 880: recipe-vocabulary name → explicit value, replacing that
@@ -727,6 +778,105 @@ mod tests {
                         "ocean pressure continuous with the atmosphere"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn drawn_independents_weld_to_the_sampler() {
+        // WI 896: the check-report view of the draws must be exactly what
+        // `sample` consumed — welded per archetype at a fixed seed, both
+        // unpinned and with one suppressed field.
+        let seed = 7;
+        for arch in [
+            Archetype::Moon,
+            Archetype::RockyPlanet,
+            Archetype::OceanWorld,
+        ] {
+            let bands = crate::content::canonical_bands(arch);
+            for pins in [BTreeMap::new(), BTreeMap::from([("bond_albedo", 0.21_f64)])] {
+                let body = sample(seed, arch, &bands, &pins);
+                let drawn: BTreeMap<&str, (f64, String)> =
+                    drawn_independents(seed, arch, &bands, &pins)
+                        .into_iter()
+                        .map(|(n, v, t)| (n, (v, t)))
+                        .collect();
+                // Directly visible fields.
+                assert_eq!(drawn["radius"].0, body.radius, "{arch:?}");
+                assert_eq!(drawn["gravity"].0, body.fluid_medium.gravity, "{arch:?}");
+                assert_eq!(
+                    drawn["rotation_period"].0, body.rotation.sidereal_period,
+                    "{arch:?}"
+                );
+                // The thermal chain recomposes to the body's temperature.
+                let greenhouse = match arch {
+                    Archetype::Moon => 0.0,
+                    _ => drawn["greenhouse_delta_t"].0,
+                };
+                assert_eq!(
+                    body_derive::surface_temperature(
+                        body_derive::equilibrium_temperature(
+                            drawn["nominal_insolation"].0,
+                            drawn["bond_albedo"].0,
+                        ),
+                        greenhouse,
+                    ),
+                    body.fluid_medium.atmosphere_temperature,
+                    "{arch:?}"
+                );
+                if arch != Archetype::Moon {
+                    assert_eq!(
+                        drawn["atmosphere_surface_pressure"].0,
+                        body.fluid_medium.atmosphere_surface_pressure,
+                        "{arch:?}"
+                    );
+                    // The gas chain recomposes to the body's density — welds
+                    // the drawn molar mass.
+                    assert_eq!(
+                        body_derive::atmosphere_surface_density(
+                            drawn["atmosphere_surface_pressure"].0,
+                            drawn["mean_molar_mass"].0,
+                            body.fluid_medium.atmosphere_temperature,
+                        ),
+                        body.fluid_medium.atmosphere_surface_density,
+                        "{arch:?}"
+                    );
+                }
+                if arch == Archetype::OceanWorld {
+                    assert_eq!(
+                        drawn["ocean_temperature"].0, body.fluid_medium.ocean_temperature,
+                        "{arch:?}"
+                    );
+                    // The shared gate recomposes to the body's ocean trio —
+                    // welds the drawn ocean density.
+                    assert_eq!(
+                        body_derive::gate_ocean(
+                            body.fluid_medium.atmosphere_temperature,
+                            drawn["atmosphere_surface_pressure"].0,
+                            drawn["ocean_surface_density"].0,
+                            drawn["atmosphere_surface_pressure"].0,
+                            0.0,
+                        ),
+                        (
+                            body.fluid_medium.ocean_surface_density,
+                            body.fluid_medium.ocean_surface_pressure,
+                            body.fluid_medium.ocean_density_gradient,
+                        ),
+                        "{arch:?}"
+                    );
+                }
+                // Tags: pinned fields carry none; drawn fields carry the
+                // frozen `<slug>/<tag>` stream key (the alias seam included).
+                let albedo_tag = &drawn["bond_albedo"].1;
+                if pins.is_empty() {
+                    assert_eq!(albedo_tag, &format!("{}/bond_albedo", arch.slug()));
+                } else {
+                    assert!(albedo_tag.is_empty(), "pinned field has no stream tag");
+                }
+                assert_eq!(
+                    drawn["rotation_period"].1,
+                    format!("{}/sidereal_period", arch.slug())
+                );
             }
         }
     }

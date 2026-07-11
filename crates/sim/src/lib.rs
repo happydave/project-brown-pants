@@ -20,6 +20,7 @@ pub mod body_library;
 pub mod body_ref;
 pub mod bodygen;
 pub mod breakage;
+pub mod check;
 pub mod collision;
 pub mod collision_detect;
 pub mod command;
