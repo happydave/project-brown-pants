@@ -110,7 +110,7 @@ const STRUCTURAL_FIELDS: [&str; 6] = ["id", "parent", "abstract", "class", "shap
 /// the ceiling of exact integer representation in an f64. Above it the slot
 /// silently loses precision, so validation rejects it loudly instead (WI 891,
 /// parked decision (b) from WIs 881/883).
-const MAX_AUTHORED_SEED: f64 = 9_007_199_254_740_992.0;
+pub(crate) const MAX_AUTHORED_SEED: f64 = 9_007_199_254_740_992.0;
 
 // ---------------------------------------------------------------------------
 // Errors

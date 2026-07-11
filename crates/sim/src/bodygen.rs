@@ -232,6 +232,37 @@ fn recipe_alias(tag: &str) -> &str {
     }
 }
 
+/// The synthesized identity of a generated body: the `gen-<slug>-<016x>` id
+/// and the label-based display name [`sample`] stamps (WI 897: the export
+/// path reuses these so an exported record's defaults match `generate`'s
+/// output exactly — the formats live only here).
+pub(crate) fn generated_identity(seed: u64, archetype: Archetype) -> (String, String) {
+    (
+        format!("gen-{}-{:016x}", archetype.slug(), seed),
+        format!("{} {:04X}", archetype.label(), (seed & 0xFFFF) as u16),
+    )
+}
+
+/// Parse a generated-body id (`gen-<slug>-<16 lowercase hex>`) back to its
+/// archetype and seed — the inverse of [`generated_identity`]'s id half.
+/// `None` for anything else (a real catalog record named `gen-…` is looked
+/// up first by callers; this is for ids that exist nowhere but a save or a
+/// keep-loop screenshot). Pinned round-trip by test.
+pub fn parse_generated_id(id: &str) -> Option<(Archetype, u64)> {
+    let rest = id.strip_prefix("gen-")?;
+    let (slug, hex) = rest.rsplit_once('-')?;
+    let archetype = Archetype::from_slug(slug)?;
+    if hex.len() != 16
+        || hex
+            .chars()
+            .any(|c| !c.is_ascii_hexdigit() || c.is_ascii_uppercase())
+    {
+        return None;
+    }
+    let seed = u64::from_str_radix(hex, 16).ok()?;
+    Some((archetype, seed))
+}
+
 /// The sampler stream tag of a recipe-vocabulary field name — the inverse of
 /// [`recipe_alias`].
 fn tag_alias(recipe_name: &str) -> &str {
@@ -418,9 +449,10 @@ pub(crate) fn sample(
         }
     };
 
+    let (id, name) = generated_identity(seed, archetype);
     BodyAsset {
-        id: format!("gen-{}-{:016x}", archetype.slug(), seed),
-        name: format!("{} {:04X}", archetype.label(), (seed & 0xFFFF) as u16),
+        id,
+        name,
         mu,
         radius,
         rotation,

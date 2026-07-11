@@ -50,6 +50,7 @@ mod crash_scene;
 mod debug_control;
 mod dive_scene;
 mod editor;
+mod export_cli;
 mod floating_origin;
 mod flooding_scene;
 mod gallery_scene;
@@ -170,6 +171,12 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some("check") {
         let args: Vec<String> = std::env::args().skip(2).collect();
         std::process::exit(check_cli::run(&args));
+    }
+    // `sounding export-body` (WI 897): the write-side sibling — emit a kept
+    // body as an authored, self-verified pack; same pre-Bevy dispatch.
+    if std::env::args().nth(1).as_deref() == Some("export-body") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(export_cli::run(&args));
     }
     // Toys 1–3 keep running headless: the on-rails orbit and the runtime bus stay
     // live so the companion still works, whichever scene is shown. All SI (WI 527):
